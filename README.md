@@ -11,6 +11,12 @@ the rest.
 Built for people who use more than one AI coding tool and are tired of managing
 MCP servers per app.
 
+## Screenshots
+
+| Servers | Activity | Playground |
+|---|---|---|
+| ![All servers](docs/screenshots/servers.png) | ![Activity and metrics](docs/screenshots/activity.png) | ![Tool playground](docs/screenshots/playground.png) |
+
 ## Why
 
 Every AI client wants its own MCP configuration. Run a handful of agents and you
