@@ -114,7 +114,36 @@ fn config() -> Option<PathBuf> {
 }
 
 fn claude_desktop_path() -> Option<PathBuf> {
-    Some(config()?.join("Claude").join("claude_desktop_config.json"))
+    // Claude Desktop is MSIX-packaged, so its Roaming config can live at the real
+    // %APPDATA% and/or inside the package's virtualized LocalCache. Prefer the
+    // real path (home-anchored via `config()`); if only the package copy exists,
+    // find it by scanning for the `Claude*` package so we don't depend on a
+    // process running under the same virtualization.
+    let real = config()?.join("Claude").join("claude_desktop_config.json");
+    if real.exists() {
+        return Some(real);
+    }
+    if let Some(home) = dirs::home_dir() {
+        let packages = home.join("AppData").join("Local").join("Packages");
+        if let Ok(entries) = std::fs::read_dir(&packages) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().starts_with("Claude") {
+                    let p = entry
+                        .path()
+                        .join("LocalCache")
+                        .join("Roaming")
+                        .join("Claude")
+                        .join("claude_desktop_config.json");
+                    if p.exists() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+    // Default to the real path even if absent, so the status reads "not found"
+    // rather than erroring.
+    Some(real)
 }
 
 fn cursor_path() -> Option<PathBuf> {
