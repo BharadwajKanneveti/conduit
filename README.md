@@ -91,6 +91,10 @@ Prebuilt installers are published on the
 targets **Windows**; macOS and Linux support is in progress. To run from source,
 see Development below.
 
+The installer is not yet code signed, so Windows may show "Windows protected your
+PC", click **More info → Run anyway**. See [docs/SIGNING.md](docs/SIGNING.md) for
+the signing plan.
+
 ## Development
 
 Requires Node and the Rust toolchain.
