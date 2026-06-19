@@ -39,17 +39,12 @@ fn missing_secret(server: &ServerEntry) -> bool {
         .any(|e| e.secret && e.value.is_none() && secrets::get_secret(&server.id, &e.key).is_none())
 }
 
-/// Connect to one server and report whether it came up and how many tools it has.
-fn probe_one(server: &ServerEntry) -> ProbeResult {
-    let fail = |e: String, auth_required: bool| ProbeResult {
-        server_id: server.id.clone(),
-        ok: false,
-        tool_count: 0,
-        error: Some(e),
-        auth_required,
-    };
-
-    let connected = if let Some(command) = &server.command {
+/// Connect to one server (stdio or remote), injecting any vaulted secrets, and
+/// return the live connection (its tools are already listed). Shared by the
+/// health probe and the tool playground - the running gateway is a separate
+/// process, so the app connects on demand for these one-off operations.
+fn connect_server(server: &ServerEntry) -> Result<DownstreamServer, String> {
+    if let Some(command) = &server.command {
         let mut env: Vec<(String, String)> = Vec::new();
         for e in &server.env {
             if let Some(v) = &e.value {
@@ -60,17 +55,18 @@ fn probe_one(server: &ServerEntry) -> ProbeResult {
                 }
             }
         }
-        match StdioTransport::spawn(command, &server.args, &env) {
-            Ok(t) => DownstreamServer::connect(server.id.clone(), Box::new(t)),
-            Err(e) => return fail(e, missing_secret(server)),
-        }
+        let t = StdioTransport::spawn(command, &server.args, &env)?;
+        DownstreamServer::connect(server.id.clone(), Box::new(t))
     } else if let Some(url) = &server.url {
         remote::connect_remote(&server.id, url)
     } else {
-        return fail("no command or url".to_string(), false);
-    };
+        Err("no command or url".to_string())
+    }
+}
 
-    match connected {
+/// Connect to one server and report whether it came up and how many tools it has.
+fn probe_one(server: &ServerEntry) -> ProbeResult {
+    match connect_server(server) {
         Ok(ds) => ProbeResult {
             server_id: server.id.clone(),
             ok: true,
@@ -80,10 +76,13 @@ fn probe_one(server: &ServerEntry) -> ProbeResult {
         },
         // A stdio server that spawned but didn't list tools is very likely missing
         // its key; a remote 401/403 is an auth error outright.
-        Err(e) => {
-            let auth = remote::is_auth_error(&e) || missing_secret(server);
-            fail(e, auth)
-        }
+        Err(e) => ProbeResult {
+            server_id: server.id.clone(),
+            ok: false,
+            tool_count: 0,
+            auth_required: remote::is_auth_error(&e) || missing_secret(server),
+            error: Some(e),
+        },
     }
 }
 
@@ -121,6 +120,7 @@ fn server_from_detected(server: &clients::McpServer, client_id: &str) -> ServerE
             .collect(),
         url: server.url.clone(),
         source: Some(format!("imported:{client_id}")),
+        disabled_tools: vec![],
     }
 }
 
@@ -350,6 +350,13 @@ fn get_audit_log(limit: usize) -> Vec<serde_json::Value> {
     audit::read_recent(limit)
 }
 
+/// Aggregate the recent audit log into per-server call/error/latency stats for
+/// the observability dashboard.
+#[tauri::command]
+fn audit_stats(window: usize) -> serde_json::Value {
+    audit::stats(window)
+}
+
 /// Connect to each enabled server in the active profile and report health + tool count.
 #[tauri::command]
 async fn probe_servers(state: State<'_, RegistryState>) -> Result<Vec<ProbeResult>, String> {
@@ -372,6 +379,96 @@ async fn probe_servers(state: State<'_, RegistryState>) -> Result<Vec<ProbeResul
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Snapshot one server out of the registry by id (dropping the lock before I/O).
+fn server_by_id(state: &RegistryState, server_id: &str) -> Result<ServerEntry, String> {
+    let reg = state.lock().unwrap();
+    reg.servers
+        .iter()
+        .find(|s| s.id == server_id)
+        .cloned()
+        .ok_or_else(|| format!("server '{server_id}' not found"))
+}
+
+/// List the tools one server exposes (raw MCP tool objects: name, description,
+/// inputSchema). Connects on demand and disconnects when the connection drops.
+/// Powers the tool playground's tool picker.
+#[tauri::command]
+async fn list_server_tools(
+    state: State<'_, RegistryState>,
+    server_id: String,
+) -> Result<Vec<serde_json::Value>, String> {
+    let server = server_by_id(state.inner(), &server_id)?;
+    tauri::async_runtime::spawn_blocking(move || connect_server(&server).map(|ds| ds.tools))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Invoke one tool on a server with the given arguments and return its raw MCP
+/// result (`{ content, isError }`). Connects on demand and records the call in
+/// the audit log, just like a call routed through the gateway.
+#[tauri::command]
+async fn call_tool(
+    state: State<'_, RegistryState>,
+    server_id: String,
+    tool: String,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let server = server_by_id(state.inner(), &server_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut ds = connect_server(&server)?;
+        let started = std::time::Instant::now();
+        let result = ds.call(&tool, arguments);
+        let ms = started.elapsed().as_millis() as u64;
+        // Mirror the gateway's success accounting: a result with isError=true is
+        // a failed call even though the transport round-tripped fine.
+        let ok = result
+            .as_ref()
+            .map(|r| !r.get("isError").and_then(|v| v.as_bool()).unwrap_or(false))
+            .unwrap_or(false);
+        audit::record_timed(&server.id, &tool, ok, Some(ms));
+        result
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Enable or disable a single tool on a server. The gateway hides disabled
+/// tools from `tools/list` and rejects calls to them; the change propagates live
+/// via the registry watcher. Returns the updated registry.
+#[tauri::command]
+fn set_tool_enabled(
+    state: State<RegistryState>,
+    server_id: String,
+    tool: String,
+    enabled: bool,
+) -> Result<Registry, String> {
+    let mut reg = state.lock().unwrap();
+    reg.set_tool_enabled(&server_id, &tool, enabled)?;
+    registry::save(&reg)?;
+    Ok(reg.clone())
+}
+
+/// Flip the global destructive-tool deny switch. When on, the gateway hides and
+/// blocks every tool annotated `destructiveHint: true` across all servers.
+#[tauri::command]
+fn set_deny_destructive(state: State<RegistryState>, deny: bool) -> Result<Registry, String> {
+    let mut reg = state.lock().unwrap();
+    reg.set_deny_destructive(deny);
+    registry::save(&reg)?;
+    Ok(reg.clone())
+}
+
+/// Set lazy discovery globally. The gateway reads this from the registry, so it
+/// takes effect for every client (including ones that don't forward env vars).
+/// Clients pick it up the next time they (re)spawn the gateway.
+#[tauri::command]
+fn set_lazy_discovery(state: State<RegistryState>, lazy: bool) -> Result<Registry, String> {
+    let mut reg = state.lock().unwrap();
+    reg.set_lazy_discovery(lazy);
+    registry::save(&reg)?;
+    Ok(reg.clone())
 }
 
 /// Re-save the registry to bump its mtime. The running gateway watches that file
@@ -425,11 +522,18 @@ async fn authenticate_oauth(
     server_id: String,
     url: String,
 ) -> Result<(), String> {
+    let resource = url.clone();
     let res = tauri::async_runtime::spawn_blocking(move || oauth::authenticate(&url))
         .await
         .map_err(|e| e.to_string())??;
     secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &res.access_token)?;
-    remote::store_oauth_state(&server_id, &res.token_endpoint, &res.client_id, res.refresh_token)?;
+    remote::store_oauth_state(
+        &server_id,
+        &res.token_endpoint,
+        &res.client_id,
+        res.refresh_token,
+        Some(resource),
+    )?;
     nudge_gateway(state.inner());
     Ok(())
 }
@@ -460,6 +564,7 @@ fn promote_to_catalog(state: State<RegistryState>, server_id: String) -> Result<
         env_keys: server.env.iter().map(|e| e.key.clone()).collect(),
         source: "user".to_string(),
         homepage: None,
+        publisher: None,
     };
     catalog::promote(entry)
 }
@@ -516,7 +621,13 @@ pub fn run() {
             delete_secret,
             secret_status,
             get_audit_log,
+            audit_stats,
             probe_servers,
+            list_server_tools,
+            call_tool,
+            set_tool_enabled,
+            set_deny_destructive,
+            set_lazy_discovery,
             set_auth_token,
             clear_auth_token,
             has_auth_token,

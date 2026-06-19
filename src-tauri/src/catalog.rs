@@ -28,6 +28,11 @@ pub struct CatalogEntry {
     /// "curated" | "registry"
     pub source: String,
     pub homepage: Option<String>,
+    /// Publishing namespace from the official registry id, e.g. `io.github.acme`
+    /// for `io.github.acme/widget`. A provenance signal (who published it), not a
+    /// cryptographic guarantee. `None` for curated/user entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
 }
 
 /// The hand-verified popular set. Hosted (URL) servers are favored here because
@@ -46,10 +51,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         env_keys: vec![],
         source: "curated".to_string(),
         homepage: Some(home.to_string()),
-    };
-    let sse = |name: &str, desc: &str, url: &str, home: &str| CatalogEntry {
-        transport: "sse".to_string(),
-        ..http(name, desc, url, home)
+        publisher: None,
     };
     // Local (stdio) servers: `command` + args, with any required secret env keys.
     let cmd =
@@ -64,6 +66,7 @@ pub fn curated() -> Vec<CatalogEntry> {
                 env_keys: env.iter().map(|s| s.to_string()).collect(),
                 source: "curated".to_string(),
                 homepage: Some(home.to_string()),
+                publisher: None,
             }
         };
 
@@ -78,13 +81,13 @@ pub fn curated() -> Vec<CatalogEntry> {
         cmd("AWS", "AWS APIs, docs, and best practices via AWS Labs MCP.", "uvx", &["awslabs.core-mcp-server@latest"], &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], "https://github.com/awslabs/mcp"),
         // --- Databases ---
         http("Supabase", "Query and manage your Supabase projects.", "https://mcp.supabase.com/mcp", "https://supabase.com/docs/guides/getting-started/mcp"),
-        sse("Neon", "Serverless Postgres: branches, queries, projects.", "https://mcp.neon.tech/sse", "https://neon.tech/docs/ai/neon-mcp-server"),
+        http("Neon", "Serverless Postgres: branches, queries, projects.", "https://mcp.neon.tech/mcp", "https://neon.tech/docs/ai/neon-mcp-server"),
         cmd("PostgreSQL", "Query a Postgres database (add your connection string to args).", "npx", &["-y", "@modelcontextprotocol/server-postgres"], &[], "https://github.com/modelcontextprotocol/servers"),
         // --- Project management & docs ---
         http("Notion", "Search and edit Notion pages and databases.", "https://mcp.notion.com/mcp", "https://developers.notion.com"),
-        sse("Linear", "Issues, projects, and cycles in Linear.", "https://mcp.linear.app/sse", "https://linear.app/docs"),
-        sse("Atlassian", "Jira issues and Confluence pages.", "https://mcp.atlassian.com/v1/sse", "https://support.atlassian.com/atlassian-rovo-mcp-server/"),
-        sse("Asana", "Tasks, projects, and portfolios in Asana.", "https://mcp.asana.com/sse", "https://developers.asana.com/docs/mcp-server"),
+        http("Linear", "Issues, projects, and cycles in Linear.", "https://mcp.linear.app/mcp", "https://linear.app/docs"),
+        http("Atlassian", "Jira issues and Confluence pages.", "https://mcp.atlassian.com/v1/mcp", "https://support.atlassian.com/atlassian-rovo-mcp-server/"),
+        http("Asana", "Tasks, projects, and portfolios in Asana.", "https://mcp.asana.com/mcp", "https://developers.asana.com/docs/mcp-server"),
         // --- Communication ---
         cmd("Slack", "Read and send Slack messages and manage channels.", "npx", &["-y", "@modelcontextprotocol/server-slack"], &["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"], "https://github.com/modelcontextprotocol/servers"),
         // --- Knowledge & search ---
@@ -226,6 +229,9 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
         .and_then(|r| r.get("url"))
         .and_then(|v| v.as_str())
         .map(String::from);
+    // Registry ids are namespaced (`io.github.acme/widget`); the namespace tells
+    // you who published it - a provenance signal we surface in the catalog.
+    let publisher = id.split_once('/').map(|(ns, _)| ns.to_string());
 
     if let Some(remote) = server
         .get("remotes")
@@ -245,6 +251,7 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
                 env_keys: vec![],
                 source: "registry".to_string(),
                 homepage,
+                publisher,
             });
         }
     }
@@ -293,6 +300,7 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
             env_keys,
             source: "registry".to_string(),
             homepage,
+            publisher,
         });
     }
 

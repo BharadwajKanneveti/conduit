@@ -32,6 +32,7 @@ import { ClientDetail } from "@/components/ClientDetail";
 import { ActivityView } from "@/components/ActivityView";
 import { ServerDialog } from "@/components/ServerDialog";
 import { CatalogView } from "@/components/CatalogView";
+import { PlaygroundView } from "@/components/PlaygroundView";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -46,7 +47,7 @@ function App() {
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
-  const [view, setView] = useState<"servers" | "activity" | "catalog">("servers");
+  const [view, setView] = useState<"servers" | "activity" | "catalog" | "playground">("servers");
   const [activityKey, setActivityKey] = useState(0);
   const [health, setHealth] = useState<Record<string, ProbeResult>>({});
   const [probing, setProbing] = useState(false);
@@ -92,7 +93,7 @@ function App() {
   }
 
   // Catalog and Activity are top-level destinations, so leave any selected client.
-  function selectView(v: "servers" | "activity" | "catalog") {
+  function selectView(v: "servers" | "activity" | "catalog" | "playground") {
     setSelectedClientId(null);
     setView(v);
   }
@@ -228,17 +229,21 @@ function App() {
                   ? "Activity"
                   : view === "catalog"
                     ? "Browse catalog"
-                    : selectedClient
-                      ? selectedClient.name
-                      : "Servers"}
+                    : view === "playground"
+                      ? "Playground"
+                      : selectedClient
+                        ? selectedClient.name
+                        : "Servers"}
               </h1>
               <p className="truncate text-sm text-muted-foreground">
                 {view === "activity"
                   ? "Tool calls routed through Conduit"
                   : view === "catalog"
                     ? "Add MCP servers from the registry"
-                    : selectedClient
-                      ? "MCP client"
+                    : view === "playground"
+                      ? "Invoke a server's tools and see the raw result"
+                      : selectedClient
+                        ? "MCP client"
                       : loading || !registry
                         ? "Loading…"
                         : `${enabledCount} of ${servers.length} enabled` +
@@ -307,6 +312,8 @@ function App() {
                 <ActivityView refreshKey={activityKey} />
               ) : view === "catalog" ? (
                 <CatalogView registry={registry} onAdded={setRegistry} />
+              ) : view === "playground" ? (
+                <PlaygroundView registry={registry} onRegistryChange={setRegistry} />
               ) : selectedClient ? (
                 <ClientDetail
                   client={selectedClient}

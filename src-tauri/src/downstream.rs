@@ -8,11 +8,18 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Max time to wait for a single stdio response before giving up. Without this a
+/// server that never replies would block its thread (and the batch health probe)
+/// forever.
+const STDIO_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Build an `Authorization` header value from a raw token, adding the `Bearer`
 /// scheme unless the caller already included one.
@@ -61,10 +68,12 @@ pub trait Transport: Send {
 }
 
 /// Talks to a downstream MCP server over its stdio (a spawned child process).
+/// Stdout is drained on a background thread into a channel so reads can time out
+/// (a blocking `read_line` on an unresponsive child would otherwise hang forever).
 pub struct StdioTransport {
     child: Child,
     stdin: ChildStdin,
-    reader: BufReader<ChildStdout>,
+    rx: Receiver<String>,
     next_id: i64,
 }
 
@@ -82,10 +91,31 @@ impl StdioTransport {
             .map_err(|e| format!("failed to spawn '{command}': {e}"))?;
         let stdin = child.stdin.take().ok_or("no child stdin")?;
         let stdout = child.stdout.take().ok_or("no child stdout")?;
+
+        // Drain stdout line-by-line on a dedicated thread; the request loop pulls
+        // from the channel with a timeout. The thread ends on EOF/read error or
+        // when the receiver is dropped (transport closed).
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            loop {
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if tx.send(line).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
         Ok(StdioTransport {
             child,
             stdin,
-            reader: BufReader::new(stdout),
+            rx,
             next_id: 1,
         })
     }
@@ -100,12 +130,22 @@ impl Transport for StdioTransport {
         self.stdin.flush().map_err(|e| e.to_string())?;
 
         // Read until the response with our id arrives, skipping notifications.
+        // The deadline bounds the whole wait so an unresponsive server fails fast
+        // instead of hanging the thread (and the batch probe) indefinitely.
+        let deadline = Instant::now() + STDIO_READ_TIMEOUT;
         loop {
-            let mut line = String::new();
-            let n = self.reader.read_line(&mut line).map_err(|e| e.to_string())?;
-            if n == 0 {
-                return Err("downstream server closed the connection".to_string());
-            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            let line = match self.rx.recv_timeout(remaining) {
+                Ok(l) => l,
+                Err(RecvTimeoutError::Timeout) => {
+                    return Err(format!("timed out waiting for '{method}' response"))
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err("downstream server closed the connection".to_string())
+                }
+            };
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 continue;
@@ -256,17 +296,28 @@ impl Transport for HttpTransport {
     }
 }
 
-/// One connected downstream server: its id, its transport, and its cached tools.
+/// One connected downstream server: its id, its transport, and its cached
+/// tools, resources, and prompts.
 pub struct DownstreamServer {
     pub id: String,
     transport: Box<dyn Transport>,
     pub tools: Vec<Value>,
+    pub resources: Vec<Value>,
+    pub prompts: Vec<Value>,
+    /// Whether the server's `initialize` advertised resources / prompts. The
+    /// actual lists are fetched lazily via `load_resources_prompts`.
+    caps_resources: bool,
+    caps_prompts: bool,
 }
 
 impl DownstreamServer {
-    /// Handshake with the server and fetch its tool list.
+    /// Handshake with the server and fetch its tool list. Resources and prompts
+    /// are NOT fetched here - only whether the server advertises them is noted,
+    /// so the health probe (which connects to every server in one batch) stays
+    /// tools-only and fast and can't stall on a slow or hanging resources/prompts
+    /// endpoint. The gateway calls `load_resources_prompts` to populate them.
     pub fn connect(id: String, mut transport: Box<dyn Transport>) -> Result<Self, String> {
-        transport.request(
+        let init = transport.request(
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
@@ -274,24 +325,66 @@ impl DownstreamServer {
                 "clientInfo": { "name": "conduit-gateway", "version": env!("CARGO_PKG_VERSION") }
             }),
         )?;
+        let caps = init.get("capabilities");
+        let caps_resources = caps.and_then(|c| c.get("resources")).is_some();
+        let caps_prompts = caps.and_then(|c| c.get("prompts")).is_some();
         transport.notify("notifications/initialized", json!({}))?;
+
         let result = transport.request("tools/list", json!({}))?;
-        let tools = result
-            .get("tools")
-            .and_then(|t| t.as_array())
-            .cloned()
-            .unwrap_or_default();
+        let tools = extract_array(&result, "tools");
+
         Ok(DownstreamServer {
             id,
             transport,
             tools,
+            resources: Vec::new(),
+            prompts: Vec::new(),
+            caps_resources,
+            caps_prompts,
         })
+    }
+
+    /// Fetch the resources and prompts the server advertised. Best-effort: an
+    /// error or empty response just leaves the list empty. Kept out of `connect`
+    /// so only the gateway (which actually proxies these) pays the cost.
+    pub fn load_resources_prompts(&mut self) {
+        if self.caps_resources {
+            if let Ok(r) = self.transport.request("resources/list", json!({})) {
+                self.resources = extract_array(&r, "resources");
+            }
+        }
+        if self.caps_prompts {
+            if let Ok(r) = self.transport.request("prompts/list", json!({})) {
+                self.prompts = extract_array(&r, "prompts");
+            }
+        }
     }
 
     pub fn call(&mut self, tool: &str, arguments: Value) -> Result<Value, String> {
         self.transport
             .request("tools/call", json!({ "name": tool, "arguments": arguments }))
     }
+
+    /// Read one resource by its (original, downstream) uri.
+    pub fn read_resource(&mut self, uri: &str) -> Result<Value, String> {
+        self.transport
+            .request("resources/read", json!({ "uri": uri }))
+    }
+
+    /// Get one prompt by its (original, downstream) name.
+    pub fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value, String> {
+        self.transport
+            .request("prompts/get", json!({ "name": name, "arguments": arguments }))
+    }
+}
+
+/// Pull a named array field out of a JSON-RPC result, or an empty vec.
+fn extract_array(result: &Value, key: &str) -> Vec<Value> {
+    result
+        .get(key)
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

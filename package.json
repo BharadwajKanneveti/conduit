@@ -7,7 +7,10 @@
     "dev": "vite",
     "build": "tsc && vite build",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "prepare:sidecar": "node scripts/prepare-sidecar.mjs",
+    "build:bundle": "npm run build && npm run prepare:sidecar",
+    "tauri:bundle": "tauri build --config src-tauri/tauri.bundle.conf.json"
   },
   "dependencies": {
     "@fontsource-variable/geist": "^5.2.9",

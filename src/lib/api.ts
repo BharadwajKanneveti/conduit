@@ -1,13 +1,16 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   AuditEntry,
+  AuditStats,
   AuthInfo,
   CatalogEntry,
   DetectedClient,
+  McpTool,
   MigrateResult,
   ProbeResult,
   Registry,
   ServerEntry,
+  ToolCallResult,
   WriteOutcome,
 } from "./types";
 
@@ -36,9 +39,47 @@ export function getAuditLog(limit = 200): Promise<AuditEntry[]> {
   return invoke<AuditEntry[]>("get_audit_log", { limit });
 }
 
+/** Aggregated per-server stats (calls, error rate, latency) from the audit log. */
+export function getAuditStats(window = 2000): Promise<AuditStats> {
+  return invoke<AuditStats>("audit_stats", { window });
+}
+
 /** Connect to each enabled server and report health + tool count. */
 export function probeServers(): Promise<ProbeResult[]> {
   return invoke<ProbeResult[]>("probe_servers");
+}
+
+/** List the tools one server exposes (connects on demand). Playground picker. */
+export function listServerTools(serverId: string): Promise<McpTool[]> {
+  return invoke<McpTool[]>("list_server_tools", { serverId });
+}
+
+/** Invoke one tool on a server and return its raw MCP result. */
+export function callTool(
+  serverId: string,
+  tool: string,
+  args: Record<string, unknown>,
+): Promise<ToolCallResult> {
+  return invoke<ToolCallResult>("call_tool", { serverId, tool, arguments: args });
+}
+
+/** Enable/disable one tool on a server (gateway hides+blocks disabled tools). */
+export function setToolEnabled(
+  serverId: string,
+  tool: string,
+  enabled: boolean,
+): Promise<Registry> {
+  return invoke<Registry>("set_tool_enabled", { serverId, tool, enabled });
+}
+
+/** Toggle the global destructive-tool deny switch. */
+export function setDenyDestructive(deny: boolean): Promise<Registry> {
+  return invoke<Registry>("set_deny_destructive", { deny });
+}
+
+/** Toggle global lazy discovery (meta-tools vs full catalog) for all clients. */
+export function setLazyDiscovery(lazy: boolean): Promise<Registry> {
+  return invoke<Registry>("set_lazy_discovery", { lazy });
 }
 
 /** Probe every supported MCP client and read its current server configuration. */

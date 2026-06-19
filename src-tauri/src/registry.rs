@@ -45,6 +45,11 @@ pub struct ServerEntry {
     /// Where this entry came from, e.g. "imported:cursor" or "manual".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
+    /// Original (downstream) tool names the user has switched off. The gateway
+    /// hides these from `tools/list` and rejects calls to them. Default-allow:
+    /// an empty list means every tool the server advertises is exposed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -64,6 +69,23 @@ pub struct Registry {
     pub profiles: Vec<Profile>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_profile_id: Option<String>,
+    /// Global safety switch: when true, the gateway hides and blocks any tool a
+    /// server annotates with `destructiveHint: true` (deletes, drops, writes).
+    /// One toggle to keep agents read-only across every connected server.
+    #[serde(default)]
+    pub deny_destructive: bool,
+    /// Lazy discovery: the gateway exposes 3 meta-tools (status/search/call)
+    /// instead of every downstream tool, so clients with tool-count limits don't
+    /// drop tools. The gateway reads this from the registry file it already
+    /// loads, so it applies to EVERY client regardless of whether the client
+    /// passes the `CONDUIT_DISCOVERY` env var (an explicit env still overrides).
+    /// Defaults on, since clients commonly cap the tool list.
+    #[serde(default = "default_true")]
+    pub lazy_discovery: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Registry {
@@ -77,6 +99,8 @@ impl Default for Registry {
                 enabled_server_ids: Vec::new(),
             }],
             active_profile_id: Some(DEFAULT_PROFILE_ID.to_string()),
+            deny_destructive: false,
+            lazy_discovery: true,
         }
     }
 }
@@ -187,6 +211,47 @@ impl Registry {
             profile.enabled_server_ids.retain(|s| s != server_id);
         }
         Ok(())
+    }
+
+    /// Enable or disable a single tool on a server. Disabling adds it to the
+    /// server's `disabled_tools`; enabling removes it. Idempotent.
+    pub fn set_tool_enabled(
+        &mut self,
+        server_id: &str,
+        tool: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        let server = self
+            .servers
+            .iter_mut()
+            .find(|s| s.id == server_id)
+            .ok_or_else(|| format!("No server with id '{server_id}'"))?;
+        let present = server.disabled_tools.iter().any(|t| t == tool);
+        if enabled && present {
+            server.disabled_tools.retain(|t| t != tool);
+        } else if !enabled && !present {
+            server.disabled_tools.push(tool.to_string());
+        }
+        Ok(())
+    }
+
+    /// Whether a specific tool is enabled (default-allow: unknown tools are on).
+    pub fn is_tool_enabled(&self, server_id: &str, tool: &str) -> bool {
+        self.servers
+            .iter()
+            .find(|s| s.id == server_id)
+            .map(|s| !s.disabled_tools.iter().any(|t| t == tool))
+            .unwrap_or(true)
+    }
+
+    /// Set the global destructive-tool deny switch.
+    pub fn set_deny_destructive(&mut self, deny: bool) {
+        self.deny_destructive = deny;
+    }
+
+    /// Set lazy discovery mode (gateway exposes meta-tools vs the full catalog).
+    pub fn set_lazy_discovery(&mut self, lazy: bool) {
+        self.lazy_discovery = lazy;
     }
 
     pub fn add_profile(&mut self, name: &str) -> String {
@@ -344,6 +409,7 @@ mod tests {
             env: vec![],
             url: None,
             source: Some("manual".to_string()),
+            disabled_tools: vec![],
         }
     }
 
@@ -407,6 +473,41 @@ mod tests {
         assert_eq!(by_id, vec![db]);
         // Unknown reference falls back to the active profile (default).
         assert_eq!(r.enabled_servers_for("nope").len(), 1);
+    }
+
+    #[test]
+    fn tool_disable_is_default_allow_and_idempotent() {
+        let mut r = Registry::default();
+        let id = r.add_server(sample_server("github"));
+        // Unknown tools are enabled by default.
+        assert!(r.is_tool_enabled(&id, "create_issue"));
+        // Disable, then confirm; double-disable doesn't duplicate.
+        r.set_tool_enabled(&id, "create_issue", false).unwrap();
+        r.set_tool_enabled(&id, "create_issue", false).unwrap();
+        assert!(!r.is_tool_enabled(&id, "create_issue"));
+        let server = r.servers.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(server.disabled_tools, vec!["create_issue".to_string()]);
+        // Re-enable removes it.
+        r.set_tool_enabled(&id, "create_issue", true).unwrap();
+        assert!(r.is_tool_enabled(&id, "create_issue"));
+        assert!(r.servers.iter().find(|s| s.id == id).unwrap().disabled_tools.is_empty());
+    }
+
+    #[test]
+    fn deny_destructive_round_trips_through_disk() {
+        let mut r = Registry::default();
+        let id = r.add_server(sample_server("postgres"));
+        r.set_tool_enabled(&id, "drop_table", false).unwrap();
+        r.set_deny_destructive(true);
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("conduit-policy-test-{}.json", std::process::id()));
+        save_to(&path, &r).unwrap();
+        let loaded = load_from(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert!(loaded.deny_destructive);
+        assert!(!loaded.is_tool_enabled(&id, "drop_table"));
     }
 
     #[test]

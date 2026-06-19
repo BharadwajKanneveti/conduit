@@ -1,4 +1,4 @@
-import { Boxes, Layers, Link2, Puzzle, ScrollText, Store } from "lucide-react";
+import { Boxes, FlaskConical, Layers, Link2, Puzzle, ScrollText, Store } from "lucide-react";
 import {
   importableServers,
   type DetectedClient,
@@ -113,8 +113,8 @@ interface Props {
   onRegistryChange: (registry: Registry) => void;
   selectedClientId: string | null;
   onSelectClient: (id: string | null) => void;
-  view: "servers" | "activity" | "catalog";
-  onSelectView: (view: "servers" | "activity" | "catalog") => void;
+  view: "servers" | "activity" | "catalog" | "playground";
+  onSelectView: (view: "servers" | "activity" | "catalog" | "playground") => void;
 }
 
 export function AppSidebar({
@@ -165,6 +165,15 @@ export function AppSidebar({
         >
           <Store className="size-4 shrink-0 text-muted-foreground" />
           <span>Browse catalog</span>
+        </button>
+        <button
+          onClick={() => onSelectView("playground")}
+          className={`flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-accent ${
+            view === "playground" ? "bg-accent" : ""
+          }`}
+        >
+          <FlaskConical className="size-4 shrink-0 text-muted-foreground" />
+          <span>Playground</span>
         </button>
         <button
           onClick={() => onSelectView("activity")}

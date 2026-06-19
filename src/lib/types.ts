@@ -50,6 +50,51 @@ export interface ProbeResult {
   authRequired: boolean;
 }
 
+/** A tool as advertised by a downstream MCP server (raw `tools/list` entry). */
+export interface McpTool {
+  name: string;
+  description?: string;
+  inputSchema?: {
+    type?: string;
+    properties?: Record<string, JsonSchemaProp>;
+    required?: string[];
+  };
+}
+
+/** The subset of JSON Schema the playground form renders per argument. */
+export interface JsonSchemaProp {
+  type?: string | string[];
+  description?: string;
+  enum?: unknown[];
+  default?: unknown;
+  items?: JsonSchemaProp;
+}
+
+/** Raw MCP `tools/call` result: content blocks plus an error flag. */
+export interface ToolCallResult {
+  content?: Array<{ type: string; text?: string; [k: string]: unknown }>;
+  isError?: boolean;
+  [k: string]: unknown;
+}
+
+/** Per-server aggregate from the audit log (calls, error rate, latency). */
+export interface ServerStat {
+  server: string;
+  calls: number;
+  errors: number;
+  errorRate: number;
+  avgMs: number | null;
+  p95Ms: number | null;
+  lastTs: number;
+}
+
+export interface AuditStats {
+  total: number;
+  errors: number;
+  errorRate: number;
+  servers: ServerStat[];
+}
+
 export interface AuthInfo {
   kind: "none" | "oauth" | "token" | "unknown";
   vendor: string | null;
@@ -68,6 +113,8 @@ export interface CatalogEntry {
   envKeys: string[];
   source: "curated" | "registry" | "user";
   homepage: string | null;
+  /** Publishing namespace from the registry (who published it), if known. */
+  publisher?: string | null;
 }
 
 /** A server merged across every client that has it configured. */
@@ -127,6 +174,8 @@ export interface ServerEntry {
   env: EnvVar[];
   url: string | null;
   source: string | null;
+  /** Original tool names switched off; hidden from clients by the gateway. */
+  disabledTools?: string[];
 }
 
 export interface Profile {
@@ -140,6 +189,10 @@ export interface Registry {
   servers: ServerEntry[];
   profiles: Profile[];
   activeProfileId: string | null;
+  /** Global switch: hide and block every destructive-hinted tool. */
+  denyDestructive?: boolean;
+  /** Global switch: expose 3 meta-tools instead of the full catalog. */
+  lazyDiscovery?: boolean;
 }
 
 export function activeProfile(registry: Registry): Profile | undefined {

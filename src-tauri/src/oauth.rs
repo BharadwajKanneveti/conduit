@@ -220,6 +220,25 @@ pub fn build_authorize_url(
 struct TokenResponse {
     access_token: String,
     refresh_token: Option<String>,
+    /// Access-token lifetime in seconds, when the server reports it. Logged for
+    /// diagnostics so we can see how often a server expects re-auth.
+    #[serde(default)]
+    expires_in: Option<u64>,
+}
+
+/// Ensure `offline_access` is among the requested scopes so the server issues a
+/// refresh token. Only touches servers that already advertise a scope; servers
+/// that request none (scope omitted) are left untouched. `offline_access` is the
+/// standard OAuth/OIDC scope for refresh tokens and is safely ignored by servers
+/// that don't recognize it.
+fn ensure_offline_access(scope: Option<String>) -> Option<String> {
+    scope.map(|s| {
+        if s.split_whitespace().any(|t| t == "offline_access") {
+            s
+        } else {
+            format!("{s} offline_access")
+        }
+    })
 }
 
 fn exchange_code(
@@ -242,23 +261,44 @@ fn exchange_code(
         .map_err(|e| e.to_string())?
         .into_json()
         .map_err(|e| e.to_string())?;
+    debug_log(&format!(
+        "token response: refresh_token={} expires_in={:?}",
+        resp.refresh_token.is_some(),
+        resp.expires_in
+    ));
     Ok(Tokens {
         access_token: resp.access_token,
         refresh_token: resp.refresh_token,
     })
 }
 
-/// Exchange a refresh token for a fresh access token (non-interactive).
-pub fn refresh(token_endpoint: &str, client_id: &str, refresh_token: &str) -> Result<Tokens, String> {
+/// Exchange a refresh token for a fresh access token (non-interactive). When a
+/// `resource` is given it's sent as the RFC 8707 resource indicator, so the
+/// refreshed token stays bound to the same MCP server it was first issued for.
+pub fn refresh(
+    token_endpoint: &str,
+    client_id: &str,
+    refresh_token: &str,
+    resource: Option<&str>,
+) -> Result<Tokens, String> {
+    let mut form: Vec<(&str, &str)> = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id),
+    ];
+    if let Some(r) = resource {
+        form.push(("resource", r));
+    }
     let resp: TokenResponse = ureq::post(token_endpoint)
-        .send_form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", client_id),
-        ])
+        .send_form(&form)
         .map_err(|e| e.to_string())?
         .into_json()
         .map_err(|e| e.to_string())?;
+    debug_log(&format!(
+        "refresh response: refresh_token={} expires_in={:?}",
+        resp.refresh_token.is_some(),
+        resp.expires_in
+    ));
     Ok(Tokens {
         access_token: resp.access_token,
         refresh_token: resp.refresh_token,
@@ -342,7 +382,20 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
         endpoints.registration_endpoint,
         endpoints.scope
     ));
-    let redirect_uri = format!("http://127.0.0.1:{REDIRECT_PORT}/callback");
+    // Bind the callback listener BEFORE registering/opening the browser, so a
+    // fast redirect can't arrive before we're listening AND we know the real
+    // port. Prefer the stable port, but fall back to an OS-assigned one when it's
+    // busy - a prior auth attempt's listener can still be in its 180s wait window,
+    // which otherwise fails the new bind with "os error 10048". DCR registers the
+    // exact redirect_uri for this flow, so a variable loopback port is fine.
+    let listener = TcpListener::bind(("127.0.0.1", REDIRECT_PORT))
+        .or_else(|_| TcpListener::bind(("127.0.0.1", 0)))
+        .map_err(|e| format!("could not bind a loopback callback port: {e}"))?;
+    let port = listener.local_addr().map_err(|e| e.to_string())?.port();
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
+    let redirect_uri = format!("http://127.0.0.1:{port}/callback");
+    debug_log(&format!("callback listening on {redirect_uri}"));
+
     let client_id = match &endpoints.registration_endpoint {
         Some(reg) => register_client(reg, &redirect_uri)?,
         None => {
@@ -359,12 +412,9 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
     let (verifier, challenge) = pkce();
     let state = random_token(16);
 
-    // Bind the callback listener BEFORE opening the browser, so a fast redirect
-    // can't arrive before we're listening.
-    let listener = TcpListener::bind(("127.0.0.1", REDIRECT_PORT))
-        .map_err(|e| format!("could not bind callback port {REDIRECT_PORT}: {e}"))?;
-    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
-
+    // Request offline_access so the server issues a refresh token (otherwise a
+    // short-lived access token forces full re-auth on expiry, as with Expo).
+    let scope = ensure_offline_access(endpoints.scope.clone());
     let auth_url = build_authorize_url(
         &endpoints.authorization_endpoint,
         &client_id,
@@ -372,7 +422,7 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
         &challenge,
         &state,
         mcp_url,
-        endpoints.scope.as_deref(),
+        scope.as_deref(),
     );
     debug_log(&format!("authorize_url={auth_url}"));
     open_browser(&auth_url);
@@ -442,6 +492,21 @@ mod tests {
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A41789%2Fcallback"));
         assert!(url.contains("scope=mcp"));
+    }
+
+    #[test]
+    fn offline_access_added_only_when_a_scope_exists() {
+        assert_eq!(
+            ensure_offline_access(Some("mcp:access".into())).as_deref(),
+            Some("mcp:access offline_access")
+        );
+        // Already present -> unchanged (no duplicate).
+        assert_eq!(
+            ensure_offline_access(Some("openid offline_access profile".into())).as_deref(),
+            Some("openid offline_access profile")
+        );
+        // No advertised scope -> leave it alone (don't impose one).
+        assert_eq!(ensure_offline_access(None), None);
     }
 
     #[test]

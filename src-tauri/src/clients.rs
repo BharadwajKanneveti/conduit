@@ -92,10 +92,25 @@ fn home() -> Option<PathBuf> {
     dirs::home_dir()
 }
 
-/// Roaming app config dir: `%APPDATA%` on Windows,
-/// `~/Library/Application Support` on macOS, `~/.config` on Linux.
+/// Roaming app config dir: `%APPDATA%` on Windows, `~/Library/Application
+/// Support` on macOS, `~/.config` on Linux.
+///
+/// On Windows it's anchored to the user profile (`~/AppData/Roaming`) rather than
+/// `dirs::config_dir()`. MSIX-packaged apps (Claude Desktop) virtualize the
+/// Roaming known-folder into their package's LocalCache, and if the Conduit
+/// process is ever launched inside such a context, `config_dir()` would resolve
+/// to that sandbox - so reads of Claude Desktop's `claude_desktop_config.json`
+/// would miss the real file and report "not configured". The user-profile path
+/// is not virtualized, matching how the registry path is anchored.
 fn config() -> Option<PathBuf> {
-    dirs::config_dir()
+    #[cfg(windows)]
+    {
+        Some(dirs::home_dir()?.join("AppData").join("Roaming"))
+    }
+    #[cfg(not(windows))]
+    {
+        dirs::config_dir()
+    }
 }
 
 fn claude_desktop_path() -> Option<PathBuf> {
@@ -698,7 +713,23 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
 fn resolve_gateway_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
-    Some(dir.join(format!("conduit-gateway{}", std::env::consts::EXE_SUFFIX)))
+    let ext = std::env::consts::EXE_SUFFIX;
+    // Dev / `cargo run`: the gateway is built next to the app as `conduit-gateway`.
+    let plain = dir.join(format!("conduit-gateway{ext}"));
+    if plain.exists() {
+        return Some(plain);
+    }
+    // Packaged: Tauri installs the externalBin sidecar next to the app binary
+    // keeping its `-<target-triple>` suffix (the sidecar resolver appends it).
+    if let Some(triple) = option_env!("CONDUIT_TARGET_TRIPLE").filter(|t| !t.is_empty()) {
+        let suffixed = dir.join(format!("conduit-gateway-{triple}{ext}"));
+        if suffixed.exists() {
+            return Some(suffixed);
+        }
+    }
+    // Fall back to the plain path so callers surface a clear "not found" error
+    // rather than silently resolving to nothing.
+    Some(plain)
 }
 
 fn gateway_entry(profile: Option<&str>) -> Result<ServerEntry, String> {
@@ -708,10 +739,12 @@ fn gateway_entry(profile: Option<&str>) -> Result<ServerEntry, String> {
         value: Some(v.to_string()),
         secret: false,
     };
-    // Connect clients in lazy-discovery mode by default: the gateway advertises a
-    // few meta-tools instead of the full catalog, keeping each client's context
-    // small. Plain (non-secret) env values, written into the client's own config.
-    let mut env = vec![env_var("CONDUIT_DISCOVERY", "lazy")];
+    // Discovery mode (lazy vs full) is NOT written here: the gateway reads it
+    // from the registry, so the app's global setting governs every client
+    // uniformly - including clients that don't forward env vars to the spawned
+    // gateway (e.g. Antigravity), where a config env would never take effect.
+    // Only per-client profile scoping needs an env var.
+    let mut env: Vec<crate::registry::EnvVar> = Vec::new();
     // Optionally scope this client to one profile, so it only ever sees that
     // slice of servers (no cross-domain tool ambiguity).
     if let Some(p) = profile.map(str::trim).filter(|p| !p.is_empty()) {
@@ -726,6 +759,7 @@ fn gateway_entry(profile: Option<&str>) -> Result<ServerEntry, String> {
         env,
         url: None,
         source: Some("conduit".to_string()),
+        disabled_tools: Vec::new(),
     })
 }
 
@@ -859,6 +893,7 @@ mod tests {
             }],
             url: None,
             source: None,
+            disabled_tools: vec![],
         }
     }
 
@@ -950,9 +985,10 @@ mod tests {
         let servers = root["mcpServers"].as_object().unwrap();
         assert!(servers.contains_key("conduit"));
         assert!(servers.contains_key("existing"));
-        // The gateway is installed in lazy-discovery mode, scoped to the profile.
-        assert_eq!(servers["conduit"]["env"]["CONDUIT_DISCOVERY"], "lazy");
+        // Discovery mode comes from the registry, not the client config; only the
+        // profile scope is written as an env var.
         assert_eq!(servers["conduit"]["env"]["CONDUIT_PROFILE"], "Billing");
+        assert!(servers["conduit"]["env"].get("CONDUIT_DISCOVERY").is_none());
         // Unrelated key and the existing server's secret value are untouched.
         assert_eq!(root["theme"], "dark");
         assert_eq!(servers["existing"]["env"]["SECRET"], "keepme");

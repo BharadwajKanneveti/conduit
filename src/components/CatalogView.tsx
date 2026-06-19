@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Check, ExternalLink, Loader2, Plus, Search, X } from "lucide-react";
+import { Check, ExternalLink, Loader2, Plus, Search, ShieldCheck, X } from "lucide-react";
 import { toast } from "sonner";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import {
@@ -160,6 +160,28 @@ export function CatalogView({ registry, onAdded }: Props) {
   );
 }
 
+/** Source-tier + publisher signal. Honest provenance: where the entry came
+ * from and who published it, not a cryptographic attestation. */
+function Provenance({ entry }: { entry: CatalogEntry }) {
+  const tier =
+    entry.source === "curated"
+      ? { label: "Conduit verified", cls: "text-emerald-400" }
+      : entry.source === "registry"
+        ? { label: "MCP Registry", cls: "text-violet-300" }
+        : { label: "Your pick", cls: "text-sky-400" };
+  return (
+    <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
+      <ShieldCheck className={`size-3 shrink-0 ${tier.cls}`} />
+      <span className={tier.cls}>{tier.label}</span>
+      {entry.publisher && (
+        <span className="truncate text-muted-foreground/70">
+          · {entry.publisher}
+        </span>
+      )}
+    </div>
+  );
+}
+
 function CatalogCard({
   entry,
   added,
@@ -216,6 +238,7 @@ function CatalogCard({
       <code className="truncate font-mono text-[11px] text-muted-foreground/70">
         {target}
       </code>
+      <Provenance entry={entry} />
       <div className="mt-auto flex justify-end pt-1">
         {added ? (
           <span className="inline-flex items-center gap-1 text-xs text-emerald-400">

@@ -27,7 +27,7 @@ use conduit_lib::clients;
 use conduit_lib::downstream::{DownstreamServer, StdioTransport, PROTOCOL_VERSION};
 use conduit_lib::registry::{self, Registry, ServerEntry};
 use conduit_lib::remote;
-use conduit_lib::router::Router;
+use conduit_lib::router::{Router, ToolPolicy};
 use conduit_lib::secrets;
 
 fn success(id: Value, result: Value) -> Value {
@@ -200,7 +200,11 @@ fn handle_request(
                 id,
                 json!({
                     "protocolVersion": proto,
-                    "capabilities": { "tools": { "listChanged": true } },
+                    "capabilities": {
+                        "tools": { "listChanged": true },
+                        "resources": { "listChanged": true },
+                        "prompts": { "listChanged": true }
+                    },
                     "serverInfo": { "name": "conduit-gateway", "version": env!("CARGO_PKG_VERSION") }
                 }),
             ))
@@ -291,17 +295,20 @@ fn handle_request(
             let name = name.as_str();
 
             let (srv, tool) = name.split_once("__").unwrap_or(("?", name));
+            let started = Instant::now();
             match router.route_call(name, arguments) {
                 Ok(result) => {
                     let ok = !result
                         .get("isError")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    audit::record(srv, tool, ok);
+                    let ms = started.elapsed().as_millis() as u64;
+                    audit::record_timed(srv, tool, ok, Some(ms));
                     Some(success(id, result))
                 }
                 Err(e) => {
-                    audit::record(srv, tool, false);
+                    let ms = started.elapsed().as_millis() as u64;
+                    audit::record_timed(srv, tool, false, Some(ms));
                     Some(success(
                         id,
                         json!({
@@ -310,6 +317,42 @@ fn handle_request(
                         }),
                     ))
                 }
+            }
+        }
+        "resources/list" => {
+            let resources = router.aggregated_resources();
+            glog(&format!("resources/list -> {} resources", resources.len()));
+            Some(success(id, json!({ "resources": resources })))
+        }
+        "resources/read" => {
+            let uri = req
+                .get("params")
+                .and_then(|p| p.get("uri"))
+                .and_then(|u| u.as_str())
+                .unwrap_or("");
+            match router.read_resource(uri) {
+                Ok(result) => Some(success(id, result)),
+                Err(e) => Some(error(id, -32602, &format!("Conduit: {e}"))),
+            }
+        }
+        "prompts/list" => {
+            let prompts = router.aggregated_prompts();
+            glog(&format!("prompts/list -> {} prompts", prompts.len()));
+            Some(success(id, json!({ "prompts": prompts })))
+        }
+        "prompts/get" => {
+            let params = req.get("params");
+            let name = params
+                .and_then(|p| p.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("");
+            let arguments = params
+                .and_then(|p| p.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match router.get_prompt(name, arguments) {
+                Ok(result) => Some(success(id, result)),
+                Err(e) => Some(error(id, -32602, &format!("Conduit: {e}"))),
             }
         }
         "ping" => Some(success(id, json!({}))),
@@ -331,13 +374,26 @@ fn build_router(reg: &Registry, profile: Option<&str>) -> Router {
         .cloned()
         .collect();
 
+    // Build the policy from the same server set: per-tool disables + the global
+    // destructive switch. The router enforces it as servers are added.
+    let mut disabled = std::collections::HashMap::new();
+    for s in &servers {
+        if !s.disabled_tools.is_empty() {
+            disabled.insert(s.id.clone(), s.disabled_tools.iter().cloned().collect());
+        }
+    }
+    let policy = ToolPolicy {
+        disabled,
+        deny_destructive: reg.deny_destructive,
+    };
+
     // Connect concurrently so total time is the slowest server, not the sum.
     let handles: Vec<_> = servers
         .into_iter()
         .map(|server| std::thread::spawn(move || connect_one(&server)))
         .collect();
 
-    let mut router = Router::new();
+    let mut router = Router::with_policy(policy);
     for handle in handles {
         if let Ok(Some(ds)) = handle.join() {
             router.add(ds);
@@ -376,7 +432,10 @@ fn connect_one(server: &ServerEntry) -> Option<DownstreamServer> {
     };
 
     match result {
-        Ok(ds) => {
+        Ok(mut ds) => {
+            // Only the gateway needs resources/prompts (to proxy them); fetch
+            // them here, off the health-probe path.
+            ds.load_resources_prompts();
             let msg = format!("connected '{}' ({} tools)", server.id, ds.tools.len());
             eprintln!("conduit: {msg}");
             glog(&msg);
@@ -506,9 +565,16 @@ fn watch_registry(
 }
 
 fn main() {
-    let lazy = std::env::var("CONDUIT_DISCOVERY")
-        .map(|v| v.eq_ignore_ascii_case("lazy"))
-        .unwrap_or(false);
+    // Lazy discovery resolves from an explicit env override first (per-client),
+    // then the registry's global setting. Reading the registry means lazy mode
+    // applies to EVERY client, including ones that don't forward env vars to the
+    // gateway process (e.g. Antigravity) or servers added by hand in a client UI.
+    let lazy = match std::env::var("CONDUIT_DISCOVERY") {
+        Ok(v) => v.eq_ignore_ascii_case("lazy"),
+        Err(_) => registry::load_resolved()
+            .map(|r| r.lazy_discovery)
+            .unwrap_or(true),
+    };
     // Per-client scoping: this gateway exposes only the named profile's servers.
     let profile = std::env::var("CONDUIT_PROFILE")
         .ok()
@@ -605,7 +671,9 @@ fn main() {
         // (first ever run). tools/call waits for live downstream connections.
         let wait = match method {
             "tools/list" => cached_tools.lock().unwrap().is_empty(),
-            "tools/call" => true,
+            // These have no disk cache, so they need the live router connected.
+            "tools/call" | "resources/list" | "resources/read" | "prompts/list"
+            | "prompts/get" => true,
             _ => false,
         };
         if wait {
@@ -708,6 +776,7 @@ mod tests {
             env: vec![],
             url: None,
             source: None,
+            disabled_tools: vec![],
         });
         reg.set_server_enabled("default", &id, true).unwrap();
 

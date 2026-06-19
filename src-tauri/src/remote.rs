@@ -17,6 +17,10 @@ struct OAuthState {
     token_endpoint: String,
     client_id: String,
     refresh_token: Option<String>,
+    /// The RFC 8707 resource indicator (the MCP server URL) the token is bound
+    /// to. Optional for back-compat with states vaulted before this existed.
+    #[serde(default)]
+    resource: Option<String>,
 }
 
 /// Persist what's needed to refresh this server's token later.
@@ -25,11 +29,13 @@ pub fn store_oauth_state(
     token_endpoint: &str,
     client_id: &str,
     refresh_token: Option<String>,
+    resource: Option<String>,
 ) -> Result<(), String> {
     let state = OAuthState {
         token_endpoint: token_endpoint.to_string(),
         client_id: client_id.to_string(),
         refresh_token,
+        resource,
     };
     let json = serde_json::to_string(&state).map_err(|e| e.to_string())?;
     secrets::set_secret(server_id, STATE_KEY, &json)
@@ -48,13 +54,19 @@ pub fn refresh_token(server_id: &str) -> Result<String, String> {
         .refresh_token
         .as_deref()
         .ok_or("no refresh token available")?;
-    let tokens = oauth::refresh(&state.token_endpoint, &state.client_id, rt)?;
+    let tokens = oauth::refresh(
+        &state.token_endpoint,
+        &state.client_id,
+        rt,
+        state.resource.as_deref(),
+    )?;
     secrets::set_secret(server_id, secrets::HTTP_AUTH_KEY, &tokens.access_token)?;
     // Persist a rotated refresh token if the server issued one.
     let new_state = OAuthState {
         token_endpoint: state.token_endpoint,
         client_id: state.client_id,
         refresh_token: tokens.refresh_token.or(state.refresh_token),
+        resource: state.resource,
     };
     if let Ok(json) = serde_json::to_string(&new_state) {
         let _ = secrets::set_secret(server_id, STATE_KEY, &json);
