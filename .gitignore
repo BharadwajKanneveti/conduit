@@ -31,3 +31,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Mobile icons from `tauri icon` (desktop-only project)
+/src-tauri/icons/android/
+/src-tauri/icons/ios/

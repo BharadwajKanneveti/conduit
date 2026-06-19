@@ -1,4 +1,4 @@
-import { Boxes, FlaskConical, Layers, Link2, Puzzle, ScrollText, Store } from "lucide-react";
+import { FlaskConical, Layers, Link2, Puzzle, ScrollText, Store } from "lucide-react";
 import {
   importableServers,
   type DetectedClient,
@@ -129,9 +129,14 @@ export function AppSidebar({
   return (
     <aside className="flex w-72 shrink-0 flex-col border-r bg-sidebar">
       <div className="flex items-center gap-2.5 px-4 py-4">
-        <div className="flex size-8 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-          <Boxes className="size-5" />
-        </div>
+        <svg className="size-8" viewBox="0 0 48 48" aria-hidden="true">
+          <rect width="48" height="48" rx="12" fill="#34d399" />
+          <g fill="none" stroke="#06140e" strokeWidth="2.9" strokeLinecap="round">
+            <path d="M33.6 12.5 A 15 15 0 1 0 33.6 35.5" />
+            <path d="M30.2 16.7 A 9.4 9.4 0 1 0 30.2 31.3" />
+            <circle cx="33" cy="24" r="2.7" fill="#06140e" stroke="none" />
+          </g>
+        </svg>
         <div className="leading-tight">
           <div className="font-semibold tracking-tight">Conduit</div>
           <div className="text-xs text-muted-foreground">MCP control center</div>
