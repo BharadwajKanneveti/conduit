@@ -38,7 +38,10 @@ jobs:
         if: matrix.os == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+          # pkg-config + libdbus-1-dev are required to build libdbus-sys, pulled in
+          # by the Secret Service keychain backend; without them the Linux build
+          # fails to compile.
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev
 
       - uses: Swatinem/rust-cache@v2
         with:

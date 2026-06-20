@@ -146,6 +146,11 @@ The frontend is typechecked with `npx tsc --noEmit`.
   in dev.** An unsigned dev build gets an unstable code-signing identity, so the
   keychain re-prompts or denies reads. A signed release fixes this; it is a
   dev-only artifact.
+- **"could not read/store secret" on Linux.** Secret storage uses the freedesktop
+  Secret Service (libsecret), provided by GNOME Keyring, KWallet, or similar. A
+  headless box or a session without a running keyring daemon has nowhere to store
+  secrets. Run Conduit in a desktop session, or install and unlock a keyring
+  (e.g. `gnome-keyring`).
 
 ## Status
 
