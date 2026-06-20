@@ -41,10 +41,14 @@ fn base64url(data: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
 }
 
-/// Append a line to the OAuth debug log (`<config>/Conduit/oauth-debug.log`).
+/// Append a line to the OAuth debug log (`<conduit dir>/oauth-debug.log`).
+/// Off unless `CONDUIT_DEBUG` is set, so auth-flow metadata isn't written to disk
+/// for every user. Never log token values here.
 fn debug_log(msg: &str) {
-    if let Some(dir) = dirs::config_dir() {
-        let path = dir.join("Conduit").join("oauth-debug.log");
+    if std::env::var_os("CONDUIT_DEBUG").is_none() {
+        return;
+    }
+    if let Some(path) = crate::registry::conduit_dir().map(|d| d.join("oauth-debug.log")) {
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -139,6 +143,20 @@ fn metadata_candidates(issuer: &str) -> Vec<String> {
     }
 }
 
+/// Require an endpoint to use https, allowing only loopback http for local dev.
+fn require_https(url: &str, what: &str) -> Result<(), String> {
+    let lower = url.trim().to_ascii_lowercase();
+    let ok = lower.starts_with("https://")
+        || lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("http://[::1]");
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("{what} must use https (got {url})"))
+    }
+}
+
 /// Discover the authorization + token endpoints for an MCP server URL.
 pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
     let origin = origin_of(mcp_url);
@@ -154,6 +172,15 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
 
     for url in metadata_candidates(&issuer) {
         if let Ok(meta) = get_json::<AsMeta>(&url) {
+            // OAuth 2.1 requires TLS for these endpoints. Without this check a
+            // hostile/MITM'd metadata document could point the token endpoint at
+            // an attacker (or an internal address), and we'd POST the auth code +
+            // PKCE verifier there in cleartext.
+            require_https(&meta.authorization_endpoint, "authorization endpoint")?;
+            require_https(&meta.token_endpoint, "token endpoint")?;
+            if let Some(reg) = &meta.registration_endpoint {
+                require_https(reg, "registration endpoint")?;
+            }
             return Ok(Endpoints {
                 authorization_endpoint: meta.authorization_endpoint,
                 token_endpoint: meta.token_endpoint,
@@ -424,7 +451,10 @@ pub fn authenticate(mcp_url: &str) -> Result<AuthResult, String> {
         mcp_url,
         scope.as_deref(),
     );
-    debug_log(&format!("authorize_url={auth_url}"));
+    debug_log(&format!(
+        "opening authorize endpoint: {}",
+        endpoints.authorization_endpoint
+    ));
     open_browser(&auth_url);
     let code = wait_for_code(&listener, &state)?;
     debug_log(&format!("got code (len {})", code.len()));

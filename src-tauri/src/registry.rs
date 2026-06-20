@@ -328,7 +328,11 @@ impl Registry {
 /// is NOT redirected by MSIX, so deriving the path from it keeps packaged and
 /// unpackaged processes on the same file. Elsewhere the platform config dir is
 /// correct and not virtualized.
-fn conduit_dir() -> Option<PathBuf> {
+///
+/// Public so every Conduit file (registry, tool cache, audit log, debug logs)
+/// derives from the same anchor - otherwise the app and a client-spawned gateway
+/// would write to different dirs under MSIX virtualization.
+pub fn conduit_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
         Some(

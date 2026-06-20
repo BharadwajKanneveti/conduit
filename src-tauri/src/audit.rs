@@ -10,7 +10,9 @@ use std::path::PathBuf;
 use serde_json::{json, Value};
 
 pub fn audit_path() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("Conduit").join("audit.jsonl"))
+    // Same anchor as the registry, so the app and a client-spawned gateway (which
+    // may run under MSIX virtualization) write to the *same* audit log.
+    Some(crate::registry::conduit_dir()?.join("audit.jsonl"))
 }
 
 fn epoch_millis() -> u128 {

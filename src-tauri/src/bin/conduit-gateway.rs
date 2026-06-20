@@ -263,7 +263,16 @@ fn handle_request(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(10)
                     .clamp(1, 50) as usize;
-                let matches = search_catalog(cached, query, limit);
+                // Prefer the cached catalog (instant); on a cold cache fall back to
+                // the live router so a first-time search doesn't return 0 results.
+                let live;
+                let source: &[Value] = if cached.is_empty() {
+                    live = router.aggregated_tools();
+                    &live
+                } else {
+                    cached
+                };
+                let matches = search_catalog(source, query, limit);
                 let text = format!(
                     "Found {} tool(s) for \"{}\". Call one with conduit_call_tool using its exact name.\n\n{}",
                     matches.len(),
@@ -466,8 +475,11 @@ fn notify_tools_changed(stdout: &Arc<Mutex<std::io::Stdout>>) {
 
 /// Append a line to the gateway debug log (for diagnosing client connections).
 fn glog(msg: &str) {
-    if let Some(dir) = dirs::config_dir() {
-        let path = dir.join("Conduit").join("gateway-debug.log");
+    if std::env::var_os("CONDUIT_DEBUG").is_none() {
+        return;
+    }
+    if let Some(dir) = registry::conduit_dir() {
+        let path = dir.join("gateway-debug.log");
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -485,7 +497,7 @@ fn glog(msg: &str) {
 /// (`tool-cache-<profile>.json`) so a billing-scoped client never reads a
 /// coding-scoped client's catalog - which would defeat the scoping.
 fn tool_cache_path(profile: Option<&str>) -> Option<PathBuf> {
-    let dir = dirs::config_dir()?.join("Conduit");
+    let dir = registry::conduit_dir()?;
     let file = match profile {
         Some(p) if !p.is_empty() => {
             let slug: String = p
