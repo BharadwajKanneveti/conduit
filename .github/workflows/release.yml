@@ -20,7 +20,9 @@ jobs:
         include:
           - os: windows-latest
             bundles: nsis
-          - os: macos-latest
+          - os: macos-latest # Apple Silicon (arm64)
+            bundles: dmg
+          - os: macos-13 # Intel (x86_64), for older Macs
             bundles: dmg
           - os: ubuntu-22.04
             bundles: deb,appimage
