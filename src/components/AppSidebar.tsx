@@ -24,7 +24,10 @@ type ClientStatus = "active" | "empty" | "error" | "missing";
 
 function statusOf(client: DetectedClient): ClientStatus {
   if (client.error) return "error";
-  if (!client.configExists) return "missing";
+  // "missing" means the app itself isn't here, not merely that MCP is
+  // unconfigured. A present-but-unconfigured client (installed, no servers yet)
+  // is "empty", so it reads as "ready" rather than "not found".
+  if (!client.appPresent) return "missing";
   return client.servers.length > 0 ? "active" : "empty";
 }
 

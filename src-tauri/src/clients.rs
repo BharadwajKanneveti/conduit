@@ -40,6 +40,13 @@ pub struct DetectedClient {
     pub uses_connectors: bool,
     pub config_path: String,
     pub config_exists: bool,
+    /// Whether the client app appears installed on this machine, independent of
+    /// whether it has an MCP config yet. Inferred from the existence of the
+    /// client's own data directory (the config file's parent). Lets us tell
+    /// "installed but no servers" apart from "not installed at all", so we don't
+    /// label a present client "not found" or write a config into a client that
+    /// isn't here.
+    pub app_present: bool,
     pub servers: Vec<McpServer>,
     /// Servers that live outside the main config file but are still readable
     /// (e.g. Cursor plugin servers). Read-only inventory - managed by the client.
@@ -480,12 +487,23 @@ fn read_client(def: &ClientDef) -> DetectedClient {
                  servers: Vec<McpServer>,
                  error: Option<String>| {
         let gateway_installed = servers.iter().any(|s| s.name == GATEWAY_ENTRY_NAME);
+        // The config file's parent is the client's own data dir (e.g. `.../Code/User`,
+        // `.../Claude`, `~/.codex`); its presence means the app has run here. If the
+        // config itself exists the app is obviously present. An empty path means we
+        // couldn't even resolve a location, so the app is not detectable.
+        let app_present = config_exists
+            || (!config_path.is_empty()
+                && std::path::Path::new(&config_path)
+                    .parent()
+                    .map(|p| p.exists())
+                    .unwrap_or(false));
         DetectedClient {
             id: def.id.to_string(),
             name: def.name.to_string(),
             uses_connectors: def.uses_connectors,
             config_path,
             config_exists,
+            app_present,
             servers,
             plugin_servers: plugin_servers.clone(),
             gateway_installed,

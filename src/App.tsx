@@ -19,6 +19,7 @@ import {
   setServerEnabled,
 } from "@/lib/api";
 import {
+  importableServers,
   isEnabled,
   isGatewayServer,
   type DetectedClient,
@@ -134,7 +135,15 @@ function App() {
     disabled: visible.filter((s) => groupOf(s) === "disabled").sort(byName),
   };
 
-  const importable = clients.reduce((n, c) => n + c.servers.length, 0);
+  // Count what would actually be imported: drop the gateway entry and anything
+  // already in the registry, then dedupe by name across clients (the backend
+  // import dedupes too). Using raw server counts here made the banner promise
+  // imports that the importer then correctly skipped.
+  const importable = new Set(
+    clients.flatMap((c) =>
+      importableServers(c, registry).map((s) => s.name.toLowerCase()),
+    ),
+  ).size;
   const selectedClient = selectedClientId
     ? clients.find((c) => c.id === selectedClientId)
     : undefined;

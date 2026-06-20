@@ -16,6 +16,9 @@ export interface DetectedClient {
   usesConnectors: boolean;
   configPath: string;
   configExists: boolean;
+  /** Whether the client app appears installed (its data dir exists), even if it
+   * has no MCP config yet. Distinguishes "installed, no servers" from "not here". */
+  appPresent: boolean;
   servers: McpServer[];
   /** Servers found outside the config file (e.g. Cursor plugins); read-only. */
   pluginServers: McpServer[];

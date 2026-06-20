@@ -45,6 +45,10 @@ export function ClientDetail({
   const [profile, setProfile] = useState("");
   const [migrateOpen, setMigrateOpen] = useState(false);
   const installed = client.gatewayInstalled;
+  // Whether the client app is actually on this machine. We allow Disconnect even
+  // when absent (to clean up a stale entry), but block a fresh Connect, writing a
+  // config into a client that isn't installed just creates a file nothing reads.
+  const present = client.appPresent;
   const profiles = registry?.profiles ?? [];
   // Servers configured directly in the client (not the gateway) that migrate
   // would move into Conduit and strip from the client's config.
@@ -170,8 +174,18 @@ export function ClientDetail({
             </span>
           )}
           <p className="truncate font-mono text-xs text-muted-foreground">
-            {client.configExists ? client.configPath : "not configured on this machine"}
+            {client.configExists
+              ? client.configPath
+              : present
+                ? "installed - no MCP config yet"
+                : "not installed on this machine"}
           </p>
+          {!present && !installed && (
+            <p className="mt-1 text-xs text-amber-400">
+              {client.name} doesn't appear to be installed here. Install it first,
+              then connect.
+            </p>
+          )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {!installed && profiles.length > 1 && (
@@ -193,7 +207,7 @@ export function ClientDetail({
             size="sm"
             variant={installed ? "outline" : "default"}
             onClick={toggleInstall}
-            disabled={busy}
+            disabled={busy || (!installed && !present)}
           >
             {installed ? (
               <>
