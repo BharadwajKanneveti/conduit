@@ -279,7 +279,7 @@ export function ClientDetail({
                 disabled={busy}
               >
                 <Shuffle className="size-3" />
-                Move config in
+                Move config in ({movable.length})
               </Button>
             )}
           </div>
