@@ -102,7 +102,7 @@ function VersionFooter({ onImport }: { onImport: (r: Registry) => void }) {
  * servers they manage, then alphabetical. Keeps not-installed clients at the
  * bottom. */
 function sortClients(clients: DetectedClient[]): DetectedClient[] {
-  const present = (c: DetectedClient) => (c.configExists || c.usesConnectors ? 1 : 0);
+  const present = (c: DetectedClient) => (c.appPresent ? 1 : 0);
   const count = (c: DetectedClient) => c.servers.length + c.pluginServers.length;
   return [...clients].sort((a, b) => {
     if (present(a) !== present(b)) return present(b) - present(a);
@@ -141,7 +141,7 @@ interface RowProps {
  * client inventory isn't something you manage from the sidebar. */
 function ClientRow({ client, importCount, selected, onSelect }: RowProps) {
   const status = statusOf(client);
-  const missing = status === "missing" && !client.usesConnectors;
+  const missing = status === "missing";
   const connected = client.gatewayInstalled;
 
   const right =
