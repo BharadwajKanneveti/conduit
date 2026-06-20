@@ -479,6 +479,19 @@ fn parse_toml(content: &str) -> Result<Vec<McpServer>, String> {
     Ok(servers)
 }
 
+/// Whether the client app appears installed, given its config path and whether
+/// the config file exists. The config's parent is the app's own data dir, so its
+/// presence means the app has run here even if it has no MCP config yet. An empty
+/// path means we couldn't resolve a location, so the app isn't detectable.
+fn app_present_for(config_path: &str, config_exists: bool) -> bool {
+    config_exists
+        || (!config_path.is_empty()
+            && std::path::Path::new(config_path)
+                .parent()
+                .map(|p| p.exists())
+                .unwrap_or(false))
+}
+
 fn read_client(def: &ClientDef) -> DetectedClient {
     let plugin_servers = def.plugin_scan.map(|scan| scan()).unwrap_or_default();
 
@@ -491,12 +504,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         // `.../Claude`, `~/.codex`); its presence means the app has run here. If the
         // config itself exists the app is obviously present. An empty path means we
         // couldn't even resolve a location, so the app is not detectable.
-        let app_present = config_exists
-            || (!config_path.is_empty()
-                && std::path::Path::new(&config_path)
-                    .parent()
-                    .map(|p| p.exists())
-                    .unwrap_or(false));
+        let app_present = app_present_for(&config_path, config_exists);
         DetectedClient {
             id: def.id.to_string(),
             name: def.name.to_string(),
@@ -965,6 +973,23 @@ pub fn migrate_to_gateway(client_id: &str, profile: Option<&str>) -> Result<Writ
 mod tests {
     use super::*;
     use crate::registry::EnvVar;
+
+    #[test]
+    fn app_present_distinguishes_installed_from_absent() {
+        // Config file present => app is obviously present.
+        assert!(app_present_for("/anywhere/config.json", true));
+        // No resolvable path => not detectable.
+        assert!(!app_present_for("", false));
+        // Data dir exists but no MCP config yet (the "installed, no servers" case
+        // that used to read as "not found") => present.
+        let cfg = std::env::temp_dir().join("conduit-app-present-probe.json");
+        assert!(app_present_for(&cfg.to_string_lossy(), false));
+        // Parent dir absent => app not installed here.
+        assert!(!app_present_for(
+            "/no/such/dir/deep/conduit-absent/config.json",
+            false
+        ));
+    }
 
     fn stdio(name: &str) -> ServerEntry {
         ServerEntry {

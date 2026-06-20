@@ -327,6 +327,11 @@ export function ClientDetail({
               uses <span className="font-medium text-foreground">only the Conduit gateway</span>.
               The original config is backed up first.
             </p>
+            <p className="rounded-md bg-amber-400/10 p-2 text-xs text-amber-300">
+              Secret values (API keys, tokens) aren't carried over, they stay only
+              in the backed-up config. After migrating, re-enter them under each
+              server's secrets so the gateway can connect.
+            </p>
             <div className="rounded-md bg-muted/40 p-2 font-mono text-xs text-muted-foreground">
               {movable.map((s) => s.name).join(", ")}
             </div>
