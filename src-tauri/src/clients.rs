@@ -761,13 +761,27 @@ fn resolve_gateway_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     let ext = std::env::consts::EXE_SUFFIX;
-    // Dev / `cargo run`: the gateway is built next to the app as `conduit-gateway`.
+    // Dev / `cargo run`, and most packaged builds: the gateway sits next to the app
+    // binary as `conduit-gateway` (Tauri strips the sidecar's target-triple suffix
+    // when installing). True for Windows (install dir), macOS (.app/Contents/MacOS),
+    // and the Linux .deb (/usr/bin).
     let plain = dir.join(format!("conduit-gateway{ext}"));
+
+    // AppImage is the exception: it runs from an ephemeral mount (e.g.
+    // /tmp/.mount_XXXX) that disappears when the app exits, so a gateway path inside
+    // it would be dead by the time a client tries to spawn it. Copy the gateway to a
+    // stable per-user location and hand clients that path. ($APPIMAGE is only set
+    // when running inside an AppImage.)
+    if std::env::var_os("APPIMAGE").is_some() && plain.exists() {
+        if let Some(stable) = stable_gateway_copy(&plain) {
+            return Some(stable);
+        }
+    }
+
     if plain.exists() {
         return Some(plain);
     }
-    // Packaged: Tauri installs the externalBin sidecar next to the app binary
-    // keeping its `-<target-triple>` suffix (the sidecar resolver appends it).
+    // Packaged fallback: a sidecar that kept its `-<target-triple>` suffix.
     if let Some(triple) = option_env!("CONDUIT_TARGET_TRIPLE").filter(|t| !t.is_empty()) {
         let suffixed = dir.join(format!("conduit-gateway-{triple}{ext}"));
         if suffixed.exists() {
@@ -777,6 +791,32 @@ fn resolve_gateway_path() -> Option<PathBuf> {
     // Fall back to the plain path so callers surface a clear "not found" error
     // rather than silently resolving to nothing.
     Some(plain)
+}
+
+/// Copy the gateway binary to a stable per-user location, so a client config can
+/// point at a path that outlives an ephemeral AppImage mount. Re-copies when the
+/// source size differs (e.g. after an app update). Returns the stable path.
+fn stable_gateway_copy(src: &std::path::Path) -> Option<PathBuf> {
+    let dest_dir = crate::registry::conduit_dir()?.join("bin");
+    std::fs::create_dir_all(&dest_dir).ok()?;
+    let dest = dest_dir.join("conduit-gateway");
+    let stale = match (std::fs::metadata(&dest), std::fs::metadata(src)) {
+        (Ok(d), Ok(s)) => d.len() != s.len(),
+        _ => true,
+    };
+    if stale {
+        std::fs::copy(src, &dest).ok()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&dest) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o755);
+                let _ = std::fs::set_permissions(&dest, perms);
+            }
+        }
+    }
+    Some(dest)
 }
 
 fn gateway_entry(profile: Option<&str>) -> Result<ServerEntry, String> {
