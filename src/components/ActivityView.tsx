@@ -92,8 +92,8 @@ export function ActivityView({ refreshKey }: { refreshKey: number }) {
         <div>
           <p className="font-medium">No tool calls yet</p>
           <p className="max-w-md text-sm text-muted-foreground">
-            Once a client runs a tool through Conduit, every call is recorded here
-            — the audit trail behind the governance story.
+            Once a client runs a tool through Conduit, every call is recorded
+            here, with per-server latency and error rates.
           </p>
         </div>
       </div>

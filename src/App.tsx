@@ -432,9 +432,15 @@ function ErrorState({ message }: { message: string }) {
       <div>
         <p className="font-medium">Couldn't reach the backend</p>
         <p className="max-w-md text-sm text-muted-foreground">
-          Make sure you're running the desktop app with{" "}
-          <code className="font-mono">npm run tauri dev</code>, not the
-          browser-only dev server.
+          {import.meta.env.DEV ? (
+            <>
+              Make sure you're running the desktop app with{" "}
+              <code className="font-mono">npm run tauri dev</code>, not the
+              browser-only dev server.
+            </>
+          ) : (
+            <>Conduit's backend didn't start. Try quitting and reopening the app.</>
+          )}
         </p>
         <p className="mt-2 font-mono text-xs text-muted-foreground/70">{message}</p>
       </div>

@@ -196,15 +196,22 @@ export function AppSidebar({
           Clients
         </div>
         <nav className="flex flex-col gap-0.5">
-          {sortClients(clients).map((client) => (
-            <ClientRow
-              key={client.id}
-              client={client}
-              importCount={importableServers(client, registry).length}
-              selected={view === "servers" && selectedClientId === client.id}
-              onSelect={() => onSelectClient(client.id)}
-            />
-          ))}
+          {clients.length === 0 ? (
+            <p className="px-2.5 py-1.5 text-xs text-muted-foreground">
+              No MCP clients found. Install Claude Desktop, Cursor, or another
+              supported tool, then refresh.
+            </p>
+          ) : (
+            sortClients(clients).map((client) => (
+              <ClientRow
+                key={client.id}
+                client={client}
+                importCount={importableServers(client, registry).length}
+                selected={view === "servers" && selectedClientId === client.id}
+                onSelect={() => onSelectClient(client.id)}
+              />
+            ))
+          )}
         </nav>
       </div>
     </aside>

@@ -1,8 +1,8 @@
 [package]
 name = "conduit"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Local MCP gateway and manager for AI coding tools"
+authors = ["South Forge AI"]
 edition = "2021"
 default-run = "conduit"
 
