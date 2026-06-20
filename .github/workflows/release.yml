@@ -20,9 +20,12 @@ jobs:
         include:
           - os: windows-latest
             bundles: nsis
-          - os: macos-latest # universal: Apple Silicon + Intel in one .dmg
+          - os: macos-latest # Apple Silicon (native)
             bundles: dmg
-            target: universal-apple-darwin
+            target: aarch64-apple-darwin
+          - os: macos-latest # Intel (cross-compiled on the arm64 runner)
+            bundles: dmg
+            target: x86_64-apple-darwin
           - os: ubuntu-22.04
             bundles: deb,appimage
     runs-on: ${{ matrix.os }}
@@ -44,9 +47,9 @@ jobs:
           # fails to compile.
           sudo apt-get install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev
 
-      - name: Add macOS universal Rust targets
-        if: matrix.target == 'universal-apple-darwin'
-        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Add the macOS Rust target
+        if: matrix.target
+        run: rustup target add ${{ matrix.target }}
 
       - uses: Swatinem/rust-cache@v2
         with:
@@ -58,8 +61,8 @@ jobs:
       - name: Build installer
         run: npx tauri build --config src-tauri/tauri.bundle.conf.json --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
         env:
-          # When set, prepare-sidecar builds the gateway for this target (or lipos a
-          # universal one); empty on Windows/Linux, which build for the host.
+          # When set, prepare-sidecar builds the gateway for this target; empty on
+          # Windows/Linux, which build for the host.
           CONDUIT_SIDECAR_TARGET: ${{ matrix.target }}
           # macOS code signing + notarization. Empty/ignored on Windows and Linux;
           # Tauri only acts on these when building the macOS bundle. Set these as
@@ -79,7 +82,7 @@ jobs:
           generate_release_notes: true
           files: |
             src-tauri/target/release/bundle/nsis/*-setup.exe
-            src-tauri/target/release/bundle/dmg/*.dmg
-            src-tauri/target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
             src-tauri/target/release/bundle/deb/*.deb
             src-tauri/target/release/bundle/appimage/*.AppImage

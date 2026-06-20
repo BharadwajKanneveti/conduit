@@ -3,10 +3,8 @@
 // Runs as part of `beforeBuildCommand`, so a packaged app always ships a gateway
 // matching the target.
 //
-// By default it builds for the host triple. Set CONDUIT_SIDECAR_TARGET to:
-//   - a target triple (e.g. "x86_64-apple-darwin") to cross-build, or
-//   - "universal-apple-darwin" to build both macOS arches and lipo them into one
-//     universal binary (so a single .dmg runs on Intel and Apple Silicon).
+// By default it builds for the host triple. Set CONDUIT_SIDECAR_TARGET to a target
+// triple (e.g. "x86_64-apple-darwin") to cross-build the gateway for that target.
 // Pass `--debug` to stage a debug build instead.
 import { execSync } from "node:child_process";
 import { mkdirSync, copyFileSync, existsSync, writeFileSync, chmodSync, rmSync } from "node:fs";
@@ -56,14 +54,8 @@ if (!existsSync(dest)) {
 }
 
 try {
-  if (requested === "universal-apple-darwin") {
-    const arm = buildGateway("aarch64-apple-darwin");
-    const intel = buildGateway("x86_64-apple-darwin");
-    execSync(`lipo -create "${arm}" "${intel}" -output "${dest}"`, { stdio: "inherit" });
-  } else {
-    const src = buildGateway(requested || undefined);
-    copyFileSync(src, dest);
-  }
+  const src = buildGateway(requested || undefined);
+  copyFileSync(src, dest);
 } catch (e) {
   // Don't leave the empty placeholder behind - it would ship as a 0-byte gateway.
   rmSync(dest, { force: true });
