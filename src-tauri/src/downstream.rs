@@ -148,6 +148,14 @@ impl StdioTransport {
         // Give the child the augmented PATH too, so e.g. `npx` can find `node`.
         #[cfg(not(windows))]
         cmd.env("PATH", augmented_path());
+        // CREATE_NO_WINDOW: without it, every stdio server we spawn flashes a
+        // console window on Windows (very visible during a probe/refresh, which
+        // spawns one per server). The app and the gateway both spawn through here.
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x0800_0000);
+        }
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn '{command}': {e}"))?;
