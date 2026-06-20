@@ -5,9 +5,15 @@
 //! AI tool invoked which server's tool, and when. Local and append-only.
 
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+
+/// Trim the log once it passes this size, so it can't grow without bound.
+const MAX_AUDIT_BYTES: u64 = 4 * 1024 * 1024;
+/// How many of the most recent lines to keep when trimming. Comfortably more than
+/// any dashboard window, so the trim is invisible to the stats/log views.
+const KEEP_LINES: usize = 5000;
 
 pub fn audit_path() -> Option<PathBuf> {
     // Same anchor as the registry, so the app and a client-spawned gateway (which
@@ -50,7 +56,38 @@ pub fn record_timed(server: &str, tool: &str, ok: bool, duration_ms: Option<u64>
         {
             let _ = writeln!(file, "{entry}");
         }
+        // File handle dropped above; safe to rewrite the path now.
+        rotate_if_large(&path);
     }
+}
+
+/// Trim the audit log to its most recent `KEEP_LINES` lines once it exceeds the
+/// size cap, so it stays bounded over months of use. Best-effort: a failure here
+/// never affects the call being logged.
+fn rotate_if_large(path: &Path) {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if size <= MAX_AUDIT_BYTES {
+        return;
+    }
+    if let Ok(content) = std::fs::read_to_string(path) {
+        let trimmed = trimmed_tail(&content, KEEP_LINES);
+        // Write to a temp file then rename, so a crash mid-write can't corrupt the log.
+        let tmp = PathBuf::from(format!("{}.tmp", path.display()));
+        if std::fs::write(&tmp, &trimmed).is_ok() {
+            let _ = std::fs::rename(&tmp, path);
+        }
+    }
+}
+
+/// Keep the last `keep` non-empty lines of `content`, newline-terminated.
+fn trimmed_tail(content: &str, keep: usize) -> String {
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(keep);
+    let mut out = lines[start..].join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
 }
 
 /// The most recent `limit` entries, newest first.
@@ -209,5 +246,15 @@ mod tests {
         assert_eq!(s["total"], 0);
         assert_eq!(s["errorRate"], 0.0);
         assert_eq!(s["servers"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn trimmed_tail_keeps_last_n_lines() {
+        assert_eq!(trimmed_tail("a\nb\nc\nd\ne\n", 2), "d\ne\n");
+        // Fewer lines than the cap -> unchanged (re-normalized with trailing \n).
+        assert_eq!(trimmed_tail("x\ny\n", 5), "x\ny\n");
+        // Blank lines are dropped.
+        assert_eq!(trimmed_tail("a\n\n\nb\n", 5), "a\nb\n");
+        assert_eq!(trimmed_tail("", 5), "");
     }
 }
