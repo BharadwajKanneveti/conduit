@@ -124,13 +124,23 @@ export function ClientDetail({
 
   async function handleImportAll() {
     setBusy(true);
-    try {
-      for (const s of toImport) await importOne(s);
-      toast.success(`Imported ${toImport.length} server(s) into Conduit`);
-    } catch (e) {
-      toast.error(`${e}`);
-    } finally {
-      setBusy(false);
+    let ok = 0;
+    const failed: string[] = [];
+    for (const s of toImport) {
+      try {
+        await importOne(s);
+        ok += 1;
+      } catch {
+        failed.push(s.name);
+      }
+    }
+    setBusy(false);
+    if (failed.length === 0) {
+      toast.success(`Imported ${ok} server${ok === 1 ? "" : "s"} into Conduit`);
+    } else if (ok > 0) {
+      toast.warning(`Imported ${ok}, couldn't import ${failed.join(", ")}`);
+    } else {
+      toast.error(`Couldn't import ${failed.join(", ")}`);
     }
   }
 

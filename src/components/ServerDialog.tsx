@@ -48,6 +48,23 @@ export function ServerDialog({ trigger, onSaved, editId, initial }: Props) {
   const isStdio = form.transport === "stdio";
   const editing = editId !== undefined;
 
+  // The dialog instance is mounted persistently (e.g. the header "Add server"
+  // button), so reset the form each time it opens - otherwise it keeps the last
+  // entry's values instead of starting blank (or re-deriving from `initial`).
+  function onOpenChange(next: boolean) {
+    if (next) {
+      setForm({
+        name: initial?.name ?? "",
+        transport: (initial?.transport ?? "stdio") as Transport,
+        command: initial?.command ?? "",
+        args: initial?.args.join(" ") ?? "",
+        url: initial?.url ?? "",
+      });
+      setEnvRows(initial?.env.map((e) => ({ key: e.key, value: "" })) ?? []);
+    }
+    setOpen(next);
+  }
+
   function set<K extends keyof typeof form>(key: K, value: (typeof form)[K]) {
     setForm((f) => ({ ...f, [key]: value }));
   }
@@ -79,9 +96,12 @@ export function ServerDialog({ trigger, onSaved, editId, initial }: Props) {
     };
     try {
       let result = editing ? await updateServer(entry) : await addServer(entry);
-      // Vault any values the user entered now. setSecret keys by server id, so we
-      // resolve the id from the saved registry (new servers get one on add).
-      const id = editId ?? result.servers.find((s) => s.name === entry.name)?.id;
+      // Vault any values the user entered now. setSecret keys by server id. For a
+      // new server, add_server appends it, so it's the last entry - resolving by
+      // name would pick the wrong one if two servers share a name.
+      const id = editing
+        ? editId
+        : result.servers[result.servers.length - 1]?.id;
       if (id) {
         for (const r of declared) {
           if (r.value) result = await setSecret(id, r.key.trim(), r.value);
@@ -96,7 +116,7 @@ export function ServerDialog({ trigger, onSaved, editId, initial }: Props) {
   }
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
+    <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogTrigger asChild>{trigger}</DialogTrigger>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
