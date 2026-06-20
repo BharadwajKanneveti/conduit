@@ -56,10 +56,16 @@ function App() {
   const [query, setQuery] = useState("");
 
   const lastProbeRef = useRef(0);
+  const probingRef = useRef(false);
 
   // Probe health quietly (no toast). Used on load and after authenticating, so
   // each server's status badge reflects reality without the user clicking around.
   const reprobe = useCallback(async () => {
+    // Never stack probes. A probe spawns/reads every server (and on macOS can
+    // trigger keychain prompts); overlapping runs amplify that into a storm,
+    // especially since each dismissed prompt returns focus and could re-trigger.
+    if (probingRef.current) return;
+    probingRef.current = true;
     lastProbeRef.current = Date.now();
     setProbing(true);
     try {
@@ -69,6 +75,7 @@ function App() {
       /* non-fatal: badges just stay in "checking" */
     } finally {
       setProbing(false);
+      probingRef.current = false;
     }
   }, []);
 
@@ -204,6 +211,8 @@ function App() {
   }
 
   async function handleProbe() {
+    if (probingRef.current) return;
+    probingRef.current = true;
     setProbing(true);
     try {
       const results = await probeServers();
@@ -214,6 +223,7 @@ function App() {
       toast.error(`Health check failed: ${e}`);
     } finally {
       setProbing(false);
+      probingRef.current = false;
     }
   }
 
