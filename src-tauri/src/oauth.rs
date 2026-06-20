@@ -370,6 +370,13 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String,
 
                 let code = params.get("code");
                 let error = params.get("error");
+                debug_log(&format!(
+                    "callback request: {} bytes of query, has_code={} has_error={} has_state={}",
+                    query.len(),
+                    code.is_some(),
+                    error.is_some(),
+                    params.contains_key("state")
+                ));
 
                 // Ignore connections that carry neither an authorization result nor
                 // an error - browsers hit the loopback with /favicon.ico and other
@@ -410,10 +417,17 @@ fn wait_for_code(listener: &TcpListener, expected_state: &str) -> Result<String,
 /// (the part after `?` in the request target). Reads until the end of the request
 /// line/headers so a long `code` isn't truncated by a single short read.
 fn read_callback_query(stream: &mut std::net::TcpStream) -> String {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    // The accepted socket can be non-blocking: on macOS/BSD it inherits the
+    // listener's mode (unlike Windows), which would make a single read return
+    // nothing and we'd serve a blank page while the browser sits on the callback.
+    // Force blocking AND tolerate WouldBlock by retrying within a deadline, so the
+    // request is read regardless of socket mode.
+    let _ = stream.set_nonblocking(false);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+    let deadline = Instant::now() + Duration::from_secs(5);
     let mut data = Vec::new();
     let mut buf = [0u8; 1024];
-    loop {
+    while Instant::now() < deadline {
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
@@ -421,6 +435,12 @@ fn read_callback_query(stream: &mut std::net::TcpStream) -> String {
                 if data.windows(4).any(|w| w == b"\r\n\r\n") || data.len() > 16384 {
                     break;
                 }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
             }
             Err(_) => break,
         }
