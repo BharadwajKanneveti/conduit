@@ -153,6 +153,10 @@ function App() {
     setBusyId(serverId);
     try {
       setRegistry(await setServerEnabled(profileId, serverId, enabled));
+      // Enabling adds a server with no health entry yet, so its card would sit on
+      // "Checking…" until a manual refresh. Probe now to resolve it. (Disabling
+      // moves it to the disabled group, no probe needed.)
+      if (enabled) void reprobe();
     } catch (e) {
       toast.error(`Couldn't toggle: ${e}`);
     } finally {
