@@ -670,6 +670,23 @@ fn open_data_dir() -> Result<(), String> {
 #[tauri::command]
 fn export_config(state: State<RegistryState>) -> Result<String, String> {
     let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    serde_json::to_string_pretty(&build_export(&reg)).map_err(|e| e.to_string())
+}
+
+/// Import a shared setup. Adds servers not already present (by name); secret
+/// values are never included, so each new server is left for the user to vault.
+#[tauri::command]
+fn import_config(state: State<RegistryState>, json: String) -> Result<Registry, String> {
+    let mut reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    apply_import(&mut reg, &json)?;
+    registry::save(&reg)?;
+    Ok(reg.clone())
+}
+
+/// Build a shareable setup document: server definitions only, with the gateway
+/// entry excluded and every secret value stripped. Pure, so the never-leak-a-key
+/// invariant is testable without Tauri state.
+fn build_export(reg: &Registry) -> serde_json::Value {
     let servers: Vec<ServerEntry> = reg
         .servers
         .iter()
@@ -683,21 +700,18 @@ fn export_config(state: State<RegistryState>) -> Result<String, String> {
             s
         })
         .collect();
-    let doc = serde_json::json!({ "kind": "conduit-setup", "version": 1, "servers": servers });
-    serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())
+    serde_json::json!({ "kind": "conduit-setup", "version": 1, "servers": servers })
 }
 
-/// Import a shared setup. Adds servers not already present (by name); secret
-/// values are never included, so each new server is left for the user to vault.
-#[tauri::command]
-fn import_config(state: State<RegistryState>, json: String) -> Result<Registry, String> {
+/// Merge a shared setup into the registry: add servers not already present (by
+/// name, case-insensitive), stripping any secret values. Pure (no Tauri state).
+fn apply_import(reg: &mut Registry, json: &str) -> Result<(), String> {
     #[derive(serde::Deserialize)]
     struct Doc {
         servers: Vec<ServerEntry>,
     }
-    let doc: Doc = serde_json::from_str(&json)
+    let doc: Doc = serde_json::from_str(json)
         .map_err(|e| format!("That doesn't look like a Conduit setup: {e}"))?;
-    let mut reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     for mut s in doc.servers {
         if reg.servers.iter().any(|e| e.name.eq_ignore_ascii_case(&s.name)) {
             continue;
@@ -709,8 +723,7 @@ fn import_config(state: State<RegistryState>, json: String) -> Result<Registry, 
         s.source = Some("shared".to_string());
         reg.add_server(s);
     }
-    registry::save(&reg)?;
-    Ok(reg.clone())
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -763,4 +776,84 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use registry::EnvVar;
+
+    fn github_with_secret() -> ServerEntry {
+        ServerEntry {
+            id: "gh".into(),
+            name: "GitHub".into(),
+            transport: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec![],
+            env: vec![EnvVar {
+                key: "TOKEN".into(),
+                value: Some("sk-live-xyz".into()),
+                secret: true,
+            }],
+            url: None,
+            source: None,
+            disabled_tools: vec![],
+        }
+    }
+
+    #[test]
+    fn export_strips_secrets_and_excludes_gateway() {
+        let mut reg = Registry::default();
+        reg.add_server(github_with_secret());
+        reg.add_server(ServerEntry {
+            id: String::new(),
+            name: "conduit".into(),
+            transport: "stdio".into(),
+            command: Some("conduit-gateway".into()),
+            args: vec![],
+            env: vec![],
+            url: None,
+            source: None,
+            disabled_tools: vec![],
+        });
+
+        let doc = build_export(&reg);
+        let serialized = serde_json::to_string(&doc).unwrap();
+        // The secret value must never appear in a shared setup.
+        assert!(!serialized.contains("sk-live-xyz"));
+        let servers = doc["servers"].as_array().unwrap();
+        // Gateway entry excluded.
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0]["env"][0]["value"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn import_dedups_by_name_and_nulls_secrets() {
+        let mut reg = Registry::default();
+        reg.add_server(github_with_secret());
+        let doc = r#"{"kind":"conduit-setup","version":1,"servers":[
+            {"name":"github","transport":"stdio","command":"npx"},
+            {"name":"Stripe","transport":"http","url":"https://x",
+             "env":[{"key":"K","value":"shh","secret":true}]}
+        ]}"#;
+        apply_import(&mut reg, doc).unwrap();
+
+        // "github" is deduped case-insensitively; only Stripe is added.
+        assert_eq!(
+            reg.servers
+                .iter()
+                .filter(|s| s.name.eq_ignore_ascii_case("github"))
+                .count(),
+            1
+        );
+        let stripe = reg.servers.iter().find(|s| s.name == "Stripe").unwrap();
+        assert_eq!(stripe.env[0].value, None);
+        assert_eq!(stripe.source.as_deref(), Some("shared"));
+    }
+
+    #[test]
+    fn import_rejects_garbage() {
+        let mut reg = Registry::default();
+        assert!(apply_import(&mut reg, "{not json").is_err());
+    }
 }

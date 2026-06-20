@@ -30,6 +30,7 @@ pub struct EnvVar {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ServerEntry {
+    #[serde(default)]
     pub id: String,
     pub name: String,
     /// "stdio" | "http" | "sse"

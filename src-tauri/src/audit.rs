@@ -94,6 +94,12 @@ fn latency(durs: &mut [u64]) -> (Option<u64>, Option<u64>) {
 /// This is the data behind the observability dashboard: call volume, error
 /// rate, and latency per server, computed locally from the audit log.
 pub fn stats(window: usize) -> Value {
+    aggregate(&read_recent(window))
+}
+
+/// Pure aggregation of audit entries into per-server + global stats. Split from
+/// `stats` so the dashboard math is testable without touching the on-disk log.
+fn aggregate(entries: &[Value]) -> Value {
     use std::collections::HashMap;
 
     #[derive(Default)]
@@ -104,12 +110,11 @@ pub fn stats(window: usize) -> Value {
         last_ts: u64,
     }
 
-    let entries = read_recent(window);
     let mut by_server: HashMap<String, Agg> = HashMap::new();
     let mut total = 0u64;
     let mut errors = 0u64;
 
-    for e in &entries {
+    for e in entries {
         let server = e.get("server").and_then(|v| v.as_str()).unwrap_or("?");
         let ok = e.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
         let ts = e.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -172,5 +177,37 @@ mod tests {
         assert_eq!(p95, Some(100)); // nearest-rank p95 of 5 samples = last
         let (a, p) = latency(&mut []);
         assert_eq!((a, p), (None, None));
+    }
+
+    #[test]
+    fn aggregate_groups_and_sorts_by_volume() {
+        let entries = vec![
+            json!({"server":"github","ok":true,"ts":100,"durationMs":10}),
+            json!({"server":"github","ok":false,"ts":200,"durationMs":30}),
+            json!({"server":"stripe","ok":true,"ts":150,"durationMs":20}),
+            json!({"server":"github","ok":true,"ts":50}), // no duration
+        ];
+        let s = aggregate(&entries);
+        assert_eq!(s["total"], 4);
+        assert_eq!(s["errors"], 1);
+        assert_eq!(s["errorRate"], 0.25);
+
+        let servers = s["servers"].as_array().unwrap();
+        // Busiest first: github (3 calls) before stripe (1).
+        assert_eq!(servers[0]["server"], "github");
+        assert_eq!(servers[0]["calls"], 3);
+        assert_eq!(servers[0]["errors"], 1);
+        assert_eq!(servers[0]["lastTs"], 200);
+        assert_eq!(servers[0]["avgMs"], 20); // only the two durations: (10+30)/2
+        assert_eq!(servers[1]["server"], "stripe");
+        assert_eq!(servers[1]["calls"], 1);
+    }
+
+    #[test]
+    fn aggregate_handles_empty() {
+        let s = aggregate(&[]);
+        assert_eq!(s["total"], 0);
+        assert_eq!(s["errorRate"], 0.0);
+        assert_eq!(s["servers"].as_array().unwrap().len(), 0);
     }
 }
