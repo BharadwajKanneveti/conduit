@@ -22,7 +22,7 @@ jobs:
             bundles: nsis
           - os: macos-latest
             bundles: dmg
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             bundles: deb,appimage
     runs-on: ${{ matrix.os }}
     steps:
@@ -35,10 +35,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install Linux build dependencies
-        if: matrix.os == 'ubuntu-latest'
+        if: matrix.os == 'ubuntu-22.04'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf
 
       - uses: Swatinem/rust-cache@v2
         with:

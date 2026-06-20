@@ -3,7 +3,7 @@
 // Runs as part of `beforeBuildCommand`, so a packaged app always ships a gateway
 // matching the host target. Pass `--debug` to stage a debug build instead.
 import { execSync } from "node:child_process";
-import { mkdirSync, copyFileSync, existsSync, writeFileSync } from "node:fs";
+import { mkdirSync, copyFileSync, existsSync, writeFileSync, chmodSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 function hostTriple() {
@@ -31,13 +31,27 @@ if (!existsSync(dest)) {
 }
 
 console.log(`[sidecar] building conduit-gateway (${profile}) for ${triple}`);
-execSync(`cargo build ${debug ? "" : "--release"} --bin conduit-gateway`, {
-  cwd: "src-tauri",
-  stdio: "inherit",
-});
+try {
+  execSync(`cargo build ${debug ? "" : "--release"} --bin conduit-gateway`, {
+    cwd: "src-tauri",
+    stdio: "inherit",
+  });
+} catch (e) {
+  // Don't leave the empty placeholder behind - it would ship as a 0-byte,
+  // non-executable "gateway".
+  rmSync(dest, { force: true });
+  throw e;
+}
 
 const src = join("src-tauri", "target", profile, `conduit-gateway${ext}`);
-if (!existsSync(src)) throw new Error(`built gateway not found at ${src}`);
+if (!existsSync(src)) {
+  rmSync(dest, { force: true });
+  throw new Error(`built gateway not found at ${src}`);
+}
 
 copyFileSync(src, dest);
+// On macOS/Linux the bundled sidecar must be executable.
+if (process.platform !== "win32") {
+  chmodSync(dest, 0o755);
+}
 console.log(`[sidecar] staged -> ${dest}`);

@@ -56,8 +56,60 @@ pub fn resolve_command(command: &str) -> String {
     command.to_string()
 }
 
+/// A PATH that includes the user's real shell PATH plus common install dirs.
+/// macOS GUI apps (and apps they launch, like the client-spawned gateway) inherit
+/// only a minimal PATH, so `npx`/`uvx`/`node` aren't found without this. Computed
+/// once and cached.
+#[cfg(not(windows))]
+pub fn augmented_path() -> &'static str {
+    use std::sync::OnceLock;
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED.get_or_init(|| {
+        let mut dirs_list: Vec<String> = std::env::var("PATH")
+            .ok()
+            .map(|p| p.split(':').map(String::from).collect())
+            .unwrap_or_default();
+        let mut push = |d: String, list: &mut Vec<String>| {
+            if !d.is_empty() && !list.iter().any(|x| *x == d) {
+                list.push(d);
+            }
+        };
+        // Best effort: the login shell's PATH (covers nvm/asdf/homebrew/volta).
+        if let Ok(shell) = std::env::var("SHELL") {
+            if let Ok(out) = std::process::Command::new(&shell)
+                .args(["-ilc", "printf %s \"$PATH\""])
+                .output()
+            {
+                if out.status.success() {
+                    for d in String::from_utf8_lossy(&out.stdout).split(':') {
+                        push(d.to_string(), &mut dirs_list);
+                    }
+                }
+            }
+        }
+        if let Some(home) = dirs::home_dir() {
+            for sub in [".local/bin", ".cargo/bin", ".bun/bin"] {
+                push(home.join(sub).to_string_lossy().into_owned(), &mut dirs_list);
+            }
+        }
+        for d in ["/usr/local/bin", "/opt/homebrew/bin", "/usr/bin", "/bin"] {
+            push(d.to_string(), &mut dirs_list);
+        }
+        dirs_list.join(":")
+    })
+}
+
 #[cfg(not(windows))]
 pub fn resolve_command(command: &str) -> String {
+    if command.contains('/') {
+        return command.to_string();
+    }
+    for dir in augmented_path().split(':').filter(|d| !d.is_empty()) {
+        let candidate = Path::new(dir).join(command);
+        if candidate.is_file() {
+            return candidate.to_string_lossy().into_owned();
+        }
+    }
     command.to_string()
 }
 
@@ -86,6 +138,9 @@ impl StdioTransport {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // Give the child the augmented PATH too, so e.g. `npx` can find `node`.
+        #[cfg(not(windows))]
+        cmd.env("PATH", augmented_path());
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn '{command}': {e}"))?;
