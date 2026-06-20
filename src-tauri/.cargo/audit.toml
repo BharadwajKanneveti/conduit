@@ -1,0 +1,14 @@
+# cargo-audit configuration (https://github.com/rustsec/rustsec/tree/main/cargo-audit).
+# Read when `cargo audit` runs from this directory (where Cargo.lock lives).
+
+[advisories]
+ignore = [
+    # glib VariantStrIter unsoundness. Linux-only, pulled in transitively by
+    # Tauri's gtk-0.18 webview stack which hard-pins `glib = "^0.18"`; the fix
+    # exists only in glib 0.20+, so it cannot be selected without moving the
+    # whole webview stack. It is a soundness/null-deref crash (not RCE) in the
+    # binding layer, not in Conduit code, and does not affect Windows or macOS.
+    # Tracked in README "Known issues". Remove when Tauri's Linux stack adopts a
+    # glib-0.20 base.
+    "RUSTSEC-2024-0429",
+]
