@@ -22,6 +22,10 @@ dist-ssr
 /docs/COMPETITIVE.md
 /docs/PLAN.md
 /docs/STATUS.md
+/docs/LAUNCH.md
+
+# Draft MCP-registry manifest (references an unpublished gateway package; not for launch yet)
+/server.json
 
 # Editor directories and files
 .vscode/*
