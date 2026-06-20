@@ -213,6 +213,18 @@ impl Registry {
         Ok(())
     }
 
+    /// Enable or disable every server in a profile at once.
+    pub fn set_all_enabled(&mut self, profile_id: &str, enabled: bool) -> Result<(), String> {
+        let ids: Vec<String> = self.servers.iter().map(|s| s.id.clone()).collect();
+        let profile = self
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == profile_id)
+            .ok_or_else(|| format!("No profile with id '{profile_id}'"))?;
+        profile.enabled_server_ids = if enabled { ids } else { Vec::new() };
+        Ok(())
+    }
+
     /// Enable or disable a single tool on a server. Disabling adds it to the
     /// server's `disabled_tools`; enabling removes it. Idempotent.
     pub fn set_tool_enabled(

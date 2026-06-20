@@ -204,6 +204,18 @@ fn set_server_enabled(
 }
 
 #[tauri::command]
+fn set_all_enabled(
+    state: State<RegistryState>,
+    profile_id: String,
+    enabled: bool,
+) -> Result<Registry, String> {
+    let mut reg = state.lock().unwrap();
+    reg.set_all_enabled(&profile_id, enabled)?;
+    registry::save(&reg)?;
+    Ok(reg.clone())
+}
+
+#[tauri::command]
 fn create_profile(state: State<RegistryState>, name: String) -> Result<Registry, String> {
     let mut reg = state.lock().unwrap();
     reg.add_profile(&name);
@@ -633,6 +645,25 @@ async fn latest_release() -> Result<String, String> {
     .map_err(|e| e.to_string())?
 }
 
+/// Open Conduit's data directory (registry, logs, audit) in the OS file manager,
+/// so users can back it up or inspect it.
+#[tauri::command]
+fn open_data_dir() -> Result<(), String> {
+    let dir = registry::conduit_dir().ok_or("could not resolve the data directory")?;
+    let _ = std::fs::create_dir_all(&dir);
+    #[cfg(target_os = "windows")]
+    let program = "explorer";
+    #[cfg(target_os = "macos")]
+    let program = "open";
+    #[cfg(target_os = "linux")]
+    let program = "xdg-open";
+    std::process::Command::new(program)
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("could not open the data directory: {e}"))?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let registry = registry::load().unwrap_or_default();
@@ -676,6 +707,8 @@ pub fn run() {
             promote_to_catalog,
             unpromote_from_catalog,
             latest_release,
+            open_data_dir,
+            set_all_enabled,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

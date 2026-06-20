@@ -16,6 +16,7 @@ import {
   importServers,
   probeServers,
   removeServer,
+  setAllEnabled,
   setServerEnabled,
 } from "@/lib/api";
 import {
@@ -190,6 +191,18 @@ function App() {
     }
   }
 
+  async function handleToggleAll() {
+    if (!profileId) return;
+    const enable = enabledCount < servers.length;
+    try {
+      setRegistry(await setAllEnabled(profileId, enable));
+      if (enable) void reprobe();
+      toast.success(enable ? "Enabled all servers" : "Disabled all servers");
+    } catch (e) {
+      toast.error(`Couldn't update servers: ${e}`);
+    }
+  }
+
   async function handleProbe() {
     setProbing(true);
     try {
@@ -307,6 +320,16 @@ function App() {
                     <Download className="size-4" />
                     Import
                   </Button>
+                  {servers.length > 0 && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={handleToggleAll}
+                      disabled={busyId !== null}
+                    >
+                      {enabledCount < servers.length ? "Enable all" : "Disable all"}
+                    </Button>
+                  )}
                   <Button
                     variant="outline"
                     size="sm"

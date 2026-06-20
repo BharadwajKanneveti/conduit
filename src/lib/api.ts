@@ -166,6 +166,19 @@ export function latestRelease(): Promise<string> {
   return invoke<string>("latest_release");
 }
 
+/** Open Conduit's data directory (registry, logs, audit) in the OS file manager. */
+export function openDataDir(): Promise<void> {
+  return invoke<void>("open_data_dir");
+}
+
+/** Enable or disable every server in a profile at once. */
+export function setAllEnabled(
+  profileId: string,
+  enabled: boolean,
+): Promise<Registry> {
+  return invoke<Registry>("set_all_enabled", { profileId, enabled });
+}
+
 /** Load Conduit's registry (servers + profiles). */
 export function getRegistry(): Promise<Registry> {
   return invoke<Registry>("get_registry");

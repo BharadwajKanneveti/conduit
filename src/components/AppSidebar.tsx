@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   ArrowUpCircle,
   FlaskConical,
+  FolderOpen,
   Layers,
   Link2,
   Puzzle,
@@ -15,7 +16,7 @@ import {
   type DetectedClient,
   type Registry,
 } from "@/lib/types";
-import { latestRelease } from "@/lib/api";
+import { latestRelease, openDataDir } from "@/lib/api";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ProfileBar } from "@/components/ProfileBar";
 
@@ -55,20 +56,28 @@ function VersionFooter() {
 
   if (!version) return null;
   return (
-    <div className="mt-auto border-t px-4 py-3 text-xs">
+    <div className="mt-auto flex items-center justify-between gap-2 border-t px-4 py-3 text-xs">
       {update ? (
         <button
           onClick={() =>
             openUrl("https://github.com/tsouth89/conduit/releases/latest")
           }
-          className="flex items-center gap-1.5 text-emerald-400 transition hover:underline"
+          className="flex min-w-0 items-center gap-1.5 text-emerald-400 transition hover:underline"
         >
-          <ArrowUpCircle className="size-3.5" />
-          Update available ({update})
+          <ArrowUpCircle className="size-3.5 shrink-0" />
+          <span className="truncate">Update available ({update})</span>
         </button>
       ) : (
         <span className="text-muted-foreground">Conduit v{version}</span>
       )}
+      <button
+        onClick={() => openDataDir().catch(() => {})}
+        title="Open data folder (config, logs)"
+        aria-label="Open data folder"
+        className="shrink-0 text-muted-foreground transition hover:text-foreground"
+      >
+        <FolderOpen className="size-3.5" />
+      </button>
     </div>
   );
 }
