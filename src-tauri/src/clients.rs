@@ -243,6 +243,12 @@ fn kiro_path() -> Option<PathBuf> {
     Some(home()?.join(".kiro").join("settings").join("mcp.json"))
 }
 
+/// LM Studio reads MCP servers from `~/.lmstudio/mcp.json` (`mcpServers`, plain
+/// JSON). The file is created by LM Studio, so the parent-dir presence check works.
+fn lmstudio_path() -> Option<PathBuf> {
+    Some(home()?.join(".lmstudio").join("mcp.json"))
+}
+
 /// Zed keeps MCP ("context") servers in its main settings.json (JSONC). Windows
 /// uses %APPDATA%\Zed; macOS and Linux use ~/.config/zed (not App Support). The
 /// parent dir is created on install, so the default presence heuristic works.
@@ -439,6 +445,14 @@ fn defs() -> Vec<ClientDef> {
             format: Format::JsonContextServers,
             uses_connectors: false,
             path: zed_path,
+            plugin_scan: None,
+        },
+        ClientDef {
+            id: "lm-studio",
+            name: "LM Studio",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            path: lmstudio_path,
             plugin_scan: None,
         },
     ]
@@ -1346,10 +1360,10 @@ mod tests {
 
     #[test]
     fn new_json_clients_are_registered() {
-        // Warp, Amazon Q, and Kiro all use the standard mcpServers JSON shape, so a
-        // ClientDef + path is all they need. Lock in their registration, format, and
-        // that their config paths resolve on this OS.
-        for id in ["warp", "amazon-q", "kiro"] {
+        // Warp, Amazon Q, Kiro, and LM Studio all use the standard mcpServers JSON
+        // shape, so a ClientDef + path is all they need. Lock in their registration,
+        // format, and that their config paths resolve on this OS.
+        for id in ["warp", "amazon-q", "kiro", "lm-studio"] {
             let d = defs()
                 .into_iter()
                 .find(|d| d.id == id)
