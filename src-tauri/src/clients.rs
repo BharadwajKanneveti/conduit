@@ -586,9 +586,11 @@ fn find_def(client_id: &str) -> Option<ClientDef> {
 }
 
 fn backup_dir(client_id: &str) -> Option<PathBuf> {
+    // Anchor to the same home-based dir as the registry (see registry::conduit_dir)
+    // so config backups land in one place regardless of whether a packaged or
+    // unpackaged process wrote them.
     Some(
-        dirs::config_dir()?
-            .join("Conduit")
+        crate::registry::conduit_dir()?
             .join("backups")
             .join(client_id),
     )

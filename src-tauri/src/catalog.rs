@@ -108,7 +108,10 @@ pub fn curated() -> Vec<CatalogEntry> {
 }
 
 fn user_catalog_path() -> Option<std::path::PathBuf> {
-    Some(dirs::config_dir()?.join("Conduit").join("user-catalog.json"))
+    // Anchor to the same home-based dir as the registry (see registry::conduit_dir),
+    // so a packaged (client-spawned) process and the unpackaged app don't read/write
+    // the user catalog in different, MSIX-virtualized locations.
+    Some(crate::registry::conduit_dir()?.join("user-catalog.json"))
 }
 
 /// Servers the user has promoted into their own catalog (their real-world picks).

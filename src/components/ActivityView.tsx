@@ -5,7 +5,7 @@ import type { AuditEntry, AuditStats, ServerStat } from "@/lib/types";
 
 /** Compact latency string: "180 ms" or "1.2 s", or a dash when unmeasured. */
 function fmtMs(ms: number | null): string {
-  if (ms == null) return "—";
+  if (ms == null) return "-";
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`;
 }
 

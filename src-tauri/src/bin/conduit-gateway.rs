@@ -601,16 +601,31 @@ fn main() {
         std::env::var("CONDUIT_REGISTRY").ok(),
         registry::resolved_path()
     ));
-    match registry::load_resolved() {
-        Ok(r) => glog(&format!(
-            "load_resolved OK: {} servers total, {} enabled (active={})",
-            r.servers.len(),
-            r.enabled_servers().len(),
-            r.active_profile_id()
-        )),
-        Err(e) => glog(&format!("load_resolved ERR: {e}")),
-    }
-    let registry = Arc::new(Mutex::new(registry::load_resolved().unwrap_or_default()));
+    let loaded = match registry::load_resolved() {
+        Ok(r) => {
+            glog(&format!(
+                "load_resolved OK: {} servers total, {} enabled (active={})",
+                r.servers.len(),
+                r.enabled_servers().len(),
+                r.active_profile_id()
+            ));
+            r
+        }
+        Err(e) => {
+            // Always surface this (not only under CONDUIT_DEBUG). A corrupt or
+            // unreadable registry would otherwise silently serve an empty catalog,
+            // making every tool appear to vanish in the client with no explanation.
+            // We keep running on a default so the gateway stays up, and the on-disk
+            // tool cache still answers tools/list from the last good build.
+            eprintln!(
+                "conduit-gateway: could not load registry ({e}); serving cached tools only. \
+                 Fix or recreate the registry to restore full functionality."
+            );
+            glog(&format!("load_resolved ERR: {e}"));
+            registry::Registry::default()
+        }
+    };
+    let registry = Arc::new(Mutex::new(loaded));
     // Empty router + cached catalog: the handshake and tools/list answer instantly
     // (from cache), while downstream servers connect in the background for the
     // actual tool calls.

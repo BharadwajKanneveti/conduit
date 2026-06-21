@@ -502,9 +502,11 @@ fn set_lazy_discovery(state: State<RegistryState>, lazy: bool) -> Result<Registr
 /// and rebuilds on change, so freshly-vaulted credentials take effect (and the
 /// server's tools flow to connected clients) without a manual restart.
 fn nudge_gateway(state: &RegistryState) {
-    if let Ok(reg) = state.lock() {
-        let _ = registry::save(&reg);
-    }
+    // Recover from a poisoned lock like every other command does; otherwise a
+    // poisoned mutex would skip this re-save and freshly-vaulted credentials would
+    // silently never propagate to the running gateway.
+    let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = registry::save(&reg);
 }
 
 /// Store a bearer token for an http server (used as `Authorization: Bearer ...`).

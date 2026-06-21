@@ -136,6 +136,23 @@ jobs:
           mac_arm=$(pick 'aarch64-apple-darwin\.app\.tar\.gz$')
           mac_x64=$(pick 'x86_64-apple-darwin\.app\.tar\.gz$')
           lin=$(pick '\.AppImage$')
+
+          # Refuse to compose a manifest with a missing asset or empty signature: a
+          # blank signature makes that platform's updater silently reject EVERY
+          # update. If a matrix build failed (fail-fast is off), its artifacts are
+          # absent here. Better to fail this job - the installers are already on the
+          # draft - than publish a manifest that bricks a platform's auto-update.
+          fail=0
+          for pair in "windows:$win" "darwin-aarch64:$mac_arm" "darwin-x86_64:$mac_x64" "linux:$lin"; do
+            label="${pair%%:*}"; name="${pair#*:}"
+            if [ -z "$name" ]; then echo "::error::missing installer asset for $label"; fail=1; continue; fi
+            if [ ! -s "sigs/$name.sig" ]; then echo "::error::missing or empty signature for $name ($label)"; fail=1; fi
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Refusing to compose latest.json with missing assets/signatures. Re-run the failed build job(s), then re-run this job."
+            exit 1
+          fi
+
           sig() { cat "sigs/$1.sig"; }
           jq -n \
             --arg version "$TAG" \
@@ -154,5 +171,10 @@ jobs:
                  "linux-x86_64":   { signature: $lin_sig,  url: $lin_url }
                }
              }' > latest.json
+
+          # Belt and suspenders: never upload a manifest with an empty signature.
+          if jq -e '[.platforms[].signature] | any(. == "")' latest.json >/dev/null; then
+            echo "::error::latest.json has an empty signature; not uploading."; exit 1
+          fi
           echo "--- latest.json ---"; cat latest.json
           gh release upload "$TAG" latest.json --repo "$REPO" --clobber

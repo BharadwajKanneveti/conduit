@@ -246,7 +246,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                 <div className="flex items-start gap-2 rounded-md bg-emerald-400/10 p-2.5 text-xs text-emerald-300">
                   <Check className="mt-0.5 size-3.5 shrink-0" />
                   <span>
-                    This server connects without auth. Just enable it — no token needed.
+                    This server connects without auth. Just enable it, no token needed.
                   </span>
                 </div>
               ) : (

@@ -382,7 +382,13 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string_pretty(registry).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| e.to_string())
+    // Write atomically: a sibling temp file, then rename over the target. The
+    // registry is the single source of truth for every server, so a crash, power
+    // loss, or full disk mid-write must not be able to truncate it. The temp file
+    // sits in the same directory so the rename stays on one filesystem.
+    let tmp = PathBuf::from(format!("{}.conduit-tmp", path.display()));
+    std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
 }
 
 pub fn load() -> Result<Registry, String> {
