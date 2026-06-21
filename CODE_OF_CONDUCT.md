@@ -14,7 +14,7 @@ Harassment and exclusionary behavior of any kind are not tolerated.
 ## Reporting
 
 If you experience or witness unacceptable behavior, report it privately to the
-maintainer at **tsouth2@gmail.com**. All reports are reviewed and handled
+maintainer at **tyler@southforgeai.com**. All reports are reviewed and handled
 confidentially. The maintainer is responsible for enforcement and may take any
 action they deem appropriate, up to and including a permanent ban.
 

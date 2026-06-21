@@ -9,7 +9,7 @@ Please report security issues **privately**, not as a public issue:
 
 - Preferred: GitHub's [private vulnerability reporting](https://github.com/tsouth89/conduit/security/advisories/new)
   (repo **Security** tab to **Report a vulnerability**).
-- Or email the maintainer at **tsouth2@gmail.com**.
+- Or email the maintainer at **tyler@southforgeai.com**.
 
 Please include reproduction steps and the affected version/commit. We aim to
 acknowledge within a few days. Coordinated disclosure is appreciated; we will
