@@ -203,36 +203,38 @@ fn search_catalog(
 /// + description only, flagged `schemaOmitted` so the agent can fetch a specific
 /// tool's full schema by searching its exact name (or scoping with `server`).
 fn project_budgeted(tools: &[&Value]) -> Vec<Value> {
-    const SCHEMA_BUDGET: usize = 24_000;
-    // Cap each description too: some servers ship multi-KB descriptions, which add
-    // up across results. Enough to choose a tool; full text comes from a scoped or
-    // exact-name search.
-    const DESC_MAX: usize = 500;
-    let truncate_desc = |d: Option<&Value>| match d.and_then(|v| v.as_str()) {
-        Some(s) if s.chars().count() > DESC_MAX => {
-            let head: String = s.chars().take(DESC_MAX).collect();
+    // Only the top result carries a full schema and a longer description - it's the
+    // one we tell the model to call. Every other result is a compact menu entry:
+    // name plus a one-line description, no schema. A 25-result response then stays a
+    // few KB instead of tens, which matters because a (slow, local) model re-reads
+    // the whole thing on every turn. Full schema/text for any other tool comes from
+    // a scoped or exact-name search, as the response text explains.
+    const TOP_DESC_MAX: usize = 500;
+    const MENU_DESC_MAX: usize = 140;
+    let truncate = |d: Option<&Value>, max: usize| match d.and_then(|v| v.as_str()) {
+        Some(s) if s.chars().count() > max => {
+            let head: String = s.chars().take(max).collect();
             Value::String(format!("{head}…"))
         }
         _ => d.cloned().unwrap_or(Value::Null),
     };
-    let mut used = 0usize;
     tools
         .iter()
         .enumerate()
         .map(|(i, t)| {
             let name = t.get("name").cloned().unwrap_or(Value::Null);
-            let description = truncate_desc(t.get("description"));
-            let schema = t.get("inputSchema").cloned().unwrap_or(Value::Null);
-            let slen = if schema.is_null() {
-                0
+            if i == 0 {
+                json!({
+                    "name": name,
+                    "description": truncate(t.get("description"), TOP_DESC_MAX),
+                    "inputSchema": t.get("inputSchema").cloned().unwrap_or(Value::Null),
+                })
             } else {
-                schema.to_string().len()
-            };
-            if i == 0 || used + slen <= SCHEMA_BUDGET {
-                used += slen;
-                json!({ "name": name, "description": description, "inputSchema": schema })
-            } else {
-                json!({ "name": name, "description": description, "schemaOmitted": true })
+                json!({
+                    "name": name,
+                    "description": truncate(t.get("description"), MENU_DESC_MAX),
+                    "schemaOmitted": true,
+                })
             }
         })
         .collect()
@@ -1112,6 +1114,24 @@ mod tests {
         let (all, total) = search_catalog(&catalog(), "", Some("rc"), 10);
         assert_eq!(total, 1);
         assert_eq!(all[0]["name"], "rc__list_offerings");
+    }
+
+    #[test]
+    fn menu_entries_are_compact_after_the_top() {
+        // Past the top result, entries are name + a one-line description and no schema,
+        // so a big result set stays small for a local model to re-read each turn.
+        let cat = vec![
+            json!({ "name": "a__one", "description": "x".repeat(5000), "inputSchema": { "type": "object" } }),
+            json!({ "name": "a__two", "description": "y".repeat(5000), "inputSchema": { "type": "object" } }),
+        ];
+        let (hits, _) = search_catalog(&cat, "", Some("a"), 10);
+        // Top: keeps schema and the longer description.
+        assert!(hits[0].get("inputSchema").is_some());
+        assert!(hits[0]["description"].as_str().unwrap().chars().count() <= 501);
+        // Menu: no schema, short description.
+        assert!(hits[1].get("inputSchema").is_none());
+        assert_eq!(hits[1]["schemaOmitted"], json!(true));
+        assert!(hits[1]["description"].as_str().unwrap().chars().count() <= 141);
     }
 
     #[test]
