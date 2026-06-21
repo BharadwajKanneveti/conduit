@@ -152,7 +152,13 @@ export function ShareDialog({ trigger, onImported }: Props) {
                 className="h-8 text-sm"
               />
             </div>
-            <textarea readOnly value={exported} rows={5} className={area} />
+            <textarea
+              readOnly
+              aria-label="Exported setup"
+              value={exported}
+              rows={5}
+              className={area}
+            />
             <div className="flex flex-wrap gap-2">
               <Button
                 size="sm"
@@ -187,6 +193,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
             <Label className="text-sm">Import a setup</Label>
             <textarea
               placeholder="Paste a shared setup here"
+              aria-label="Paste a shared setup"
               value={paste}
               onChange={(e) => setPaste(e.target.value)}
               rows={5}

@@ -687,6 +687,20 @@ fn entry_to_toml(entry: &ServerEntry) -> toml::Value {
     toml::Value::Table(t)
 }
 
+/// Write `contents` to `path` atomically: write a sibling temp file, then rename
+/// over the target. A crash, power loss, or full disk mid-write can't leave a
+/// client's config truncated or empty - the rename either fully happens or it
+/// doesn't. Mirrors the audit-log rotation writer. The temp file sits in the same
+/// directory so the rename stays on one filesystem (and is therefore atomic).
+fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let tmp = PathBuf::from(format!("{}.conduit-tmp", path.display()));
+    std::fs::write(&tmp, contents).map_err(|e| e.to_string())?;
+    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+}
+
 fn write_json(path: &Path, key: &str, servers: &[ServerEntry]) -> Result<(), String> {
     let mut root = if path.exists() {
         let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
@@ -710,10 +724,7 @@ fn write_json(path: &Path, key: &str, servers: &[ServerEntry]) -> Result<(), Str
     obj.insert(key.to_string(), serde_json::Value::Object(servers_map));
 
     let json = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, json).map_err(|e| e.to_string())
+    atomic_write(path, &json)
 }
 
 fn write_toml(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
@@ -735,10 +746,7 @@ fn write_toml(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
     table.insert("mcp_servers".into(), toml::Value::Table(servers_table));
 
     let out = toml::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, out).map_err(|e| e.to_string())
+    atomic_write(path, &out)
 }
 
 /// Write a server set into a client's config, backing up the existing file first
@@ -895,10 +903,7 @@ fn edit_json_gateway(
     }
 
     let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, out).map_err(|e| e.to_string())
+    atomic_write(path, &out)
 }
 
 fn edit_toml_gateway(path: &Path, install: bool, profile: Option<&str>) -> Result<(), String> {
@@ -927,10 +932,7 @@ fn edit_toml_gateway(path: &Path, install: bool, profile: Option<&str>) -> Resul
     }
 
     let out = toml::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(path, out).map_err(|e| e.to_string())
+    atomic_write(path, &out)
 }
 
 fn install_or_remove(

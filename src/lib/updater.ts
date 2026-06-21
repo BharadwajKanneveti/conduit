@@ -1,14 +1,21 @@
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import { relaunch } from "@tauri-apps/plugin-process";
 
-/** Best-effort check for a newer release via the Tauri updater. Returns null on
- * any failure (dev build, offline, or no manifest published yet) so callers can
- * just fall back to showing the current version. */
-export async function checkForUpdate(): Promise<Update | null> {
+/** Outcome of an update check. `error` is distinct from `current` so the UI can
+ * tell "you're up to date" apart from "couldn't reach the update server". */
+export type UpdateCheck =
+  | { kind: "update"; update: Update }
+  | { kind: "current" }
+  | { kind: "error"; message: string };
+
+/** Check for a newer release via the Tauri updater. Never throws; failures
+ * (dev build, offline, or no manifest published yet) come back as `error`. */
+export async function checkForUpdate(): Promise<UpdateCheck> {
   try {
-    return await check();
-  } catch {
-    return null;
+    const u = await check();
+    return u?.available ? { kind: "update", update: u } : { kind: "current" };
+  } catch (e) {
+    return { kind: "error", message: String(e) };
   }
 }
 

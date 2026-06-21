@@ -18,6 +18,7 @@ import {
 } from "@/lib/api";
 import {
   importableServers,
+  isGatewayServer,
   type CatalogEntry,
   type DetectedClient,
   type Registry,
@@ -195,7 +196,7 @@ function AddServers({
     try {
       const next = await importServers();
       onImport(next);
-      setImported(next.servers.length);
+      setImported(next.servers.filter((s) => !isGatewayServer(s)).length);
       toast.success("Imported servers from your clients");
     } catch (e) {
       toast.error(`Import failed: ${e}`);

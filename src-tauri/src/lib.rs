@@ -689,6 +689,14 @@ fn import_config_from_path(
     state: State<RegistryState>,
     path: String,
 ) -> Result<Registry, String> {
+    // A shared setup is a small JSON document. Cap the read so a malicious or
+    // accidental huge/nested file can't OOM or stall the app.
+    const MAX_SETUP_BYTES: u64 = 4 * 1024 * 1024;
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > MAX_SETUP_BYTES {
+            return Err("That file is too large to be a Conduit setup.".to_string());
+        }
+    }
     let json = std::fs::read_to_string(&path).map_err(|e| format!("Couldn't read the file: {e}"))?;
     let mut reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     apply_import(&mut reg, &json)?;

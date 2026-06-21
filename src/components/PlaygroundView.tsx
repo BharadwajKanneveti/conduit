@@ -8,6 +8,7 @@ import {
   ShieldAlert,
   XCircle,
 } from "lucide-react";
+import { toast } from "sonner";
 import {
   callTool,
   listServerTools,
@@ -232,6 +233,8 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
     setPolicyBusy(true);
     try {
       onRegistryChange(await setToolEnabled(serverId, toolName, enabled));
+    } catch (e) {
+      toast.error(`Couldn't update the tool: ${e}`);
     } finally {
       setPolicyBusy(false);
     }
@@ -241,6 +244,8 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
     setPolicyBusy(true);
     try {
       onRegistryChange(await setDenyDestructive(deny));
+    } catch (e) {
+      toast.error(`Couldn't update the policy: ${e}`);
     } finally {
       setPolicyBusy(false);
     }
@@ -250,6 +255,8 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
     setPolicyBusy(true);
     try {
       onRegistryChange(await setLazyDiscovery(lazy));
+    } catch (e) {
+      toast.error(`Couldn't update discovery mode: ${e}`);
     } finally {
       setPolicyBusy(false);
     }

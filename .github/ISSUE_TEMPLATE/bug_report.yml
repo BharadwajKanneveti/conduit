@@ -1,0 +1,58 @@
+name: Bug report
+description: Something in Conduit isn't working
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. The more detail, the faster it gets fixed.
+        For security issues, please use [SECURITY.md](../blob/main/SECURITY.md) instead of a public issue.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What went wrong, and what did you expect instead?
+      placeholder: When I clicked X, Y happened. I expected Z.
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open Conduit
+        2. ...
+        3. ...
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS (Apple Silicon)
+        - macOS (Intel)
+        - Linux
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Conduit version
+      description: Shown in the bottom-left of the sidebar (e.g. v0.3.3).
+    validations:
+      required: true
+  - type: input
+    id: clients
+    attributes:
+      label: AI client(s) involved
+      description: Which tools were connected? (Claude Desktop, Cursor, VS Code, Codex, etc.)
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >
+        Optional but helpful. Open the data folder (folder icon in the sidebar footer)
+        and attach `gateway-debug.log` or relevant lines. Redact any secrets first.
+      render: shell

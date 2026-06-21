@@ -217,7 +217,7 @@ export function ActivityView({ refreshKey }: { refreshKey: number }) {
         ) : (
           visible.map((e, i) => (
             <div
-              key={i}
+              key={`${e.ts}-${e.server}-${e.tool}-${i}`}
               className="flex items-center gap-3 rounded-md border border-border/50 px-3 py-2 text-sm"
             >
               {e.ok ? (

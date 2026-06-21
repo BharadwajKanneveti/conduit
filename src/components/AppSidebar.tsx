@@ -56,8 +56,8 @@ function VersionFooter({
     getVersion().then((v) => {
       if (alive) setVersion(v);
     });
-    checkForUpdate().then((u) => {
-      if (alive && u?.available) setUpdate(u);
+    checkForUpdate().then((r) => {
+      if (alive && r.kind === "update") setUpdate(r.update);
     });
     return () => {
       alive = false;
@@ -68,12 +68,16 @@ function VersionFooter({
     if (checking || installing) return;
     setChecking(true);
     try {
-      const u = await checkForUpdate();
-      if (u?.available) {
-        setUpdate(u);
+      const r = await checkForUpdate();
+      if (r.kind === "update") {
+        setUpdate(r.update);
         setShowNotes(true);
-      } else {
+      } else if (r.kind === "current") {
         toast.success("You're on the latest version");
+      } else {
+        toast.error("Couldn't check for updates", {
+          description: "You may be offline. Try again in a moment.",
+        });
       }
     } finally {
       setChecking(false);
@@ -204,12 +208,8 @@ function UpdateNotes({
             </p>
           )}
           <div className="flex justify-end gap-2">
-            <Button
-              variant="ghost"
-              onClick={() => onOpenChange(false)}
-              disabled={installing}
-            >
-              Later
+            <Button variant="ghost" onClick={() => onOpenChange(false)}>
+              {installing ? "Hide" : "Later"}
             </Button>
             <Button onClick={onInstall} disabled={installing}>
               {installing ? (
