@@ -21,6 +21,11 @@ pub const PROTOCOL_VERSION: &str = "2025-06-18";
 /// server that never replies would block its thread (and the batch health probe)
 /// forever.
 const STDIO_READ_TIMEOUT: Duration = Duration::from_secs(30);
+/// Tighter bound for the connect handshake (initialize + tools/list). The batch
+/// probe and every router rebuild connect to all servers and wait on the slowest,
+/// so one hung server should fail in seconds, not stall everything for the full
+/// live-call timeout. Restored to STDIO_READ_TIMEOUT once connected.
+const STDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Keep at most this many bytes of a child's stderr tail for error reporting.
 const STDERR_TAIL_CAP: usize = 4096;
 
@@ -120,6 +125,10 @@ pub fn resolve_command(command: &str) -> String {
 pub trait Transport: Send {
     fn request(&mut self, method: &str, params: Value) -> Result<Value, String>;
     fn notify(&mut self, method: &str, params: Value) -> Result<(), String>;
+    /// Bound how long a single `request` waits for its response. Used to fail the
+    /// connect handshake fast. Default no-op: transports with their own fixed
+    /// request timeout (e.g. HTTP) ignore it.
+    fn set_read_timeout(&mut self, _timeout: Duration) {}
 }
 
 /// Talks to a downstream MCP server over its stdio (a spawned child process).
@@ -134,6 +143,9 @@ pub struct StdioTransport {
     /// so we can report that instead of a bare "closed the connection".
     stderr: Arc<Mutex<String>>,
     next_id: i64,
+    /// How long a single request waits for its response. Lowered during the
+    /// connect handshake, then restored for (potentially slow) live tool calls.
+    read_timeout: Duration,
 }
 
 impl StdioTransport {
@@ -212,6 +224,7 @@ impl StdioTransport {
             rx,
             stderr: stderr_buf,
             next_id: 1,
+            read_timeout: STDIO_READ_TIMEOUT,
         })
     }
 
@@ -252,7 +265,7 @@ impl Transport for StdioTransport {
         // Read until the response with our id arrives, skipping notifications.
         // The deadline bounds the whole wait so an unresponsive server fails fast
         // instead of hanging the thread (and the batch probe) indefinitely.
-        let deadline = Instant::now() + STDIO_READ_TIMEOUT;
+        let deadline = Instant::now() + self.read_timeout;
         loop {
             let remaining = deadline
                 .checked_duration_since(Instant::now())
@@ -287,6 +300,10 @@ impl Transport for StdioTransport {
         let msg = json!({ "jsonrpc": "2.0", "method": method, "params": params });
         writeln!(self.stdin, "{msg}").map_err(|e| e.to_string())?;
         self.stdin.flush().map_err(|e| e.to_string())
+    }
+
+    fn set_read_timeout(&mut self, timeout: Duration) {
+        self.read_timeout = timeout;
     }
 }
 
@@ -459,6 +476,9 @@ impl DownstreamServer {
     /// tools-only and fast and can't stall on a slow or hanging resources/prompts
     /// endpoint. The gateway calls `load_resources_prompts` to populate them.
     pub fn connect(id: String, mut transport: Box<dyn Transport>) -> Result<Self, String> {
+        // Fail the handshake fast so one unresponsive server can't stall the whole
+        // batch probe / router rebuild for the full live-call timeout.
+        transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
         let init = transport.request(
             "initialize",
             json!({
@@ -474,6 +494,9 @@ impl DownstreamServer {
 
         let result = transport.request("tools/list", json!({}))?;
         let tools = extract_array(&result, "tools");
+
+        // Restore the longer timeout: actual tool calls can legitimately be slow.
+        transport.set_read_timeout(STDIO_READ_TIMEOUT);
 
         Ok(DownstreamServer {
             id,
