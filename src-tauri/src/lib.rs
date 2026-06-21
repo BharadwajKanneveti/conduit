@@ -685,25 +685,63 @@ fn import_config(state: State<RegistryState>, json: String) -> Result<Registry, 
     Ok(reg.clone())
 }
 
-/// Import a shared setup from a file on disk (the path comes from an open dialog).
+/// Read a shared-setup file from disk (path from an open dialog), capped so a
+/// malicious or accidental huge file can't OOM the app. The contents go to the UI
+/// for a preview/confirm step; nothing is imported here.
 #[tauri::command]
-fn import_config_from_path(
-    state: State<RegistryState>,
-    path: String,
-) -> Result<Registry, String> {
-    // A shared setup is a small JSON document. Cap the read so a malicious or
-    // accidental huge/nested file can't OOM or stall the app.
+fn read_setup_file(path: String) -> Result<String, String> {
     const MAX_SETUP_BYTES: u64 = 4 * 1024 * 1024;
     if let Ok(meta) = std::fs::metadata(&path) {
         if meta.len() > MAX_SETUP_BYTES {
             return Err("That file is too large to be a Conduit setup.".to_string());
         }
     }
-    let json = std::fs::read_to_string(&path).map_err(|e| format!("Couldn't read the file: {e}"))?;
-    let mut reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    apply_import(&mut reg, &json)?;
-    registry::save(&reg)?;
-    Ok(reg.clone())
+    std::fs::read_to_string(&path).map_err(|e| format!("Couldn't read the file: {e}"))
+}
+
+/// One server a shared setup would add. The UI shows the exact command/args/url so
+/// the user reviews what an (attacker-controllable) shared config will run before
+/// accepting it - enabling a server later spawns its command.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ImportItem {
+    name: String,
+    transport: String,
+    command: Option<String>,
+    args: Vec<String>,
+    url: Option<String>,
+    /// False if a server with this name already exists (the import would skip it).
+    is_new: bool,
+}
+
+/// Parse a shared setup and report what it WOULD add, without importing anything.
+#[tauri::command]
+fn preview_import(state: State<RegistryState>, json: String) -> Result<Vec<ImportItem>, String> {
+    #[derive(serde::Deserialize)]
+    struct Doc {
+        servers: Vec<ServerEntry>,
+    }
+    let doc: Doc = serde_json::from_str(&json)
+        .map_err(|e| format!("That doesn't look like a Conduit setup: {e}"))?;
+    let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(doc
+        .servers
+        .into_iter()
+        .map(|s| {
+            let is_new = !reg
+                .servers
+                .iter()
+                .any(|e| e.name.eq_ignore_ascii_case(&s.name));
+            ImportItem {
+                name: s.name,
+                transport: s.transport,
+                command: s.command,
+                args: s.args,
+                url: s.url,
+                is_new,
+            }
+        })
+        .collect())
 }
 
 /// Build a shareable setup document: server definitions only, with the gateway
@@ -810,7 +848,8 @@ pub fn run() {
             export_config,
             export_config_to_path,
             import_config,
-            import_config_from_path,
+            read_setup_file,
+            preview_import,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

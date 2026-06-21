@@ -1,14 +1,23 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { Check, Copy, FileDown, FileUp, Upload } from "lucide-react";
+import {
+  ArrowLeft,
+  Check,
+  Copy,
+  FileDown,
+  FileUp,
+  ShieldAlert,
+  Upload,
+} from "lucide-react";
 import { toast } from "sonner";
 import { open as openFile, save } from "@tauri-apps/plugin-dialog";
 import {
   exportConfig,
   exportConfigToPath,
   importConfig,
-  importConfigFromPath,
+  previewImport,
+  readSetupFile,
 } from "@/lib/api";
-import type { Registry } from "@/lib/types";
+import type { ImportItem, Registry } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -27,8 +36,11 @@ interface Props {
 
 /** Share a curated server set with a teammate (and import theirs). Secret values
  * are never included - each person vaults their own keys after importing. This is
- * the no-backend version of "push a setup to your team". Export via clipboard or
- * a file; label it with a name + description so the recipient knows what it is. */
+ * the no-backend version of "push a setup to your team".
+ *
+ * A shared setup is untrusted input: each server carries a command that runs when
+ * the server is enabled. So importing is two steps - preview exactly what would be
+ * added (command/args/url), then confirm - rather than applying a pasted blob blind. */
 export function ShareDialog({ trigger, onImported }: Props) {
   const [open, setOpen] = useState(false);
   const [name, setName] = useState("");
@@ -37,9 +49,10 @@ export function ShareDialog({ trigger, onImported }: Props) {
   const [paste, setPaste] = useState("");
   const [copied, setCopied] = useState(false);
   const [busy, setBusy] = useState(false);
+  // When set, the dialog shows the review-and-confirm view for `pendingJson`.
+  const [preview, setPreview] = useState<ImportItem[] | null>(null);
+  const [pendingJson, setPendingJson] = useState("");
 
-  // Re-serialize whenever the dialog opens or the label changes, so the textarea
-  // and any file/clipboard export carry the current name + description.
   useEffect(() => {
     if (!open) return;
     exportConfig(name, description)
@@ -52,6 +65,8 @@ export function ShareDialog({ trigger, onImported }: Props) {
     if (next) {
       setPaste("");
       setCopied(false);
+      setPreview(null);
+      setPendingJson("");
     }
   }
 
@@ -80,6 +95,20 @@ export function ShareDialog({ trigger, onImported }: Props) {
     }
   }
 
+  // Parse + preview a candidate setup (paste or file) before importing anything.
+  async function startPreview(json: string) {
+    setBusy(true);
+    try {
+      const items = await previewImport(json);
+      setPendingJson(json);
+      setPreview(items);
+    } catch (e) {
+      toast.error(`Couldn't read that setup: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function loadFromFile() {
     try {
       const path = await openFile({
@@ -89,26 +118,17 @@ export function ShareDialog({ trigger, onImported }: Props) {
         filters: [{ name: "Conduit setup", extensions: ["json"] }],
       });
       if (!path || typeof path !== "string") return;
-      setBusy(true);
-      const reg = await importConfigFromPath(path);
-      onImported(reg);
-      toast.success("Imported shared setup", {
-        description: "Add any API keys each server needs, then enable them.",
-      });
-      setOpen(false);
+      const json = await readSetupFile(path);
+      await startPreview(json);
     } catch (e) {
-      toast.error(`Couldn't import: ${e}`);
-    } finally {
-      setBusy(false);
+      toast.error(`Couldn't open that file: ${e}`);
     }
   }
 
-  async function doImport() {
-    if (!paste.trim()) return;
+  async function confirmImport() {
     setBusy(true);
     try {
-      const reg = await importConfig(paste);
-      onImported(reg);
+      onImported(await importConfig(pendingJson));
       toast.success("Imported shared setup", {
         description: "Add any API keys each server needs, then enable them.",
       });
@@ -123,97 +143,176 @@ export function ShareDialog({ trigger, onImported }: Props) {
   const area =
     "w-full rounded-md border bg-background p-2.5 font-mono text-xs resize-none focus:outline-none focus:ring-1 focus:ring-ring";
 
+  const newCount = preview?.filter((i) => i.isNew).length ?? 0;
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogTrigger asChild>{trigger}</DialogTrigger>
       <DialogContent className="sm:max-w-lg">
         <DialogHeader>
-          <DialogTitle>Share setup</DialogTitle>
+          <DialogTitle>{preview ? "Review this setup" : "Share setup"}</DialogTitle>
         </DialogHeader>
 
-        <div className="flex flex-col gap-5 py-1">
-          <div className="flex flex-col gap-2">
-            <Label className="text-sm">Your setup</Label>
+        {preview ? (
+          <div className="flex flex-col gap-4 py-1">
             <p className="text-xs text-muted-foreground">
-              Send this to a teammate to share your server set. Secrets are never
-              included - each person adds their own keys after importing.
+              These servers come from a shared file. Each runs the command shown when
+              you enable it, so review them before importing. You'll add your own keys
+              after.
             </p>
-            <div className="grid grid-cols-2 gap-2">
-              <Input
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                placeholder="Name (optional)"
-                className="h-8 text-sm"
-              />
-              <Input
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                placeholder="Description (optional)"
-                className="h-8 text-sm"
-              />
+            <div className="flex max-h-72 flex-col gap-2 overflow-y-auto">
+              {preview.map((item, i) => (
+                <ImportRow key={`${item.name}-${i}`} item={item} />
+              ))}
             </div>
-            <textarea
-              readOnly
-              aria-label="Exported setup"
-              value={exported}
-              rows={5}
-              className={area}
-            />
-            <div className="flex flex-wrap gap-2">
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8"
-                onClick={copy}
-                disabled={!exported}
-              >
-                {copied ? (
-                  <>
-                    <Check className="size-3.5" /> Copied
-                  </>
-                ) : (
-                  <>
-                    <Copy className="size-3.5" /> Copy
-                  </>
-                )}
+            <div className="flex items-center justify-between gap-2 border-t pt-3">
+              <Button variant="ghost" onClick={() => setPreview(null)} disabled={busy}>
+                <ArrowLeft className="size-4" />
+                Back
               </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                className="h-8"
-                onClick={saveToFile}
-                disabled={!exported}
-              >
-                <FileDown className="size-3.5" /> Save to file
+              <Button onClick={confirmImport} disabled={busy || newCount === 0}>
+                <Check className="size-4" />
+                {newCount === 0
+                  ? "Nothing new to import"
+                  : `Import ${newCount} server${newCount === 1 ? "" : "s"}`}
               </Button>
             </div>
           </div>
+        ) : (
+          <div className="flex flex-col gap-5 py-1">
+            <div className="flex flex-col gap-2">
+              <Label className="text-sm">Your setup</Label>
+              <p className="text-xs text-muted-foreground">
+                Send this to a teammate to share your server set. Secrets are never
+                included - each person adds their own keys after importing.
+              </p>
+              <div className="grid grid-cols-2 gap-2">
+                <Input
+                  value={name}
+                  onChange={(e) => setName(e.target.value)}
+                  placeholder="Name (optional)"
+                  className="h-8 text-sm"
+                />
+                <Input
+                  value={description}
+                  onChange={(e) => setDescription(e.target.value)}
+                  placeholder="Description (optional)"
+                  className="h-8 text-sm"
+                />
+              </div>
+              <textarea
+                readOnly
+                aria-label="Exported setup"
+                value={exported}
+                rows={5}
+                className={area}
+              />
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8"
+                  onClick={copy}
+                  disabled={!exported}
+                >
+                  {copied ? (
+                    <>
+                      <Check className="size-3.5" /> Copied
+                    </>
+                  ) : (
+                    <>
+                      <Copy className="size-3.5" /> Copy
+                    </>
+                  )}
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  className="h-8"
+                  onClick={saveToFile}
+                  disabled={!exported}
+                >
+                  <FileDown className="size-3.5" /> Save to file
+                </Button>
+              </div>
+            </div>
 
-          <div className="flex flex-col gap-2 border-t pt-4">
-            <Label className="text-sm">Import a setup</Label>
-            <textarea
-              placeholder="Paste a shared setup here"
-              aria-label="Paste a shared setup"
-              value={paste}
-              onChange={(e) => setPaste(e.target.value)}
-              rows={5}
-              className={area}
-            />
-            <div className="flex flex-wrap gap-2">
-              <Button onClick={doImport} disabled={busy || !paste.trim()}>
-                <Upload className="size-4" />
-                Import
-              </Button>
-              <Button variant="outline" onClick={loadFromFile} disabled={busy}>
-                <FileUp className="size-4" />
-                Load from file
-              </Button>
+            <div className="flex flex-col gap-2 border-t pt-4">
+              <Label className="text-sm">Import a setup</Label>
+              <textarea
+                placeholder="Paste a shared setup here"
+                aria-label="Paste a shared setup"
+                value={paste}
+                onChange={(e) => setPaste(e.target.value)}
+                rows={5}
+                className={area}
+              />
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  onClick={() => startPreview(paste)}
+                  disabled={busy || !paste.trim()}
+                >
+                  <Upload className="size-4" />
+                  Review and import
+                </Button>
+                <Button variant="outline" onClick={loadFromFile} disabled={busy}>
+                  <FileUp className="size-4" />
+                  Load from file
+                </Button>
+              </div>
             </div>
           </div>
-        </div>
+        )}
       </DialogContent>
     </Dialog>
   );
+}
+
+/** One reviewable server: name, what it runs, and a flag if it spawns a shell. */
+function ImportRow({ item }: { item: ImportItem }) {
+  const runs =
+    item.command != null
+      ? [item.command, ...item.args].join(" ")
+      : (item.url ?? "");
+  const shell = runsShell(item.command);
+  return (
+    <div className="rounded-md border px-3 py-2">
+      <div className="flex items-center gap-2">
+        <span className="truncate text-sm font-medium">{item.name}</span>
+        <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground uppercase">
+          {item.transport}
+        </span>
+        {!item.isNew && (
+          <span className="ml-auto shrink-0 text-xs text-muted-foreground">
+            already added
+          </span>
+        )}
+      </div>
+      {runs && (
+        <p className="mt-1 font-mono text-xs break-all text-muted-foreground">
+          {runs}
+        </p>
+      )}
+      {shell && (
+        <p className="mt-1.5 flex items-center gap-1.5 text-xs text-amber-400">
+          <ShieldAlert className="size-3.5 shrink-0" />
+          Runs a shell command. Only import setups you trust.
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** True if the command spawns a shell interpreter (extra scrutiny on import). */
+function runsShell(command: string | null): boolean {
+  if (!command) return false;
+  const base = command
+    .replace(/\\/g, "/")
+    .split("/")
+    .pop()!
+    .toLowerCase()
+    .replace(/\.exe$/, "");
+  return ["cmd", "sh", "bash", "zsh", "powershell", "pwsh"].includes(base);
 }
 
 /** A filesystem-safe slug for the default filename. */

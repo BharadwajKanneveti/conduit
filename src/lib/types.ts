@@ -118,6 +118,17 @@ export interface AuthInfo {
   instructions: string | null;
 }
 
+/** One server a shared setup would add, shown for review before importing. */
+export interface ImportItem {
+  name: string;
+  transport: Transport;
+  command: string | null;
+  args: string[];
+  url: string | null;
+  /** False if a server with this name is already present (import skips it). */
+  isNew: boolean;
+}
+
 /** An addable server from the catalog (curated seed or the live MCP Registry). */
 export interface CatalogEntry {
   name: string;

@@ -5,6 +5,7 @@ import type {
   AuthInfo,
   CatalogEntry,
   DetectedClient,
+  ImportItem,
   McpTool,
   MigrateResult,
   ProbeResult,
@@ -196,9 +197,14 @@ export function importConfig(json: string): Promise<Registry> {
   return invoke<Registry>("import_config", { json });
 }
 
-/** Import a shared setup from a file on disk (path from an open dialog). */
-export function importConfigFromPath(path: string): Promise<Registry> {
-  return invoke<Registry>("import_config_from_path", { path });
+/** Read a shared-setup file from disk (path from an open dialog), size-capped. */
+export function readSetupFile(path: string): Promise<string> {
+  return invoke<string>("read_setup_file", { path });
+}
+
+/** Parse a shared setup and report what it would add, without importing. */
+export function previewImport(json: string): Promise<ImportItem[]> {
+  return invoke<ImportItem[]>("preview_import", { json });
 }
 
 /** Enable or disable every server in a profile at once. */
