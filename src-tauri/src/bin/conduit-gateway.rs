@@ -54,14 +54,20 @@ fn search_tool_def() -> Value {
     json!({
         "name": "conduit_search_tools",
         "description": "Search across every tool from all MCP servers connected through Conduit. \
-            Returns matching tools with their exact name, description, and input schema. \
-            Use this to find a tool, then run it with conduit_call_tool. \
-            Search by capability or vendor, e.g. \"send email\", \"list stripe charges\", \"revenuecat offerings\".",
+            Returns matching tools with their exact name, description, and input schema; call one with \
+            conduit_call_tool. \
+            Pass `server` (a server name/prefix like \"stripe\") to scope results to one server, and \
+            pass an EMPTY `query` together with `server` to list ALL of that server's tools. \
+            If the result says more tools matched than were shown, narrow with `server` or raise \
+            `limit` before concluding a capability is missing - many servers expose a generic API \
+            bridge (a single write/create tool), so search by capability, not just an exact operation \
+            name. conduit_status lists every server prefix and its tool count.",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": { "type": "string", "description": "Keywords describing the tool you need." },
-                "limit": { "type": "integer", "description": "Max results (default 10).", "default": 10 }
+                "query": { "type": "string", "description": "Keywords describing the tool. Empty lists tools (use with `server`)." },
+                "server": { "type": "string", "description": "Optional: limit to this server, by name/prefix (e.g. \"stripe\")." },
+                "limit": { "type": "integer", "description": "Max results (default 25, up to 200).", "default": 25 }
             },
             "required": ["query"],
             "additionalProperties": false
@@ -86,12 +92,36 @@ fn call_tool_def() -> Value {
     })
 }
 
-/// Rank the cached catalog against a query. A name hit weighs more than a
-/// description hit; tools matching more terms rank higher. Empty query returns
-/// the first `limit` tools so a bare call still surfaces something.
-fn search_catalog(cached: &[Value], query: &str, limit: usize) -> Vec<Value> {
+/// The server prefix of a namespaced tool name ("stripe_2__create" -> "stripe_2").
+fn tool_prefix(t: &Value) -> String {
+    t.get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .split("__")
+        .next()
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+/// Rank the cached catalog against a query, optionally scoped to one server.
+/// A name hit weighs more than a description hit; tools matching more terms rank
+/// higher. An empty query lists tools (all of a server's when `server` is set).
+/// Returns (results, total_matched) so the caller can tell the agent when results
+/// were truncated - otherwise a buried tool reads as "doesn't exist". When NOT
+/// scoped to a server, results are diversified so one chatty server can't flood
+/// the window (the bug where a "create product" query returned only RevenueCat).
+fn search_catalog(
+    cached: &[Value],
+    query: &str,
+    server: Option<&str>,
+    limit: usize,
+) -> (Vec<Value>, usize) {
+    use std::collections::HashMap;
     let q = query.to_lowercase();
     let terms: Vec<&str> = q.split_whitespace().filter(|t| !t.is_empty()).collect();
+    let server_filter = server
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty());
 
     let project = |t: &Value| {
         json!({
@@ -101,12 +131,26 @@ fn search_catalog(cached: &[Value], query: &str, limit: usize) -> Vec<Value> {
         })
     };
 
+    // Optionally restrict to one server (its prefix contains the filter text).
+    let pool: Vec<&Value> = cached
+        .iter()
+        .filter(|t| match &server_filter {
+            Some(sf) => tool_prefix(t).contains(sf.as_str()),
+            None => true,
+        })
+        .collect();
+
+    // Empty query: list the pool. With `server` set this enumerates that server.
     if terms.is_empty() {
-        return cached.iter().take(limit).map(project).collect();
+        let total = pool.len();
+        return (
+            pool.into_iter().take(limit).map(|t| project(t)).collect(),
+            total,
+        );
     }
 
-    let mut scored: Vec<(i32, &Value)> = cached
-        .iter()
+    let mut scored: Vec<(i32, &Value)> = pool
+        .into_iter()
         .filter_map(|t| {
             let name = t
                 .get("name")
@@ -129,13 +173,35 @@ fn search_catalog(cached: &[Value], query: &str, limit: usize) -> Vec<Value> {
             (score > 0).then_some((score, t))
         })
         .collect();
-
     // Stable, highest score first.
     scored.sort_by(|a, b| b.0.cmp(&a.0));
-    scored.into_iter().take(limit).map(|(_, t)| project(t)).collect()
+    let total = scored.len();
+
+    // Scoped to a server: take the top `limit`. Unscoped: cap per server so one
+    // server with many matching tools can't crowd the others out of the window.
+    let results: Vec<Value> = if server_filter.is_some() {
+        scored.into_iter().take(limit).map(|(_, t)| project(t)).collect()
+    } else {
+        let cap = (limit / 3).max(4);
+        let mut per: HashMap<String, usize> = HashMap::new();
+        let mut out = Vec::new();
+        for (_, t) in scored {
+            if out.len() >= limit {
+                break;
+            }
+            let c = per.entry(tool_prefix(t)).or_insert(0);
+            if *c >= cap {
+                continue;
+            }
+            *c += 1;
+            out.push(project(t));
+        }
+        out
+    };
+    (results, total)
 }
 
-fn enabled_summary(reg: &Registry, profile: Option<&str>) -> String {
+fn enabled_summary(reg: &Registry, cached: &[Value], profile: Option<&str>) -> String {
     let active = match profile {
         Some(p) => reg.resolve_profile_id(p),
         None => reg.active_profile_id(),
@@ -169,6 +235,25 @@ fn enabled_summary(reg: &Registry, profile: Option<&str>) -> String {
             _ => "(none)".to_string(),
         };
         out.push_str(&format!("- {} [{}] {}\n", s.name, s.transport, target.trim()));
+    }
+
+    // Tool counts by server prefix, from the live catalog. These prefixes are
+    // exactly what precedes "__" in tool names, so the agent can enumerate a
+    // server's full tool set with conduit_search_tools(server: "<prefix>").
+    if !cached.is_empty() {
+        let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for t in cached {
+            let prefix = tool_prefix(t);
+            if !prefix.is_empty() {
+                *counts.entry(prefix).or_insert(0) += 1;
+            }
+        }
+        if !counts.is_empty() {
+            out.push_str("\nTools by server (pass the prefix as `server` to list them all):\n");
+            for (p, c) in counts {
+                out.push_str(&format!("- {p}: {c} tool(s)\n"));
+            }
+        }
     }
     out
 }
@@ -247,7 +332,7 @@ fn handle_request(
                 return Some(success(
                     id,
                     json!({
-                        "content": [{ "type": "text", "text": enabled_summary(reg, profile) }],
+                        "content": [{ "type": "text", "text": enabled_summary(reg, cached, profile) }],
                         "isError": false
                     }),
                 ));
@@ -258,11 +343,12 @@ fn handle_request(
                     .get("query")
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                let server = arguments.get("server").and_then(|v| v.as_str());
                 let limit = arguments
                     .get("limit")
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(10)
-                    .clamp(1, 50) as usize;
+                    .unwrap_or(25)
+                    .clamp(1, 200) as usize;
                 // Prefer the cached catalog (instant); on a cold cache fall back to
                 // the live router so a first-time search doesn't return 0 results.
                 let live;
@@ -272,11 +358,30 @@ fn handle_request(
                 } else {
                     cached
                 };
-                let matches = search_catalog(source, query, limit);
+                let (matches, total) = search_catalog(source, query, server, limit);
+                let scope = server
+                    .filter(|s| !s.trim().is_empty())
+                    .map(|s| format!(" on \"{s}\""))
+                    .unwrap_or_default();
+                // Tell the agent when results were truncated, so a buried tool isn't
+                // mistaken for a missing capability.
+                let more = if total > matches.len() {
+                    format!(
+                        " Showing {} of {}; narrow with the `server` filter (e.g. server: \
+                         \"{}\") or raise `limit` (up to 200) before concluding a capability \
+                         is missing.",
+                        matches.len(),
+                        total,
+                        matches.first().map(tool_prefix).unwrap_or_default()
+                    )
+                } else {
+                    String::new()
+                };
                 let text = format!(
-                    "Found {} tool(s) for \"{}\". Call one with conduit_call_tool using its exact name.\n\n{}",
-                    matches.len(),
-                    query,
+                    "Found {} matching tool(s){}.{} Call one with conduit_call_tool using its exact name.\n\n{}",
+                    total,
+                    scope,
+                    more,
                     serde_json::to_string_pretty(&matches).unwrap_or_default()
                 );
                 return Some(success(
@@ -862,10 +967,40 @@ mod tests {
     #[test]
     fn search_ranks_name_matches_first() {
         // "email" hits resend's name and rc's description; the name hit ranks higher.
-        let hits = search_catalog(&catalog(), "email", 10);
+        let (hits, total) = search_catalog(&catalog(), "email", None, 10);
         assert_eq!(hits[0]["name"], "resend__send_email");
         assert!(hits.iter().any(|h| h["name"] == "rc__list_offerings"));
         assert!(!hits.iter().any(|h| h["name"] == "stripe__list_charges"));
+        assert_eq!(total, 2);
+    }
+
+    #[test]
+    fn search_server_filter_scopes_and_enumerates() {
+        // A `server` filter restricts to that server's tools...
+        let (hits, _) = search_catalog(&catalog(), "list", Some("stripe"), 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["name"], "stripe__list_charges");
+        // ...and an empty query with a `server` lists ALL of that server's tools.
+        let (all, total) = search_catalog(&catalog(), "", Some("rc"), 10);
+        assert_eq!(total, 1);
+        assert_eq!(all[0]["name"], "rc__list_offerings");
+    }
+
+    #[test]
+    fn search_diversifies_across_servers_when_unscoped() {
+        // One server with many matching tools shouldn't crowd the others out.
+        let mut cat = catalog();
+        for i in 0..20 {
+            cat.push(json!({
+                "name": format!("rc__list_{i}"),
+                "description": "list things",
+                "inputSchema": {}
+            }));
+        }
+        // "list" matches stripe (1), rc (21). With a small limit, stripe must still appear.
+        let (hits, total) = search_catalog(&cat, "list", None, 6);
+        assert!(total >= 22);
+        assert!(hits.iter().any(|h| h["name"] == "stripe__list_charges"));
     }
 
     #[test]
