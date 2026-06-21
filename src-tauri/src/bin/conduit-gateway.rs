@@ -629,6 +629,10 @@ fn main() {
     // Empty router + cached catalog: the handshake and tools/list answer instantly
     // (from cache), while downstream servers connect in the background for the
     // actual tool calls.
+    //
+    // LOCK ORDER: when both are held, always lock `registry` before `router`. The
+    // request loop, the watcher, and the self-heal path all follow this, so there's
+    // no deadlock; keep new code consistent with it.
     let router = Arc::new(Mutex::new(Router::new()));
     let cached_tools = Arc::new(Mutex::new(load_tool_cache(profile.as_deref())));
     let stdout = Arc::new(Mutex::new(std::io::stdout()));

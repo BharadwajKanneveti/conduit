@@ -58,6 +58,9 @@ export function Onboarding({
       importableServers(c, registry).map((s) => s.name.toLowerCase()),
     ),
   ).size;
+  // Live progress, so the final step reflects what the user actually did.
+  const serverCount = registry.servers.filter((s) => !isGatewayServer(s)).length;
+  const connectedCount = clients.filter((c) => c.gatewayInstalled).length;
 
   const steps = [
     <Welcome key="welcome" present={present} onNext={() => setStep(1)} />,
@@ -74,7 +77,12 @@ export function Onboarding({
       onConnected={onClientsRefresh}
       onNext={() => setStep(3)}
     />,
-    <Done key="done" onFinish={onFinish} />,
+    <Done
+      key="done"
+      serverCount={serverCount}
+      connectedCount={connectedCount}
+      onFinish={onFinish}
+    />,
   ];
 
   return (
@@ -376,15 +384,46 @@ function ConnectClients({
   );
 }
 
-function Done({ onFinish }: { onFinish: () => void }) {
+function Done({
+  serverCount,
+  connectedCount,
+  onFinish,
+}: {
+  serverCount: number;
+  connectedCount: number;
+  onFinish: () => void;
+}) {
+  const ready = serverCount > 0 && connectedCount > 0;
+  const missing = [
+    serverCount === 0 ? "added a server" : null,
+    connectedCount === 0 ? "connected a client" : null,
+  ]
+    .filter(Boolean)
+    .join(" or ");
   return (
     <>
-      <StepHeader icon={<Check className="size-5" />} title="You're set up">
-        Manage your servers here and they stay in sync across every connected
-        tool. Toggle one on or off and your clients update live, no restart.
+      <StepHeader
+        icon={<Check className="size-5" />}
+        title={ready ? "You're set up" : "Setup started"}
+      >
+        {ready ? (
+          <>
+            Conduit now manages {serverCount} server
+            {serverCount === 1 ? "" : "s"} across {connectedCount} connected tool
+            {connectedCount === 1 ? "" : "s"}. Toggle one on or off and your clients
+            update live, no restart. And each client loads 3 search tools instead of
+            every tool, so the agent's context stays small.
+          </>
+        ) : (
+          <>
+            You haven't {missing} yet. You can do both any time from the main
+            screen: add or import servers, then connect a client so your tools share
+            them.
+          </>
+        )}
       </StepHeader>
       <Button onClick={onFinish} className="self-start">
-        Start using Conduit
+        {ready ? "Start using Conduit" : "Got it"}
         <ArrowRight className="size-4" />
       </Button>
     </>

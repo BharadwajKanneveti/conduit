@@ -326,6 +326,12 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                           ? "Waiting for browser sign-in…"
                           : "Sign in with OAuth"}
                       </Button>
+                      {!oauthBusy && /mac/i.test(navigator.userAgent) && (
+                        <p className="text-[11px] text-muted-foreground">
+                          On macOS, set Chrome or Brave as your default browser
+                          first. Safari can block the local sign-in redirect.
+                        </p>
+                      )}
                       {oauthBusy && (
                         <p className="text-[11px] text-muted-foreground">
                           Finish signing in and approve access in your browser. If

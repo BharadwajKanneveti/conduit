@@ -351,6 +351,9 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
               ))}
             </SelectContent>
           </Select>
+          <p className="text-[11px] text-muted-foreground">
+            Tests any server directly, regardless of the active profile.
+          </p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <label className="flex items-center gap-2.5 rounded-md border px-3 py-2 text-sm">

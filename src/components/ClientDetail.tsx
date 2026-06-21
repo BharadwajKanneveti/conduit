@@ -234,6 +234,11 @@ export function ClientDetail({
         </div>
       </div>
 
+      <p className="text-sm text-muted-foreground">
+        Connect points {client.name} at Conduit so it uses your managed servers.
+        Import copies this client's own servers into Conduit so it can manage them.
+      </p>
+
       {client.usesConnectors && (
         <Card className="gap-0 border-violet-400/20 bg-violet-400/5">
           <CardContent className="flex gap-3 p-4">

@@ -413,7 +413,11 @@ function App() {
               ) : error ? (
                 <ErrorState message={error} />
               ) : servers.length === 0 ? (
-                <EmptyState importable={importable} onImport={handleImport} />
+                <EmptyState
+                  importable={importable}
+                  onImport={handleImport}
+                  onBrowseCatalog={() => selectView("catalog")}
+                />
               ) : visible.length === 0 ? (
                 <div className="py-16 text-center text-sm text-muted-foreground">
                   No servers match "{query}".
@@ -496,9 +500,11 @@ function ServerGroup({
 function EmptyState({
   importable,
   onImport,
+  onBrowseCatalog,
 }: {
   importable: number;
   onImport: () => void;
+  onBrowseCatalog: () => void;
 }) {
   return (
     <div className="flex flex-col items-center justify-center gap-4 py-24 text-center">
@@ -508,13 +514,18 @@ function EmptyState({
         <p className="text-sm text-muted-foreground">
           {importable > 0
             ? `Found ${importable} server${importable === 1 ? "" : "s"} in your installed clients. Import them to get started.`
-            : "Add a server, or install one in a client and import it."}
+            : "Browse the catalog to add one, or import servers from a client."}
         </p>
       </div>
-      {importable > 0 && (
+      {importable > 0 ? (
         <Button onClick={onImport}>
           <Download className="size-4" />
           Import {importable} from clients
+        </Button>
+      ) : (
+        <Button onClick={onBrowseCatalog}>
+          <Store className="size-4" />
+          Browse catalog
         </Button>
       )}
     </div>

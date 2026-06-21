@@ -28,11 +28,6 @@ fn epoch_millis() -> u128 {
         .unwrap_or(0)
 }
 
-/// Append one tool-call record. Best-effort: never fails the call it's logging.
-pub fn record(server: &str, tool: &str, ok: bool) {
-    record_timed(server, tool, ok, None)
-}
-
 /// Append a tool-call record including how long the call took. Powers the
 /// in-app latency/error-rate dashboard.
 pub fn record_timed(server: &str, tool: &str, ok: bool, duration_ms: Option<u64>) {
