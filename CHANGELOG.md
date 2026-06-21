@@ -5,6 +5,8 @@ All notable changes to Conduit are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-06-21
+
 ### Fixed
 - Client config writes are now atomic (temp file + rename), so a crash or full
   disk mid-write can't truncate a client's MCP config.
@@ -13,6 +15,8 @@ All notable changes to Conduit are documented here. Format loosely follows
 - Playground policy toggles report failures instead of silently reverting.
 - The share-import file size is capped before reading.
 - Updater "Check for updates" tells "up to date" apart from "couldn't check".
+- macOS builds now publish auto-update artifacts; macOS auto-update was inert in
+  v0.3.3 (the update manifest had empty macOS entries).
 
 ## [0.3.3] - 2026-06-21
 
@@ -42,7 +46,8 @@ All notable changes to Conduit are documented here. Format loosely follows
 - First public release: local MCP gateway and manager with lazy discovery,
   per-agent profiles, the catalog, the tool playground, and the activity log.
 
-[Unreleased]: https://github.com/tsouth89/conduit/compare/v0.3.3...HEAD
+[Unreleased]: https://github.com/tsouth89/conduit/compare/v0.3.4...HEAD
+[0.3.4]: https://github.com/tsouth89/conduit/releases/tag/v0.3.4
 [0.3.3]: https://github.com/tsouth89/conduit/releases/tag/v0.3.3
 [0.3.2]: https://github.com/tsouth89/conduit/releases/tag/v0.3.2
 [0.3.0]: https://github.com/tsouth89/conduit/releases/tag/v0.3.0
