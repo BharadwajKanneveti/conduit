@@ -5,6 +5,28 @@ All notable changes to Conduit are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.7] - 2026-06-21
+
+### Added
+- **Five more clients: Zed, LM Studio, Warp, Amazon Q, and Kiro.** Conduit detects
+  each, installs the gateway with one click, and imports its existing servers.
+  - Zed keeps MCP servers under `context_servers` in its `settings.json`, which is
+    JSONC (comments and trailing commas) holding the user's whole editor config. That
+    file is now read leniently so a commented config isn't mistaken for corrupt, and
+    is **never replaced with an empty document on a parse failure**, so Conduit cannot
+    wipe your settings.
+  - LM Studio, Warp, Amazon Q, and Kiro use the standard `mcpServers` JSON shape at
+    their respective config paths (`~/.lmstudio/mcp.json`, `~/.warp/.mcp.json`,
+    `~/.aws/amazonq/mcp.json`, `~/.kiro/settings/mcp.json`).
+
+### Fixed
+- Client detection now reflects whether an app is actually installed, not merely
+  whether an MCP config file happens to exist. The old "config file's parent dir"
+  heuristic was wrong for some clients: Claude Code's config lives at `~/.claude.json`
+  (parent is the home dir, which always exists, so it falsely showed as installed
+  everywhere), and Warp's `~/.warp` only appears after its first file-based MCP use.
+  Those clients now check an explicit install/data directory.
+
 ## [0.3.6] - 2026-06-21
 
 ### Fixed
