@@ -44,6 +44,17 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Windows runs downstream `.cmd`/`.bat` shims (e.g. npx.cmd) through cmd.exe;
+      # Rust 1.77.2 fixed batch-file argument escaping (CVE-2024-24576 / BatBadBut).
+      # `@stable` is always well past this, but assert it so a future toolchain
+      # downgrade can't silently reintroduce the argument-injection class.
+      - name: Verify Rust meets the batch-arg-escaping floor (>= 1.77.2)
+        shell: bash
+        run: |
+          v=$(rustc --version | awk '{print $2}')
+          printf '1.77.2\n%s\n' "$v" | sort -V -C || {
+            echo "::error::rustc $v is below the 1.77.2 floor for Windows .cmd argument escaping"; exit 1; }
+
       - name: Install Linux build dependencies
         if: matrix.os == 'ubuntu-22.04'
         run: |

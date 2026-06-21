@@ -155,6 +155,80 @@ fn require_https(url: &str, what: &str) -> Result<(), String> {
     }
 }
 
+/// The host (no scheme, userinfo, port, or brackets) of a URL.
+fn host_of_url(url: &str) -> Option<String> {
+    let after = url.split("://").nth(1)?;
+    let authority = after.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit('@').next()?; // strip any userinfo
+    if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal: [::1]:443 -> ::1
+        return rest.split(']').next().map(|s| s.to_string());
+    }
+    authority.split(':').next().map(|s| s.to_string())
+}
+
+fn ip_is_private(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                // carrier-grade NAT 100.64.0.0/10
+                || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
+                || v6
+                    .to_ipv4_mapped()
+                    .map(|m| ip_is_private(&IpAddr::V4(m)))
+                    .unwrap_or(false)
+        }
+    }
+}
+
+/// True if `host` is loopback, private, or link-local. Resolves DNS (literal IPs
+/// resolve to themselves); fails closed (treats an unresolvable host as private).
+fn host_is_private(host: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let h = host.trim().to_ascii_lowercase();
+    if h.is_empty() || h == "localhost" || h.ends_with(".localhost") {
+        return true;
+    }
+    match (h.as_str(), 0u16).to_socket_addrs() {
+        Ok(addrs) => {
+            let ips: Vec<_> = addrs.map(|sa| sa.ip()).collect();
+            ips.is_empty() || ips.iter().any(ip_is_private)
+        }
+        Err(_) => true,
+    }
+}
+
+/// SSRF guard for an OAuth endpoint taken from a fetched metadata document. A
+/// server that is itself local may legitimately use local endpoints, but a public
+/// server must not be able to point our token POST / browser redirect at the
+/// user's loopback or internal network. `server_local` = the originally configured
+/// MCP server is itself on a private/loopback host.
+fn guard_endpoint(url: &str, server_local: bool, what: &str) -> Result<(), String> {
+    if server_local {
+        return Ok(());
+    }
+    if let Some(host) = host_of_url(url) {
+        if host_is_private(&host) {
+            return Err(format!(
+                "{what} points at a private or loopback address ({host}); refusing \
+                 (a hostile metadata document could use this to reach your internal network)."
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Discover the authorization + token endpoints for an MCP server URL.
 pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
     let origin = origin_of(mcp_url);
@@ -168,6 +242,14 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
         Err(_) => origin.clone(),
     };
 
+    // Is the configured MCP server itself local? If so, local OAuth endpoints are
+    // expected and allowed; if it's public, its metadata must not redirect us at a
+    // private/loopback host (SSRF).
+    let server_local = host_of_url(mcp_url).map(|h| host_is_private(&h)).unwrap_or(false);
+    // The issuer can come from the protected-resource document, so guard the
+    // metadata fetch too, not just the final endpoints.
+    guard_endpoint(&issuer, server_local, "authorization server")?;
+
     for url in metadata_candidates(&issuer) {
         if let Ok(meta) = get_json::<AsMeta>(&url) {
             // OAuth 2.1 requires TLS for these endpoints. Without this check a
@@ -178,6 +260,12 @@ pub fn discover(mcp_url: &str) -> Result<Endpoints, String> {
             require_https(&meta.token_endpoint, "token endpoint")?;
             if let Some(reg) = &meta.registration_endpoint {
                 require_https(reg, "registration endpoint")?;
+            }
+            // SSRF: a public server must not point these at a private/loopback host.
+            guard_endpoint(&meta.authorization_endpoint, server_local, "authorization endpoint")?;
+            guard_endpoint(&meta.token_endpoint, server_local, "token endpoint")?;
+            if let Some(reg) = &meta.registration_endpoint {
+                guard_endpoint(reg, server_local, "registration endpoint")?;
             }
             return Ok(Endpoints {
                 authorization_endpoint: meta.authorization_endpoint,
@@ -571,6 +659,55 @@ mod tests {
     fn origin_strips_path() {
         assert_eq!(origin_of("https://mcp.example.com/mcp"), "https://mcp.example.com");
         assert_eq!(origin_of("https://a.b:8080/x/y"), "https://a.b:8080");
+    }
+
+    #[test]
+    fn host_of_url_extracts_host() {
+        assert_eq!(host_of_url("https://example.com/x").as_deref(), Some("example.com"));
+        assert_eq!(host_of_url("https://example.com:8443/x").as_deref(), Some("example.com"));
+        assert_eq!(host_of_url("http://[::1]:7000/cb").as_deref(), Some("::1"));
+        assert_eq!(host_of_url("https://user:pw@host.tld/p").as_deref(), Some("host.tld"));
+        assert_eq!(host_of_url("https://127.0.0.1/x").as_deref(), Some("127.0.0.1"));
+    }
+
+    #[test]
+    fn ip_is_private_classifies() {
+        use std::net::IpAddr;
+        let p = |s: &str| ip_is_private(&s.parse::<IpAddr>().unwrap());
+        assert!(p("127.0.0.1"));
+        assert!(p("10.0.0.5"));
+        assert!(p("192.168.1.1"));
+        assert!(p("172.16.0.1"));
+        assert!(p("169.254.10.10"));
+        assert!(p("100.64.1.1")); // CGNAT
+        assert!(p("::1"));
+        assert!(p("fe80::1"));
+        assert!(p("fc00::1"));
+        assert!(p("::ffff:127.0.0.1")); // IPv4-mapped loopback
+        assert!(!p("8.8.8.8"));
+        assert!(!p("140.82.112.3")); // a public GitHub IP range
+        assert!(!p("2606:4700:4700::1111")); // public IPv6
+    }
+
+    #[test]
+    fn host_is_private_handles_localhost_and_literals() {
+        assert!(host_is_private("localhost"));
+        assert!(host_is_private("foo.localhost"));
+        assert!(host_is_private("127.0.0.1"));
+        assert!(host_is_private("10.1.2.3"));
+        assert!(host_is_private("")); // fail closed
+        assert!(!host_is_private("8.8.8.8"));
+    }
+
+    #[test]
+    fn guard_endpoint_blocks_private_for_public_server() {
+        // Public server: a metadata doc pointing at loopback/internal is rejected.
+        assert!(guard_endpoint("http://127.0.0.1:9000/token", false, "token").is_err());
+        assert!(guard_endpoint("https://10.0.0.5/token", false, "token").is_err());
+        // A public endpoint is allowed (literal IP, so the test needs no DNS).
+        assert!(guard_endpoint("https://8.8.8.8/token", false, "token").is_ok());
+        // Local server: local endpoints are expected and allowed.
+        assert!(guard_endpoint("http://127.0.0.1:9000/token", true, "token").is_ok());
     }
 
     #[test]
