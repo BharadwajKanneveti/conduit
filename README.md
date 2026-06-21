@@ -106,13 +106,34 @@ namespaced per server, so the two never collide even in the same profile.
 Prebuilt installers are published on the
 [Releases](https://github.com/tsouth89/conduit/releases) page. Conduit runs on
 **Windows and macOS** (the macOS build is signed and notarized), with **Linux**
-(.deb and AppImage) in beta. To run from source, see Development below.
+in beta. On Linux, prefer the **`.deb`** (it links your system's WebKitGTK and is
+the most reliable package); the **AppImage** is a portable, no-root fallback but
+can clash with very new or virtualized graphics stacks (see Troubleshooting). To
+run from source, see Development below.
 
 The installer is not yet code signed. On **Windows**, SmartScreen may show
 "Windows protected your PC", click **More info → Run anyway**. On **macOS**,
 Gatekeeper may say the app "is damaged" or cannot be opened; right-click the app
 and choose **Open**, or run `xattr -dr com.apple.quarantine /Applications/Conduit.app`.
 See [docs/SIGNING.md](docs/SIGNING.md) for the signing plan.
+
+**Updating and uninstalling on Linux.** There is no graphical uninstaller, use the
+terminal. The package name is `conduit`.
+
+```bash
+# Update to a newer version: just install the new .deb, it upgrades in place.
+sudo apt install ./Conduit_0.3.6_amd64.deb
+
+# Uninstall (keeps your config + saved secrets).
+sudo apt remove conduit
+
+# Uninstall and wipe app config too (secrets in the keyring stay).
+sudo apt purge conduit
+```
+
+If you used the **AppImage**, there's nothing to uninstall, just delete the
+`.AppImage` file. (On Windows use Add or Remove Programs; on macOS drag
+**Conduit.app** to the Trash.)
 
 ## Development
 
@@ -168,6 +189,14 @@ The frontend is typechecked with `npx tsc --noEmit`.
 - **VS Code: the conduit server doesn't start automatically.** VS Code may require
   you to click **Start Server** on the conduit MCP entry the first time, that's VS
   Code's own MCP handling, not Conduit. After that it reconnects on its own.
+- **Linux: the AppImage won't launch / no window (`EGL_BAD_PARAMETER`).** The
+  AppImage bundles its own libraries, which can clash with a very new or
+  virtualized graphics stack (e.g. VMware's `vmwgfx` driver, where the default EGL
+  display fails). **Use the `.deb` instead**, it links your system's WebKitGTK and
+  is the more reliable Linux package. If you must use the AppImage, try
+  `EGL_PLATFORM=surfaceless ./Conduit_*.AppImage`, or in a VM enable 3D
+  acceleration. (This is a packaging/GPU issue, not a Conduit bug; the `.deb` works
+  where the AppImage doesn't.)
 
 ## Status
 
