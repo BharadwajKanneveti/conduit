@@ -562,11 +562,24 @@ fn warp_data_dir() -> Option<PathBuf> {
     None
 }
 
-/// An extra "is it installed" marker for clients whose MCP config lives somewhere
-/// other than their install dir (so the config-parent heuristic misses them).
-fn extra_app_marker(id: &str) -> Option<PathBuf> {
+/// An explicit install/data dir for clients where the default "config file's
+/// parent = app data dir" heuristic gives a wrong answer (too broad, like a config
+/// that sits directly in the home dir, or too narrow, like a config dir that only
+/// appears after first use). Returning `Some` here OVERRIDES the parent heuristic
+/// for that client, so detection reflects whether the app is actually installed,
+/// not merely whether an MCP config file happens to exist.
+fn install_override(id: &str) -> Option<PathBuf> {
     match id {
+        // ~/.warp only appears on first file-based MCP use; the app itself lives
+        // under the OS data dir.
         "warp" => warp_data_dir(),
+        // Config is ~/.claude.json, whose parent is the home dir (always present),
+        // which would mark Claude Code installed everywhere. Its real data dir is
+        // ~/.claude.
+        "claude-code" => Some(home()?.join(".claude")),
+        // ~/.kiro/settings may not exist until something is configured; ~/.kiro is
+        // created on install.
+        "kiro" => Some(home()?.join(".kiro")),
         _ => None,
     }
 }
@@ -585,10 +598,13 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         // `.../Claude`, `~/.codex`); its presence means the app has run here. If the
         // config itself exists the app is obviously present. An empty path means we
         // couldn't even resolve a location, so the app is not detectable.
-        let app_present = app_present_for(&config_path, config_exists)
-            || extra_app_marker(def.id)
-                .map(|p| p.exists())
-                .unwrap_or(false);
+        // Clients with an explicit install dir use it (and ignore the config-parent
+        // heuristic, which for them is wrong); everyone else uses the parent of
+        // their resolved config path (which is their data dir, e.g. ~/.codex).
+        let app_present = match install_override(def.id) {
+            Some(marker) => config_exists || marker.exists(),
+            None => app_present_for(&config_path, config_exists),
+        };
         DetectedClient {
             id: def.id.to_string(),
             name: def.name.to_string(),
@@ -1215,11 +1231,18 @@ mod tests {
     }
 
     #[test]
-    fn extra_app_marker_only_for_warp() {
-        assert!(extra_app_marker("cursor").is_none());
-        assert!(extra_app_marker("vscode").is_none());
-        // "warp" delegates to warp_data_dir() (env-dependent); just ensure no panic.
-        let _ = extra_app_marker("warp");
+    fn install_override_targets_the_unreliable_clients() {
+        // Clients whose config-parent heuristic is wrong get an explicit install dir.
+        assert!(
+            install_override("claude-code").unwrap().ends_with(".claude"),
+            "Claude Code must check ~/.claude, not the home dir its config sits in"
+        );
+        assert!(install_override("kiro").unwrap().ends_with(".kiro"));
+        let _ = install_override("warp"); // env-dependent; just ensure no panic.
+        // Well-behaved clients have no override (they use the config-parent heuristic).
+        assert!(install_override("cursor").is_none());
+        assert!(install_override("codex").is_none());
+        assert!(install_override("vscode").is_none());
     }
 
     #[test]
