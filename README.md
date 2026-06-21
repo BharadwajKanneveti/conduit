@@ -94,6 +94,13 @@ written for you when you connect a client:
 - `CONDUIT_REGISTRY=<path>` - override the registry file location. Defaults to a
   stable per-user path so packaged and unpackaged clients agree.
 
+**Multiple accounts for the same service.** Credentials belong to a server, not a
+profile. To use, say, a work and a personal GitHub, add GitHub twice as two
+servers ("GitHub (work)", "GitHub (personal)"), authenticate each with its own
+account, and enable one in each profile. A client scoped to the work profile
+(`CONDUIT_PROFILE`) then only ever sees the work account. Tool names are
+namespaced per server, so the two never collide even in the same profile.
+
 ## Install
 
 Prebuilt installers are published on the
