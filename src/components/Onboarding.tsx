@@ -180,6 +180,7 @@ function AddServers({
   const [starters, setStarters] = useState<CatalogEntry[]>([]);
   const [adding, setAdding] = useState<string | null>(null);
   const [added, setAdded] = useState<Set<string>>(new Set());
+  const [startersFailed, setStartersFailed] = useState(false);
 
   // A few popular servers for a one-click start, zero-config (no keys) first so
   // the user gets something that works immediately.
@@ -193,7 +194,9 @@ function AddServers({
         );
         setStarters(sorted.slice(0, 4));
       })
-      .catch(() => {});
+      .catch(() => {
+        if (alive) setStartersFailed(true);
+      });
     return () => {
       alive = false;
     };
@@ -285,6 +288,13 @@ function AddServers({
               })}
             </div>
           </div>
+        )}
+
+        {startersFailed && (
+          <p className="text-xs text-muted-foreground">
+            Couldn't load popular servers (are you offline?). You can still import
+            or browse the catalog.
+          </p>
         )}
 
         <Button variant="outline" onClick={onBrowseCatalog}>

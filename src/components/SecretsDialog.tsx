@@ -24,6 +24,17 @@ import {
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 
+/** Turn a raw secret-store error into something actionable. On a headless or
+ * keyring-less Linux box the backend surfaces an opaque Secret Service / D-Bus
+ * string; explain in user terms that a running keyring is required. */
+function secretErrorMessage(e: unknown): string {
+  const msg = `${e}`;
+  if (/secret service|freedesktop\.secret|keyring|dbus|d-bus/i.test(msg)) {
+    return "No system keyring found. Conduit keeps secrets in your OS keyring; on Linux that needs a running Secret Service (e.g. gnome-keyring or KWallet). Start and unlock one, then retry.";
+  }
+  return msg;
+}
+
 interface Props {
   server: ServerEntry;
   onSaved: (registry: Registry) => void;
@@ -134,7 +145,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       toast.success("Saved auth token");
       onChanged?.();
     } catch (e) {
-      toast.error(`${e}`);
+      toast.error(secretErrorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -148,7 +159,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       toast.success("Cleared auth token");
       onChanged?.();
     } catch (e) {
-      toast.error(`${e}`);
+      toast.error(secretErrorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -189,7 +200,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       toast.success(`Saved ${key}`);
       onChanged?.();
     } catch (e) {
-      toast.error(`${e}`);
+      toast.error(secretErrorMessage(e));
     } finally {
       setBusy(false);
     }
@@ -202,7 +213,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
       toast.success(`Removed ${key}`);
       onChanged?.();
     } catch (e) {
-      toast.error(`${e}`);
+      toast.error(secretErrorMessage(e));
     } finally {
       setBusy(false);
     }
