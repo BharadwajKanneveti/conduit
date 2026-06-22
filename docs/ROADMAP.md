@@ -1,8 +1,11 @@
 # Conduit roadmap
 
-Conduit is a cross-platform manager for MCP servers across AI coding tools
-(Claude Desktop, Cursor, VS Code, Windsurf, Codex CLI). This document is the
-working spec. It captures the architecture decision and the build order.
+Conduit is a local MCP gateway for AI coding tools (Claude Desktop, Cursor,
+VS Code, Windsurf, Codex CLI). Every server you connect dumps its whole tool list
+into the agent's context on every request; Conduit routes them through one gateway
+that exposes 3 meta-tools the agent searches on demand, so context stays flat:
+measured ~90% fewer tokens at the same task success. This document is the working
+spec, capturing the architecture decision and the build order.
 
 **Status (2026-06-22):** launched and shipping fast. v0.3.10 is out; signed/notarized
 macOS (Apple Silicon + Intel), Windows, and Linux (deb/AppImage) via a tag-triggered
@@ -26,8 +29,13 @@ A tool that only edits each client's MCP JSON config is a dead end:
 
 Conduit instead runs a **local MCP gateway**. Each client points at Conduit
 once (as a local stdio server and/or a custom connector URL). Conduit holds the
-real registry of servers and routes to them. This flips every weakness:
+real registry of servers and routes to them. This unlocks the headline win and
+flips every weakness:
 
+- **~90% fewer tokens.** In lazy-discovery mode the gateway advertises 3 meta-tools
+  instead of every server's full tool list, so the agent's context stays flat no
+  matter how many servers you connect. Measured: 97% less tool overhead per request
+  (see [BENCHMARK.md](../BENCHMARK.md)).
 - **Hot toggle, no restart.** Enable/disable a server, the gateway re-emits its
   tool list via the MCP `notifications/tools/list_changed`; supporting clients
   update live. The client's own config never changed, so nothing reloads.
