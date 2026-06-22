@@ -148,9 +148,83 @@ fn tool_prefix(t: &Value) -> String {
         .to_lowercase()
 }
 
+// --- Lexical search ranking (tokens + light stemming + synonyms + IDF) ---
+// This is the relevance core; it's deliberately self-contained so an optional
+// embedding-based scorer can blend in or replace it later without touching the
+// search plumbing (server filter, diversification, projection) around it.
+
+/// Field weights: a token hit in the tool NAME counts far more than in its description.
+const NAME_W: f64 = 3.0;
+const DESC_W: f64 = 1.0;
+
+/// Split a camelCase/PascalCase word into lowercased pieces ("listProjects" -> [list, projects]).
+fn split_camel(word: &str) -> Vec<String> {
+    let mut parts = Vec::new();
+    let mut cur = String::new();
+    let mut prev_lower = false;
+    for ch in word.chars() {
+        if ch.is_uppercase() && prev_lower && !cur.is_empty() {
+            parts.push(std::mem::take(&mut cur));
+        }
+        for lc in ch.to_lowercase() {
+            cur.push(lc);
+        }
+        prev_lower = ch.is_lowercase();
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    parts
+}
+
+/// Lightweight stem: strip a trailing plural `s` so "products"/"product",
+/// "charges"/"charge", "teams"/"team" compare equal. Intentionally minimal (no
+/// ing/ed handling) - over-stemming creates more mismatches than it fixes here.
+fn stem_token(token: &str) -> String {
+    let t = token.to_lowercase();
+    if t.len() > 3 && t.ends_with('s') && !t.ends_with("ss") {
+        t[..t.len() - 1].to_string()
+    } else {
+        t
+    }
+}
+
+/// Tokenize tool text or a query into normalized search tokens (break on
+/// non-alphanumeric and camelCase, lowercase, stem, drop 1-char tokens).
+fn search_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .flat_map(split_camel)
+        .filter(|t| t.len() > 1)
+        .map(|t| stem_token(&t))
+        .collect()
+}
+
+/// Synonym group for a (stemmed) token, bridging common MCP vocabulary so e.g.
+/// "mail" finds an "email" tool and "get" finds a "list" tool. Empty if none.
+fn synonym_group(token: &str) -> &'static [&'static str] {
+    const GROUPS: &[&[&str]] = &[
+        &["list", "get", "fetch", "show", "read", "find", "search", "view"],
+        &["create", "add", "new", "make", "insert"],
+        &["delete", "remove", "destroy", "drop"],
+        &["update", "edit", "modify", "change", "set"],
+        &["email", "mail", "message"],
+        &["project", "repo", "repository"],
+        &["user", "account", "member", "customer"],
+        &["team", "org", "organization", "workspace"],
+    ];
+    GROUPS
+        .iter()
+        .find(|g| g.contains(&token))
+        .copied()
+        .unwrap_or(&[])
+}
+
 /// Rank the cached catalog against a query, optionally scoped to one server.
-/// A name hit weighs more than a description hit; tools matching more terms rank
-/// higher. An empty query lists tools (all of a server's when `server` is set).
+/// Ranking is lexical with IDF weighting: query and tools are tokenized (camelCase
+/// split, light stemming, small synonym map), a name hit outweighs a description hit,
+/// and a rare token (e.g. "products") outweighs a common one (e.g. "list") so the
+/// specific tool wins over generic ones. An empty query lists tools (all of a
+/// server's when `server` is set).
 /// Returns (results, total_matched) so the caller can tell the agent when results
 /// were truncated - otherwise a buried tool reads as "doesn't exist". When NOT
 /// scoped to a server, results are diversified so one chatty server can't flood
@@ -183,32 +257,63 @@ fn search_catalog(
         let total = pool.len();
         (pool.into_iter().take(limit).collect(), total)
     } else {
-        let mut scored: Vec<(i32, &Value)> = pool
-            .into_iter()
-            .filter_map(|t| {
-                let name = t
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                let desc = t
-                    .get("description")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                let mut score = 0;
-                for term in &terms {
-                    if name.contains(term) {
-                        score += 3;
-                    } else if desc.contains(term) {
-                        score += 1;
+        // Tokenize each tool and compute document frequencies, so IDF can weight a
+        // rare token (e.g. "products", "teams") far above a common one (e.g. "list",
+        // "get"). That makes "list products" rank the products tool over the many
+        // generic "list" tools - the keyword-only wandering we hit with Stripe.
+        use std::collections::HashSet;
+        let docs: Vec<(&Value, HashSet<String>, HashSet<String>)> = pool
+            .iter()
+            .map(|t| {
+                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
+                (
+                    *t,
+                    search_tokens(name).into_iter().collect(),
+                    search_tokens(desc).into_iter().collect(),
+                )
+            })
+            .collect();
+        let n = docs.len().max(1) as f64;
+        let mut df: HashMap<&str, usize> = HashMap::new();
+        for (_, name_set, desc_set) in &docs {
+            for tok in name_set.union(desc_set) {
+                *df.entry(tok.as_str()).or_insert(0) += 1;
+            }
+        }
+        let idf = |tok: &str| ((n + 1.0) / (*df.get(tok).unwrap_or(&0) as f64 + 1.0)).ln() + 1.0;
+
+        let q_tokens = search_tokens(query);
+        let mut scored: Vec<(f64, &Value)> = docs
+            .iter()
+            .filter_map(|(t, name_set, desc_set)| {
+                let mut score = 0.0_f64;
+                for qt in &q_tokens {
+                    // Best field hit across the query token and its synonyms; name
+                    // beats description, and the matched token's IDF sets the weight.
+                    let mut best = 0.0_f64;
+                    let cands =
+                        std::iter::once(qt.as_str()).chain(synonym_group(qt).iter().copied());
+                    for c in cands {
+                        if name_set.contains(c) {
+                            best = best.max(NAME_W * idf(c));
+                        } else if desc_set.contains(c) {
+                            best = best.max(DESC_W * idf(c));
+                        }
                     }
+                    // Prefix fallback for partial words ("proj" -> "project").
+                    if best == 0.0 && qt.len() >= 3 {
+                        if let Some(tok) = name_set.iter().find(|t| t.starts_with(qt.as_str())) {
+                            best = 0.6 * NAME_W * idf(tok);
+                        }
+                    }
+                    score += best;
                 }
-                (score > 0).then_some((score, t))
+                (score > 0.0).then_some((score, *t))
             })
             .collect();
         // Stable, highest score first.
-        scored.sort_by(|a, b| b.0.cmp(&a.0));
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         let total = scored.len();
 
         // Scoped to a server: take the top `limit`. Unscoped: cap per server so one
@@ -1347,5 +1452,42 @@ mod tests {
             json!(true),
             "conduit_call_tool's arguments must accept arbitrary properties"
         );
+    }
+
+    #[test]
+    fn search_ranks_rare_token_over_common_one() {
+        // The Stripe-wandering fix: "list products" should rank the products tool above
+        // the many generic "list" tools, because "products" is rare (high IDF) and
+        // "list" is common (low IDF).
+        let mut cat = vec![json!({
+            "name": "stripe__list_products", "description": "List products", "inputSchema": {}
+        })];
+        for i in 0..10 {
+            cat.push(json!({
+                "name": format!("svc{i}__list_items"), "description": "List items", "inputSchema": {}
+            }));
+        }
+        let (hits, _) = search_catalog(&cat, "list products", None, 12);
+        assert_eq!(hits[0]["name"], "stripe__list_products");
+    }
+
+    #[test]
+    fn search_bridges_synonyms_and_stems_and_camelcase() {
+        let cat = vec![
+            json!({ "name": "resend__send_email", "description": "Send an email", "inputSchema": {} }),
+            json!({ "name": "stripe__list_charges", "description": "List charges", "inputSchema": {} }),
+            json!({ "name": "gh__listPullRequests", "description": "List PRs", "inputSchema": {} }),
+        ];
+        // Synonym: "mail" finds the email tool even though it never says "mail".
+        let (hits, _) = search_catalog(&cat, "mail", None, 10);
+        assert_eq!(hits[0]["name"], "resend__send_email");
+
+        // Stemming: singular query matches the plural-ish tool name.
+        let (hits, _) = search_catalog(&cat, "charge", None, 10);
+        assert_eq!(hits[0]["name"], "stripe__list_charges");
+
+        // camelCase: "pull requests" tokenizes listPullRequests into pull/request.
+        let (hits, _) = search_catalog(&cat, "pull requests", None, 10);
+        assert_eq!(hits[0]["name"], "gh__listPullRequests");
     }
 }
