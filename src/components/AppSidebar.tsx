@@ -354,7 +354,7 @@ export function AppSidebar({
   onReplayOnboarding,
 }: Props) {
   return (
-    <aside className="flex w-72 shrink-0 flex-col border-r bg-sidebar">
+    <aside className="flex h-screen w-72 shrink-0 flex-col overflow-y-auto border-r bg-sidebar">
       <div className="flex items-center gap-2.5 px-4 py-4">
         <svg className="size-8" viewBox="0 0 48 48" aria-hidden="true">
           <rect width="48" height="48" rx="12" fill="#34d399" />
