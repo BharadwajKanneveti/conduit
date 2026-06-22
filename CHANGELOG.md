@@ -5,6 +5,17 @@ All notable changes to Conduit are documented here. Format loosely follows
 
 ## [Unreleased]
 
+## [0.3.10] - 2026-06-22
+
+### Improved
+- **Tool search ranks the right tool more often.** When a query mixed a common word
+  with a specific one (e.g. "list products"), keyword matching could surface a generic
+  "list" tool instead of the products one. Search now tokenizes queries and tools
+  (splitting camelCase, light stemming), weights matches by how rare the token is so a
+  specific word like "products" outweighs a common one like "list", and bridges a small
+  synonym map (mail/email, get/list, team/org). The agent finds the intended tool with
+  fewer searches.
+
 ## [0.3.9] - 2026-06-22
 
 ### Added
