@@ -42,9 +42,9 @@ const TOOL_RESULT_CAP = 8000; // trim huge tool outputs so one result can't skew
 // Edit to match the servers you have connected. Keep them single + multi-step so
 // the comparison shows both the easy win and the round-trip cost of lazy mode.
 const TASKS = [
-  { name: "single-email", prompt: "List the subject lines of my 3 most recent emails sent via Resend." },
-  { name: "single-projects", prompt: "List my Neon projects (just the names)." },
-  { name: "multi-step", prompt: "List my Vercel projects. If a team id is required, find it first, then use it." },
+  { name: "stripe-products", prompt: "List my Stripe products (just the names)." },
+  { name: "neon-projects", prompt: "List my Neon projects (just the names)." },
+  { name: "vercel-projects", prompt: "List my Vercel projects. If a team id is required, find it first, then use it." },
 ];
 
 function defaultGateway() {
