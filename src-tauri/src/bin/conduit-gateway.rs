@@ -82,7 +82,8 @@ fn call_tool_def() -> Value {
     json!({
         "name": "conduit_call_tool",
         "description": "Invoke a tool discovered via conduit_search_tools. Pass the tool's exact \
-            `name` (as returned by the search) and its `arguments` object matching that tool's input schema.",
+            `name` (as returned by the search) and put ALL of that tool's parameters INSIDE the \
+            `arguments` object (matching its input schema) - not at the top level next to `name`.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -93,6 +94,38 @@ fn call_tool_def() -> Value {
             "additionalProperties": false
         }
     })
+}
+
+/// Unwrap a `conduit_call_tool` payload into (inner tool name, inner arguments).
+/// The tool's params normally nest under `arguments`, but models frequently flatten
+/// this double-nested shape and put them at the top level next to `name` instead -
+/// which otherwise drops a required param (e.g. Vercel's `teamId`) so it arrives
+/// downstream as undefined. Prefer a non-empty nested `arguments`; otherwise fall
+/// back to the sibling keys (everything except `name`/`arguments`).
+fn unwrap_call_tool(payload: &Value) -> (String, Value) {
+    let inner = payload
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let nested_nonempty = payload
+        .get("arguments")
+        .and_then(|v| v.as_object())
+        .map(|o| !o.is_empty())
+        .unwrap_or(false);
+    let args = if nested_nonempty {
+        payload.get("arguments").cloned().unwrap()
+    } else {
+        let mut siblings = payload.as_object().cloned().unwrap_or_default();
+        siblings.remove("name");
+        siblings.remove("arguments");
+        if siblings.is_empty() {
+            json!({})
+        } else {
+            Value::Object(siblings)
+        }
+    };
+    (inner, args)
 }
 
 /// The server prefix of a namespaced tool name ("stripe_2__create" -> "stripe_2").
@@ -514,16 +547,7 @@ fn handle_request(
             // conduit_call_tool dispatches a discovered tool: unwrap to its real
             // name + arguments and fall through to the normal routing below.
             let (name, arguments) = if name == "conduit_call_tool" {
-                let inner = arguments
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let inner_args = arguments
-                    .get("arguments")
-                    .cloned()
-                    .unwrap_or_else(|| json!({}));
-                (inner, inner_args)
+                unwrap_call_tool(&arguments)
             } else {
                 (name.to_string(), arguments)
             };
@@ -1272,5 +1296,34 @@ mod tests {
             assert!(text.contains("Top match:"), "query {q} should stay polite");
             assert!(!text.contains(ESCALATION_MARK), "query {q} must not escalate");
         }
+    }
+
+    #[test]
+    fn unwrap_call_tool_tolerates_flattened_args() {
+        // Correctly nested arguments.
+        let (n, a) = unwrap_call_tool(&json!({
+            "name": "vercel__list_projects",
+            "arguments": { "teamId": "team_x" }
+        }));
+        assert_eq!(n, "vercel__list_projects");
+        assert_eq!(a["teamId"], "team_x");
+
+        // Flattened: a model put the param at the top level next to `name` (the
+        // Jan/Vercel failure). It must still reach the tool, not arrive as undefined.
+        let (n, a) = unwrap_call_tool(&json!({
+            "name": "vercel__list_projects",
+            "teamId": "team_x"
+        }));
+        assert_eq!(n, "vercel__list_projects");
+        assert_eq!(a["teamId"], "team_x", "flattened args must still reach the tool");
+
+        // No params (e.g. a list tool with no required args).
+        let (n, a) = unwrap_call_tool(&json!({ "name": "x__list" }));
+        assert_eq!(n, "x__list");
+        assert_eq!(a, json!({}));
+
+        // Empty nested object with no siblings stays empty.
+        let (_, a) = unwrap_call_tool(&json!({ "name": "x__list", "arguments": {} }));
+        assert_eq!(a, json!({}));
     }
 }
