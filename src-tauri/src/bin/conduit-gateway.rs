@@ -2,17 +2,21 @@
 //!
 //! A local MCP server, spoken over stdio (newline-delimited JSON-RPC 2.0). Each
 //! AI client points at this one binary; the gateway routes to all the real
-//! servers the active profile enables. This is what gives us one control point,
-//! and (next) hot-toggle, runtime secret injection, and an audit log.
+//! servers the active profile enables, so there's one control point in front of
+//! everything.
 //!
-//! Implemented: the MCP handshake, a `conduit_status` meta-tool, and downstream
-//! proxying - it spawns each enabled stdio server, lists its real tools
-//! (namespaced by server id), and forwards `tools/call` to the right one.
-//!
-//! TODO(gateway): watch the registry file and emit notifications/tools/list_changed
-//!                so toggles apply live without restarting the client.
-//! TODO(gateway): inject secrets from the OS keychain at spawn time.
-//! TODO(gateway): proxy remote (http/sse) servers, not just stdio.
+//! What it does:
+//! - Proxies stdio AND remote (http/sse) servers, namespacing each server's tools
+//!   (`stripe__list_charges`) and forwarding `tools/call` to the right one.
+//! - Injects secrets from the OS keychain at spawn time, so client configs never
+//!   hold a plaintext key.
+//! - Watches the registry file and emits `notifications/tools/list_changed` on
+//!   change, so enabling/disabling a server applies live without a client restart
+//!   (on clients that honor it).
+//! - Lazy discovery: in lazy mode it advertises only 3 meta-tools (`conduit_status`,
+//!   `conduit_search_tools`, `conduit_call_tool`) instead of the full catalog; the
+//!   model searches and calls on demand, keeping context flat.
+//! - Records every tool call to a local audit log.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};

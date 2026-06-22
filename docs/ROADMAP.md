@@ -4,11 +4,15 @@ Conduit is a cross-platform manager for MCP servers across AI coding tools
 (Claude Desktop, Cursor, VS Code, Windsurf, Codex CLI). This document is the
 working spec. It captures the architecture decision and the build order.
 
-**Status (2026-06-20):** shipping. Signed/notarized macOS (Apple Silicon + Intel),
-Windows, and Linux (deb/AppImage) builds via a tag-triggered release pipeline. v0.3.2
-released. First-run onboarding and an in-app auto-updater are built (pending the v0.3.3
-release). Next: cut v0.3.3, the macOS keychain access-group entitlement, and the launch
-(Product Hunt scheduled, MCP registries listed).
+**Status (2026-06-22):** launched and shipping fast. v0.3.10 is out; signed/notarized
+macOS (Apple Silicon + Intel), Windows, and Linux (deb/AppImage) via a tag-triggered
+pipeline, with an in-app auto-updater. 17 clients supported (incl. local: Jan, LM Studio,
+Goose). Lazy discovery, OAuth/key auth with live propagation, the catalog, import/migrate,
+per-tool + destructive-tool governance, an audit log, resources/prompts proxying, and a
+tool playground all working. Recent focus: local-model reliability (a fix so grammar-
+constrained clients can pass required tool params) and IDF-weighted tool search. Next:
+distribution (the bottleneck, adoption is still early) and, on demand, semantic-search
+phase 2 (index cleaning -> always-on/lazy hybrid -> embeddings) and team/enterprise.
 
 ## The core decision: Conduit is a gateway, not a file editor
 
