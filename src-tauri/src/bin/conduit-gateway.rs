@@ -194,11 +194,48 @@ fn stem_token(token: &str) -> String {
 }
 
 /// Tokenize tool text or a query into normalized search tokens (break on
-/// non-alphanumeric and camelCase, lowercase, stem, drop 1-char tokens).
+/// non-alphanumeric and camelCase, lowercase, stem, drop 1-char tokens). Used for
+/// tool NAMES, which are terse and meaningful, so nothing is dropped.
 fn search_tokens(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .flat_map(split_camel)
         .filter(|t| t.len() > 1)
+        .map(|t| stem_token(&t))
+        .collect()
+}
+
+/// Noise words to drop from the search index and queries. Tool descriptions are
+/// written for a human skimming a README (full of boilerplate like "Purpose:",
+/// "Returns:", "When to use"), so these dilute the IDF signal without helping
+/// retrieval. Deliberately conservative: NO capability words (list/get/create/send/
+/// etc.), only function words and description boilerplate. Checked pre-stem.
+const STOPWORDS: &[&str] = &[
+    // function words
+    "an", "the", "and", "or", "but", "if", "of", "to", "for", "in", "on", "at", "by",
+    "with", "from", "into", "as", "is", "are", "be", "was", "were", "this", "that",
+    "these", "those", "it", "its", "you", "your", "their", "them", "they", "we", "our",
+    "us", "can", "will", "would", "should", "could", "may", "might", "do", "does", "did",
+    "has", "have", "had", "not", "no", "all", "any", "each", "more", "most", "some",
+    "such", "than", "then", "there", "here", "when", "where", "what", "which", "who",
+    "whom", "how", "why", "also", "just", "only", "via", "per", "out", "off", "over",
+    "under", "about", "between", "after", "before", "during", "while", "both", "either",
+    // MCP-description boilerplate
+    "purpose", "returns", "return", "use", "used", "uses", "using", "note", "notes",
+    "example", "examples", "optional", "required", "param", "params", "parameter",
+    "parameters",
+];
+
+fn is_stopword(token: &str) -> bool {
+    STOPWORDS.contains(&token)
+}
+
+/// Tokens for the search INDEX and for queries: like `search_tokens` but with noise
+/// words removed (checked pre-stem). Cleaning what we index buys more ranking signal
+/// than a fancier retrieval method, the corpus is the lever. Names keep everything.
+fn index_tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .flat_map(split_camel)
+        .filter(|t| t.len() > 1 && !is_stopword(t))
         .map(|t| stem_token(&t))
         .collect()
 }
@@ -274,7 +311,7 @@ fn search_catalog(
                 (
                     *t,
                     search_tokens(name).into_iter().collect(),
-                    search_tokens(desc).into_iter().collect(),
+                    index_tokens(desc).into_iter().collect(),
                 )
             })
             .collect();
@@ -287,7 +324,7 @@ fn search_catalog(
         }
         let idf = |tok: &str| ((n + 1.0) / (*df.get(tok).unwrap_or(&0) as f64 + 1.0)).ln() + 1.0;
 
-        let q_tokens = search_tokens(query);
+        let q_tokens = index_tokens(query);
         let mut scored: Vec<(f64, &Value)> = docs
             .iter()
             .filter_map(|(t, name_set, desc_set)| {
@@ -1493,5 +1530,26 @@ mod tests {
         // camelCase: "pull requests" tokenizes listPullRequests into pull/request.
         let (hits, _) = search_catalog(&cat, "pull requests", None, 10);
         assert_eq!(hits[0]["name"], "gh__listPullRequests");
+    }
+
+    #[test]
+    fn index_tokens_drops_boilerplate_and_stopwords() {
+        let toks = index_tokens("**Purpose:** Returns the list of products for the user.");
+        // capability words survive (stemmed); boilerplate + function words are gone.
+        assert!(toks.contains(&"product".to_string()));
+        assert!(toks.contains(&"list".to_string()));
+        assert!(!toks.iter().any(|t| t == "purpose" || t == "return" || t == "the" || t == "of"));
+    }
+
+    #[test]
+    fn search_ignores_query_noise_words() {
+        // A query full of filler still lands on the right tool, the noise words don't
+        // match anything and don't dilute the IDF signal of the real word ("invoices").
+        let cat = vec![
+            json!({ "name": "billing__list_invoices", "description": "List invoices", "inputSchema": {} }),
+            json!({ "name": "misc__do_thing", "description": "Does a thing", "inputSchema": {} }),
+        ];
+        let (hits, _) = search_catalog(&cat, "what are the invoices for this account", None, 10);
+        assert_eq!(hits[0]["name"], "billing__list_invoices");
     }
 }
