@@ -111,6 +111,14 @@ export interface AuditStats {
   servers: ServerStat[];
 }
 
+/** Cumulative tool-definition tokens lazy discovery kept out of client context. */
+export interface SavingsSummary {
+  tokensSaved: number;
+  listLoads: number;
+  peakCatalog: number;
+  sinceTs: number;
+}
+
 export interface AuthInfo {
   kind: "none" | "oauth" | "token" | "unknown";
   vendor: string | null;

@@ -32,6 +32,7 @@ use conduit_lib::downstream::{DownstreamServer, StdioTransport, PROTOCOL_VERSION
 use conduit_lib::registry::{self, Registry, ServerEntry};
 use conduit_lib::remote;
 use conduit_lib::router::{Router, ToolPolicy};
+use conduit_lib::savings;
 use conduit_lib::secrets;
 
 fn success(id: Value, result: Value) -> Value {
@@ -549,6 +550,25 @@ fn handle_request(
             // finds real tools via conduit_search_tools and runs conduit_call_tool.
             if lazy {
                 let tools = vec![status_tool_def(), search_tool_def(), call_tool_def()];
+                // Record what lazy discovery kept out of the client's context: the
+                // full catalog we'd otherwise serve (status + every downstream tool)
+                // minus these 3 meta-tools. Estimating over the cached slice avoids
+                // cloning the whole catalog on a serve.
+                let agg;
+                let catalog: &[Value] = if cached.is_empty() {
+                    agg = router.aggregated_tools();
+                    &agg
+                } else {
+                    cached
+                };
+                let status = status_tool_def();
+                let full_tokens = savings::estimate_tokens(catalog)
+                    + savings::estimate_tokens(std::slice::from_ref(&status));
+                savings::record(
+                    full_tokens,
+                    savings::estimate_tokens(&tools),
+                    catalog.len() as u64 + 1,
+                );
                 glog("tools/list -> 3 tools (lazy discovery)");
                 return Some(success(id, json!({ "tools": tools })));
             }

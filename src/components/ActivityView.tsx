@@ -1,12 +1,53 @@
 import { useEffect, useMemo, useState } from "react";
-import { CheckCircle2, ChevronRight, ScrollText, XCircle } from "lucide-react";
-import { getAuditLog, getAuditStats } from "@/lib/api";
-import type { AuditEntry, AuditStats, ServerStat } from "@/lib/types";
+import { CheckCircle2, ChevronRight, ScrollText, Sparkles, XCircle } from "lucide-react";
+import { getAuditLog, getAuditStats, getSavingsSummary } from "@/lib/api";
+import type { AuditEntry, AuditStats, SavingsSummary, ServerStat } from "@/lib/types";
 
 /** Compact latency string: "180 ms" or "1.2 s", or a dash when unmeasured. */
 function fmtMs(ms: number | null): string {
   if (ms == null) return "-";
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)} s` : `${ms} ms`;
+}
+
+/** Compact token count: "1.84M", "23.4k", or the raw number when small. */
+function fmtTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(2)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
+  return `${n}`;
+}
+
+/** Hero stat: tool-definition tokens lazy discovery kept out of agent context. */
+function SavingsBanner({ savings }: { savings: SavingsSummary }) {
+  const since =
+    savings.sinceTs > 0
+      ? new Date(savings.sinceTs).toLocaleDateString(undefined, {
+          month: "short",
+          day: "numeric",
+        })
+      : null;
+  const details = [
+    `across ${savings.listLoads.toLocaleString()} tool-list load${savings.listLoads === 1 ? "" : "s"}`,
+    savings.peakCatalog > 3
+      ? `biggest catalog collapsed ${savings.peakCatalog} tools to 3`
+      : null,
+    since ? `since ${since}` : null,
+  ].filter(Boolean);
+  return (
+    <div className="mb-6 rounded-lg border border-emerald-500/30 bg-emerald-500/[0.06] p-4">
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+        <Sparkles className="size-4 text-emerald-400" />
+        <span className="text-3xl font-semibold tabular-nums text-emerald-400">
+          ≈ {fmtTokens(savings.tokensSaved)}
+        </span>
+        <span className="text-sm text-muted-foreground">
+          tool-definition tokens kept out of your agent&apos;s context
+        </span>
+      </div>
+      <p className="mt-1.5 text-xs text-muted-foreground">
+        {details.join(" · ")}. Lazy discovery, estimated.
+      </p>
+    </div>
+  );
 }
 
 function errCell(errors: number, errorRate: number) {
@@ -128,6 +169,7 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
 export function ActivityView({ refreshKey }: { refreshKey: number }) {
   const [entries, setEntries] = useState<AuditEntry[] | null>(null);
   const [stats, setStats] = useState<AuditStats | null>(null);
+  const [savings, setSavings] = useState<SavingsSummary | null>(null);
   const [serverFilter, setServerFilter] = useState<string>("");
   const [errorsOnly, setErrorsOnly] = useState(false);
 
@@ -139,10 +181,16 @@ export function ActivityView({ refreshKey }: { refreshKey: number }) {
     getAuditStats(2000)
       .then((s) => alive && setStats(s))
       .catch(() => alive && setStats(null));
+    getSavingsSummary()
+      .then((s) => alive && setSavings(s))
+      .catch(() => alive && setSavings(null));
     return () => {
       alive = false;
     };
   }, [refreshKey]);
+
+  const banner =
+    savings && savings.tokensSaved > 0 ? <SavingsBanner savings={savings} /> : null;
 
   const servers = useMemo(
     () => [...new Set((entries ?? []).map((e) => e.server))].sort(),
@@ -156,22 +204,28 @@ export function ActivityView({ refreshKey }: { refreshKey: number }) {
 
   if (entries === null) {
     return (
-      <div className="flex items-center justify-center py-24 text-sm text-muted-foreground">
-        Loading activity…
+      <div>
+        {banner}
+        <div className="flex items-center justify-center py-24 text-sm text-muted-foreground">
+          Loading activity…
+        </div>
       </div>
     );
   }
 
   if (entries.length === 0) {
     return (
-      <div className="flex flex-col items-center justify-center gap-3 py-24 text-center">
-        <ScrollText className="size-10 text-muted-foreground/50" />
-        <div>
-          <p className="font-medium">No tool calls yet</p>
-          <p className="max-w-md text-sm text-muted-foreground">
-            Once a client runs a tool through Conduit, every call is recorded
-            here, with per-server latency and error rates.
-          </p>
+      <div>
+        {banner}
+        <div className="flex flex-col items-center justify-center gap-3 py-24 text-center">
+          <ScrollText className="size-10 text-muted-foreground/50" />
+          <div>
+            <p className="font-medium">No tool calls yet</p>
+            <p className="max-w-md text-sm text-muted-foreground">
+              Once a client runs a tool through Conduit, every call is recorded
+              here, with per-server latency and error rates.
+            </p>
+          </div>
         </div>
       </div>
     );
@@ -179,6 +233,7 @@ export function ActivityView({ refreshKey }: { refreshKey: number }) {
 
   return (
     <div>
+      {banner}
       {stats && <StatsPanel stats={stats} />}
 
       <div className="mb-2 flex items-center gap-2">

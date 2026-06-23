@@ -10,6 +10,7 @@ import type {
   MigrateResult,
   ProbeResult,
   Registry,
+  SavingsSummary,
   ServerEntry,
   ToolCallResult,
   WriteOutcome,
@@ -43,6 +44,11 @@ export function getAuditLog(limit = 200): Promise<AuditEntry[]> {
 /** Aggregated per-server stats (calls, error rate, latency) from the audit log. */
 export function getAuditStats(window = 2000): Promise<AuditStats> {
   return invoke<AuditStats>("audit_stats", { window });
+}
+
+/** Cumulative tokens lazy discovery has kept out of client context. */
+export function getSavingsSummary(): Promise<SavingsSummary> {
+  return invoke<SavingsSummary>("savings_summary");
 }
 
 /** Connect to each enabled server and report health + tool count. */

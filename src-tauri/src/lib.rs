@@ -10,6 +10,7 @@ pub mod oauth;
 pub mod registry;
 pub mod remote;
 pub mod router;
+pub mod savings;
 pub mod secrets;
 pub mod vendors;
 
@@ -382,6 +383,13 @@ fn get_audit_log(limit: usize) -> Vec<serde_json::Value> {
 #[tauri::command]
 fn audit_stats(window: usize) -> serde_json::Value {
     audit::stats(window)
+}
+
+/// Cumulative tool-definition tokens that lazy discovery has kept out of clients'
+/// context, summed from the local savings log for the in-app counter.
+#[tauri::command]
+fn savings_summary() -> serde_json::Value {
+    savings::summary()
 }
 
 /// Connect to each enabled server in the active profile and report health + tool count.
@@ -828,6 +836,7 @@ pub fn run() {
             secret_status,
             get_audit_log,
             audit_stats,
+            savings_summary,
             probe_servers,
             list_server_tools,
             call_tool,
