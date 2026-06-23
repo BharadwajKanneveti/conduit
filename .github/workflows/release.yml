@@ -76,6 +76,19 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Give the Linux runner headroom (no cache means a from-scratch build)
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          # v0.3.14's Linux job was killed mid-build with no error output: removing
+          # the cache means a full from-scratch compile, and the WebKitGTK link step
+          # exhausts the runner. Free disk and add swap so it can't OOM/run out.
+          # Best-effort so a transient hiccup here never fails the release.
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/share/swift 2>/dev/null || true
+          sudo fallocate -l 10G /mnt/conduit-swap && sudo chmod 600 /mnt/conduit-swap \
+            && sudo mkswap /mnt/conduit-swap && sudo swapon /mnt/conduit-swap || true
+          echo "disk:"; df -h /
+          echo "mem:"; free -h
+
       - name: Build installer
         run: npx tauri build --config src-tauri/tauri.bundle.conf.json --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
         env:
