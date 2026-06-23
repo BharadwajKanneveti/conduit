@@ -75,6 +75,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Force-rebuild the workspace crate (guard against a stale Rust cache)
+        shell: bash
+        # v0.3.12 shipped a binary missing a newly added command: the cached
+        # target/ served a stale workspace compilation and lib.rs was never
+        # recompiled. Always clean the conduit package (lib + both bins) so a new
+        # feature can't be absent from the shipped binary. Dependencies stay cached.
+        run: cargo clean -p conduit --manifest-path src-tauri/Cargo.toml ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
+
       - name: Build installer
         run: npx tauri build --config src-tauri/tauri.bundle.conf.json --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
         env:
