@@ -68,20 +68,13 @@ jobs:
         if: matrix.target
         run: rustup target add ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: src-tauri
-
+      # No Rust build cache on releases. A restored target/ kept serving a stale
+      # workspace compilation that cargo trusted (the crate compiled 0 times), so
+      # v0.3.12 and v0.3.13 shipped binaries missing the newly added savings_summary
+      # command. Building from scratch guarantees the binary matches the tagged
+      # source. Releases are infrequent, so the extra compile time is worth it.
       - name: Install dependencies
         run: npm ci
-
-      - name: Force-rebuild the workspace crate (guard against a stale Rust cache)
-        shell: bash
-        # v0.3.12 shipped a binary missing a newly added command: the cached
-        # target/ served a stale workspace compilation and lib.rs was never
-        # recompiled. Always clean the conduit package (lib + both bins) so a new
-        # feature can't be absent from the shipped binary. Dependencies stay cached.
-        run: cargo clean -p conduit --manifest-path src-tauri/Cargo.toml ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
 
       - name: Build installer
         run: npx tauri build --config src-tauri/tauri.bundle.conf.json --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }}
