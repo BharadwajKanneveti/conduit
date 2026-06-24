@@ -166,6 +166,10 @@ fn cursor_path() -> Option<PathBuf> {
     Some(home()?.join(".cursor").join("mcp.json"))
 }
 
+fn boltai_path() -> Option<PathBuf> {
+    Some(home()?.join(".boltai").join("mcp.json"))
+}
+
 fn vscode_path() -> Option<PathBuf> {
     Some(config()?.join("Code").join("User").join("mcp.json"))
 }
@@ -511,6 +515,14 @@ fn defs() -> Vec<ClientDef> {
             format: Format::JsonMcpServers,
             uses_connectors: false,
             path: jan_path,
+            plugin_scan: None,
+        },
+        ClientDef {
+            id: "boltai",
+            name: "BoltAI",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            path: boltai_path,
             plugin_scan: None,
         },
         ClientDef {
