@@ -142,7 +142,7 @@ Tier 3 - launch prep
       unsigned with documented bypass); cargo-audit in CI.
 - [x] Verify macOS / Linux (signed mac dmgs arm64 + Intel, Linux deb/AppImage;
       tested across Windows/macOS/Ubuntu VMs)
-- [x] Marketing site (conduit.southforgeai.com) with demo video.
+- [x] Marketing site (conduitmcp.app) with demo video.
 - [x] In-app auto-updater (Tauri v2 updater plugin + signed `latest.json` from the
       release pipeline). Live from v0.3.3 onward.
 - [x] First-run onboarding wizard (detect clients, add servers, connect a client).
