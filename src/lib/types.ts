@@ -232,6 +232,8 @@ export interface Registry {
   denyDestructive?: boolean;
   /** Global switch: expose 3 meta-tools instead of the full catalog. */
   lazyDiscovery?: boolean;
+  /** Opt-in: let an agent enable/disable servers via the gateway's control tools. */
+  allowAgentControl?: boolean;
 }
 
 export function activeProfile(registry: Registry): Profile | undefined {

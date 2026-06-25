@@ -111,6 +111,13 @@ pub struct Registry {
     /// Defaults on, since clients commonly cap the tool list.
     #[serde(default = "default_true")]
     pub lazy_discovery: bool,
+    /// Opt-in agent control: when true, an agent may turn servers on or off via
+    /// the gateway's `conduit_enable_server` / `conduit_disable_server` tools.
+    /// Off by default. The `deny_destructive` safety switch is never agent-
+    /// writable regardless, so granting this cannot let an agent escalate past
+    /// the user's governance, only flip which servers are connected.
+    #[serde(default)]
+    pub allow_agent_control: bool,
 }
 
 fn default_true() -> bool {
@@ -130,6 +137,7 @@ impl Default for Registry {
             active_profile_id: Some(DEFAULT_PROFILE_ID.to_string()),
             deny_destructive: false,
             lazy_discovery: true,
+            allow_agent_control: false,
         }
     }
 }

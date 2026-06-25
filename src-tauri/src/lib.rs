@@ -1,6 +1,6 @@
 use std::sync::Mutex;
 
-use tauri::State;
+use tauri::{Emitter, Manager, State};
 
 pub mod audit;
 pub mod catalog;
@@ -597,6 +597,17 @@ fn set_lazy_discovery(state: State<RegistryState>, lazy: bool) -> Result<Registr
     Ok(reg.clone())
 }
 
+/// Opt into agent control: lets an agent enable or disable servers through the
+/// gateway's `conduit_enable_server` / `conduit_disable_server` tools. Off by
+/// default; the destructive-tool safety switch stays user-only regardless of this.
+#[tauri::command]
+fn set_allow_agent_control(state: State<RegistryState>, allow: bool) -> Result<Registry, String> {
+    let mut reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    reg.allow_agent_control = allow;
+    registry::save(&reg)?;
+    Ok(reg.clone())
+}
+
 /// Re-save the registry to bump its mtime. The running gateway watches that file
 /// and rebuilds on change, so freshly-vaulted credentials take effect (and the
 /// server's tools flow to connected clients) without a manual restart.
@@ -897,6 +908,44 @@ fn apply_import(reg: &mut Registry, json: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Watch the registry file and mirror external changes (e.g. an agent enabling a
+/// server through the gateway) back into the app's in-memory state, then nudge the
+/// UI to refetch. Without this, a gateway-written change would be invisible to the
+/// app and clobbered by its next save. Polls mtime (the gateway uses the same
+/// approach) and skips identical touches so an mtime-only bump doesn't churn the UI.
+fn watch_registry_for_app(handle: tauri::AppHandle) {
+    let Some(path) = registry::registry_path() else {
+        return;
+    };
+    let mtime = |p: &std::path::Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
+    let mut last = mtime(&path);
+    let mut last_json = registry::load_from(&path)
+        .ok()
+        .and_then(|r| serde_json::to_string(&r).ok())
+        .unwrap_or_default();
+    loop {
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let cur = mtime(&path);
+        if cur == last {
+            continue;
+        }
+        last = cur;
+        let Ok(fresh) = registry::load_from(&path) else {
+            continue; // half-written file; retry next tick
+        };
+        let fresh_json = serde_json::to_string(&fresh).unwrap_or_default();
+        if fresh_json == last_json {
+            continue; // identical content (e.g. an mtime bump to nudge the gateway)
+        }
+        last_json = fresh_json;
+        {
+            let state = handle.state::<RegistryState>();
+            *state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = fresh.clone();
+        }
+        let _ = handle.emit("registry-changed", &fresh);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let registry = registry::load().unwrap_or_default();
@@ -935,6 +984,7 @@ pub fn run() {
             set_tool_enabled,
             set_deny_destructive,
             set_lazy_discovery,
+            set_allow_agent_control,
             set_auth_token,
             clear_auth_token,
             has_auth_token,
@@ -952,6 +1002,13 @@ pub fn run() {
             read_setup_file,
             preview_import,
         ])
+        .setup(|app| {
+            // Mirror external registry changes (an agent toggling a server through
+            // the gateway) back into the app and the UI, in a background thread.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || watch_registry_for_app(handle));
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

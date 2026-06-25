@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import { listen } from "@tauri-apps/api/event";
 import {
   Download,
   HeartPulse,
@@ -114,6 +115,19 @@ function App() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // An agent toggling a server through the gateway writes the registry; the backend
+  // watches that file and emits this event, so the UI reflects the change live
+  // without a manual reload.
+  useEffect(() => {
+    const unlisten = listen<Registry>("registry-changed", (e) => {
+      setRegistry(e.payload);
+      setActivityKey((k) => k + 1);
+    });
+    return () => {
+      void unlisten.then((f) => f());
+    };
+  }, []);
 
   function selectClient(id: string | null) {
     setSelectedClientId(id);

@@ -94,6 +94,11 @@ export function setLazyDiscovery(lazy: boolean): Promise<Registry> {
   return invoke<Registry>("set_lazy_discovery", { lazy });
 }
 
+/** Opt into agent control: let an agent enable/disable servers via the gateway. */
+export function setAllowAgentControl(allow: boolean): Promise<Registry> {
+  return invoke<Registry>("set_allow_agent_control", { allow });
+}
+
 /** Probe every supported MCP client and read its current server configuration. */
 export function detectClients(): Promise<DetectedClient[]> {
   return invoke<DetectedClient[]>("detect_clients");

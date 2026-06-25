@@ -110,6 +110,101 @@ fn call_tool_def() -> Value {
     })
 }
 
+fn enable_server_tool_def() -> Value {
+    json!({
+        "name": "conduit_enable_server",
+        "description": "Turn ON an MCP server in Conduit so its tools become available to you. \
+            Pass the server's id or name (run conduit_status to see the list). Takes effect within \
+            about a second. Only works when the user has allowed agent control in Conduit; the \
+            global block on destructive tools stays under the user's control and cannot be changed here.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "description": "The server id or name to enable, e.g. \"github\"." }
+            },
+            "required": ["server"],
+            "additionalProperties": false
+        }
+    })
+}
+
+fn disable_server_tool_def() -> Value {
+    json!({
+        "name": "conduit_disable_server",
+        "description": "Turn OFF an MCP server in Conduit so its tools are no longer loaded. Pass the \
+            server's id or name (run conduit_status to see the list). Takes effect within about a \
+            second. Only works when the user has allowed agent control in Conduit.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "server": { "type": "string", "description": "The server id or name to disable." }
+            },
+            "required": ["server"],
+            "additionalProperties": false
+        }
+    })
+}
+
+/// Apply an agent-initiated enable/disable of a server. Gated behind the user's
+/// `allow_agent_control` opt-in (re-checked against a fresh on-disk copy to close
+/// the toggle-off-mid-request window), resolves the target by id or name, writes
+/// the registry, and lets the gateway's own watcher rebuild and connect it. The
+/// `deny_destructive` safety switch is intentionally NOT reachable from here.
+fn set_server_enabled_via_agent(
+    reg: &Registry,
+    profile: Option<&str>,
+    path: &Path,
+    target: &str,
+    enable: bool,
+) -> Result<String, String> {
+    if !reg.allow_agent_control {
+        return Err("Conduit: agent control is off. The user must turn on \"Allow agent control\" \
+            in Conduit before an agent can enable or disable servers."
+            .to_string());
+    }
+    let target = target.trim();
+    if target.is_empty() {
+        return Err("Conduit: pass the `server` id or name to change (run conduit_status for the list).".to_string());
+    }
+    let server = reg
+        .servers
+        .iter()
+        .find(|s| s.id.eq_ignore_ascii_case(target) || s.name.eq_ignore_ascii_case(target))
+        .ok_or_else(|| {
+            let known: Vec<&str> = reg.servers.iter().map(|s| s.name.as_str()).collect();
+            format!("Conduit: no server matches \"{target}\". Known servers: {}.", known.join(", "))
+        })?;
+    let server_id = server.id.clone();
+    let server_name = server.name.clone();
+    let profile_id = profile
+        .map(str::to_string)
+        .or_else(|| reg.active_profile_id.clone())
+        .ok_or_else(|| "Conduit: no active profile to change.".to_string())?;
+
+    // Load fresh so a concurrent edit in the app isn't clobbered, and re-check the
+    // opt-in on that fresh copy (the user may have just turned it off).
+    let mut fresh = registry::load_from(path)
+        .map_err(|e| format!("Conduit: could not read the registry ({e})."))?;
+    if !fresh.allow_agent_control {
+        return Err("Conduit: agent control is off.".to_string());
+    }
+    if fresh.is_enabled(&profile_id, &server_id) == enable {
+        return Ok(format!("{server_name} is already {}.", if enable { "on" } else { "off" }));
+    }
+    fresh.set_server_enabled(&profile_id, &server_id, enable)?;
+    registry::save_to(path, &fresh)
+        .map_err(|e| format!("Conduit: could not save the registry ({e})."))?;
+    glog(&format!(
+        "agent control: {} server '{server_id}' in profile '{profile_id}'",
+        if enable { "ENABLED" } else { "DISABLED" }
+    ));
+    Ok(format!(
+        "Turned {} \"{server_name}\". Its tools will be {} within about a second.",
+        if enable { "on" } else { "off" },
+        if enable { "available" } else { "removed" }
+    ))
+}
+
 /// Unwrap a `conduit_call_tool` payload into (inner tool name, inner arguments).
 /// The tool's params normally nest under `arguments`, but models frequently flatten
 /// this double-nested shape and put them at the top level next to `name` instead -
@@ -587,7 +682,13 @@ fn handle_request(
             // holds a handful of tool defs instead of the whole catalog. The model
             // finds real tools via conduit_search_tools and runs conduit_call_tool.
             if lazy {
-                let tools = vec![status_tool_def(), search_tool_def(), call_tool_def()];
+                let mut tools = vec![status_tool_def(), search_tool_def(), call_tool_def()];
+                // Opt-in: surface the agent-control tools only when the user has
+                // allowed it, so an agent can't even see them otherwise.
+                if reg.allow_agent_control {
+                    tools.push(enable_server_tool_def());
+                    tools.push(disable_server_tool_def());
+                }
                 // Record what lazy discovery kept out of the client's context: the
                 // full catalog we'd otherwise serve (status + every downstream tool)
                 // minus these 3 meta-tools. Estimating over the cached slice avoids
@@ -754,6 +855,23 @@ fn handle_request(
                 return Some(success(
                     id,
                     json!({ "content": [{ "type": "text", "text": text }], "isError": false }),
+                ));
+            }
+
+            if name == "conduit_enable_server" || name == "conduit_disable_server" {
+                let enable = name == "conduit_enable_server";
+                let target = arguments.get("server").and_then(|v| v.as_str()).unwrap_or("");
+                let result = match registry::resolved_path() {
+                    Some(p) => set_server_enabled_via_agent(reg, profile, &p, target, enable),
+                    None => Err("Conduit: could not locate the registry file.".to_string()),
+                };
+                let (text, is_error) = match result {
+                    Ok(msg) => (msg, false),
+                    Err(msg) => (msg, true),
+                };
+                return Some(success(
+                    id,
+                    json!({ "content": [{ "type": "text", "text": text }], "isError": is_error }),
                 ));
             }
 
@@ -1318,6 +1436,42 @@ mod tests {
 
     fn router() -> Router {
         Router::new()
+    }
+
+    #[test]
+    fn agent_control_gates_then_persists() {
+        // Two servers, only Alpha enabled, agent control OFF.
+        let path = std::env::temp_dir().join(format!("conduit-ac-test-{}.json", std::process::id()));
+        let json = r#"{"version":1,
+            "servers":[
+                {"id":"a","name":"Alpha","transport":"stdio","command":"x","args":[],"env":[]},
+                {"id":"b","name":"Beta","transport":"stdio","command":"x","args":[],"env":[]}],
+            "profiles":[{"id":"p","name":"P","enabledServerIds":["a"]}],
+            "activeProfileId":"p","allowAgentControl":false}"#;
+        std::fs::write(&path, json).unwrap();
+        let reg = registry::load_from(&path).unwrap();
+
+        // Gated off: refused, and nothing on disk changes.
+        assert!(set_server_enabled_via_agent(&reg, Some("p"), &path, "Beta", true).is_err());
+        assert!(!registry::load_from(&path).unwrap().is_enabled("p", "b"));
+
+        // Opt in (persisting it so the fresh-copy re-check passes), then enable
+        // Beta by name, case-insensitively.
+        let mut reg2 = reg.clone();
+        reg2.allow_agent_control = true;
+        registry::save_to(&path, &reg2).unwrap();
+        let ok = set_server_enabled_via_agent(&reg2, Some("p"), &path, "beta", true);
+        assert!(ok.is_ok(), "enable should succeed: {ok:?}");
+        assert!(registry::load_from(&path).unwrap().is_enabled("p", "b"));
+        // The destructive-tool safety switch is never reachable from agent control.
+        assert!(!registry::load_from(&path).unwrap().deny_destructive);
+
+        // Unknown server: helpful error naming the known ones.
+        let bad = set_server_enabled_via_agent(&reg2, Some("p"), &path, "nope", true);
+        assert!(bad.as_ref().is_err());
+        assert!(bad.unwrap_err().contains("Alpha"));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

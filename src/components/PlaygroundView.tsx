@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import {
+  Bot,
   CheckCircle2,
   FlaskConical,
   Layers,
@@ -12,6 +13,7 @@ import { toast } from "sonner";
 import {
   callTool,
   listServerTools,
+  setAllowAgentControl,
   setDenyDestructive,
   setLazyDiscovery,
   setToolEnabled,
@@ -159,6 +161,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
   const servers = registry?.servers ?? [];
   const denyDestructive = registry?.denyDestructive ?? false;
   const lazyDiscovery = registry?.lazyDiscovery ?? true;
+  const allowAgentControl = registry?.allowAgentControl ?? false;
 
   const [serverId, setServerId] = useState<string | null>(null);
   const [policyBusy, setPolicyBusy] = useState(false);
@@ -253,6 +256,17 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
       onRegistryChange(await setLazyDiscovery(lazy));
     } catch (e) {
       toast.error(`Couldn't update discovery mode: ${e}`);
+    } finally {
+      setPolicyBusy(false);
+    }
+  }
+
+  async function toggleAllowAgentControl(allow: boolean) {
+    setPolicyBusy(true);
+    try {
+      onRegistryChange(await setAllowAgentControl(allow));
+    } catch (e) {
+      toast.error(`Couldn't update agent control: ${e}`);
     } finally {
       setPolicyBusy(false);
     }
@@ -381,6 +395,22 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
             <Switch
               checked={denyDestructive}
               onCheckedChange={toggleDeny}
+              disabled={policyBusy}
+            />
+          </label>
+          <label className="flex items-center gap-2.5 rounded-md border px-3 py-2 text-sm">
+            <Bot
+              className={`size-4 ${allowAgentControl ? "text-emerald-400" : "text-muted-foreground"}`}
+            />
+            <span className="flex flex-col leading-tight">
+              <span className="font-medium">Allow agent control</span>
+              <span className="text-xs text-muted-foreground">
+                Let an agent turn servers on/off (the block above stays yours)
+              </span>
+            </span>
+            <Switch
+              checked={allowAgentControl}
+              onCheckedChange={toggleAllowAgentControl}
               disabled={policyBusy}
             />
           </label>
