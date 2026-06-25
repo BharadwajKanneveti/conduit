@@ -50,10 +50,13 @@ export function getAuditStats(window = 2000): Promise<AuditStats> {
  * (rug-pull signal) or a known server added a tool. */
 export interface SecurityEvent {
   ts: number;
+  /** "tool_drift" (definition changed/added) or "tool_poison_flag" (injection in a definition). */
   type: string;
   server: string;
   tool: string;
   change: string;
+  /** For tool_poison_flag: which heuristic signatures matched. */
+  signatures?: string[];
 }
 
 /** Recent tool-definition integrity events (newest first). */

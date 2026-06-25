@@ -6,12 +6,14 @@ All notable changes to Conduit are documented here. Format loosely follows
 ## [Unreleased]
 
 ### Added
-- **Tool-definition integrity (rug-pull detection).** The gateway now fingerprints
-  every tool when a server is first connected and diffs it on each refresh. If a
-  previously-approved tool's definition changes, or a known server adds a tool (the
-  signature of a "rug pull"), it records a security event and surfaces it as a notice
-  in the Activity view. Detection only, never blocks; on by default
-  (`integrityCheck`), fully local. New `get_security_events` command + `security.jsonl`.
+- **Tool-definition integrity (rug-pull + poisoning detection).** The gateway now
+  fingerprints every tool when a server is first connected and diffs it on each
+  refresh. If a previously-approved tool's definition changes, or a known server adds
+  a tool (the signature of a "rug pull"), it records a security event. It also scans
+  each tool's description/schema for injection-like content (tool poisoning / line
+  jumping) when first seen or when it changes. Both surface as notices in the Activity
+  view. Detection only, never blocks; on by default (`integrityCheck`), fully local.
+  New `get_security_events` command + `security.jsonl`.
 - **OpenRouter** added to the curated catalog (live model intelligence; OAuth).
 
 ### Changed
