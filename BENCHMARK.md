@@ -83,6 +83,25 @@ matter how many servers you add, which is why the reduction *grows* with your se
 The measured average here is ~397 tokens per tool, consistent with the ~387 the
 public [calculator](https://conduitmcp.app/calculator) uses.
 
+## Latency: the gateway is not the bottleneck
+
+Tokens are the headline, but a gateway adds a hop, so does it cost you time? Measure
+it with [`benchmark/latency.mjs`](benchmark/latency.mjs), which spawns the gateway
+against an instant mock downstream so the number is purely Conduit's own overhead
+(no model, no network, no API keys):
+
+| Operation | Median |
+|---|---|
+| Handshake (one-time, per gateway start) | ~21 ms |
+| `tools/list` (lazy, 3 tools) | ~0.2 ms |
+| `conduit_search_tools` | ~0.1 ms |
+| A tool call through Conduit vs. calling the server directly | **+~0.75 ms** |
+
+Conduit adds well under a millisecond to a tool call. Real MCP servers take tens to
+hundreds of ms each (a process or a network API), so that overhead is noise, and it
+buys the ~90% token reduction above. (Numbers from a dev laptop over 200 iterations;
+run it on yours: `node benchmark/latency.mjs`.)
+
 ## Honest caveats
 
 - **Small sample**, one model, one machine, three tasks. Treat the *direction* (a large,
