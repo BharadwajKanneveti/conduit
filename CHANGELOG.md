@@ -5,6 +5,35 @@ All notable changes to Conduit are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Added
+- **Controllable MCP (opt-in agent control).** A new *Allow agent control* switch
+  (off by default) lets an agent enable or disable servers through the gateway
+  (`conduit_enable_server` / `conduit_disable_server`). The destructive-tool block
+  stays user-only, so granting it can't let an agent escalate past your governance;
+  the app watches the registry and reflects an agent's change live.
+
+## [0.3.18] - 2026-06-25
+
+### Added
+- **Ask your agent what Conduit is saving you.** `conduit_status` now reports the
+  tokens lazy discovery has kept out of context, a dollar estimate at Claude Sonnet
+  input rates, the number of tool-list loads, and your biggest catalog collapse.
+
+### Changed
+- The in-app savings model picker and the public calculator group models by provider
+  (Anthropic, OpenAI, Google), with a custom-price option on the calculator.
+
+### Fixed
+- Native select dropdowns render readable in the dark theme (no more light text on a
+  light popup).
+
+## [0.3.17] - 2026-06-25
+
+### Added
+- **Token economics card.** The Activity tab shows the dollar value of what lazy
+  discovery has saved you, with a model-price selector and a one-click Share that
+  copies a "Conduit saved me ~X tokens (~$Y)" snippet.
+
 ### Security
 - Hardened three findings from an internal audit: OAuth PKCE/state generation now
   fails loudly instead of silently returning zeros if the OS RNG is unavailable;

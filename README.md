@@ -40,7 +40,8 @@ Conduit fixes both:
   instead of the full catalog. The agent searches and calls on demand, so context
   stays flat no matter how many servers you connect. In a measured benchmark that's
   97% less tool-definition overhead per request and ~90% fewer total tokens at the
-  same success rate ([BENCHMARK.md](BENCHMARK.md)).
+  same success rate ([BENCHMARK.md](BENCHMARK.md)). Ask `conduit_status` and it
+  reports what it has saved you so far, in tokens and dollars.
 - **Set up once, use everywhere.** Each client points at one Conduit gateway.
   Add a server and authenticate it a single time; it appears in every client.
 - **Per-agent scoping.** Give each client only the servers it should see. A
@@ -55,6 +56,11 @@ Conduit fixes both:
 - **Governance built in.** Toggle any tool on or off, or flip one switch to hide
   every destructive tool from every client at once. Every tool call is recorded
   in an audit log, with per-server latency and error rates.
+- **Agent-controllable, on your terms.** Turn on *Allow agent control* and an
+  agent can enable or disable servers itself through the gateway
+  (`conduit_enable_server` / `conduit_disable_server`), with the change reflected
+  in the app live. Off by default, and the destructive-tool switch stays yours, so
+  an agent can never escalate past your governance.
 - **Full MCP, not just tools.** Tools, resources, and prompts are all proxied.
 - **Test before you wire it up.** A built-in playground invokes any tool with a
   form generated from its schema, so you can confirm a server works without
