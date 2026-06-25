@@ -3,7 +3,7 @@
 All notable changes to Conduit are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 
-## [Unreleased]
+## [0.3.19] - 2026-06-25
 
 ### Added
 - **Controllable MCP (opt-in agent control).** A new *Allow agent control* switch
@@ -11,6 +11,10 @@ All notable changes to Conduit are documented here. Format loosely follows
   (`conduit_enable_server` / `conduit_disable_server`). The destructive-tool block
   stays user-only, so granting it can't let an agent escalate past your governance;
   the app watches the registry and reflects an agent's change live.
+
+### Fixed
+- The Playground policy toggles lay out as an even responsive grid instead of
+  orphaning the third switch onto its own row.
 
 ## [0.3.18] - 2026-06-25
 
