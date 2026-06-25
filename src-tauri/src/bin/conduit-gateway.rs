@@ -46,7 +46,7 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 fn status_tool_def() -> Value {
     json!({
         "name": "conduit_status",
-        "description": "List the MCP servers Conduit has enabled in the active profile.",
+        "description": "Report Conduit's status: the MCP servers enabled in the active profile, each server's tool count, and how many tokens (and dollars) lazy discovery has saved you so far.",
         "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
     })
 }
@@ -483,7 +483,45 @@ fn enabled_summary(reg: &Registry, cached: &[Value], profile: Option<&str>) -> S
             }
         }
     }
+    out.push_str(&savings_line());
     out
+}
+
+/// Compact token count for status text: "1.2M", "541k", or the raw number.
+fn fmt_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.0}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+/// One line summarizing what lazy discovery has saved, for conduit_status, so an
+/// agent can answer "what is Conduit saving me?". Empty until something is saved
+/// (a fresh install, or non-lazy mode where nothing is recorded).
+fn savings_line() -> String {
+    let s = savings::summary();
+    let saved = s.get("tokensSaved").and_then(Value::as_u64).unwrap_or(0);
+    if saved == 0 {
+        return String::new();
+    }
+    let loads = s.get("listLoads").and_then(Value::as_u64).unwrap_or(0);
+    let peak = s.get("peakCatalog").and_then(Value::as_u64).unwrap_or(0);
+    let dollars = (saved as f64 / 1_000_000.0) * 3.0; // Claude Sonnet input $/M
+    let mut line = format!(
+        "\nLazy discovery has kept ~{} tokens of tool definitions out of your agent's \
+         context so far (about ${:.2} at Claude Sonnet input rates) across {loads} \
+         tool-list load(s)",
+        fmt_tokens(saved),
+        dollars
+    );
+    if peak > 3 {
+        line.push_str(&format!("; the biggest catalog collapsed {peak} tools to 3"));
+    }
+    line.push_str(".\n");
+    line
 }
 
 /// Dispatch one JSON-RPC message. Returns `None` for notifications (no reply).
