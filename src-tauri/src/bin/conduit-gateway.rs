@@ -569,7 +569,7 @@ fn handle_request(
                     savings::estimate_tokens(&tools),
                     catalog.len() as u64 + 1,
                 );
-                glog("tools/list -> 3 tools (lazy discovery)");
+                gtrace("tools/list -> 3 tools (lazy discovery)");
                 return Some(success(id, json!({ "tools": tools })));
             }
             let mut tools = vec![status_tool_def()];
@@ -579,7 +579,7 @@ fn handle_request(
             } else {
                 tools.extend(cached.iter().cloned());
             }
-            glog(&format!(
+            gtrace(&format!(
                 "tools/list -> {} tools (cache={})",
                 tools.len(),
                 !cached.is_empty()
@@ -755,7 +755,7 @@ fn handle_request(
         }
         "resources/list" => {
             let resources = router.aggregated_resources();
-            glog(&format!("resources/list -> {} resources", resources.len()));
+            gtrace(&format!("resources/list -> {} resources", resources.len()));
             Some(success(id, json!({ "resources": resources })))
         }
         "resources/read" => {
@@ -771,7 +771,7 @@ fn handle_request(
         }
         "prompts/list" => {
             let prompts = router.aggregated_prompts();
-            glog(&format!("prompts/list -> {} prompts", prompts.len()));
+            gtrace(&format!("prompts/list -> {} prompts", prompts.len()));
             Some(success(id, json!({ "prompts": prompts })))
         }
         "prompts/get" => {
@@ -922,24 +922,56 @@ fn persist_and_emit(
     notify_tools_changed(stdout);
 }
 
-/// Append a line to the gateway debug log (for diagnosing client connections).
+/// Keep the always-on gateway log bounded; trimmed to roughly the back half once
+/// it grows past this, so a long-running client can't let it grow without limit.
+const GATEWAY_LOG_CAP: u64 = 256 * 1024;
+
+/// Append a line to the always-on gateway log (connection lifecycle: starts,
+/// connect successes and failures). This is what `gather_diagnostics` bundles
+/// into a bug report, so it stays on regardless of `CONDUIT_DEBUG`.
 fn glog(msg: &str) {
-    if std::env::var_os("CONDUIT_DEBUG").is_none() {
+    let Some(path) = registry::gateway_log_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = writeln!(f, "{msg}");
+    }
+    trim_log_if_large(&path);
+}
+
+/// Per-request trace, gated behind `CONDUIT_DEBUG` so the always-on log stays
+/// focused on connection lifecycle and doesn't fill with one line per call.
+fn gtrace(msg: &str) {
+    if std::env::var_os("CONDUIT_DEBUG").is_some() {
+        glog(msg);
+    }
+}
+
+/// Trim the log to its back half (on a line boundary) once it exceeds the cap.
+/// Best-effort: a read/rewrite race between concurrent gateways at worst drops a
+/// few diagnostic lines, which is fine for a log.
+fn trim_log_if_large(path: &Path) {
+    let over = std::fs::metadata(path).map(|m| m.len() > GATEWAY_LOG_CAP).unwrap_or(false);
+    if !over {
         return;
     }
-    if let Some(dir) = registry::conduit_dir() {
-        let path = dir.join("gateway-debug.log");
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = writeln!(f, "{msg}");
-        }
-    }
+    let Ok(data) = std::fs::read(path) else {
+        return;
+    };
+    let keep_from = data.len().saturating_sub((GATEWAY_LOG_CAP / 2) as usize);
+    let start = data[keep_from..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| keep_from + i + 1)
+        .unwrap_or(keep_from);
+    let _ = std::fs::write(path, &data[start..]);
 }
 
 /// Cache file for a given profile. Scoped clients get their own file
@@ -1178,7 +1210,7 @@ fn main() {
             Err(_) => continue,
         };
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        glog(&format!("request: {method}"));
+        gtrace(&format!("request: {method}"));
 
         // tools/list answers from cache instantly; only block on a cold cache
         // (first ever run). tools/call waits for live downstream connections.
@@ -1624,5 +1656,23 @@ mod tests {
         ];
         let (hits, _) = search_catalog(&cat, "what are the invoices for this account", None, 10);
         assert_eq!(hits[0]["name"], "billing__list_invoices");
+    }
+
+    #[test]
+    fn trim_log_bounds_size_and_keeps_a_line_boundary() {
+        // A file past the cap is trimmed to its back half, starting at a clean
+        // line boundary, and the most recent line survives.
+        let path = std::env::temp_dir().join("conduit-trim-test.log");
+        let filler = "x".repeat(GATEWAY_LOG_CAP as usize + 8192);
+        std::fs::write(&path, format!("OLDEST\n{filler}\nNEWEST\n")).unwrap();
+
+        trim_log_if_large(&path);
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!((after.len() as u64) <= GATEWAY_LOG_CAP, "still over cap");
+        assert!(after.ends_with("NEWEST\n"), "lost the newest line");
+        assert!(!after.contains("OLDEST"), "kept the oldest line past the cap");
+        assert!(!after.starts_with('x'), "did not cut on a line boundary");
+        std::fs::remove_file(&path).ok();
     }
 }

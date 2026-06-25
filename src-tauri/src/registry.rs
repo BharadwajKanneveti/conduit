@@ -366,6 +366,13 @@ pub fn registry_path() -> Option<PathBuf> {
     Some(conduit_dir()?.join("registry.json"))
 }
 
+/// The always-on gateway log (connection lifecycle: starts, connect successes
+/// and failures). Shared by the gateway (writer) and the diagnostics command
+/// (reader) so the path can't drift between them.
+pub fn gateway_log_path() -> Option<PathBuf> {
+    Some(conduit_dir()?.join("gateway.log"))
+}
+
 pub fn load_from(path: &Path) -> Result<Registry, String> {
     if !path.exists() {
         return Ok(Registry::default());

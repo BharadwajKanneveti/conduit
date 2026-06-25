@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   ArrowUpCircle,
+  ClipboardList,
   Compass,
   FlaskConical,
   FolderOpen,
@@ -21,7 +22,7 @@ import {
   type DetectedClient,
   type Registry,
 } from "@/lib/types";
-import { openDataDir } from "@/lib/api";
+import { gatherDiagnostics, openDataDir } from "@/lib/api";
 import { checkForUpdate, installUpdate } from "@/lib/updater";
 import { Button } from "@/components/ui/button";
 import {
@@ -169,6 +170,21 @@ function VersionFooter({
           className="text-muted-foreground transition hover:text-foreground"
         >
           <FolderOpen className="size-3.5" />
+        </button>
+        <button
+          onClick={async () => {
+            try {
+              await navigator.clipboard.writeText(await gatherDiagnostics());
+              toast.success("Diagnostics copied, paste them into your bug report");
+            } catch {
+              toast.error("Could not copy diagnostics");
+            }
+          }}
+          title="Copy diagnostics for a bug report"
+          aria-label="Copy diagnostics"
+          className="text-muted-foreground transition hover:text-foreground"
+        >
+          <ClipboardList className="size-3.5" />
         </button>
       </div>
     </div>

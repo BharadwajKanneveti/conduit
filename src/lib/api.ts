@@ -51,6 +51,11 @@ export function getSavingsSummary(): Promise<SavingsSummary> {
   return invoke<SavingsSummary>("savings_summary");
 }
 
+/** A shareable diagnostics blob (version, registry summary, gateway log tail) for bug reports. */
+export function gatherDiagnostics(): Promise<string> {
+  return invoke<string>("gather_diagnostics");
+}
+
 /** Connect to each enabled server and report health + tool count. */
 export function probeServers(): Promise<ProbeResult[]> {
   return invoke<ProbeResult[]>("probe_servers");

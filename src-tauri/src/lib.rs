@@ -392,6 +392,81 @@ fn savings_summary() -> serde_json::Value {
     savings::summary()
 }
 
+/// How many trailing gateway-log lines the diagnostics bundle includes.
+const DIAG_LOG_LINES: usize = 200;
+
+/// A shareable diagnostics blob for bug reports: Conduit version + OS, a
+/// secrets-stripped registry summary, and the tail of the always-on gateway log.
+/// Safe to paste into a public issue, secret values live in the OS keychain and
+/// are never included; env vars are listed by key name only.
+#[tauri::command]
+fn gather_diagnostics() -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "Conduit diagnostics");
+    let _ = writeln!(out, "version: {}", env!("CARGO_PKG_VERSION"));
+    let _ = writeln!(out, "os: {} {}", std::env::consts::OS, std::env::consts::ARCH);
+
+    let reg = registry::load().unwrap_or_default();
+    let active = reg.active_profile_id();
+    let _ = writeln!(out, "\nsettings:");
+    let _ = writeln!(out, "  lazy discovery: {}", reg.lazy_discovery);
+    let _ = writeln!(out, "  deny destructive: {}", reg.deny_destructive);
+    let _ = writeln!(out, "  active profile: {active}");
+
+    let _ = writeln!(out, "\nservers ({}):", reg.servers.len());
+    for s in &reg.servers {
+        let on = if reg.is_enabled(&active, &s.id) { "on" } else { "off" };
+        let target = match (&s.command, &s.url) {
+            (Some(cmd), _) => format!("{cmd} {}", s.args.join(" ")).trim().to_string(),
+            (None, Some(url)) => url.clone(),
+            _ => String::new(),
+        };
+        let _ = writeln!(out, "  [{on}] {} ({}) {}", s.id, s.transport, target);
+        if !s.env.is_empty() {
+            let keys: Vec<String> = s
+                .env
+                .iter()
+                .map(|e| if e.secret { format!("{} (secret)", e.key) } else { e.key.clone() })
+                .collect();
+            let _ = writeln!(out, "        env: {}", keys.join(", "));
+        }
+    }
+
+    let _ = writeln!(out, "\nprofiles ({}):", reg.profiles.len());
+    for p in &reg.profiles {
+        let _ = writeln!(out, "  {}: [{}]", p.name, p.enabled_server_ids.join(", "));
+    }
+
+    let _ = writeln!(out, "\ngateway log (last {DIAG_LOG_LINES} lines):");
+    out.push_str(&gateway_log_tail(DIAG_LOG_LINES));
+    out
+}
+
+/// The last `n` lines of the always-on gateway log, or a friendly note when it
+/// hasn't been written yet (no client has connected through the gateway).
+fn gateway_log_tail(n: usize) -> String {
+    let Some(path) = registry::gateway_log_path() else {
+        return "(log path unavailable)\n".to_string();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => last_lines(&text, n),
+        _ => "(no gateway log yet, connect a client to populate it)\n".to_string(),
+    }
+}
+
+/// The last `n` lines of `text`, newline-terminated. Returns everything when the
+/// text has fewer than `n` lines.
+fn last_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    let mut tail = lines[start..].join("\n");
+    if !tail.is_empty() {
+        tail.push('\n');
+    }
+    tail
+}
+
 /// Connect to each enabled server in the active profile and report health + tool count.
 #[tauri::command]
 async fn probe_servers(state: State<'_, RegistryState>) -> Result<Vec<ProbeResult>, String> {
@@ -837,6 +912,7 @@ pub fn run() {
             get_audit_log,
             audit_stats,
             savings_summary,
+            gather_diagnostics,
             probe_servers,
             list_server_tools,
             call_tool,
@@ -944,5 +1020,16 @@ mod tests {
     fn import_rejects_garbage() {
         let mut reg = Registry::default();
         assert!(apply_import(&mut reg, "{not json").is_err());
+    }
+
+    #[test]
+    fn last_lines_returns_the_tail() {
+        let text = "a\nb\nc\nd\ne";
+        // Fewer requested than available: just the tail, newline-terminated.
+        assert_eq!(last_lines(text, 2), "d\ne\n");
+        // More requested than available: everything.
+        assert_eq!(last_lines(text, 99), "a\nb\nc\nd\ne\n");
+        // Empty input stays empty (no stray newline).
+        assert_eq!(last_lines("", 10), "");
     }
 }
