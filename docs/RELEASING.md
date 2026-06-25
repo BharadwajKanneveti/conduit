@@ -3,9 +3,11 @@
 Releases are built by CI on a version tag (`.github/workflows/release.yml`).
 
 1. Bump the version to match the tag in:
-   - `src-tauri/tauri.conf.json` (`version`) — drives the installer filename
+   - `src-tauri/tauri.conf.json` (`version`), drives the installer filename
    - `src-tauri/Cargo.toml` (`version`)
    - `package.json` (`version`)
+   - `server.json` (TWO fields: the top-level `version` and the npm package `version`)
+   - `src-tauri/Cargo.lock` (run `cargo check` after bumping `Cargo.toml` to refresh it)
 2. Commit the bump.
 3. Tag and push:
 
@@ -32,5 +34,5 @@ gh release create v0.2.0 \
 
 ## Signing
 
-Installers are currently unsigned (SmartScreen warning). See
-[SIGNING.md](SIGNING.md) for the plan and how to wire signing into the build.
+macOS installers are signed and notarized. Windows installers are currently
+unsigned (SmartScreen warning). See [SIGNING.md](SIGNING.md) for details.

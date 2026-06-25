@@ -7,15 +7,16 @@ that exposes 3 meta-tools the agent searches on demand, so context stays flat:
 measured ~90% fewer tokens at the same task success. This document is the working
 spec, capturing the architecture decision and the build order.
 
-**Status (2026-06-22):** launched and shipping fast. v0.3.10 is out; signed/notarized
+**Status (2026-06-25):** launched and shipping fast. v0.3.16 is out; signed/notarized
 macOS (Apple Silicon + Intel), Windows, and Linux (deb/AppImage) via a tag-triggered
-pipeline, with an in-app auto-updater. 17 clients supported (incl. local: Jan, LM Studio,
+pipeline, with an in-app auto-updater. 18 clients supported (incl. local: Jan, LM Studio,
 Goose). Lazy discovery, OAuth/key auth with live propagation, the catalog, import/migrate,
 per-tool + destructive-tool governance, an audit log, resources/prompts proxying, and a
-tool playground all working. Recent focus: local-model reliability (a fix so grammar-
-constrained clients can pass required tool params) and IDF-weighted tool search. Next:
-distribution (the bottleneck, adoption is still early) and, on demand, semantic-search
-phase 2 (index cleaning -> always-on/lazy hybrid -> embeddings) and team/enterprise.
+tool playground all working. Recent: live tool-refresh when a downstream server changes its
+own tool set, an always-on gateway log + one-click "Copy diagnostics", and a security
+hardening pass. Next: distribution (the bottleneck, adoption is still early) and, on
+demand, semantic-search phase 2 (index cleaning -> always-on/lazy hybrid -> embeddings)
+and team/enterprise.
 
 ## The core decision: Conduit is a gateway, not a file editor
 
@@ -134,8 +135,8 @@ Tier 2 - feature completeness (in progress)
 - [x] Tool playground: invoke any tool from the app and see the result
 - [x] Proxy resources + prompts (capability-gated discovery, namespaced prompts,
       uri-routed resources); sampling / elicitation passthrough still TODO
-- [x] Observability: per-server latency (avg/p95), success/error rates (Activity
-      dashboard); per-tool breakdown + filters still TODO
+- [x] Observability: per-server latency (avg/p95), success/error rates, per-tool
+      breakdown, and server/errors-only filters (Activity dashboard)
 
 Tier 3 - launch prep
 - [x] Bundle the gateway sidecar; signed/notarized macOS installers (Win/Linux
@@ -148,7 +149,7 @@ Tier 3 - launch prep
 - [x] First-run onboarding wizard (detect clients, add servers, connect a client).
 - [ ] macOS keychain access-group entitlement (app + gateway share secrets with
       no "Always Allow" prompt)
-- [ ] Launch: Product Hunt (scheduled), MCP registries (Glama/mcp.so/awesome-mcp listed)
+- [x] Launch: Product Hunt, MCP registries (Glama/mcp.so/awesome-mcp listed)
 
 Tier 4 - teams / enterprise (paid)
 - [ ] Hosted/remote gateway, shared/synced config, RBAC/SSO

@@ -53,6 +53,8 @@ body:
     attributes:
       label: Logs
       description: >
-        Optional but helpful. Open the data folder (folder icon in the sidebar footer)
-        and attach `gateway-debug.log` or relevant lines. Redact any secrets first.
+        Optional but helpful. Easiest: click "Copy diagnostics" in the sidebar footer
+        (it bundles your version, OS, a secrets-stripped server summary, and the recent
+        gateway log) and paste it here. Or open the data folder (folder icon) and attach
+        lines from `gateway.log`. Redact any secrets first.
       render: shell

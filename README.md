@@ -1,26 +1,26 @@
 # Conduit
 
-**Your agent doesn't need 500 tools loaded on every request. It needs 3.**
+**All your MCP servers in one place, with ~90% fewer tokens.**
 
 ![Conduit: every tool from all your servers, collapsed to the 3 your agent loads](docs/feature.png)
 
 ![Conduit demo: add a server, connect it to every AI tool, and the agent uses it](docs/demo.gif)
 
-Conduit is a local MCP (Model Context Protocol) gateway. Every MCP server you
-connect dumps all of its tools into your agent's context on every single request,
-and it adds up fast: just 3 servers (62 tools) cost ~24,000 tokens of definitions
-before you've asked anything. Conduit puts your servers behind one gateway that
-advertises 3 meta-tools the agent searches on demand, so it pays ~660 tokens
-instead of ~24,000.
+Conduit is a local MCP (Model Context Protocol) gateway. You set up and
+authenticate each server once, and every AI client (Claude, Cursor, Codex, and
+the rest) points at Conduit and shares them, so you stop configuring the same
+servers separately in each app.
+
+It also fixes what those servers cost your agent. Every MCP server you connect
+dumps all of its tools into context on every single request, and it adds up fast:
+just 3 servers (62 tools) cost ~24,000 tokens of definitions before you've asked
+anything. Conduit advertises 3 meta-tools the agent searches on demand instead,
+so it pays ~660 tokens.
 
 **Measured: 97% less tool-definition overhead per request and ~90% fewer total
 tokens, at the same task success rate** (see [BENCHMARK.md](BENCHMARK.md)). That
 holds whether you run one AI tool or five, on cloud models (where tokens are your
 bill) or local ones (where tool defs eat your context window).
-
-And because everything sits behind one gateway, you also set up and authenticate
-each server once and it's available in all of them, no more configuring the same
-servers separately in Cursor, Claude, Codex, and the rest.
 
 ## Screenshots
 
@@ -59,6 +59,9 @@ Conduit fixes both:
 - **Test before you wire it up.** A built-in playground invokes any tool with a
   form generated from its schema, so you can confirm a server works without
   configuring a client first.
+- **Diagnostics in one click.** A "Copy diagnostics" button bundles your version,
+  OS, a secrets-stripped server summary, and the recent gateway log, ready to
+  paste into a bug report.
 
 ## How it works
 
@@ -83,13 +86,15 @@ AI client (Cursor / Claude / Codex / Antigravity / ...)
 
 The registry is the shared source of truth; the gateway watches it and rebuilds
 live, so toggles and new credentials take effect without restarting the client.
+If a connected server changes its own tool set mid-session, Conduit picks that up
+and refreshes too.
 
 ## Supported clients
 
 Cursor, Claude Desktop, Claude Code, Codex, Google Antigravity, VS Code,
 Windsurf, Gemini CLI, Cline, Roo Code, Warp, Amazon Q, Kiro, Zed, LM Studio, Jan,
-and Goose. Conduit detects each one, installs the gateway with one click, and can
-import a client's existing servers.
+Goose, and BoltAI. Conduit detects each one, installs the gateway with one click,
+and can import a client's existing servers.
 
 ## Configuration
 

@@ -5,6 +5,59 @@ All notable changes to Conduit are documented here. Format loosely follows
 
 ## [Unreleased]
 
+### Security
+- Hardened three findings from an internal audit: OAuth PKCE/state generation now
+  fails loudly instead of silently returning zeros if the OS RNG is unavailable;
+  file writes use a unique atomic-write temp name (no torn writes under concurrent
+  writers); and a saved bearer token is refused over non-HTTPS to a public host.
+
+## [0.3.16] - 2026-06-25
+
+### Added
+- **Live tool refresh.** When a connected server changes its own tool set
+  mid-session (via `tools/list_changed`), Conduit re-queries it in place, so new
+  or removed tools reach your agent without a restart.
+- **Always-on diagnostics.** A size-capped gateway log of connection events, plus
+  a one-click **Copy diagnostics** button that bundles your version, OS, a
+  secrets-stripped server summary, and the recent log, ready to paste into a bug
+  report.
+- **BoltAI** is now a supported client (18 total), thanks to a first-time
+  contributor (#18).
+
+## [0.3.15] - 2026-06-23
+
+### Fixed
+- Clean, all-platforms build of the tokens-saved counter. v0.3.14's Linux job was
+  OOM-killed mid-compile, leaving no Linux build or updater manifest; the pipeline
+  now gives the Linux runner enough disk and swap, so auto-update works on all four
+  platforms again.
+
+## [0.3.14] - 2026-06-23
+
+### Fixed
+- The v0.3.12 "tokens saved" counter was missing from the release binaries (a CI
+  build cache compiled a stale library from before the command existed). The
+  pipeline now builds the workspace from scratch, so the counter ships.
+
+## [0.3.12] - 2026-06-23
+
+### Added
+- **"Tokens saved" counter in Activity.** A running estimate of the
+  tool-definition tokens lazy discovery has kept out of your agent's context, with
+  tool-list loads, your biggest catalog collapse, and since-when. No setup.
+
+## [0.3.11] - 2026-06-22
+
+### Improved
+- **Cleaner search index.** The gateway strips boilerplate and stopwords from tool
+  descriptions and queries before indexing, so `conduit_search_tools` ranks on the
+  words that actually distinguish one tool from another.
+
+### Added
+- **BENCHMARK.md** with a reproducible harness: ~97% less tool-definition overhead
+  per request and ~90% fewer total tokens at the same task success rate (3 servers,
+  62 tools, local model, repeated runs).
+
 ## [0.3.10] - 2026-06-22
 
 ### Improved
@@ -159,7 +212,16 @@ All notable changes to Conduit are documented here. Format loosely follows
 - First public release: local MCP gateway and manager with lazy discovery,
   per-agent profiles, the catalog, the tool playground, and the activity log.
 
-[Unreleased]: https://github.com/tsouth89/conduit/compare/v0.3.6...HEAD
+[Unreleased]: https://github.com/tsouth89/conduit/compare/v0.3.16...HEAD
+[0.3.16]: https://github.com/tsouth89/conduit/releases/tag/v0.3.16
+[0.3.15]: https://github.com/tsouth89/conduit/releases/tag/v0.3.15
+[0.3.14]: https://github.com/tsouth89/conduit/releases/tag/v0.3.14
+[0.3.12]: https://github.com/tsouth89/conduit/releases/tag/v0.3.12
+[0.3.11]: https://github.com/tsouth89/conduit/releases/tag/v0.3.11
+[0.3.10]: https://github.com/tsouth89/conduit/releases/tag/v0.3.10
+[0.3.9]: https://github.com/tsouth89/conduit/releases/tag/v0.3.9
+[0.3.8]: https://github.com/tsouth89/conduit/releases/tag/v0.3.8
+[0.3.7]: https://github.com/tsouth89/conduit/releases/tag/v0.3.7
 [0.3.6]: https://github.com/tsouth89/conduit/releases/tag/v0.3.6
 [0.3.5]: https://github.com/tsouth89/conduit/releases/tag/v0.3.5
 [0.3.4]: https://github.com/tsouth89/conduit/releases/tag/v0.3.4
