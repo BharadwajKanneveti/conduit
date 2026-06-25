@@ -57,3 +57,24 @@ dist-ssr
 
 # Stray test artifacts (e.g. share/export test exports)
 /src-tauri/test.json
+
+# Benchmark run outputs - can contain real account data (product/project names, team IDs)
+/benchmark/**/answers.txt
+/benchmark/**/sweep-results.csv
+/benchmark/**/sweep-summary.md
+/benchmark/answers.txt
+/benchmark/sweep-results.csv
+/benchmark/sweep-summary.md
+/benchmark/ctx*/
+/benchmark/smoke/
+/benchmark/capable/
+/benchmark/local-*/
+/benchmark/groq/
+/benchmark/gemini/
+# Local ground-truth for grading (your real account items) - never commit
+/benchmark/expect.local.json
+
+# Internal planning/strategy docs (kept local, like MONETIZATION/STATUS/COMPETITIVE/PLAN)
+/docs/SITE-MESSAGING.md
+/docs/specs/
+/docs/drafts/

@@ -10,7 +10,25 @@ so the numbers are directly comparable: lazy mode makes **more tool calls**
 (search round-trips) but should use **far fewer tokens** because it never dumps
 every schema into context.
 
-## Run it
+## No-model catalog report (`token-cost.mjs`)
+
+Want the headline numbers without standing up a local LLM? `token-cost.mjs` reads
+the catalog Conduit already built and reports, deterministically: per-server
+definition tokens, the per-tool size distribution, how much of each model's context
+window the definitions eat, the reduction-vs-tool-count scaling curve, and monthly
+dollar cost across request volumes.
+
+```bash
+node benchmark/token-cost.mjs            # auto-reads the active profile's cache
+node benchmark/token-cost.mjs <path>     # or point at a specific tool-cache JSON
+```
+
+With no argument it resolves Conduit's data dir for you (Windows `%APPDATA%\Conduit`,
+macOS `~/Library/Application Support/Conduit`, Linux `~/.config/Conduit`). A
+profile-scoped client writes `tool-cache-<profile>.json`; the unscoped default is
+`tool-cache.json`, which is what the auto-path uses.
+
+## Run the agent-loop benchmark
 
 ```bash
 # 1. Build the gateway

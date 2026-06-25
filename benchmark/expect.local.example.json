@@ -1,0 +1,6 @@
+{
+  "_comment": "Copy this to expect.local.json (gitignored) and fill in real item names from YOUR accounts so the sweep can grade correctness. A run is correct only if the agent's answer contains every listed string (case-insensitive). 1-3 distinctive, definitely-present names per task is plenty.",
+  "stripe-products": ["Your Product Name", "Another Product"],
+  "neon-projects": ["your-neon-project"],
+  "vercel-projects": ["your-vercel-project"]
+}
