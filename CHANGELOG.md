@@ -3,6 +3,35 @@
 All notable changes to Conduit are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 
+## [0.4.2] - 2026-06-26
+
+### Added
+- **Conduit Teams (beta), desktop side.** A new Teams tab connects your local Conduit
+  to a self-hosted Conduit Teams server and syncs a shared MCP server set into your
+  registry. Keys never leave your machine: only the server set syncs, and you
+  authenticate each server locally. Inert until you connect to a team.
+- **Composio** in the curated catalog (connect agents to 1,000+ apps via MCP). (#23)
+
+### Fixed
+- **Custom API keys now reach HTTP servers.** A remote/HTTP server that uses a manually
+  vaulted secret (e.g. a `BEARER` key) gets it injected as the bearer token, not just
+  OAuth tokens, so "Manage secrets" works for HTTP servers. (#22)
+- **Cleaner multi-account duplicates.** Duplicating a server produces collision-free
+  names (`Server (2)`, `(3)`) instead of `Server 2`, with an "add another account"
+  hint. (#24)
+- **Hermes config keys.** Hermes `mcp_servers` entries are keyed by server name, so the
+  config round-trips correctly. (#25)
+
+### Internal
+- **macOS secret storage moved to the SecItem keychain API** for new entries, which
+  avoids the per-application ACLs behind repeated keychain prompts (#21). If you're on
+  macOS and still see prompts, they're from entries created by older versions: clear
+  Conduit's old entries in Keychain Access and re-authenticate to use the new path. A
+  confirmed prompt-elimination claim is pending validation on signed release builds.
+
+### Thanks
+- @bradhallett (#21, #22, #23, #25) and @BharadwajKanneveti (#24).
+
 ## [0.4.1] - 2026-06-26
 
 ### Changed
