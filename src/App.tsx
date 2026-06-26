@@ -283,6 +283,7 @@ function App() {
     <RegistryServerCard
       key={server.id}
       server={server}
+      registry={registry}
       enabled={registry ? isEnabled(registry, server.id) : false}
       busy={busyId === server.id}
       health={health[server.id]}
