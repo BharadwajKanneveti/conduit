@@ -437,6 +437,11 @@ impl HttpTransport {
             url: url.to_string(),
             agent: ureq::AgentBuilder::new()
                 .timeout(std::time::Duration::from_secs(30))
+                // Never follow redirects. MCP Streamable HTTP doesn't need cross-host
+                // redirects, and following one would let a malicious server bounce us to
+                // an internal address (SSRF, e.g. cloud metadata) or replay our
+                // Authorization bearer to a host of its choosing (token theft).
+                .redirects(0)
                 .build(),
             session_id: None,
             next_id: 1,

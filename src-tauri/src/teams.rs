@@ -300,6 +300,25 @@ fn team_server_entry(s: &Value, tag: &str) -> Option<ServerEntry> {
     let orig_id = str_field("id");
     let name = str_field("name").or(orig_id)?;
     let id = format!("team_{}", slugify_id(orig_id.unwrap_or(name)));
+
+    // SECURITY: a synced team config must never make a member's gateway run a local
+    // command (that would be remote code execution on every member, from one
+    // compromised team server or a rogue admin) or reach a private/loopback address
+    // (SSRF into the member's own machine or internal network, e.g. cloud metadata).
+    // Teams may only share REMOTE servers on a public URL; a stdio/command entry or a
+    // private-host URL is dropped. Members add their own local servers themselves.
+    let transport = str_field("transport").unwrap_or("stdio");
+    if transport == "stdio" || str_field("command").is_some() {
+        return None;
+    }
+    let url = str_field("url")?;
+    let host_private = crate::oauth::host_of_url(url)
+        .map(|h| crate::oauth::host_is_private(&h))
+        .unwrap_or(true);
+    if host_private {
+        return None;
+    }
+
     let str_array = |k: &str| {
         s.get(k)
             .and_then(Value::as_array)
@@ -325,11 +344,11 @@ fn team_server_entry(s: &Value, tag: &str) -> Option<ServerEntry> {
     Some(ServerEntry {
         id,
         name: name.to_string(),
-        transport: str_field("transport").unwrap_or("stdio").to_string(),
-        command: str_field("command").map(String::from),
+        transport: transport.to_string(),
+        command: None, // never carried from a team (guarded above)
         args: str_array("args"),
         env,
-        url: str_field("url").map(String::from),
+        url: Some(url.to_string()),
         source: Some(tag.to_string()),
         disabled_tools: str_array("disabledTools"),
     })
@@ -396,9 +415,9 @@ mod tests {
     fn merge_adds_team_servers_without_touching_local() {
         let mut r = base_registry();
         let cfg = json!({ "servers": [
-            { "id": "github", "name": "GitHub", "transport": "http", "url": "https://api.example/mcp",
+            { "id": "github", "name": "GitHub", "transport": "http", "url": "https://1.2.3.4/mcp",
               "env": [{ "key": "TOKEN", "secret": true }] },
-            { "id": "stripe", "name": "Stripe", "transport": "stdio", "command": "stripe-mcp" }
+            { "id": "stripe", "name": "Stripe", "transport": "http", "url": "https://1.2.3.5/mcp" }
         ]});
         assert_eq!(apply_team_config(&mut r, "t1", &cfg), 2);
 
@@ -421,8 +440,8 @@ mod tests {
             &mut r,
             "t1",
             &json!({ "servers": [
-                { "id": "a", "name": "A", "transport": "stdio", "command": "a" },
-                { "id": "b", "name": "B", "transport": "stdio", "command": "b" }
+                { "id": "a", "name": "A", "transport": "http", "url": "https://1.2.3.4/mcp" },
+                { "id": "b", "name": "B", "transport": "http", "url": "https://1.2.3.5/mcp" }
             ]}),
         );
         // Team drops "b", adds "c".
@@ -430,8 +449,8 @@ mod tests {
             &mut r,
             "t1",
             &json!({ "servers": [
-                { "id": "a", "name": "A", "transport": "stdio", "command": "a" },
-                { "id": "c", "name": "C", "transport": "stdio", "command": "c" }
+                { "id": "a", "name": "A", "transport": "http", "url": "https://1.2.3.4/mcp" },
+                { "id": "c", "name": "C", "transport": "http", "url": "https://1.2.3.6/mcp" }
             ]}),
         );
         let team_ids: Vec<_> = r
@@ -463,11 +482,30 @@ mod tests {
         apply_team_config(
             &mut r,
             "t1",
-            &json!({ "servers": [{ "id": "a", "name": "A", "transport": "stdio", "command": "a" }] }),
+            &json!({ "servers": [{ "id": "a", "name": "A", "transport": "http", "url": "https://1.2.3.4/mcp" }] }),
         );
         remove_team(&mut r, "t1");
         assert!(r.servers.iter().all(|s| s.source.as_deref() != Some("team:t1")));
         assert!(r.servers.iter().any(|s| s.id == "mine"), "local server preserved");
         assert!(!active_enabled(&r).iter().any(|id| id.starts_with("team_")));
+    }
+
+    #[test]
+    fn team_config_drops_local_commands_and_private_urls() {
+        let mut r = base_registry();
+        // From a team, a stdio command and a command-bearing entry are RCE, and a
+        // loopback/link-local URL is SSRF. Only the public remote server survives.
+        let cfg = json!({ "servers": [
+            { "id": "safe", "name": "Safe", "transport": "http", "url": "https://1.2.3.4/mcp" },
+            { "id": "rce", "name": "RCE", "transport": "stdio", "command": "powershell" },
+            { "id": "rce2", "name": "RCE2", "transport": "http", "command": "sh", "url": "https://1.2.3.5/mcp" },
+            { "id": "ssrf", "name": "SSRF", "transport": "http", "url": "http://169.254.169.254/latest/meta-data/" },
+            { "id": "ssrf2", "name": "SSRF2", "transport": "http", "url": "http://127.0.0.1:9000/mcp" }
+        ]});
+        assert_eq!(apply_team_config(&mut r, "t1", &cfg), 1, "only the safe remote server is merged");
+        let team: Vec<_> = r.servers.iter().filter(|s| s.source.as_deref() == Some("team:t1")).collect();
+        assert_eq!(team.len(), 1);
+        assert_eq!(team[0].id, "team_safe");
+        assert!(team[0].command.is_none(), "no command ever carried from a team");
     }
 }
