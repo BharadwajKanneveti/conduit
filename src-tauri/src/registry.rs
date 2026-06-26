@@ -134,6 +134,29 @@ pub struct Registry {
     /// is pure lexical exactly as before.
     #[serde(default)]
     pub semantic_search: SemanticSettings,
+    /// Connection to a Conduit Teams server (the paid config-sync layer), if the user
+    /// has joined a team. The member token is NOT stored here, it lives in the OS
+    /// keychain like any other secret. Servers pulled from the team are merged into
+    /// `servers` tagged `source = "team:<id>"`, non-destructively.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<TeamConnection>,
+}
+
+/// A joined Conduit Teams server. Holds only non-secret connection metadata; the
+/// member bearer token is vaulted in the OS keychain (see `secrets`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamConnection {
+    /// Base URL of the conduit-teams server, e.g. `https://teams.example.com`.
+    pub server_url: String,
+    pub team_id: String,
+    /// "admin" | "member".
+    pub role: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_name: Option<String>,
+    /// Last config version pulled, for change display and ETag polling.
+    #[serde(default)]
+    pub last_version: i64,
 }
 
 /// Settings for embedding-based search re-ranking. The embedding API key, if the
@@ -184,6 +207,7 @@ impl Default for Registry {
             integrity_check: true,
             content_defense: true,
             semantic_search: SemanticSettings::default(),
+            team: None,
         }
     }
 }

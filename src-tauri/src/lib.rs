@@ -14,6 +14,7 @@ pub mod router;
 pub mod savings;
 pub mod semantic;
 pub mod secrets;
+pub mod teams;
 pub mod vendors;
 
 use downstream::{DownstreamServer, StdioTransport};
@@ -618,6 +619,65 @@ fn set_allow_agent_control(state: State<RegistryState>, allow: bool) -> Result<R
     Ok(reg.clone())
 }
 
+/// Flush the in-memory registry to disk so the teams module (which reads the registry
+/// file) operates on the current state, then refresh the in-memory state from disk
+/// after the team operation merged into it.
+fn flush_to_disk(state: &RegistryState) -> Result<(), String> {
+    let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    registry::save(&reg)
+}
+
+fn reload_into_state(state: &RegistryState) -> Result<Registry, String> {
+    let fresh = registry::load()?;
+    *state.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = fresh.clone();
+    Ok(fresh)
+}
+
+/// Join a Conduit Teams server with an invite code. Vaults the member token in the OS
+/// keychain, pulls the team's server set, and merges it into the local registry
+/// non-destructively (team servers are tagged and enabled in the active profile).
+#[tauri::command]
+fn team_connect(
+    state: State<RegistryState>,
+    server_url: String,
+    invite_code: String,
+    member_name: Option<String>,
+) -> Result<Registry, String> {
+    flush_to_disk(state.inner())?;
+    teams::connect(&server_url, &invite_code, member_name.as_deref())?;
+    let fresh = reload_into_state(state.inner())?;
+    nudge_gateway(state.inner());
+    Ok(fresh)
+}
+
+/// Pull the latest team config and re-merge it. A no-op when nothing changed.
+#[tauri::command]
+fn team_sync(state: State<RegistryState>) -> Result<Registry, String> {
+    flush_to_disk(state.inner())?;
+    teams::sync_now()?;
+    let fresh = reload_into_state(state.inner())?;
+    nudge_gateway(state.inner());
+    Ok(fresh)
+}
+
+/// Leave the team: remove its merged servers, clear the connection and the token.
+#[tauri::command]
+fn team_disconnect(state: State<RegistryState>) -> Result<Registry, String> {
+    flush_to_disk(state.inner())?;
+    teams::disconnect()?;
+    let fresh = reload_into_state(state.inner())?;
+    nudge_gateway(state.inner());
+    Ok(fresh)
+}
+
+/// Admin: push the current local server set as the team's shared config (own servers
+/// only, secret values never sent). Returns the new config version.
+#[tauri::command]
+fn team_push(state: State<RegistryState>) -> Result<i64, String> {
+    flush_to_disk(state.inner())?;
+    teams::push_current()
+}
+
 /// Re-save the registry to bump its mtime. The running gateway watches that file
 /// and rebuilds on change, so freshly-vaulted credentials take effect (and the
 /// server's tools flow to connected clients) without a manual restart.
@@ -996,6 +1056,10 @@ pub fn run() {
             set_deny_destructive,
             set_lazy_discovery,
             set_allow_agent_control,
+            team_connect,
+            team_sync,
+            team_disconnect,
+            team_push,
             set_auth_token,
             clear_auth_token,
             has_auth_token,
