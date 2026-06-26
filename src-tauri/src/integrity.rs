@@ -198,7 +198,11 @@ pub fn scan_text(text: &str) -> Vec<String> {
         "hide this from the user",
         "without informing the user",
     ];
-    const EXEC: &[&str] = &["| sh", "|sh", "curl -s", "bash -c", "rm -rf", "invoke-expression", "iex(", "iex "];
+    const EXEC: &[&str] = &[
+        "| sh", "|sh", "| bash", "|bash", "curl -s", "wget ", "bash -c", "sh -c", "rm -rf",
+        "invoke-expression", "iex(", "iex ", "downloadstring(", "powershell -e", "powershell.exe -e",
+        "python -c", "python3 -c", "certutil -urlcache", "base64 -d",
+    ];
 
     if OVERRIDE.iter().any(|p| hay.contains(p)) {
         hits.push("instruction-override".to_string());

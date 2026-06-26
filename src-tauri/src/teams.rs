@@ -31,6 +31,15 @@ fn base(server_url: &str) -> String {
     server_url.trim_end_matches('/').to_string()
 }
 
+/// A ureq agent with a connect + read timeout. The team commands run on the Tauri
+/// command thread, so a slow or black-holed team server must not hang the UI: bare
+/// `ureq::get/post/put` have no timeout, this does.
+fn agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+}
+
 // --- HTTP client (ureq) ---
 
 #[derive(Debug)]
@@ -44,7 +53,7 @@ pub struct Joined {
 pub fn join(server_url: &str, invite_code: &str, member_name: Option<&str>) -> Result<Joined, String> {
     let url = format!("{}/join", base(server_url));
     let body = serde_json::json!({ "invite_code": invite_code, "member_name": member_name });
-    let resp = ureq::post(&url).send_json(body).map_err(stringify)?;
+    let resp = agent().post(&url).send_json(body).map_err(stringify)?;
     let v: Value = resp.into_json().map_err(|e| e.to_string())?;
     let token = v["member_token"].as_str().unwrap_or_default().to_string();
     if token.is_empty() {
@@ -67,7 +76,8 @@ pub fn pull_config(
 ) -> Result<Option<(i64, Value)>, String> {
     let url = format!("{}/teams/{}/config", base(server_url), team_id);
     let etag = format!("\"v{last_version}\"");
-    let req = ureq::get(&url)
+    let req = agent()
+        .get(&url)
         .set("authorization", &format!("Bearer {token}"))
         .set("if-none-match", &etag);
     match req.call() {
@@ -76,7 +86,19 @@ pub fn pull_config(
                 return Ok(None);
             }
             let v: Value = resp.into_json().map_err(|e| e.to_string())?;
-            Ok(Some((v["version"].as_i64().unwrap_or(0), v["config"].clone())))
+            // Guard a malformed-but-200 body: without a real server list we must NOT
+            // proceed, since apply_team_config would read the missing list as "the team
+            // removed every server" and wipe the user's merged team servers. An empty
+            // `servers: []` is legitimate (team genuinely has none); a missing/non-array
+            // `servers` is not.
+            let config = v.get("config").cloned().unwrap_or(Value::Null);
+            if !config.get("servers").map(Value::is_array).unwrap_or(false) {
+                return Err("team server returned a config without a server list".into());
+            }
+            let version = v["version"]
+                .as_i64()
+                .ok_or("team server returned a config without a version")?;
+            Ok(Some((version, config)))
         }
         Err(ureq::Error::Status(304, _)) => Ok(None),
         Err(e) => Err(stringify(e)),
@@ -87,12 +109,15 @@ pub fn pull_config(
 pub fn push_config(server_url: &str, team_id: &str, token: &str, config: &Value) -> Result<i64, String> {
     let url = format!("{}/teams/{}/config", base(server_url), team_id);
     let body = serde_json::json!({ "config": config });
-    let resp = ureq::put(&url)
+    let resp = agent()
+        .put(&url)
         .set("authorization", &format!("Bearer {token}"))
         .send_json(body)
         .map_err(stringify)?;
     let v: Value = resp.into_json().map_err(|e| e.to_string())?;
-    Ok(v["version"].as_i64().unwrap_or(0))
+    v["version"]
+        .as_i64()
+        .ok_or_else(|| "team server did not return a version after push".to_string())
 }
 
 fn stringify(e: ureq::Error) -> String {
@@ -112,6 +137,15 @@ fn stringify(e: ureq::Error) -> String {
 pub fn connect(server_url: &str, invite_code: &str, member_name: Option<&str>) -> Result<TeamConnection, String> {
     let joined = join(server_url, invite_code, member_name)?;
     save_token(&joined.member_token)?;
+    // The token is now in the keychain. Any failure past this point must clear it,
+    // or we'd orphan a live bearer token with no local record of the connection.
+    finish_connect(server_url, member_name, joined).map_err(|e| {
+        let _ = clear_token();
+        e
+    })
+}
+
+fn finish_connect(server_url: &str, member_name: Option<&str>, joined: Joined) -> Result<TeamConnection, String> {
     let mut reg = crate::registry::load()?;
     let conn = TeamConnection {
         server_url: base(server_url),
