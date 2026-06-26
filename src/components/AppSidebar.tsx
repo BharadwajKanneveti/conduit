@@ -60,12 +60,19 @@ function VersionFooter({
 
   useEffect(() => {
     let alive = true;
-    getVersion().then((v) => {
-      if (alive) setVersion(v);
-    });
-    checkForUpdate().then((r) => {
-      if (alive && r.kind === "update") setUpdate(r.update);
-    });
+    getVersion()
+      .then((v) => {
+        if (alive) setVersion(v);
+      })
+      .catch(() => {
+        // Never let a failed version lookup hide the whole footer toolbar.
+        if (alive) setVersion("?");
+      });
+    checkForUpdate()
+      .then((r) => {
+        if (alive && r.kind === "update") setUpdate(r.update);
+      })
+      .catch(() => {});
     return () => {
       alive = false;
     };

@@ -1,4 +1,10 @@
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
   Download,
@@ -51,8 +57,11 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [togglingAll, setTogglingAll] = useState(false);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
-  const [view, setView] = useState<"servers" | "activity" | "catalog" | "playground" | "teams">("servers");
+  const [view, setView] = useState<
+    "servers" | "activity" | "catalog" | "playground" | "teams"
+  >("servers");
   const [activityKey, setActivityKey] = useState(0);
   const [health, setHealth] = useState<Record<string, ProbeResult>>({});
   const [probing, setProbing] = useState(false);
@@ -136,7 +145,9 @@ function App() {
   }
 
   // Catalog and Activity are top-level destinations, so leave any selected client.
-  function selectView(v: "servers" | "activity" | "catalog" | "playground" | "teams") {
+  function selectView(
+    v: "servers" | "activity" | "catalog" | "playground" | "teams",
+  ) {
     setSelectedClientId(null);
     setView(v);
   }
@@ -159,7 +170,9 @@ function App() {
     const h = health[s.id];
     return h && !h.ok ? "attention" : "active";
   };
-  const attentionCount = servers.filter((s) => groupOf(s) === "attention").length;
+  const attentionCount = servers.filter(
+    (s) => groupOf(s) === "attention",
+  ).length;
 
   const q = query.trim().toLowerCase();
   const matches = (s: ServerEntry) =>
@@ -236,14 +249,17 @@ function App() {
   }
 
   async function handleToggleAll() {
-    if (!profileId) return;
+    if (!profileId || togglingAll) return;
     const enable = enabledCount < servers.length;
+    setTogglingAll(true);
     try {
       setRegistry(await setAllEnabled(profileId, enable));
       if (enable) void reprobe();
       toast.success(enable ? "Enabled all servers" : "Disabled all servers");
     } catch (e) {
       toast.error(`Couldn't update servers: ${e}`);
+    } finally {
+      setTogglingAll(false);
     }
   }
 
@@ -335,13 +351,17 @@ function App() {
                       ? "Invoke a server's tools and see the raw result"
                       : view === "teams"
                         ? "Share one MCP server set across your team"
-                      : selectedClient
-                        ? "MCP client"
-                      : loading || !registry
-                        ? "Loading…"
-                        : `${enabledCount} of ${servers.length} enabled` +
-                          (connectedCount ? ` · ${connectedCount} connected` : "") +
-                          (attentionCount ? ` · ${attentionCount} need attention` : "")}
+                        : selectedClient
+                          ? "MCP client"
+                          : loading || !registry
+                            ? "Loading…"
+                            : `${enabledCount} of ${servers.length} enabled` +
+                              (connectedCount
+                                ? ` · ${connectedCount} connected`
+                                : "") +
+                              (attentionCount
+                                ? ` · ${attentionCount} need attention`
+                                : "")}
               </p>
             </div>
             <div className="flex shrink-0 items-center gap-2">
@@ -378,9 +398,13 @@ function App() {
                       variant="ghost"
                       size="sm"
                       onClick={handleToggleAll}
-                      disabled={busyId !== null}
+                      disabled={busyId !== null || togglingAll}
                     >
-                      {enabledCount < servers.length ? "Enable all" : "Disable all"}
+                      {togglingAll
+                        ? "Working…"
+                        : enabledCount < servers.length
+                          ? "Enable all"
+                          : "Disable all"}
                     </Button>
                   )}
                   <Button
@@ -404,7 +428,9 @@ function App() {
                 onClick={load}
                 disabled={loading}
               >
-                <RefreshCw className={`size-4 ${loading ? "animate-spin" : ""}`} />
+                <RefreshCw
+                  className={`size-4 ${loading ? "animate-spin" : ""}`}
+                />
               </Button>
             </div>
           </header>
@@ -416,7 +442,10 @@ function App() {
               ) : view === "catalog" ? (
                 <CatalogView registry={registry} onAdded={setRegistry} />
               ) : view === "playground" ? (
-                <PlaygroundView registry={registry} onRegistryChange={setRegistry} />
+                <PlaygroundView
+                  registry={registry}
+                  onRegistryChange={setRegistry}
+                />
               ) : view === "teams" ? (
                 <TeamsView registry={registry} onRegistryChange={setRegistry} />
               ) : selectedClient ? (
@@ -568,10 +597,15 @@ function ErrorState({ message }: { message: string }) {
               browser-only dev server.
             </>
           ) : (
-            <>Conduit's backend didn't start. Try quitting and reopening the app.</>
+            <>
+              Conduit's backend didn't start. Try quitting and reopening the
+              app.
+            </>
           )}
         </p>
-        <p className="mt-2 font-mono text-xs text-muted-foreground/70">{message}</p>
+        <p className="mt-2 font-mono text-xs text-muted-foreground/70">
+          {message}
+        </p>
       </div>
     </div>
   );
