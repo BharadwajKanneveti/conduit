@@ -200,16 +200,18 @@ async function chat(messages, tools) {
   };
   // Retry rate limits (429) and transient 5xx with backoff, so free-tier limits
   // slow the run down instead of corrupting it. Honors Retry-After when present.
-  // Each attempt carries a fresh cache-busting nonce on the system message, so no
-  // request (or retry) can be served from a provider prompt/response cache, and
-  // repeated runs are independent samples. Token counts are unaffected (we read the
-  // full usage either way); this just guarantees fresh inference.
+  //
+  // Cache-busting is OPT-IN (BENCH_NOCACHE=1). Provider prompt caching does NOT
+  // change the reported token counts (we read full `usage`) and never returns a
+  // stale completion (it's recomputed at temperature 0), so leaving it on just
+  // makes a token-heavy flat run much cheaper. Set BENCH_NOCACHE=1 only if you want
+  // to force fully independent samples (e.g. for variance analysis).
+  const noCache = ["1", "true", "yes", "on"].includes((process.env.BENCH_NOCACHE || "").toLowerCase());
   let res;
   for (let attempt = 0; ; attempt++) {
-    const nonce = randomUUID();
     const msgs =
-      messages[0]?.role === "system"
-        ? [{ ...messages[0], content: `${messages[0].content}\n[uncached: ${nonce}]` }, ...messages.slice(1)]
+      noCache && messages[0]?.role === "system"
+        ? [{ ...messages[0], content: `${messages[0].content}\n[uncached: ${randomUUID()}]` }, ...messages.slice(1)]
         : messages;
     const body = JSON.stringify({ model: MODEL, messages: msgs, tools, tool_choice: "auto", temperature: 0 });
     res = await fetch(LLM_URL, { method: "POST", headers, body });

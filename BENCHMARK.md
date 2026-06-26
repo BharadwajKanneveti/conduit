@@ -1,51 +1,52 @@
 # Conduit token benchmark
 
-**Routing MCP servers through Conduit's lazy discovery cut tokens by ~90% at the
-same task success rate**, on a modest 3-server / 62-tool setup. The savings come
-from not loading every tool's schema into the model's context on every request.
+**Routing MCP servers through Conduit's lazy discovery cut total tokens 74-91% at the
+SAME task success rate**, measured on a frontier model and graded for *correct answers*,
+not just completion. Every task completed correctly in both modes, and the savings grow
+as you add servers. The reduction comes from not loading every tool's schema into the
+model's context on every request.
 
-Reproduce it yourself: [`benchmark/`](benchmark/) (points at a local LM Studio / Ollama).
+Reproduce it yourself: [`benchmark/`](benchmark/).
 
 ## Method
 
-- **Servers:** Stripe (11 tools), Neon (31), Vercel (19) = **62 tools**.
 - **Two modes**, same tasks, same model:
-  - **flat** , every tool exposed directly (`CONDUIT_DISCOVERY=full`), the normal MCP setup.
-  - **lazy** , Conduit advertises 3 meta-tools (`conduit_status`, `conduit_search_tools`,
+  - **flat**, every downstream tool exposed directly (`CONDUIT_DISCOVERY=full`), the normal MCP setup.
+  - **lazy**, Conduit advertises 3 meta-tools (`conduit_status`, `conduit_search_tools`,
     `conduit_call_tool`) and the agent searches/calls on demand (`CONDUIT_DISCOVERY=lazy`).
-- **Model:** Qwen2.5-7B-Instruct, local via LM Studio.
-- **Tasks (5 runs each):** list Stripe products; list Neon projects; list Vercel
-  projects (a two-step that needs a team id first).
-- **Measured:** tool-definition overhead (tokens every request pays just to list tools),
-  total tokens to complete each task, and completion.
+- **Model:** GPT-5.5 (frontier, via the Vercel AI Gateway), so model capability is not the
+  variable, both modes can actually complete every task.
+- **Tasks (5 runs each):** list Stripe products; list Neon projects; list Vercel projects
+  (a two-step that needs a team id first).
+- **Graded for correctness:** a run counts only if the agent's final answer contains the
+  real items from the account, so "completed" can't hide a wrong or "I couldn't" answer.
+- **Swept across catalog size** (3 and 6 connected servers) to show how the gap scales.
 
 ## Results
 
-**Tool-definition overhead** , the tokens carried on *every* request:
+End-to-end tokens to complete the three tasks (median of 5 runs), both modes graded:
 
-| Mode | Tools exposed | Overhead / request |
-|---|---|---|
-| flat | 62 | **23,698 tokens** |
-| lazy | 3 | **658 tokens** |
+| Servers | Tools | Flat tokens | Lazy tokens | Reduction | Correct (flat / lazy) |
+|---|---|---|---|---|---|
+| 3 | 63 | 179,181 | 47,095 | **74%** | 15/15 · 15/15 |
+| 6 | 183 | 471,775 | 40,354 | **91%** | 15/15 · 15/15 |
 
-→ **97% less overhead, on every single call.** (Deterministic, identical across runs.)
+Two things stand out:
 
-**Total tokens to complete each task** (median of 5 runs):
-
-| Task | flat | lazy | reduction |
-|---|---|---|---|
-| stripe-products | 71,612 | 9,839 | 86% |
-| neon-projects | 48,683 | 2,840 | 94% |
-| vercel-projects | 47,687 | 4,955 | 90% |
-| **total** | **167,982** | **17,634** | **90%** |
-
-**Completion: 15/15 in both modes.** Lazy discovery did not trade success for tokens.
+- **Identical task success.** Every task completed *correctly* in both modes, 30/30.
+  Lazy discovery did not trade accuracy for tokens.
+- **The savings grow with your catalog.** Flat's cost more than doubled as servers went
+  3 → 6 (it re-sends every tool schema on every call), while lazy's actually *dropped*
+  (47K → 40K), it pays a flat ~450-token meta-tool overhead no matter how many servers
+  you connect. Per-request tool-definition overhead: flat **19,002 → 51,533**, lazy a
+  constant **451**.
 
 ## Why flat is so expensive
 
-Flat mode re-sends all 62 tool schemas on **every** LLM call, so a 2-call task pays the
-~24K overhead twice before counting any real work. Lazy mode pays ~660 tokens of meta-tool
-overhead once and searches for what it needs. The more calls a task takes, the wider the gap.
+Flat mode re-sends every tool schema on **every** LLM call, so a multi-step task pays that
+overhead several times before counting any real work, and it climbs with each server you
+add. Lazy mode pays ~450 tokens of meta-tool overhead and searches for what it needs. The
+more tools you connect and the more calls a task takes, the wider the gap.
 
 ## Measured on a real 14-server catalog
 
@@ -104,11 +105,14 @@ run it on yours: `node benchmark/latency.mjs`.)
 
 ## Honest caveats
 
-- **Small sample**, one model, one machine, three tasks. Treat the *direction* (a large,
-  consistent reduction) as the signal, not the exact percentage.
-- **Lazy adds search round-trips.** The 90% total-token figure is already net of that. The
+- **Scope:** one frontier model (GPT-5.5), one machine, three read-only "list" tasks, 5
+  runs each. Treat the *direction* (a large, consistent reduction at equal correctness) as
+  the signal, not the exact percentage. The deterministic overhead numbers above need no
+  such caveat, they're exact.
+- **Correctness is graded, not eyeballed.** A run counts only if the answer contains the
+  account's real items, so the 30/30 is "right," not just "finished." Token counts come
+  from the model's reported `usage`.
+- **Lazy adds search round-trips.** The total-token figures are already net of that. The
   trade-off only pays off past a handful of tools; for a single tiny server it's overkill.
-- **Savings scale with your tool surface.** 62 tools here; bigger setups save more, smaller
-  save less. The per-request *overhead* reduction (97%) is the most stable number.
-- Token counts come from the model's reported usage; completion means the agent produced a
-  final answer (answers were eyeballed for correctness).
+- **Savings scale with your tool surface**, and that's the point: 74% at 63 tools, 91% at
+  183, 99.6% definition-overhead at 415. The more you connect, the wider the gap.

@@ -51,22 +51,23 @@ const GATEWAY = process.env.GATEWAY || defaultGateway();
 // match the servers you have connected; a case for a capability you don't have will
 // just show as a miss (note it).
 const CASES = [
-  // --- direct (should be easy) ---
-  { q: "list my stripe products", want: ["product"], kind: "direct" },
-  { q: "list my neon projects", want: ["list_projects", "project"], kind: "direct" },
-  { q: "list my vercel projects", want: ["list_projects", "project"], kind: "direct" },
-  { q: "list my github repositories", want: ["repo", "repositor"], kind: "direct" },
+  // --- direct (should be easy). Tightened to the actual action tool name so a
+  //     loose substring (e.g. any "...project...") can't count as a false hit. ---
+  { q: "list my stripe products", want: ["list_products", "stripe_api_read", "search_stripe_resources"], kind: "direct" },
+  { q: "list my neon projects", want: ["list_projects"], kind: "direct" },
+  { q: "list my vercel projects", want: ["list_projects"], kind: "direct" },
+  { q: "list my github repositories", want: ["list_repositor", "search_repositor"], kind: "direct" },
   // --- paraphrased / indirect (the hard cases) ---
-  { q: "charge a customer's credit card", want: ["payment_intent", "charge", "payment"], kind: "paraphrase" },
-  { q: "who are my paying customers", want: ["customer", "subscription"], kind: "paraphrase" },
-  { q: "open a pull request for my branch", want: ["pull_request", "create_pull", "_pr"], kind: "paraphrase" },
-  { q: "spin up a database branch to test a migration", want: ["create_branch", "branch"], kind: "paraphrase" },
-  { q: "run a SQL query against my database", want: ["run_sql", "sql", "query", "execute"], kind: "paraphrase" },
-  { q: "send a welcome email to a new signup", want: ["send", "email"], kind: "paraphrase" },
-  { q: "roll back my last deployment", want: ["deployment", "rollback", "redeploy", "promote"], kind: "paraphrase" },
-  { q: "what's my revenue this month", want: ["revenue", "metric", "overview", "chart", "balance"], kind: "paraphrase" },
+  { q: "charge a customer's credit card", want: ["payment_intent", "create_charge", "stripe_api_write"], kind: "paraphrase" },
+  { q: "who are my paying customers", want: ["list_customer", "search_customer", "customer"], kind: "paraphrase" },
+  { q: "open a pull request for my branch", want: ["create_pull_request", "pull_request"], kind: "paraphrase" },
+  { q: "spin up a database branch to test a migration", want: ["create_branch", "prepare_database_migration"], kind: "paraphrase" },
+  { q: "run a SQL query against my database", want: ["run_sql", "execute_sql", "run_query", "execute_postgres"], kind: "paraphrase" },
+  { q: "send a welcome email to a new signup", want: ["send_email", "send-email", "emails_send"], kind: "paraphrase" },
+  { q: "roll back my last deployment", want: ["rollback", "redeploy", "promote", "revert"], kind: "paraphrase" },
+  { q: "what's my revenue this month", want: ["revenue", "overview_metric", "list_metric", "balance"], kind: "paraphrase" },
   { q: "refund a payment", want: ["refund"], kind: "paraphrase" },
-  { q: "search my supabase database schema", want: ["table", "schema", "sql", "database"], kind: "paraphrase" },
+  { q: "inspect my supabase database schema", want: ["list_tables", "execute_sql", "list_extensions"], kind: "paraphrase" },
 ];
 
 // --- minimal MCP-over-stdio client ---
@@ -120,6 +121,12 @@ function rankOf(names, want) {
 
 (async () => {
   console.log(`gateway: ${GATEWAY}`);
+  const semOn = ["on", "1", "true", "yes"].includes((process.env.CONDUIT_SEMANTIC || "").toLowerCase());
+  console.log(
+    semOn
+      ? `mode:    SEMANTIC (embed: ${process.env.CONDUIT_EMBED_MODEL || "?"} @ ${process.env.CONDUIT_EMBED_ENDPOINT || "?"})`
+      : "mode:    LEXICAL (set CONDUIT_SEMANTIC=on + CONDUIT_EMBED_ENDPOINT/MODEL for semantic)",
+  );
   console.log(`retrieval recall over ${CASES.length} cases, top-${K}\n`);
   const gw = new Gateway();
   await gw.init();
