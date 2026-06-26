@@ -41,23 +41,42 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Stable fingerprint of a tool definition. serde_json serializes object keys
-/// sorted (BTreeMap) by default, so re-encoding the same schema is byte-stable and
-/// benign key reordering cannot false-positive as a change.
+/// Fingerprint-algorithm version. Bump whenever the set of hashed fields changes; a
+/// pin carrying a different version is re-baselined quietly instead of flagged as a
+/// tool change (see `check`), so a format upgrade never floods users with "changed".
+const FP_VERSION: &str = "v2";
+
+/// Stable fingerprint of a tool definition, prefixed with the algorithm version.
+/// serde_json serializes object keys sorted (BTreeMap) by default, so re-encoding the
+/// same value is byte-stable and benign key reordering cannot false-positive. Covers
+/// the security-relevant surface: name, description, inputSchema, outputSchema, and
+/// annotations (readOnlyHint / destructiveHint / title). Hashing annotations is the
+/// point: silently flipping `readOnlyHint: true -> false` or slipping in a malicious
+/// `annotations.title` is a rug-pull the old name+desc+inputSchema hash never caught.
 pub fn fingerprint(tool: &Value) -> String {
+    let json_of = |k: &str| {
+        tool.get(k)
+            .map(|v| serde_json::to_string(v).unwrap_or_default())
+            .unwrap_or_default()
+    };
     let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
     let desc = tool.get("description").and_then(Value::as_str).unwrap_or("");
-    let schema = tool
-        .get("inputSchema")
-        .map(|s| serde_json::to_string(s).unwrap_or_default())
-        .unwrap_or_default();
     let mut h = Sha256::new();
     h.update(name.as_bytes());
     h.update([0u8]);
     h.update(desc.as_bytes());
     h.update([0u8]);
-    h.update(schema.as_bytes());
-    to_hex(&h.finalize())
+    for k in ["inputSchema", "outputSchema", "annotations"] {
+        h.update(json_of(k).as_bytes());
+        h.update([0u8]);
+    }
+    format!("{FP_VERSION}:{}", to_hex(&h.finalize()))
+}
+
+/// The algorithm-version prefix of a fingerprint (everything before the first ':').
+/// Old fingerprints had none; a version mismatch means the two aren't comparable.
+fn fp_version(fp: &str) -> &str {
+    fp.split_once(':').map(|(v, _)| v).unwrap_or("")
 }
 
 fn server_of(namespaced: &str) -> &str {
@@ -123,7 +142,10 @@ pub fn check(profile: Option<&str>, current: &[Value]) -> Vec<Value> {
         let mut scan = !est;
         if est {
             match pins.get(name) {
-                Some(old) if *old != fp => {
+                // A different fingerprint is only a real change if it came from the same
+                // algorithm version; a version mismatch is our format upgrade, not the
+                // tool's, so re-baseline quietly (no event, no re-scan).
+                Some(old) if *old != fp && fp_version(old) == fp_version(&fp) => {
                     events.push(event(server, name, "changed"));
                     scan = true;
                 }
@@ -385,6 +407,35 @@ mod tests {
     }
 
     #[test]
+    fn fingerprint_covers_annotations_and_output_schema() {
+        let base = json!({ "name": "db__query", "description": "Run a query.",
+            "inputSchema": {"type":"object"}, "annotations": { "readOnlyHint": true },
+            "outputSchema": {"type":"array"} });
+        // Flipping readOnlyHint true->false is a silent privilege change; it MUST drift
+        // (the old name+desc+inputSchema fingerprint missed it entirely).
+        let flipped = json!({ "name": "db__query", "description": "Run a query.",
+            "inputSchema": {"type":"object"}, "annotations": { "readOnlyHint": false },
+            "outputSchema": {"type":"array"} });
+        assert_ne!(fingerprint(&base), fingerprint(&flipped), "readOnlyHint flip must drift");
+        let out = json!({ "name": "db__query", "description": "Run a query.",
+            "inputSchema": {"type":"object"}, "annotations": { "readOnlyHint": true },
+            "outputSchema": {"type":"string"} });
+        assert_ne!(fingerprint(&base), fingerprint(&out), "outputSchema change must drift");
+    }
+
+    #[test]
+    fn algorithm_upgrade_rebaselines_quietly() {
+        // Pins written by an older version are bare hex (no "vN:" prefix). After a
+        // fingerprint-format upgrade the same tool hashes differently, but that's our
+        // change, not the tool's, so it must re-baseline without a spurious "changed".
+        let pins: Pins = [("stripe__charge".to_string(), "deadbeef".to_string())]
+            .into_iter()
+            .collect();
+        let current = vec![tool("stripe__charge", "Create a charge.")];
+        assert!(diff(&pins, &current).is_empty(), "format upgrade must not flag a change");
+    }
+
+    #[test]
     fn detect_changed_and_added_on_established_server() {
         // diff() is the pure core; test it directly so we don't touch disk.
         let pins: Pins = [
@@ -481,7 +532,9 @@ mod tests {
                 continue;
             }
             match pins.get(name) {
-                Some(old) if old != fp => drifts.push(event(server_of(name), name, "changed")),
+                Some(old) if old != fp && fp_version(old) == fp_version(fp) => {
+                    drifts.push(event(server_of(name), name, "changed"))
+                }
                 None => drifts.push(event(server_of(name), name, "added")),
                 _ => {}
             }
