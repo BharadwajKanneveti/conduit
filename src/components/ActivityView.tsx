@@ -65,6 +65,9 @@ function fmtDollars(n: number): string {
  *  agent context, with a one-click share so users can flex their savings. */
 /** A badge describing one security event by kind. */
 function eventBadge(e: SecurityEvent): { label: string; cls: string } {
+  if (e.type === "result_injection") {
+    return { label: "injected result", cls: "bg-destructive/15 text-destructive" };
+  }
   if (e.type === "tool_poison_flag") {
     return { label: "suspicious content", cls: "bg-destructive/15 text-destructive" };
   }
@@ -74,9 +77,10 @@ function eventBadge(e: SecurityEvent): { label: string; cls: string } {
   return { label: "new tool", cls: "bg-sky-500/15 text-sky-300" };
 }
 
-/** Surfaces tool-definition security events: a tool you already approved changed
- * (rug-pull signal), a known server quietly added one, or a tool's definition
- * contains injection-like content (poisoning). Detection only. */
+/** Surfaces tool security events: a tool you approved changed (rug-pull signal),
+ * a known server added one, a tool definition contains injection-like content
+ * (poisoning), or a tool returned data that looks like injected instructions
+ * (agentjacking, which Conduit labels as data before the agent sees it). */
 function SecurityNotices({ events }: { events: SecurityEvent[] }) {
   return (
     <div className="mb-4 rounded-lg border border-amber-500/40 bg-amber-500/5 p-4">
@@ -85,9 +89,11 @@ function SecurityNotices({ events }: { events: SecurityEvent[] }) {
         <h3 className="text-sm font-medium text-amber-300">Tool security notices</h3>
       </div>
       <p className="mb-3 max-w-2xl text-xs text-muted-foreground">
-        A tool changed after you approved it, or a tool's definition contains
-        instruction-like content. Usually benign, but it's also how rug pulls and tool
-        poisoning work, review before trusting these tools again.
+        A tool changed after you approved it, a tool's definition contains
+        instruction-like content, or a tool returned data that looks like injected
+        instructions. Usually benign, but it's how rug pulls, tool poisoning, and
+        agentjacking work, so Conduit flags it (and labels suspicious tool output as
+        data). Review before trusting these again.
       </p>
       <ul className="space-y-1.5 text-xs">
         {events.slice(0, 10).map((e, i) => {

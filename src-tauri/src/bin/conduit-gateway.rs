@@ -958,13 +958,18 @@ fn handle_request(
             let (srv, tool) = name.split_once("__").unwrap_or(("?", name));
             let started = Instant::now();
             match router.route_call(name, arguments) {
-                Ok(result) => {
+                Ok(mut result) => {
                     let ok = !result
                         .get("isError")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
                     let ms = started.elapsed().as_millis() as u64;
                     audit::record_timed(srv, tool, ok, Some(ms));
+                    // Content defense: scan this untrusted tool output for injection
+                    // and label any flagged text as data before it reaches the agent.
+                    if reg.content_defense {
+                        integrity::inspect_result(srv, tool, &mut result);
+                    }
                     Some(success(id, result))
                 }
                 Err(e) => {

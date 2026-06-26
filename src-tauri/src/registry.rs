@@ -124,6 +124,11 @@ pub struct Registry {
     /// never blocks. On by default.
     #[serde(default = "default_true")]
     pub integrity_check: bool,
+    /// Content defense (anti-agentjacking): scan untrusted tool RESULTS for injection
+    /// and label flagged content as data, not instructions, before the agent sees it.
+    /// Detection + labeling, never blocks. On by default.
+    #[serde(default = "default_true")]
+    pub content_defense: bool,
     /// Optional semantic re-ranking for tool search (blends embedding similarity
     /// into the lexical ranking). Off by default; when off or unconfigured, search
     /// is pure lexical exactly as before.
@@ -177,6 +182,7 @@ impl Default for Registry {
             lazy_discovery: true,
             allow_agent_control: false,
             integrity_check: true,
+            content_defense: true,
             semantic_search: SemanticSettings::default(),
         }
     }

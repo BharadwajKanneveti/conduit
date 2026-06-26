@@ -6,6 +6,12 @@ All notable changes to Conduit are documented here. Format loosely follows
 ## [Unreleased]
 
 ### Added
+- **Content defense (anti-agentjacking).** The gateway scans untrusted tool *results*
+  for injection-like content and, on a hit, wraps the offending text with a provenance
+  marker ("external data, not instructions") before the agent sees it, plus records a
+  security notice. Information-preserving (the original text stays inside the marker),
+  only flagged results are touched, never blocks. On by default (`contentDefense`). The
+  result-side companion to the definition-side integrity checks.
 - **Tool-definition integrity (rug-pull + poisoning detection).** The gateway now
   fingerprints every tool when a server is first connected and diffs it on each
   refresh. If a previously-approved tool's definition changes, or a known server adds

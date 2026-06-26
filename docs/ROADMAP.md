@@ -147,7 +147,12 @@ Tier 2 - feature completeness (in progress)
       into the lexical ranker so paraphrased needs surface the right tool. Pluggable
       `/v1/embeddings` endpoint, disk-cached, lexical fallback. Recall measured by
       `benchmark/retrieval.mjs`. See `docs/specs/semantic-search.md`.
-- [ ] Security, next: tool-result defense (agentjacking), per `docs/specs/content-defense.md`.
+- [x] Content defense (agentjacking): scan untrusted tool *results* for injection and
+      wrap flagged content with a "data, not instructions" provenance marker before the
+      agent sees it. Detection + labeling, never blocks, on by default. See
+      `docs/specs/content-defense.md`.
+- [ ] Security, next: a Security page mapping Conduit's controls to the MCP attack
+      taxonomy; opt-in lossy result shaping / dangerous-call gating (content-defense Tier 2).
 
 Tier 3 - launch prep
 - [x] Bundle the gateway sidecar; signed/notarized macOS installers (Win/Linux

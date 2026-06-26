@@ -74,6 +74,14 @@ Conduit fixes both:
   any call). Both show up as security notices in Activity. Detection only (it never
   blocks), on by default, and entirely local. Because Conduit is on the path and
   already watches for tool changes, it's the natural place to catch this.
+- **Content defense (anti-agentjacking).** The flip side of the result path: when a
+  tool *returns* untrusted content (a Sentry error, a web page, an issue body) that
+  contains injection-like instructions, Conduit flags it and wraps it with a marker
+  telling the agent it's external data, not instructions, the data/instruction
+  separation that blunts indirect prompt injection. The original content is preserved,
+  only flagged results are touched, and it never blocks the call. On by default. (A
+  gateway can't see execution that happens through the client's own shell, so this is
+  defense in depth, ingress hardening, not a silver bullet.)
 - **Agent-controllable, on your terms.** Turn on *Allow agent control* and an
   agent can enable or disable servers itself through the gateway
   (`conduit_enable_server` / `conduit_disable_server`), with the change reflected
