@@ -448,6 +448,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
                 >
                   <button
                     onClick={() => setSelectedTool(t.name)}
+                    aria-pressed={selected}
                     className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left"
                   >
                     <span className="flex items-center gap-2">

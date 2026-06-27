@@ -472,6 +472,7 @@ export function ActivityView({ refreshKey }: { refreshKey: number }) {
         </Select>
         <button
           onClick={() => setErrorsOnly((v) => !v)}
+          aria-pressed={errorsOnly}
           className={`h-8 rounded-md border px-2.5 text-sm transition-colors ${
             errorsOnly
               ? "border-destructive/50 bg-destructive/10 text-destructive"

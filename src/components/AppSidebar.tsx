@@ -395,6 +395,29 @@ export function AppSidebar({
   const sorted = sortClients(clients);
   const detectedClients = sorted.filter((c) => statusOf(c) !== "missing");
   const missingClients = sorted.filter((c) => statusOf(c) === "missing");
+
+  // One sidebar nav row. The active row gets the accent background, a foreground
+  // icon (not muted), and aria-current so screen readers announce the selection.
+  const navItem = (
+    Icon: typeof Layers,
+    label: string,
+    active: boolean,
+    onClick: () => void,
+  ) => (
+    <button
+      onClick={onClick}
+      aria-current={active ? "page" : undefined}
+      className={`flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-accent ${
+        active ? "bg-accent" : ""
+      }`}
+    >
+      <Icon
+        className={`size-4 shrink-0 ${active ? "text-foreground" : "text-muted-foreground"}`}
+      />
+      <span>{label}</span>
+    </button>
+  );
+
   return (
     <aside className="flex h-screen w-72 shrink-0 flex-col border-r bg-sidebar">
       <div className="flex items-center gap-2.5 px-4 py-4">
@@ -429,53 +452,26 @@ export function AppSidebar({
           </div>
         )}
 
-        <div className="flex flex-col gap-0.5 px-3 pt-2">
-          <button
-            onClick={() => onSelectClient(null)}
-            className={`flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-accent ${
-              view === "servers" && selectedClientId === null ? "bg-accent" : ""
-            }`}
-          >
-            <Layers className="size-4 shrink-0 text-muted-foreground" />
-            <span>All servers</span>
-          </button>
-          <button
-            onClick={() => onSelectView("catalog")}
-            className={`flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-accent ${
-              view === "catalog" ? "bg-accent" : ""
-            }`}
-          >
-            <Store className="size-4 shrink-0 text-muted-foreground" />
-            <span>Browse catalog</span>
-          </button>
-          <button
-            onClick={() => onSelectView("playground")}
-            className={`flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-accent ${
-              view === "playground" ? "bg-accent" : ""
-            }`}
-          >
-            <FlaskConical className="size-4 shrink-0 text-muted-foreground" />
-            <span>Playground</span>
-          </button>
-          <button
-            onClick={() => onSelectView("activity")}
-            className={`flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-accent ${
-              view === "activity" ? "bg-accent" : ""
-            }`}
-          >
-            <ScrollText className="size-4 shrink-0 text-muted-foreground" />
-            <span>Activity</span>
-          </button>
-          <button
-            onClick={() => onSelectView("teams")}
-            className={`flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-left text-sm transition-colors hover:bg-accent ${
-              view === "teams" ? "bg-accent" : ""
-            }`}
-          >
-            <Users className="size-4 shrink-0 text-muted-foreground" />
-            <span>Teams</span>
-          </button>
-        </div>
+        <nav aria-label="Views" className="flex flex-col gap-0.5 px-3 pt-2">
+          {navItem(
+            Layers,
+            "All servers",
+            view === "servers" && selectedClientId === null,
+            () => onSelectClient(null),
+          )}
+          {navItem(Store, "Browse catalog", view === "catalog", () =>
+            onSelectView("catalog"),
+          )}
+          {navItem(FlaskConical, "Playground", view === "playground", () =>
+            onSelectView("playground"),
+          )}
+          {navItem(ScrollText, "Activity", view === "activity", () =>
+            onSelectView("activity"),
+          )}
+          {navItem(Users, "Teams", view === "teams", () =>
+            onSelectView("teams"),
+          )}
+        </nav>
 
         <div className="px-3 pt-3">
           <div className="px-2.5 pb-1.5 text-xs font-medium tracking-wide text-muted-foreground uppercase">
