@@ -40,6 +40,9 @@ All notable changes to Conduit are documented here. Format loosely follows
   instead of overflowing their rows.
 - Consistent transport pills across every server list, plural-correct labels ("1 tool"),
   and several user-facing strings tidied up.
+- The server row no longer nests its toggle and Authenticate buttons inside a clickable
+  button. Mouse users still click anywhere on the row to expand; keyboard and screen
+  reader users get a dedicated chevron button with proper `aria-expanded`.
 
 ## [0.5.2] - 2026-06-27
 

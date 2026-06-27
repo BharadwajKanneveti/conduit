@@ -100,25 +100,14 @@ export function RegistryServerRow({
     <div
       className={`border-b border-border/60 last:border-b-0 ${enabled ? "" : "opacity-60"}`}
     >
+      {/* Mouse users can click anywhere on the row to expand. Keyboard and screen
+          reader users use the chevron button at the end. The row itself is not a
+          button, so the toggle and Authenticate controls aren't nested inside one. */}
       <div
-        role="button"
-        tabIndex={0}
-        aria-expanded={expanded}
-        aria-label={`${server.name} details`}
         onClick={() => setExpanded((v) => !v)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            setExpanded((v) => !v);
-          }
-        }}
-        className="flex cursor-pointer items-center gap-3 px-3.5 py-2 transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-inset"
+        className="flex cursor-pointer items-center gap-3 px-3.5 py-2 transition-colors hover:bg-accent/40"
       >
-        <span
-          className="flex items-center"
-          onClick={stop}
-          onKeyDown={stop}
-        >
+        <span className="flex items-center" onClick={stop}>
           <Switch
             checked={enabled}
             disabled={busy}
@@ -151,7 +140,6 @@ export function RegistryServerRow({
               trigger={
                 <button
                   onClick={stop}
-                  onKeyDown={stop}
                   className="inline-flex items-center gap-1.5 rounded-md border border-warning/40 px-2.5 py-1 text-xs text-warning transition-colors hover:bg-warning/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-warning"
                 >
                   <LogIn className="size-3.5" />
@@ -176,12 +164,27 @@ export function RegistryServerRow({
             />
           )}
 
-          <ChevronDown
-            className={`size-4 text-muted-foreground/50 transition-transform ${
-              expanded ? "rotate-180" : ""
-            }`}
-            aria-hidden="true"
-          />
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setExpanded((v) => !v);
+            }}
+            aria-expanded={expanded}
+            aria-label={
+              expanded
+                ? `Hide ${server.name} details`
+                : `Show ${server.name} details`
+            }
+            className="rounded p-0.5 text-muted-foreground/50 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          >
+            <ChevronDown
+              className={`size-4 transition-transform ${
+                expanded ? "rotate-180" : ""
+              }`}
+              aria-hidden="true"
+            />
+          </button>
         </span>
       </div>
 
