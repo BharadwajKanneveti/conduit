@@ -3,6 +3,58 @@
 All notable changes to Conduit are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 
+## [0.5.0] - 2026-06-27
+
+A security-hardening release. Conduit tightens the whole tool-trust boundary,
+caps and filters what the gateway will fetch and sync, and on macOS finally ends
+the repeated keychain prompts by moving secrets to the DataProtection keychain.
+Plus accessibility and UI polish.
+
+### Fixed
+- **macOS keychain prompts are gone.** Secrets now live in the macOS
+  **DataProtection keychain**, which has no per-application ACLs and no
+  cross-process prompts, so the app and the gateway both read them after a single
+  unlock. Existing secrets migrate automatically on first launch. (#26, #27)
+- **The sidebar action bar stays put.** It's pinned to the bottom of the server
+  list and always visible instead of appearing only when you scroll to the end,
+  and undetected clients collapse under a disclosure so the list stays short.
+
+### Security
+- **Hardened the anti-agentjacking scan.** Tool results are normalized before
+  scanning (lowercase, invisible/zero-width/bidi stripping, homoglyph and
+  full-width folding) and base64-decoded payloads are scanned too, so injection
+  text can't slip past with Unicode tricks or encoding. Nested `structuredContent`
+  is scanned as well.
+- **Rug-pull detection covers more of the tool definition.** Fingerprints now
+  include `outputSchema` and `annotations` (version-tagged), so a server can't
+  quietly change those behind an already-approved tool.
+- **Integrity pins fail closed.** A corrupt or tampered pin baseline now raises a
+  security event instead of silently resetting to trust-everything.
+- **Blocked RCE/SSRF from synced team config.** Team sync drops stdio/command
+  servers (remote code execution) and private-host URLs (SSRF); only public remote
+  servers sync. The gateway also stops following HTTP redirects.
+- **Capped downstream responses.** The gateway limits how much it reads from a
+  downstream MCP server (16 MiB), so a hostile or runaway server can't exhaust
+  memory.
+- **Validated catalog install specs.** Registry-supplied package IDs with shell
+  metacharacters or leading dashes are rejected, remote URLs must be http(s), and
+  the registry fetch is size-capped.
+- **Teams/OAuth hardening.** HTTP timeouts, a malformed-config guard, and token
+  cleanup after a failed connect.
+
+### Accessibility
+- **Respects "reduce motion."** When the OS prefers reduced motion, Conduit zeroes
+  out spinners, pulses, dialog and tooltip zooms, and transitions.
+
+### Internal
+- **CI on every PR**: frontend build, Rust library tests, and a gateway build
+  check now run on pull requests across the project.
+- Removed leftover Vite/Tauri scaffold files and shipped a real favicon.
+
+### Thanks
+- @bradhallett (#26, #27) for tracing the macOS keychain prompts to their root
+  cause and moving secrets to the DataProtection keychain.
+
 ## [0.4.2] - 2026-06-26
 
 ### Added
