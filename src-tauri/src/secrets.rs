@@ -47,8 +47,137 @@ mod platform {
     use super::{account, SERVICE};
 
     pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
-        set_generic_password(SERVICE, &account(server_id, key), value.as_bytes())
-            .map_err(|e| e.to_string())
+        let acct = account(server_id, key);
+        // Preferred path: create the item WITH a shared-access ACL (this app + the
+        // gateway) in one atomic SecItemAdd. Setting the ACL at creation needs no
+        // prompt; setting it AFTER creation (SecKeychainItemSetAccess) prompts for
+        // the keychain password. With the ACL in place the separately-signed gateway
+        // reads the secret with no prompt either.
+        match add_with_shared_access(&acct, value) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Never let secret storage fail: fall back to the plain ACL-free
+                // write (the gateway then falls back to a one-time "Always Allow").
+                eprintln!("conduit: shared-access write failed ({e}); using plain write");
+                let _ = delete_generic_password(SERVICE, &acct);
+                set_generic_password(SERVICE, &acct, value.as_bytes()).map_err(|e| e.to_string())
+            }
+        }
+    }
+
+    /// Create a generic-password item that BOTH the Conduit app and the
+    /// `conduit-gateway` binary can read with no keychain prompt: build a legacy
+    /// `SecAccess` whose trusted-applications list names both binaries and pass it
+    /// as `kSecAttrAccess` on `SecItemAdd`. Setting the ACL atomically at creation
+    /// avoids the keychain-password prompt that a post-hoc `SecKeychainItemSetAccess`
+    /// would raise.
+    ///
+    /// Why this and not `keychain-access-groups`: that's a *restricted* entitlement
+    /// requiring an embedded provisioning profile, which a bare CLI binary (the
+    /// gateway, spawned standalone by clients) cannot carry, so AMFI SIGKILLs it at
+    /// launch (-34018 / amfid -413). The legacy trusted-application ACL works for
+    /// Developer ID distribution with no profile. APIs are deprecated-but-functional.
+    fn add_with_shared_access(account_str: &str, value: &str) -> Result<(), String> {
+        use core_foundation::array::CFArray;
+        use core_foundation::base::{CFType, CFTypeRef, TCFType};
+        use core_foundation::data::CFData;
+        use core_foundation::dictionary::CFDictionary;
+        use core_foundation::string::CFString;
+        use std::ffi::{c_void, CString};
+        use std::os::raw::c_char;
+
+        #[link(name = "Security", kind = "framework")]
+        extern "C" {
+            fn SecTrustedApplicationCreateFromPath(
+                path: *const c_char,
+                app: *mut *mut c_void,
+            ) -> i32;
+            fn SecAccessCreate(
+                descriptor: *const c_void,
+                trustedlist: *const c_void,
+                access_ref: *mut *mut c_void,
+            ) -> i32;
+            fn SecItemAdd(attributes: *const c_void, result: *mut *const c_void) -> i32;
+            fn SecItemDelete(query: *const c_void) -> i32;
+            static kSecClass: CFTypeRef;
+            static kSecClassGenericPassword: CFTypeRef;
+            static kSecAttrService: CFTypeRef;
+            static kSecAttrAccount: CFTypeRef;
+            static kSecValueData: CFTypeRef;
+            static kSecAttrAccess: CFTypeRef;
+        }
+
+        // 1. Build a SecAccess trusting the two binaries (this app + the gateway).
+        let app_path = std::env::current_exe().map_err(|e| e.to_string())?;
+        let gw_path = crate::clients::resolve_gateway_path()
+            .ok_or_else(|| "could not resolve gateway path".to_string())?;
+        let trusted_app = |p: &std::path::Path| -> Result<CFType, String> {
+            let c = CString::new(p.to_string_lossy().into_owned()).map_err(|e| e.to_string())?;
+            let mut app: *mut c_void = std::ptr::null_mut();
+            let st = unsafe { SecTrustedApplicationCreateFromPath(c.as_ptr(), &mut app) };
+            if st != 0 || app.is_null() {
+                return Err(format!(
+                    "SecTrustedApplicationCreateFromPath({}) failed: {st}",
+                    p.display()
+                ));
+            }
+            Ok(unsafe { CFType::wrap_under_create_rule(app as CFTypeRef) })
+        };
+        let trusted = CFArray::from_CFTypes(&[trusted_app(&app_path)?, trusted_app(&gw_path)?]);
+        let label = CFString::new("conduit-mcp");
+        let mut access: *mut c_void = std::ptr::null_mut();
+        let st = unsafe {
+            SecAccessCreate(
+                label.as_concrete_TypeRef() as *const c_void,
+                trusted.as_concrete_TypeRef() as *const c_void,
+                &mut access,
+            )
+        };
+        if st != 0 || access.is_null() {
+            return Err(format!("SecAccessCreate failed: {st}"));
+        }
+        let access_cf = unsafe { CFType::wrap_under_create_rule(access as CFTypeRef) };
+
+        // The kSec* keys are CFString constants; pull them into safe CFType values.
+        let (k_class, k_generic, k_service, k_account, k_value, k_access) = unsafe {
+            (
+                CFType::wrap_under_get_rule(kSecClass),
+                CFType::wrap_under_get_rule(kSecClassGenericPassword),
+                CFType::wrap_under_get_rule(kSecAttrService),
+                CFType::wrap_under_get_rule(kSecAttrAccount),
+                CFType::wrap_under_get_rule(kSecValueData),
+                CFType::wrap_under_get_rule(kSecAttrAccess),
+            )
+        };
+        let service_cf = CFString::new(SERVICE).as_CFType();
+        let account_cf = CFString::new(account_str).as_CFType();
+
+        // 2. Remove any existing item for this account (SecItemAdd rejects dups).
+        let del = CFDictionary::from_CFType_pairs(&[
+            (k_class.clone(), k_generic.clone()),
+            (k_service.clone(), service_cf.clone()),
+            (k_account.clone(), account_cf.clone()),
+        ]);
+        unsafe {
+            SecItemDelete(del.as_concrete_TypeRef() as *const c_void);
+        }
+
+        // 3. Add the item WITH the shared-access ACL, atomically (no prompt).
+        let data_cf = CFData::from_buffer(value.as_bytes()).as_CFType();
+        let add = CFDictionary::from_CFType_pairs(&[
+            (k_class, k_generic),
+            (k_service, service_cf),
+            (k_account, account_cf),
+            (k_value, data_cf),
+            (k_access, access_cf),
+        ]);
+        let st = unsafe {
+            SecItemAdd(add.as_concrete_TypeRef() as *const c_void, std::ptr::null_mut())
+        };
+        if st != 0 {
+            return Err(format!("SecItemAdd with shared access failed: {st}"));
+        }
+        Ok(())
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
@@ -98,11 +227,12 @@ mod platform {
             match get_generic_password(SERVICE, &acct) {
                 Ok(bytes) => match String::from_utf8(bytes) {
                     Ok(value) => {
-                        // Delete just this entry, then rewrite via SecItemAdd.
-                        // Per-account scoping means an interruption between delete
-                        // and rewrite costs one key, not the entire keychain.
+                        // Delete just this entry, then rewrite via set_secret, which
+                        // recreates it WITH the shared-access ACL (app + gateway) so
+                        // the gateway reads it with no prompt. Per-account scoping
+                        // means an interruption costs one key, not the keychain.
                         let _ = delete_entry_by_account(&acct);
-                        match set_generic_password(SERVICE, &acct, value.as_bytes()) {
+                        match set_secret(server_id, key, &value) {
                             Ok(()) => migrated += 1,
                             Err(_) => failed += 1,
                         }
@@ -222,14 +352,17 @@ pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
 // items with per-application ACLs. This migration reads each entry's value,
 // deletes it, and re-creates it via the ACL-free `SecItemAdd` path.
 //
-// The migration is guarded by a marker file so it runs exactly once. Only the
-// UI app runs it — the gateway can't read legacy entries without triggering
-// prompts (it's a separately signed process without ACL grants).
+// The migration is guarded by a marker file so it runs once per marker version.
+// Only the UI app runs it — the gateway can't rewrite entries without triggering
+// prompts (it's a separately signed process). Bumping the marker name
+// (".keychain-migrated" -> ".keychain-acl-migrated") makes the migration re-run
+// once on upgrade so EXISTING secrets are rewritten WITH the shared-access ACL,
+// not just legacy keyring-API entries.
 
 /// Marker file name in the Conduit data directory. Only the macOS migration reads
 /// it, so it's cfg-gated to avoid a dead-code warning on Windows/Linux builds.
 #[cfg(target_os = "macos")]
-const MIGRATION_MARKER: &str = ".keychain-migrated";
+const MIGRATION_MARKER: &str = ".keychain-acl-migrated";
 
 /// Result of the one-time keychain migration.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
