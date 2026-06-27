@@ -79,6 +79,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("Sentry", "Errors, issues, and releases from Sentry.", "https://mcp.sentry.dev/mcp", "https://docs.sentry.io"),
         http("Cloudflare Docs", "Search Cloudflare's documentation.", "https://docs.mcp.cloudflare.com/mcp", "https://developers.cloudflare.com/agents/model-context-protocol/"),
         cmd("AWS", "AWS APIs, docs, and best practices via AWS Labs MCP.", "uvx", &["awslabs.core-mcp-server@latest"], &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], "https://github.com/awslabs/mcp"),
+        cmd("Kubernetes", "Inspect and manage Kubernetes clusters via your kubeconfig.", "npx", &["-y", "mcp-server-kubernetes"], &[], "https://github.com/Flux159/mcp-server-kubernetes"),
         // --- Databases ---
         http("Supabase", "Query and manage your Supabase projects.", "https://mcp.supabase.com/mcp", "https://supabase.com/docs/guides/getting-started/mcp"),
         http("Neon", "Serverless Postgres: branches, queries, projects.", "https://mcp.neon.tech/mcp", "https://neon.tech/docs/ai/neon-mcp-server"),
@@ -92,6 +93,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("Atlassian", "Jira issues and Confluence pages.", "https://mcp.atlassian.com/v1/mcp", "https://support.atlassian.com/atlassian-rovo-mcp-server/"),
         http("Asana", "Tasks, projects, and portfolios in Asana.", "https://mcp.asana.com/mcp", "https://developers.asana.com/docs/mcp-server"),
         cmd("Airtable", "Read and write records in your Airtable bases.", "npx", &["-y", "airtable-mcp-server"], &["AIRTABLE_API_KEY"], "https://github.com/domdomegg/airtable-mcp-server"),
+        cmd("Todoist", "Manage Todoist tasks and projects.", "npx", &["-y", "@abhiz123/todoist-mcp-server"], &["TODOIST_API_TOKEN"], "https://github.com/abhiz123/todoist-mcp-server"),
         // --- Communication ---
         cmd("Slack", "Read and send Slack messages and manage channels.", "npx", &["-y", "@modelcontextprotocol/server-slack"], &["SLACK_BOT_TOKEN", "SLACK_TEAM_ID"], "https://github.com/modelcontextprotocol/servers"),
         // --- Knowledge & search ---
@@ -102,6 +104,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         cmd("Brave Search", "Web search via the Brave Search API.", "npx", &["-y", "@modelcontextprotocol/server-brave-search"], &["BRAVE_API_KEY"], "https://github.com/modelcontextprotocol/servers"),
         cmd("Exa", "AI-native web search built for agents.", "npx", &["-y", "exa-mcp-server"], &["EXA_API_KEY"], "https://github.com/exa-labs/exa-mcp-server"),
         cmd("Tavily", "Web search and content extraction built for LLMs.", "npx", &["-y", "tavily-mcp"], &["TAVILY_API_KEY"], "https://github.com/tavily-ai/tavily-mcp"),
+        cmd("Perplexity", "Ask Perplexity for cited, up-to-date answers.", "npx", &["-y", "server-perplexity-ask"], &["PERPLEXITY_API_KEY"], "https://github.com/ppl-ai/modelcontextprotocol"),
         cmd("Firecrawl", "Web scraping and data extraction from websites.", "npx", &["-y", "firecrawl-mcp"], &["FIRECRAWL_API_KEY"], "https://github.com/firecrawl/firecrawl-mcp-server"),
         cmd("Apify", "Run Apify actors for web scraping and automation.", "npx", &["-y", "@apify/actors-mcp-server"], &["APIFY_TOKEN"], "https://github.com/apify/actors-mcp-server"),
         cmd("Browserbase", "Cloud headless browsers agents can drive.", "npx", &["-y", "@browserbasehq/mcp-server-browserbase"], &["BROWSERBASE_API_KEY", "BROWSERBASE_PROJECT_ID"], "https://github.com/browserbase/mcp-server-browserbase"),
