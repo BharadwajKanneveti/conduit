@@ -37,9 +37,9 @@ eat your context window).
 
 ## Screenshots
 
-| Servers | Activity | Playground |
+| Servers | Catalog | Activity |
 |---|---|---|
-| ![All servers](docs/screenshots/servers.png) | ![Activity and metrics](docs/screenshots/activity.png) | ![Tool playground](docs/screenshots/playground.png) |
+| ![Every server in one dense list with health, secrets, and per-tool toggles](docs/screenshots/servers.png) | ![A curated catalog of MCP servers grouped by category](docs/screenshots/catalog.png) | ![Per-server latency, error rates, token savings, and tool-security notices](docs/screenshots/activity.png) |
 
 ## Why
 
