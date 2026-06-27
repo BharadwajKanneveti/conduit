@@ -3,6 +3,17 @@
 All notable changes to Conduit are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 
+## [0.5.1] - 2026-06-27
+
+### Fixed
+- **macOS: the keychain prompts are gone.** The `conduit-gateway` helper that your
+  AI clients launch now reads your vaulted secrets (API keys, OAuth/bearer tokens)
+  with no keychain password prompt. Newly saved secrets get this automatically;
+  existing ones are upgraded on first launch. (Done with a trusted-application ACL
+  granting both the app and the gateway access, since the modern entitlement
+  approach can't work for a standalone helper binary.) Thanks @bradhallett for
+  tracing the root cause.
+
 ## [0.5.0] - 2026-06-27
 
 A security-hardening release. Conduit tightens the whole tool-trust boundary,
