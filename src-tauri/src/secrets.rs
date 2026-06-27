@@ -227,11 +227,12 @@ mod platform {
             match get_generic_password(SERVICE, &acct) {
                 Ok(bytes) => match String::from_utf8(bytes) {
                     Ok(value) => {
-                        // Delete just this entry, then rewrite via SecItemAdd.
-                        // Per-account scoping means an interruption between delete
-                        // and rewrite costs one key, not the entire keychain.
+                        // Delete just this entry, then rewrite via set_secret, which
+                        // recreates it WITH the shared-access ACL (app + gateway) so
+                        // the gateway reads it with no prompt. Per-account scoping
+                        // means an interruption costs one key, not the keychain.
                         let _ = delete_entry_by_account(&acct);
-                        match set_generic_password(SERVICE, &acct, value.as_bytes()) {
+                        match set_secret(server_id, key, &value) {
                             Ok(()) => migrated += 1,
                             Err(_) => failed += 1,
                         }
@@ -351,14 +352,17 @@ pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
 // items with per-application ACLs. This migration reads each entry's value,
 // deletes it, and re-creates it via the ACL-free `SecItemAdd` path.
 //
-// The migration is guarded by a marker file so it runs exactly once. Only the
-// UI app runs it — the gateway can't read legacy entries without triggering
-// prompts (it's a separately signed process without ACL grants).
+// The migration is guarded by a marker file so it runs once per marker version.
+// Only the UI app runs it — the gateway can't rewrite entries without triggering
+// prompts (it's a separately signed process). Bumping the marker name
+// (".keychain-migrated" -> ".keychain-acl-migrated") makes the migration re-run
+// once on upgrade so EXISTING secrets are rewritten WITH the shared-access ACL,
+// not just legacy keyring-API entries.
 
 /// Marker file name in the Conduit data directory. Only the macOS migration reads
 /// it, so it's cfg-gated to avoid a dead-code warning on Windows/Linux builds.
 #[cfg(target_os = "macos")]
-const MIGRATION_MARKER: &str = ".keychain-migrated";
+const MIGRATION_MARKER: &str = ".keychain-acl-migrated";
 
 /// Result of the one-time keychain migration.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]

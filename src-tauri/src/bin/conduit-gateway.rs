@@ -1366,6 +1366,18 @@ fn main() {
                     }
                 }
             }
+            // Bearer / OAuth tokens live under a reserved key, not as env vars.
+            match secrets::get_secret_result(&s.id, secrets::HTTP_AUTH_KEY) {
+                Ok(Some(_)) => {
+                    ok += 1;
+                    println!("OK     {} :: (auth token)", s.id);
+                }
+                Ok(None) => {}
+                Err(e2) => {
+                    err += 1;
+                    println!("ERR    {} :: (auth token)  ({e2})", s.id);
+                }
+            }
         }
         println!("\nselftest-secrets: {ok} read OK, {unset} unset, {err} errors");
         println!("If NO keychain prompt appeared, the gateway has silent access (the ACL works).");
