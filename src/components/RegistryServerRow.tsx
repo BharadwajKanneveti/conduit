@@ -150,6 +150,7 @@ export function RegistryServerRow({
               trigger={
                 <button
                   onClick={stop}
+                  onKeyDown={stop}
                   className="inline-flex items-center gap-1.5 rounded-md border border-amber-400/40 px-2.5 py-1 text-xs text-amber-500 transition-colors hover:bg-amber-400/10 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-amber-400"
                 >
                   <LogIn className="size-3.5" />

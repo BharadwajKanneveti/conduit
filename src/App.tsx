@@ -137,6 +137,10 @@ function App() {
           if (results.length > 0) {
             const up = results.filter((r) => r.ok).length;
             toast.success(`${up} of ${results.length} servers healthy`);
+          } else {
+            // Registry/clients still reloaded; give feedback even when the probe
+            // was skipped (already in flight) or there are no servers to report.
+            toast.success("Refreshed");
           }
         } else {
           void reprobe();
@@ -534,6 +538,7 @@ function App() {
       </div>
       {showOnboarding && registry && (
         <Onboarding
+          key={onboardingStep}
           initialStep={onboardingStep}
           clients={clients}
           registry={registry}
