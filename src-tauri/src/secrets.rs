@@ -48,32 +48,40 @@ mod platform {
 
     pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
         let acct = account(server_id, key);
-        set_generic_password(SERVICE, &acct, value.as_bytes()).map_err(|e| e.to_string())?;
-        // Grant the standalone gateway binary silent read access to this item, so a
-        // client-spawned gateway reads it with no keychain prompt. Best-effort: if
-        // it fails the secret is still stored, the gateway just falls back to the
-        // one-time "Always Allow" prompt.
-        if let Err(e) = apply_shared_access(&acct) {
-            eprintln!("conduit: keychain shared-access not applied for {acct}: {e}");
+        // Preferred path: create the item WITH a shared-access ACL (this app + the
+        // gateway) in one atomic SecItemAdd. Setting the ACL at creation needs no
+        // prompt; setting it AFTER creation (SecKeychainItemSetAccess) prompts for
+        // the keychain password. With the ACL in place the separately-signed gateway
+        // reads the secret with no prompt either.
+        match add_with_shared_access(&acct, value) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                // Never let secret storage fail: fall back to the plain ACL-free
+                // write (the gateway then falls back to a one-time "Always Allow").
+                eprintln!("conduit: shared-access write failed ({e}); using plain write");
+                let _ = delete_generic_password(SERVICE, &acct);
+                set_generic_password(SERVICE, &acct, value.as_bytes()).map_err(|e| e.to_string())
+            }
         }
-        Ok(())
     }
 
-    /// Give both the Conduit app and the `conduit-gateway` binary silent read
-    /// access to a keychain item by attaching a `SecAccess` whose trusted-apps list
-    /// names both binaries.
+    /// Create a generic-password item that BOTH the Conduit app and the
+    /// `conduit-gateway` binary can read with no keychain prompt: build a legacy
+    /// `SecAccess` whose trusted-applications list names both binaries and pass it
+    /// as `kSecAttrAccess` on `SecItemAdd`. Setting the ACL atomically at creation
+    /// avoids the keychain-password prompt that a post-hoc `SecKeychainItemSetAccess`
+    /// would raise.
     ///
-    /// Why this and not `keychain-access-groups`: the modern `SecItemAdd` item is
-    /// trusted only by its creator (the app), so the separately-signed gateway
-    /// triggers a keychain prompt on first read. `keychain-access-groups` is the
-    /// modern way to share, but it's a *restricted* entitlement that needs an
-    /// embedded provisioning profile, which a bare CLI binary (the gateway, spawned
-    /// standalone by clients) cannot carry, so AMFI kills it at launch (-34018 /
-    /// amfid -413). The legacy trusted-application ACL works for Developer ID
-    /// distribution with no profile. APIs are deprecated-but-functional.
-    fn apply_shared_access(account_str: &str) -> Result<(), String> {
+    /// Why this and not `keychain-access-groups`: that's a *restricted* entitlement
+    /// requiring an embedded provisioning profile, which a bare CLI binary (the
+    /// gateway, spawned standalone by clients) cannot carry, so AMFI SIGKILLs it at
+    /// launch (-34018 / amfid -413). The legacy trusted-application ACL works for
+    /// Developer ID distribution with no profile. APIs are deprecated-but-functional.
+    fn add_with_shared_access(account_str: &str, value: &str) -> Result<(), String> {
         use core_foundation::array::CFArray;
         use core_foundation::base::{CFType, CFTypeRef, TCFType};
+        use core_foundation::data::CFData;
+        use core_foundation::dictionary::CFDictionary;
         use core_foundation::string::CFString;
         use std::ffi::{c_void, CString};
         use std::os::raw::c_char;
@@ -89,14 +97,20 @@ mod platform {
                 trustedlist: *const c_void,
                 access_ref: *mut *mut c_void,
             ) -> i32;
-            fn SecKeychainItemSetAccess(item: *mut c_void, access: *mut c_void) -> i32;
+            fn SecItemAdd(attributes: *const c_void, result: *mut *const c_void) -> i32;
+            fn SecItemDelete(query: *const c_void) -> i32;
+            static kSecClass: CFTypeRef;
+            static kSecClassGenericPassword: CFTypeRef;
+            static kSecAttrService: CFTypeRef;
+            static kSecAttrAccount: CFTypeRef;
+            static kSecValueData: CFTypeRef;
+            static kSecAttrAccess: CFTypeRef;
         }
 
-        // The two binaries that must read the secret silently.
+        // 1. Build a SecAccess trusting the two binaries (this app + the gateway).
         let app_path = std::env::current_exe().map_err(|e| e.to_string())?;
         let gw_path = crate::clients::resolve_gateway_path()
             .ok_or_else(|| "could not resolve gateway path".to_string())?;
-
         let trusted_app = |p: &std::path::Path| -> Result<CFType, String> {
             let c = CString::new(p.to_string_lossy().into_owned()).map_err(|e| e.to_string())?;
             let mut app: *mut c_void = std::ptr::null_mut();
@@ -109,7 +123,6 @@ mod platform {
             }
             Ok(unsafe { CFType::wrap_under_create_rule(app as CFTypeRef) })
         };
-
         let trusted = CFArray::from_CFTypes(&[trusted_app(&app_path)?, trusted_app(&gw_path)?]);
         let label = CFString::new("conduit-mcp");
         let mut access: *mut c_void = std::ptr::null_mut();
@@ -123,37 +136,48 @@ mod platform {
         if st != 0 || access.is_null() {
             return Err(format!("SecAccessCreate failed: {st}"));
         }
-        // Own the access so it's released on return (SetAccess retains it itself).
-        let _access_owned = unsafe { CFType::wrap_under_create_rule(access as CFTypeRef) };
+        let access_cf = unsafe { CFType::wrap_under_create_rule(access as CFTypeRef) };
 
-        // Find the freshly written item and attach the access to it.
-        let results = ItemSearchOptions::new()
-            .class(ItemClass::generic_password())
-            .service(SERVICE)
-            .account(account_str)
-            .limit(Limit::All)
-            .load_refs(true)
-            .load_data(false)
-            .search()
-            .map_err(|e| format!("acl item search failed: {e}"))?;
+        // The kSec* keys are CFString constants; pull them into safe CFType values.
+        let (k_class, k_generic, k_service, k_account, k_value, k_access) = unsafe {
+            (
+                CFType::wrap_under_get_rule(kSecClass),
+                CFType::wrap_under_get_rule(kSecClassGenericPassword),
+                CFType::wrap_under_get_rule(kSecAttrService),
+                CFType::wrap_under_get_rule(kSecAttrAccount),
+                CFType::wrap_under_get_rule(kSecValueData),
+                CFType::wrap_under_get_rule(kSecAttrAccess),
+            )
+        };
+        let service_cf = CFString::new(SERVICE).as_CFType();
+        let account_cf = CFString::new(account_str).as_CFType();
 
-        let mut applied = false;
-        for result in results {
-            if let SearchResult::Ref(Reference::KeychainItem(item)) = result {
-                let st = unsafe {
-                    SecKeychainItemSetAccess(item.as_concrete_TypeRef() as *mut c_void, access)
-                };
-                if st != 0 {
-                    return Err(format!("SecKeychainItemSetAccess failed: {st}"));
-                }
-                applied = true;
-            }
+        // 2. Remove any existing item for this account (SecItemAdd rejects dups).
+        let del = CFDictionary::from_CFType_pairs(&[
+            (k_class.clone(), k_generic.clone()),
+            (k_service.clone(), service_cf.clone()),
+            (k_account.clone(), account_cf.clone()),
+        ]);
+        unsafe {
+            SecItemDelete(del.as_concrete_TypeRef() as *const c_void);
         }
-        if applied {
-            Ok(())
-        } else {
-            Err("no keychain item found to grant shared access".into())
+
+        // 3. Add the item WITH the shared-access ACL, atomically (no prompt).
+        let data_cf = CFData::from_buffer(value.as_bytes()).as_CFType();
+        let add = CFDictionary::from_CFType_pairs(&[
+            (k_class, k_generic),
+            (k_service, service_cf),
+            (k_account, account_cf),
+            (k_value, data_cf),
+            (k_access, access_cf),
+        ]);
+        let st = unsafe {
+            SecItemAdd(add.as_concrete_TypeRef() as *const c_void, std::ptr::null_mut())
+        };
+        if st != 0 {
+            return Err(format!("SecItemAdd with shared access failed: {st}"));
         }
+        Ok(())
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
