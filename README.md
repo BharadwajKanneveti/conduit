@@ -4,7 +4,7 @@
 
 # Conduit
 
-**All your MCP servers in one place, with ~90% fewer tokens.**
+**One local gateway for all your MCP servers, shared by every AI client, with far fewer tokens.**
 
 [![CI](https://github.com/tsouth89/conduit/actions/workflows/ci.yml/badge.svg)](https://github.com/tsouth89/conduit/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/tsouth89/conduit?label=release)](https://github.com/tsouth89/conduit/releases)
@@ -43,68 +43,65 @@ eat your context window).
 
 ## Why
 
-Every MCP server you connect dumps its full tool list into your agent's context,
-on every request, and most AI clients also want their own separate configuration.
-So you pay a token tax on every call and reconfigure the same servers per app.
-Conduit fixes both:
+Every MCP server you connect dumps its full tool list into your agent's context on
+every request, and most AI clients also want their own separate configuration. So you
+pay a token tax on every call and reconfigure the same servers in every app. Conduit
+fixes both.
 
-- **~90% fewer tokens.** In lazy-discovery mode the gateway advertises three
-  meta-tools (`conduit_status`, `conduit_search_tools`, `conduit_call_tool`)
-  instead of the full catalog. The agent searches and calls on demand, so context
-  stays flat no matter how many servers you connect. In a measured benchmark, graded
-  for correct answers, that's up to 91% fewer total tokens at the same task success,
-  and 97% less tool-definition overhead per request (99.6% at a real 415-tool catalog)
-  ([BENCHMARK.md](BENCHMARK.md)). Ask `conduit_status` and it reports what it has saved
-  you so far, in tokens and dollars.
-- **Set up once, use everywhere.** Each client points at one Conduit gateway.
-  Add a server and authenticate it a single time; it appears in every client.
-- **Per-agent scoping.** Give each client only the servers it should see. A
-  coding agent literally cannot call a billing tool that is not in its profile.
-- **Obvious auth.** OAuth or API key, stored once in the OS keychain. Status is
-  shown per server; a single click authenticates. Newly-authed servers propagate
-  to connected clients without a restart.
-- **A catalog to grow.** Add popular servers from a curated list or search the
-  official MCP Registry, then authenticate through the same flow.
-- **Searches by intent, not just keywords.** Lazy discovery's `conduit_search_tools`
-  ranks by relevance so the agent finds the right tool across all your servers, and
-  no tool is ever hidden: any server's full tool set is one call away. Optional
-  semantic re-ranking (point it at a local or hosted embeddings endpoint) blends
-  embedding similarity into the ranking so paraphrased needs ("charge a card") still
-  surface the right tool; off by default, pure lexical otherwise.
-- **No secrets in client configs.** Clients only ever say "talk to Conduit." Keys
-  live in the OS keychain and are injected at runtime.
-- **Governance built in.** Toggle any tool on or off, or flip one switch to hide
-  every destructive tool from every client at once. Every tool call is recorded
-  in an audit log, with per-server latency and error rates.
-- **Tool-definition integrity (rug-pull + poisoning detection).** Conduit
-  fingerprints each tool when you connect a server, and flags it if the definition
-  later changes or a known server quietly adds a tool, the signature of a "rug pull,"
-  where a tool you approved is silently swapped for a malicious one. It also scans
-  each tool's description and schema for injection-like content (the "tool poisoning"
-  / "line jumping" attack, where hidden instructions ride in a tool definition before
-  any call). Both show up as security notices in Activity. Detection only (it never
-  blocks), on by default, and entirely local. Because Conduit is on the path and
-  already watches for tool changes, it's the natural place to catch this.
-- **Content defense (anti-agentjacking).** The flip side of the result path: when a
-  tool *returns* untrusted content (a Sentry error, a web page, an issue body) that
-  contains injection-like instructions, Conduit flags it and wraps it with a marker
-  telling the agent it's external data, not instructions, the data/instruction
-  separation that blunts indirect prompt injection. The original content is preserved,
-  only flagged results are touched, and it never blocks the call. On by default. (A
-  gateway can't see execution that happens through the client's own shell, so this is
-  defense in depth, ingress hardening, not a silver bullet.)
-- **Agent-controllable, on your terms.** Turn on *Allow agent control* and an
-  agent can enable or disable servers itself through the gateway
-  (`conduit_enable_server` / `conduit_disable_server`), with the change reflected
-  in the app live. Off by default, and the destructive-tool switch stays yours, so
-  an agent can never escalate past your governance.
+### Fewer tokens
+
+- **~90% fewer tokens.** In lazy-discovery mode the gateway advertises three meta-tools
+  (`conduit_status`, `conduit_search_tools`, `conduit_call_tool`) instead of the full
+  catalog, and the agent searches and calls on demand, so context stays flat no matter
+  how many servers you connect. Benchmarked, graded for correct answers: up to 91% fewer
+  total tokens at the same task success, 97% less tool-definition overhead per request,
+  99.6% at a real 415-tool catalog ([BENCHMARK.md](BENCHMARK.md)). Ask `conduit_status`
+  for what it has saved you so far.
+- **Search by intent, not just keywords.** `conduit_search_tools` ranks by relevance
+  across every server, and no tool is ever hidden, any server's full set is one call
+  away. Optional semantic re-ranking (a local or hosted embeddings endpoint) surfaces
+  paraphrased needs like "charge a card"; off by default, pure lexical otherwise.
+
+### One setup, every client
+
+- **Set up once, use everywhere.** Each client points at one gateway. Add and
+  authenticate a server a single time and it appears in every client.
+- **Per-agent scoping.** Give each client only the servers it should see. A coding
+  agent literally cannot call a billing tool that isn't in its profile.
+- **Obvious auth.** OAuth or API key, stored once in the OS keychain, a single click per
+  server. Newly-authed servers propagate to connected clients without a restart.
+- **No secrets in client configs.** Clients only ever say "talk to Conduit." Keys live
+  in the OS keychain and are injected at runtime.
+- **A catalog to grow.** Add popular servers from a curated list or search the official
+  MCP Registry, then authenticate through the same flow.
+
+### Security, because the gateway is on the path
+
+- **Tool integrity (rug-pull + poisoning detection).** Conduit fingerprints each tool
+  when you connect a server and flags it if the definition later changes or a server
+  quietly adds one (a "rug pull"), or if a description or schema carries injection-like
+  content ("tool poisoning"). Detection only, on by default, entirely local
+  ([details](docs/specs/mcp-integrity.md)).
+- **Content defense (anti-agentjacking).** When a tool *returns* untrusted content (a
+  Sentry error, a web page, an issue body) with injection-like instructions, Conduit
+  flags it and marks it as external data, not instructions, the separation that blunts
+  indirect prompt injection. Never blocks, on by default
+  ([details](docs/specs/content-defense.md)).
+- **Governance and audit.** Toggle any tool on or off, or hide every destructive tool
+  from every client with one switch. Every call is recorded with per-server latency and
+  error rates.
+
+### Control and extras
+
+- **Agent control, on your terms.** Optionally let an agent enable or disable servers
+  through the gateway (`conduit_enable_server` / `conduit_disable_server`), reflected in
+  the app live. Off by default, and the destructive-tool switch always stays yours.
 - **Full MCP, not just tools.** Tools, resources, and prompts are all proxied.
-- **Test before you wire it up.** A built-in playground invokes any tool with a
-  form generated from its schema, so you can confirm a server works without
-  configuring a client first.
-- **Diagnostics in one click.** A "Copy diagnostics" button bundles your version,
-  OS, a secrets-stripped server summary, and the recent gateway log, ready to
-  paste into a bug report.
+- **Test before you wire it up.** A built-in playground invokes any tool with a form
+  generated from its schema, so you can confirm a server works without configuring a
+  client first.
+- **Diagnostics in one click.** Bundles your version, OS, a secrets-stripped server
+  summary, and the recent gateway log, ready to paste into a bug report.
 
 ## How it works
 
