@@ -3,7 +3,7 @@
 All notable changes to Conduit are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 
-## [Unreleased]
+## [0.5.2] - 2026-06-27
 
 ### Added
 - **More one-click catalog servers.** Added MongoDB, Elasticsearch, Airtable, Exa,
