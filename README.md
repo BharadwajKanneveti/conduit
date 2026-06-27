@@ -131,10 +131,10 @@ and refreshes too.
 
 ## Supported clients
 
-Cursor, Claude Desktop, Claude Code, Codex, Google Antigravity, VS Code,
-Windsurf, Gemini CLI, Cline, Roo Code, Warp, Amazon Q, Kiro, Zed, LM Studio, Jan,
-Goose, and BoltAI. Conduit detects each one, installs the gateway with one click,
-and can import a client's existing servers.
+Conduit detects **19 AI clients**, installs the gateway into each with one click, and
+can import a client's existing servers: Cursor, Claude Desktop, Claude Code, Codex,
+Google Antigravity, VS Code, Windsurf, Gemini CLI, Cline, Roo Code, Warp, Amazon Q,
+Kiro, Zed, LM Studio, Jan, Goose, Hermes, and BoltAI.
 
 ## Configuration
 
@@ -178,7 +178,7 @@ terminal. The package name is `conduit`.
 
 ```bash
 # Update to a newer version: just install the new .deb, it upgrades in place.
-sudo apt install ./Conduit_0.5.2_amd64.deb
+sudo apt install ./Conduit_0.6.0_amd64.deb
 
 # Uninstall (keeps your config + saved secrets).
 sudo apt remove conduit
