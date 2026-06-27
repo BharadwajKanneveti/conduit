@@ -22,6 +22,10 @@ All notable changes to Conduit are documented here. Format loosely follows
   be dismissed once reviewed; the raw call log is collapsed by default and filtered to
   errors first, so the per-server stats table stays the headline. The "has secrets" key
   icon on server rows is gone (it was a non-interactive indicator that looked clickable).
+- **Global policy moved to a Settings view.** Lazy discovery, Block destructive tools,
+  and Allow agent control now live in a dedicated Settings tab (grouped Discovery /
+  Security) instead of being buried atop the Playground, which is now a clean
+  tool-testing surface.
 
 ### Added
 - **Three more catalog servers:** Perplexity, Kubernetes, and Todoist.

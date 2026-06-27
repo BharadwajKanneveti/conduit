@@ -35,6 +35,7 @@ import {
   type ProbeResult,
   type Registry,
   type ServerEntry,
+  type View,
 } from "@/lib/types";
 import {
   DropdownMenu,
@@ -51,6 +52,7 @@ import { ServerDialog } from "@/components/ServerDialog";
 import { CatalogView } from "@/components/CatalogView";
 import { PlaygroundView } from "@/components/PlaygroundView";
 import { TeamsView } from "@/components/TeamsView";
+import { SettingsView } from "@/components/SettingsView";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -66,9 +68,7 @@ function App() {
   const [busyId, setBusyId] = useState<string | null>(null);
   const [togglingAll, setTogglingAll] = useState(false);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
-  const [view, setView] = useState<
-    "servers" | "activity" | "catalog" | "playground" | "teams"
-  >("servers");
+  const [view, setView] = useState<View>("servers");
   const [activityKey, setActivityKey] = useState(0);
   const [health, setHealth] = useState<Record<string, ProbeResult>>({});
   const [probing, setProbing] = useState(false);
@@ -185,9 +185,7 @@ function App() {
   }
 
   // Catalog and Activity are top-level destinations, so leave any selected client.
-  function selectView(
-    v: "servers" | "activity" | "catalog" | "playground" | "teams",
-  ) {
+  function selectView(v: View) {
     setSelectedClientId(null);
     setView(v);
   }
@@ -385,9 +383,11 @@ function App() {
                       ? "Playground"
                       : view === "teams"
                         ? "Teams"
-                        : selectedClient
-                          ? selectedClient.name
-                          : "Servers"}
+                        : view === "settings"
+                          ? "Settings"
+                          : selectedClient
+                            ? selectedClient.name
+                            : "Servers"}
               </h1>
               <p className="truncate text-sm text-muted-foreground">
                 {view === "activity"
@@ -398,17 +398,19 @@ function App() {
                       ? "Invoke a server's tools and see the raw result"
                       : view === "teams"
                         ? "Share one MCP server set across your team"
-                        : selectedClient
-                          ? "MCP client"
-                          : loading || !registry
-                            ? "Loading…"
-                            : `${enabledCount} of ${servers.length} enabled` +
-                              (connectedCount
-                                ? ` · ${connectedCount} connected`
-                                : "") +
-                              (attentionCount
-                                ? ` · ${attentionCount} need${attentionCount === 1 ? "s" : ""} attention`
-                                : "")}
+                        : view === "settings"
+                          ? "Global discovery and security policy"
+                          : selectedClient
+                            ? "MCP client"
+                            : loading || !registry
+                              ? "Loading…"
+                              : `${enabledCount} of ${servers.length} enabled` +
+                                (connectedCount
+                                  ? ` · ${connectedCount} connected`
+                                  : "") +
+                                (attentionCount
+                                  ? ` · ${attentionCount} need${attentionCount === 1 ? "s" : ""} attention`
+                                  : "")}
               </p>
             </div>
             <div className="flex shrink-0 items-center gap-2">
@@ -489,6 +491,8 @@ function App() {
                 />
               ) : view === "teams" ? (
                 <TeamsView registry={registry} onRegistryChange={setRegistry} />
+              ) : view === "settings" ? (
+                <SettingsView registry={registry} onRegistryChange={setRegistry} />
               ) : selectedClient ? (
                 <ClientDetail
                   client={selectedClient}

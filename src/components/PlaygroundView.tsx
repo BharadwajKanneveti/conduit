@@ -1,9 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
-  Bot,
   CheckCircle2,
   FlaskConical,
-  Layers,
   Loader2,
   Play,
   ShieldAlert,
@@ -13,9 +11,6 @@ import { toast } from "sonner";
 import {
   callTool,
   listServerTools,
-  setAllowAgentControl,
-  setDenyDestructive,
-  setLazyDiscovery,
   setToolEnabled,
 } from "@/lib/api";
 import type {
@@ -162,8 +157,6 @@ interface PlaygroundProps {
 export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) {
   const servers = registry?.servers ?? [];
   const denyDestructive = registry?.denyDestructive ?? false;
-  const lazyDiscovery = registry?.lazyDiscovery ?? true;
-  const allowAgentControl = registry?.allowAgentControl ?? false;
 
   const [serverId, setServerId] = useState<string | null>(null);
   const [policyBusy, setPolicyBusy] = useState(false);
@@ -236,39 +229,6 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
       onRegistryChange(await setToolEnabled(serverId, toolName, enabled));
     } catch (e) {
       toast.error(`Couldn't update the tool: ${e}`);
-    } finally {
-      setPolicyBusy(false);
-    }
-  }
-
-  async function toggleDeny(deny: boolean) {
-    setPolicyBusy(true);
-    try {
-      onRegistryChange(await setDenyDestructive(deny));
-    } catch (e) {
-      toast.error(`Couldn't update the policy: ${e}`);
-    } finally {
-      setPolicyBusy(false);
-    }
-  }
-
-  async function toggleLazy(lazy: boolean) {
-    setPolicyBusy(true);
-    try {
-      onRegistryChange(await setLazyDiscovery(lazy));
-    } catch (e) {
-      toast.error(`Couldn't update discovery mode: ${e}`);
-    } finally {
-      setPolicyBusy(false);
-    }
-  }
-
-  async function toggleAllowAgentControl(allow: boolean) {
-    setPolicyBusy(true);
-    try {
-      onRegistryChange(await setAllowAgentControl(allow));
-    } catch (e) {
-      toast.error(`Couldn't update agent control: ${e}`);
     } finally {
       setPolicyBusy(false);
     }
@@ -347,76 +307,24 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
 
   return (
     <div className="flex max-w-3xl flex-col gap-5">
-      {/* Server picker + global destructive-tool switch */}
-      <div className="flex flex-wrap items-end justify-between gap-3">
-        <div className="flex w-64 flex-col gap-1.5">
-          <Label className="text-xs text-muted-foreground">Server</Label>
-          <Select value={serverId ?? ""} onValueChange={setServerId}>
-            <SelectTrigger className="h-9">
-              <SelectValue placeholder="Pick a server…" />
-            </SelectTrigger>
-            <SelectContent>
-              {servers.map((s) => (
-                <SelectItem key={s.id} value={s.id}>
-                  {s.name}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <p className="text-[11px] text-muted-foreground">
-            Tests any server directly, regardless of the active profile.
-          </p>
-        </div>
-        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 xl:grid-cols-3">
-          <label className="flex items-center gap-2.5 rounded-md border px-3 py-2 text-sm">
-            <Layers
-              className={`size-4 ${lazyDiscovery ? "text-info" : "text-muted-foreground"}`}
-            />
-            <span className="flex flex-1 flex-col leading-tight min-w-0">
-              <span className="font-medium">Lazy discovery</span>
-              <span className="text-xs text-muted-foreground">
-                Expose 3 meta-tools, not the full catalog (all clients)
-              </span>
-            </span>
-            <Switch
-              checked={lazyDiscovery}
-              onCheckedChange={toggleLazy}
-              disabled={policyBusy}
-            />
-          </label>
-          <label className="flex items-center gap-2.5 rounded-md border px-3 py-2 text-sm">
-            <ShieldAlert
-              className={`size-4 ${denyDestructive ? "text-warning" : "text-muted-foreground"}`}
-            />
-            <span className="flex flex-1 flex-col leading-tight min-w-0">
-              <span className="font-medium">Block destructive tools</span>
-              <span className="text-xs text-muted-foreground">
-                Hide every {`destructiveHint`} tool from all clients
-              </span>
-            </span>
-            <Switch
-              checked={denyDestructive}
-              onCheckedChange={toggleDeny}
-              disabled={policyBusy}
-            />
-          </label>
-          <label className="flex items-center gap-2.5 rounded-md border px-3 py-2 text-sm">
-            <Bot
-              className={`size-4 ${allowAgentControl ? "text-success" : "text-muted-foreground"}`}
-            />
-            <span className="flex flex-1 flex-col leading-tight min-w-0">
-              <span className="font-medium">Allow agent control</span>
-              <span className="text-xs text-muted-foreground">
-                Let an agent turn servers on/off (the block above stays yours)
-              </span>
-            </span>
-            <Switch
-              checked={allowAgentControl}
-              onCheckedChange={toggleAllowAgentControl}
-              disabled={policyBusy}
-            />
-          </label>
-        </div>
+      {/* Server picker */}
+      <div className="flex w-64 flex-col gap-1.5">
+        <Label className="text-xs text-muted-foreground">Server</Label>
+        <Select value={serverId ?? ""} onValueChange={setServerId}>
+          <SelectTrigger className="h-9">
+            <SelectValue placeholder="Pick a server…" />
+          </SelectTrigger>
+          <SelectContent>
+            {servers.map((s) => (
+              <SelectItem key={s.id} value={s.id}>
+                {s.name}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+        <p className="text-[11px] text-muted-foreground">
+          Tests any server directly, regardless of the active profile.
+        </p>
       </div>
 
       {loadingTools && (

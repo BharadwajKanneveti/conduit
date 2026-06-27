@@ -11,6 +11,7 @@ import {
   Loader2,
   Puzzle,
   ScrollText,
+  Settings,
   Share2,
   Store,
   Users,
@@ -23,6 +24,7 @@ import {
   importableServers,
   type DetectedClient,
   type Registry,
+  type View,
 } from "@/lib/types";
 import { gatherDiagnostics, openDataDir } from "@/lib/api";
 import { checkForUpdate, installUpdate } from "@/lib/updater";
@@ -374,10 +376,8 @@ interface Props {
   onRegistryChange: (registry: Registry) => void;
   selectedClientId: string | null;
   onSelectClient: (id: string | null) => void;
-  view: "servers" | "activity" | "catalog" | "playground" | "teams";
-  onSelectView: (
-    view: "servers" | "activity" | "catalog" | "playground" | "teams",
-  ) => void;
+  view: View;
+  onSelectView: (view: View) => void;
   onReplayOnboarding: () => void;
 }
 
@@ -470,6 +470,9 @@ export function AppSidebar({
           )}
           {navItem(Users, "Teams", view === "teams", () =>
             onSelectView("teams"),
+          )}
+          {navItem(Settings, "Settings", view === "settings", () =>
+            onSelectView("settings"),
           )}
         </nav>
 
