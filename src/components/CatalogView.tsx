@@ -35,13 +35,18 @@ export function CatalogView({ registry, onAdded }: Props) {
   const [results, setResults] = useState<CatalogEntry[] | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
+  const [popularLoading, setPopularLoading] = useState(true);
+  const [popularError, setPopularError] = useState(false);
 
   const have = new Set((registry?.servers ?? []).map((s) => s.name.toLowerCase()));
 
   const reloadPopular = useCallback(() => {
+    setPopularLoading(true);
+    setPopularError(false);
     popularCatalog()
       .then(setPopular)
-      .catch(() => {});
+      .catch(() => setPopularError(true))
+      .finally(() => setPopularLoading(false));
   }, []);
 
   useEffect(() => {
@@ -175,13 +180,33 @@ export function CatalogView({ registry, onAdded }: Props) {
       </div>
 
       {shown.length === 0 ? (
-        <p className="py-20 text-center text-sm text-muted-foreground">
-          {loading
-            ? ""
-            : results !== null
-              ? `No servers match "${query}".`
-              : "Catalog unavailable."}
-        </p>
+        browsing && popularLoading ? (
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <div
+                key={i}
+                className="h-28 animate-pulse rounded-lg border bg-muted/30"
+              />
+            ))}
+          </div>
+        ) : browsing && popularError ? (
+          <div className="flex flex-col items-center gap-3 py-20 text-center">
+            <p className="text-sm text-muted-foreground">
+              Couldn't load the catalog.
+            </p>
+            <Button variant="outline" size="sm" onClick={reloadPopular}>
+              Try again
+            </Button>
+          </div>
+        ) : (
+          <p className="py-20 text-center text-sm text-muted-foreground">
+            {loading
+              ? ""
+              : results !== null
+                ? `No servers match "${query}".`
+                : "Catalog unavailable."}
+          </p>
+        )
       ) : browsing ? (
         <div className="flex flex-col gap-6">
           {byCategory.map(([cat, entries]) => (

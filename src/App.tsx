@@ -85,6 +85,7 @@ function App() {
 
   const lastProbeRef = useRef(0);
   const probingRef = useRef(false);
+  const loadedOnce = useRef(false);
 
   // Probe health quietly (no toast). Used on load and after authenticating, so
   // each server's status badge reflects reality without the user clicking around.
@@ -131,6 +132,7 @@ function App() {
         const [reg, dc] = await Promise.all([getRegistry(), detectClients()]);
         setRegistry(reg);
         setClients(dc);
+        loadedOnce.current = true;
         setActivityKey((k) => k + 1);
         if (announce) {
           const results = await reprobe();
@@ -146,7 +148,13 @@ function App() {
           void reprobe();
         }
       } catch (e) {
-        setError(String(e));
+        // After the first successful load, a refresh failure shouldn't blow away a
+        // working list. Surface it as a toast and keep what's on screen.
+        if (loadedOnce.current) {
+          toast.error(`Couldn't refresh: ${e}`);
+        } else {
+          setError(String(e));
+        }
       } finally {
         setLoading(false);
       }
