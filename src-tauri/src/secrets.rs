@@ -306,7 +306,10 @@ fn create_migration_marker() -> bool {
 mod tests {
     use super::*;
 
+    // Round-trips through the real OS keychain. Headless Linux CI has no Secret
+    // Service (D-Bus), so skip it there; it still runs on macOS and Windows.
     #[test]
+    #[cfg_attr(target_os = "linux", ignore = "no Secret Service in headless CI")]
     fn set_get_delete_round_trip() {
         let sid = "conduit-test-server";
         let key = "CONDUIT_TEST_KEY";
