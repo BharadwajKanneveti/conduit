@@ -29,6 +29,8 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
+import { Textarea } from "@/components/ui/textarea";
+import { Callout } from "@/components/Callout";
 import {
   Select,
   SelectContent,
@@ -115,13 +117,13 @@ function ArgField({ name, schema, required, value, onChange }: FieldProps) {
     );
   } else if (t === "object" || t === "array") {
     control = (
-      <textarea
+      <Textarea
         id={id}
         value={typeof value === "string" ? value : ""}
         onChange={(e) => onChange(e.target.value)}
         placeholder={t === "array" ? "[ … ]" : "{ … }"}
         rows={3}
-        className="w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-sm focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
+        className="font-mono text-xs"
       />
     );
   } else {
@@ -423,11 +425,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
         </div>
       )}
 
-      {toolsError && (
-        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {toolsError}
-        </div>
-      )}
+      {toolsError && <Callout variant="danger">{toolsError}</Callout>}
 
       {/* Tool list: click to test, switch to enable/disable per client */}
       {tools && tools.length > 0 && (
@@ -554,11 +552,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
       )}
 
       {/* Call error (transport / connection failure) */}
-      {callError && (
-        <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-          {callError}
-        </div>
-      )}
+      {callError && <Callout variant="danger">{callError}</Callout>}
 
       {/* Result */}
       {result && (

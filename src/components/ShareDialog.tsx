@@ -27,6 +27,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { TransportPill } from "@/components/TransportPill";
 import { Label } from "@/components/ui/label";
 
@@ -141,9 +142,6 @@ export function ShareDialog({ trigger, onImported }: Props) {
     }
   }
 
-  const area =
-    "w-full rounded-md border bg-background p-2.5 font-mono text-xs resize-none focus:outline-none focus:ring-1 focus:ring-ring";
-
   const newCount = preview?.filter((i) => i.isNew).length ?? 0;
 
   return (
@@ -201,12 +199,12 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   className="h-8 text-sm"
                 />
               </div>
-              <textarea
+              <Textarea
                 readOnly
                 aria-label="Exported setup"
                 value={exported}
                 rows={5}
-                className={area}
+                className="resize-none font-mono text-xs"
               />
               <div className="flex flex-wrap gap-2">
                 <Button
@@ -240,13 +238,13 @@ export function ShareDialog({ trigger, onImported }: Props) {
 
             <div className="flex flex-col gap-2 border-t pt-4">
               <Label className="text-sm">Import a setup</Label>
-              <textarea
+              <Textarea
                 placeholder="Paste a shared setup here"
                 aria-label="Paste a shared setup"
                 value={paste}
                 onChange={(e) => setPaste(e.target.value)}
                 rows={5}
-                className={area}
+                className="resize-none font-mono text-xs"
               />
               <div className="flex flex-wrap gap-2">
                 <Button

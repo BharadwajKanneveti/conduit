@@ -2,6 +2,7 @@ import { useState } from "react";
 import { RefreshCw, LogOut, Upload, ShieldCheck, Users, Server } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { Callout } from "@/components/Callout";
 import { TransportPill } from "@/components/TransportPill";
 import { Input } from "@/components/ui/input";
 import { teamConnect, teamSync, teamDisconnect, teamPush } from "@/lib/api";
@@ -81,14 +82,14 @@ export function TeamsView({
       </div>
 
       {error && (
-        <div className="mb-4 rounded-lg border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+        <Callout variant="danger" className="mb-4">
           {error}
-        </div>
+        </Callout>
       )}
       {notice && (
-        <div className="mb-4 rounded-lg border border-success/40 bg-success/10 px-4 py-3 text-sm text-success">
+        <Callout variant="success" className="mb-4">
           {notice}
-        </div>
+        </Callout>
       )}
 
       {!team ? (
