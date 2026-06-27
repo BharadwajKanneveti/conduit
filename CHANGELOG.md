@@ -18,11 +18,25 @@ All notable changes to Conduit are documented here. Format loosely follows
 
 ### Added
 - **Three more catalog servers:** Perplexity, Kubernetes, and Todoist.
+- **A confirmation step before destructive actions.** Removing a server, deleting a
+  profile, disconnecting a client, or leaving a team now asks first and says what
+  survives (your secrets stay in the keychain, your own servers are untouched).
 
 ### Fixed
 - The manual Refresh always confirms now ("Refreshed"), even when a health probe is
   already running, so the click is never silent.
 - Hardened the first-run wizard's resume-after-catalog flow against future regressions.
+- A refresh failure no longer wipes a working server list; it keeps what's on screen and
+  toasts instead. The full-screen error is reserved for the initial-load failure.
+- The catalog browse view shows a loading skeleton and a retryable error state instead
+  of silently collapsing to "Catalog unavailable."
+- Dialogs cap their height and scroll, so a server with many env vars or secrets can't
+  push the Save and Cancel buttons off-screen.
+- Accessibility: screen readers now get the selected view (aria-current) and toggle
+  state (aria-pressed), the active sidebar item reads clearly, and long names truncate
+  instead of overflowing their rows.
+- Consistent transport pills across every server list, plural-correct labels ("1 tool"),
+  and several user-facing strings tidied up.
 
 ## [0.5.2] - 2026-06-27
 
