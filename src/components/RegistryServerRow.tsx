@@ -16,6 +16,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { TransportPill } from "@/components/TransportPill";
 import { SecretsDialog } from "@/components/SecretsDialog";
 import { ServerDialog } from "@/components/ServerDialog";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 
 interface Props {
   server: ServerEntry;
@@ -245,14 +246,22 @@ export function RegistryServerRow({
               }
             />
 
-            <button
-              onClick={onRemove}
-              disabled={busy}
-              className={`${ACTION} hover:bg-destructive/10 hover:text-destructive`}
-            >
-              <Trash2 className="size-3.5" />
-              Remove
-            </button>
+            <ConfirmDialog
+              trigger={
+                <button
+                  disabled={busy}
+                  className={`${ACTION} hover:bg-destructive/10 hover:text-destructive`}
+                >
+                  <Trash2 className="size-3.5" />
+                  Remove
+                </button>
+              }
+              title={`Remove ${server.name}?`}
+              description="This deletes the server from Conduit. Any saved secrets stay in your keychain."
+              confirmLabel="Remove"
+              destructive
+              onConfirm={onRemove}
+            />
           </div>
         </div>
       )}

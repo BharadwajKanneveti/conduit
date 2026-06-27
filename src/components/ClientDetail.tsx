@@ -26,6 +26,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { TransportPill } from "@/components/TransportPill";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 
 interface Props {
   client: DetectedClient;
@@ -213,24 +214,31 @@ export function ClientDetail({
               </SelectContent>
             </Select>
           )}
-          <Button
-            size="sm"
-            variant={installed ? "outline" : "default"}
-            onClick={toggleInstall}
-            disabled={busy || (!installed && !present)}
-          >
-            {installed ? (
-              <>
-                <Plug className="size-4" />
-                Disconnect
-              </>
-            ) : (
-              <>
-                <PlugZap className="size-4" />
-                Connect to Conduit
-              </>
-            )}
-          </Button>
+          {installed ? (
+            <ConfirmDialog
+              trigger={
+                <Button size="sm" variant="outline" disabled={busy}>
+                  <Plug className="size-4" />
+                  Disconnect
+                </Button>
+              }
+              title={`Disconnect Conduit from ${client.name}?`}
+              description="This rewrites the client's MCP config to remove the gateway. You can reconnect anytime."
+              confirmLabel="Disconnect"
+              destructive
+              onConfirm={toggleInstall}
+            />
+          ) : (
+            <Button
+              size="sm"
+              variant="default"
+              onClick={toggleInstall}
+              disabled={busy || !present}
+            >
+              <PlugZap className="size-4" />
+              Connect to Conduit
+            </Button>
+          )}
         </div>
       </div>
 

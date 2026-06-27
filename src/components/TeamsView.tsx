@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { RefreshCw, LogOut, Upload, ShieldCheck, Users, Server } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Input } from "@/components/ui/input";
 import { teamConnect, teamSync, teamDisconnect, teamPush } from "@/lib/api";
 import type { Registry } from "@/lib/types";
@@ -151,10 +152,19 @@ export function TeamsView({
                   <RefreshCw className="size-3.5" />
                   {busy === "sync" ? "Syncing…" : "Sync now"}
                 </Button>
-                <Button variant="outline" size="sm" onClick={onDisconnect} disabled={busy !== null}>
-                  <LogOut className="size-3.5" />
-                  Leave
-                </Button>
+                <ConfirmDialog
+                  trigger={
+                    <Button variant="outline" size="sm" disabled={busy !== null}>
+                      <LogOut className="size-3.5" />
+                      Leave
+                    </Button>
+                  }
+                  title="Leave this team?"
+                  description="This removes the team's shared servers from Conduit. Your own servers are untouched."
+                  confirmLabel="Leave"
+                  destructive
+                  onConfirm={onDisconnect}
+                />
               </div>
             </div>
 

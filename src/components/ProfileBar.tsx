@@ -14,6 +14,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -91,15 +92,23 @@ export function ProfileBar({ registry, onChange }: Props) {
       </Button>
 
       {registry.profiles.length > 1 && (
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-8 shrink-0 text-muted-foreground hover:text-destructive"
-          aria-label="Delete current profile"
-          onClick={handleDelete}
-        >
-          <Trash2 className="size-4" />
-        </Button>
+        <ConfirmDialog
+          trigger={
+            <Button
+              variant="ghost"
+              size="icon"
+              className="size-8 shrink-0 text-muted-foreground hover:text-destructive"
+              aria-label="Delete current profile"
+            >
+              <Trash2 className="size-4" />
+            </Button>
+          }
+          title="Delete this profile?"
+          description="This removes the profile and its server scoping. Your servers and their secrets are not deleted."
+          confirmLabel="Delete"
+          destructive
+          onConfirm={handleDelete}
+        />
       )}
 
       <Dialog open={open} onOpenChange={setOpen}>
