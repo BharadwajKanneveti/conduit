@@ -26,10 +26,14 @@ mcpo now serves your tools at `http://localhost:8765` (interactive docs at `/doc
 **2. Add it to Open WebUI.** Settings -> Tools (or Connections) -> add an OpenAPI
 tool server pointing at `http://localhost:8765`. The `conduit_*` tools appear.
 
-**3. Set Function Calling to Native.** This is the setting that silently breaks
-things. In the chat Controls (or the model's Advanced Params), set **Function
-Calling** to **Native**, not Default. Default uses prompt-injection and often never
-fires; Native passes the tools through the model's real function-calling API.
+**3. Set Function Calling to Native (per chat).** This is the setting that silently
+breaks things. In the chat's **Controls** panel -> **Advanced Params**, set
+**Function Calling** to **Native**, not Default. Default uses prompt-injection and
+often never fires (the model just replies "I don't have access to that"); Native
+passes the tools through the model's real function-calling API. Note: this can reset
+to Default on each new chat, and setting it at the model level
+(Workspace -> Models) does not reliably carry over, so set it in the chat itself if
+tools stop firing.
 
 **4. Use a capable model.** Lazy discovery (the default) gives the model three
 meta-tools and it searches then calls on demand. A capable model (a frontier API
