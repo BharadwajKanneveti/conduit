@@ -7,16 +7,78 @@ that exposes 3 meta-tools the agent searches on demand, so context stays flat:
 measured ~90% fewer tokens at the same task success. This document is the working
 spec, capturing the architecture decision and the build order.
 
-**Status (2026-06-25):** launched and shipping fast. v0.3.16 is out; signed/notarized
-macOS (Apple Silicon + Intel), Windows, and Linux (deb/AppImage) via a tag-triggered
-pipeline, with an in-app auto-updater. 18 clients supported (incl. local: Jan, LM Studio,
-Goose). Lazy discovery, OAuth/key auth with live propagation, the catalog, import/migrate,
-per-tool + destructive-tool governance, an audit log, resources/prompts proxying, and a
-tool playground all working. Recent: live tool-refresh when a downstream server changes its
-own tool set, an always-on gateway log + one-click "Copy diagnostics", and a security
-hardening pass. Next: distribution (the bottleneck, adoption is still early) and, on
-demand, semantic-search phase 2 (index cleaning -> always-on/lazy hybrid -> embeddings)
-and team/enterprise.
+**Status (2026-06-28):** v0.7.0 published. Signed/notarized macOS (Apple Silicon +
+Intel), Windows (Azure Trusted Signing), Linux (deb/AppImage) via a tag-triggered
+pipeline + in-app auto-updater. 19 clients. Shipping: lazy discovery, OAuth/key auth
+with live propagation, catalog, import/migrate, per-tool + destructive-tool
+governance, audit log, resources/prompts proxying, tool playground, semantic search,
+rug-pull + injection + agentjacking detection, result-shaping Tier 1. **v0.7.0 made
+Open WebUI first-class:** the gateway speaks HTTP/OpenAPI natively (`--http` /
+`CONDUIT_HTTP`, mcpo retired), with a one-click in-app toggle, a required bearer
+token (closing a browser drive-by CSRF), and self-resolving multi-step tool calls
+(an invented-ID guard that points the model at the right list/get tool). Live
+priorities are below.
+
+## What's next (live priorities, 2026-06-28)
+
+Prioritized after v0.7.0 and a fresh-eyes audit (code/tech-debt, first-run UX,
+HTTP/security surface). Ordered by impact within each track. (S/M/L = effort.)
+
+### Security (most shipped in v0.7.0; residuals)
+- [x] HTTP bridge **bearer token** (required, OPTIONS preflight exempt), fail-closed
+      on non-loopback bind, 4 MB body cap, sanitized reflected headers, `catch_unwind`
+      per request. Closed the credential-CSRF (a browser tab can reach `localhost`).
+- [ ] Connect-guard misses IPv6 cloud-metadata: `remote.rs` `host_is_link_local` is
+      IPv4-only (169.254.x); reuse the IPv6-aware `ip_is_private`. (S)
+- [ ] DNS-rebind TOCTOU: `host_is_private` resolves once, `connect_remote`
+      re-resolves; pin the validated IP through to the connection. (M)
+- [ ] HTTP per-request read timeout + small worker pool (single-threaded accept
+      loop today, so slowloris / a slow downstream blocks all callers). (M)
+
+### New-user UX (first 10 minutes; scaffolding is strong, these are the sharp edges)
+- [ ] **Backend failures render as innocent empty states.** Gateway down ->
+      Activity shows "No tool calls yet", not "can't reach backend, retry".
+      Distinguish error from empty (CatalogView already does). Top UX fix. (M)
+- [ ] **Add-server form saves broken servers silently** (empty command/URL);
+      require + inline-validate before enabling Add. (S)
+- [ ] ClientDetail throws Connect / Import / Move at a first-timer before teaching
+      that Conduit is the gateway; lead with the mental model. (M)
+- [ ] Jargon + dead ends: rename "Move config in", tooltip "Add to catalog", helper
+      text on transports, make the Settings "See docs/openwebui.md" a real link,
+      default Activity "Recent calls" filter off, Playground "0 tools" state,
+      `vendorFromKey` fallback for unknown keys. (S each)
+
+### Robustness / tech debt
+- [ ] **Tool-cache versioning.** The gateway serves the on-disk cache verbatim with
+      no version tag, so catalog-logic changes don't take effect until a server
+      toggles or the cache is deleted. Wrap in `{version, tools}`, discard on
+      mismatch. (S)
+- [ ] **Router lock held across the downstream call** (`process_request`):
+      concurrent tool calls serialize, a slow tool blocks all others up to 30 s, and
+      HTTP now advertises concurrency to Open WebUI. Release the lock after resolving
+      the target server. (M)
+- [ ] Tests for the new HTTP transport (status mapping, error paths) and
+      `semantic.rs` (blend math, embed cache). (M)
+
+### Strategic / differentiators (what makes it amazing)
+- [ ] **OAuth client registration + per-client server scoping.** A client
+      authenticates to Conduit, shows up in the app, you assign which servers it
+      sees. Profiles already do half. This is Sigiz's explicit ask AND the proper
+      long-term auth model for the HTTP bridge. The real moat. (L)
+- [ ] **Block-on-drift / quarantine + re-approval for high-risk tools.**
+      Detection-only stays the default, but an opt-in mode quarantines a changed
+      tool until re-approval, defaulting ON for destructive/auth-bearing tools
+      (keyed off destructiveHint). From a Reddit thread; extends the existing
+      rug-pull detection. (M)
+- [ ] **Local-small-model UX.** 7B models still struggle with the lazy
+      search-then-call chain (the multi-step guard helped, didn't solve). This is
+      Open WebUI's core audience. (L)
+- [ ] **Live call-inspection in Activity** (real request/response bytes) folds MCP
+      Peek's value into Conduit, since we're already on the path. (M)
+- [ ] Result-shaping Tier 2: per-server fidelity policy, projection, code-execution
+      handoff; end-to-end "does the model actually page" validation. (M-L)
+- [ ] Showcase server (`conduit-openapi-mcp`: any OpenAPI spec -> an MCP server; npm
+      publish pending) as the funnel + a demo of lazy discovery + result-shaping.
 
 ## The core decision: Conduit is a gateway, not a file editor
 

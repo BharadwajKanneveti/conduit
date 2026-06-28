@@ -21,6 +21,15 @@ All notable changes to Conduit are documented here. Format loosely follows
   (resource-aware: a missing `teamId` suggests the team-listing tool first). The same
   recovery hint is appended whenever a call fails.
 
+### Security
+- **The HTTP endpoint now requires a bearer token.** The app auto-generates one, shows it
+  in Settings -> Integrations, and you paste it into the client (Open WebUI: the tool
+  server's API key / Bearer auth). This closes a credential-CSRF: the `localhost` bind does
+  not stop a web page open in your browser from POSTing to the port and running your tools,
+  but the token does. The gateway also refuses to bind a non-loopback host
+  (`CONDUIT_HTTP_HOST=0.0.0.0`) without a token, caps request bodies, and sanitizes
+  reflected headers so a crafted request can't inject or crash a listener.
+
 ### Changed
 - **Windows installers are now code-signed** via Azure Trusted Signing (publisher name
   shows; SmartScreen reputation still builds with downloads).
