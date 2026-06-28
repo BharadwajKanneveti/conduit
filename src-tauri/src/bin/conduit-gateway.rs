@@ -103,7 +103,10 @@ fn call_tool_def() -> Value {
         "name": "conduit_call_tool",
         "description": "Invoke a tool discovered via conduit_search_tools. Pass the tool's exact \
             `name` (as returned by the search) and put ALL of that tool's parameters INSIDE the \
-            `arguments` object (matching its input schema) - not at the top level next to `name`.",
+            `arguments` object (matching its input schema) - not at the top level next to `name`. \
+            Never invent or guess an identifier (teamId, accountId, projectId, etc.): if a required \
+            value isn't known, first call a list or get tool on the SAME server to obtain it, then \
+            call this with the real value.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -738,6 +741,113 @@ struct SearchGuard {
 /// model is stuck on one need, so return only that tool and command the call.
 const SEARCH_REPEAT_LIMIT: u32 = 3;
 
+/// True if a string argument value looks like an LLM-invented placeholder
+/// rather than a real value (e.g. "your_team_id", "<team_id>", "REPLACE_ME").
+/// Deliberately conservative so it never blocks a legitimate value.
+fn looks_like_placeholder(v: &str) -> bool {
+    let s = v.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if (s.starts_with('<') && s.ends_with('>')) || (s.starts_with("{{") && s.ends_with("}}")) {
+        return true;
+    }
+    let low = s.to_ascii_lowercase();
+    low.starts_with("your_")
+        || low.starts_with("your-")
+        || low.starts_with("your ")
+        || low.ends_with("_here")
+        || low.ends_with("-here")
+        || matches!(
+            low.as_str(),
+            "string"
+                | "placeholder"
+                | "replace_me"
+                | "replaceme"
+                | "changeme"
+                | "change_me"
+                | "example"
+                | "todo"
+                | "tbd"
+                | "xxx"
+                | "xxxx"
+                | "team_id"
+                | "teamid"
+                | "account_id"
+                | "project_id"
+                | "api_key"
+                | "your_api_key"
+        )
+}
+
+/// Find the first argument whose string value looks like a placeholder.
+fn find_placeholder_arg(arguments: &Value) -> Option<(String, String)> {
+    arguments.as_object().and_then(|obj| {
+        obj.iter().find_map(|(k, v)| {
+            v.as_str()
+                .filter(|s| looks_like_placeholder(s))
+                .map(|s| (k.clone(), s.to_string()))
+        })
+    })
+}
+
+/// The resource a parameter identifies, derived from its name: "teamId" ->
+/// "team", "account_id" -> "account". Used to prefer the right source tool.
+fn resource_stem(param: &str) -> String {
+    let low = param.to_ascii_lowercase();
+    let stem = low
+        .strip_suffix("_id")
+        .or_else(|| low.strip_suffix("id"))
+        .unwrap_or(&low);
+    stem.trim_end_matches('_').to_string()
+}
+
+/// Sibling tools on the same server that look like they return resources or
+/// identifiers (list/get/search/retrieve verbs), to point the model at a source
+/// for a value it's missing. When `resource` is given (e.g. "team" for a missing
+/// teamId), tools whose name mentions it rank first. General across every
+/// server; only the gateway can do this because it holds the whole catalog.
+fn source_tool_hints(catalog: &[Value], server: &str, resource: Option<&str>, max: usize) -> Vec<String> {
+    let prefix = format!("{server}__");
+    let mut hits: Vec<(bool, String)> = catalog
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .filter(|n| n.starts_with(&prefix))
+        .filter_map(|n| {
+            let bare = n[prefix.len()..].to_ascii_lowercase();
+            let is_source = bare.starts_with("list")
+                || bare.starts_with("get")
+                || bare.starts_with("retrieve")
+                || bare.contains("_list")
+                || bare.contains("search");
+            if !is_source {
+                return None;
+            }
+            let on_resource = resource
+                .map(|r| !r.is_empty() && bare.contains(r))
+                .unwrap_or(false);
+            Some((on_resource, n.to_string()))
+        })
+        .collect();
+    // Resource-matching tools first, then alphabetical for stability.
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    hits.into_iter().map(|(_, n)| n).take(max).collect()
+}
+
+/// A one-line recovery hint naming sibling list/get tools, appended when a call
+/// fails so the model can source a missing/invalid identifier and retry.
+fn recovery_hint(catalog: &[Value], server: &str) -> String {
+    let hints = source_tool_hints(catalog, server, None, 3);
+    if hints.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " If a required identifier was missing or wrong, get valid values from one of these on '{server}', then retry: {}.",
+            hints.join(", ")
+        )
+    }
+}
+
 fn handle_request(
     req: &Value,
     reg: &Registry,
@@ -1004,6 +1114,30 @@ fn handle_request(
             let name = name.as_str();
 
             let (srv, tool) = name.split_once("__").unwrap_or(("?", name));
+
+            // Pre-call guard: a model that invents an identifier (e.g.
+            // teamId = "your_team_id") would otherwise waste a downstream call
+            // and get a confusing failure. Catch obvious placeholders and point
+            // it at where to source the real value. General across every server.
+            if let Some((param, value)) = find_placeholder_arg(&arguments) {
+                let resource = resource_stem(&param);
+                let hints = source_tool_hints(cached, srv, Some(&resource), 3);
+                let source = if hints.is_empty() {
+                    format!("call a list or get tool on the '{srv}' server")
+                } else {
+                    format!("call one of these on the '{srv}' server first: {}", hints.join(", "))
+                };
+                let msg = format!(
+                    "Conduit: \"{value}\" for \"{param}\" looks like a placeholder, not a real \
+                     value, and was not sent. Don't invent identifiers. To get a real \"{param}\", \
+                     {source}, then call {name} again with the value it returns."
+                );
+                return Some(success(
+                    id,
+                    json!({ "content": [{ "type": "text", "text": msg }], "isError": true }),
+                ));
+            }
+
             let started = Instant::now();
             match router.route_call(name, arguments) {
                 Ok(mut result) => {
@@ -1028,15 +1162,29 @@ fn handle_request(
                         .map(|&b| b as usize)
                         .unwrap_or_else(shaping::budget);
                     shaping::shape_result(&mut result, budget);
+                    // Recover from a downstream failure: point the model at
+                    // sibling list/get tools that can supply a missing/invalid
+                    // identifier. Appended after shaping so it's never truncated.
+                    if !ok {
+                        let hint = recovery_hint(cached, srv);
+                        if !hint.is_empty() {
+                            if let Some(arr) =
+                                result.get_mut("content").and_then(|c| c.as_array_mut())
+                            {
+                                arr.push(json!({ "type": "text", "text": hint.trim() }));
+                            }
+                        }
+                    }
                     Some(success(id, result))
                 }
                 Err(e) => {
                     let ms = started.elapsed().as_millis() as u64;
                     audit::record_timed(srv, tool, false, Some(ms));
+                    let recovery = recovery_hint(cached, srv);
                     Some(success(
                         id,
                         json!({
-                            "content": [{ "type": "text", "text": format!("Conduit: {e}") }],
+                            "content": [{ "type": "text", "text": format!("Conduit: {e}.{recovery}") }],
                             "isError": true
                         }),
                     ))
@@ -1770,21 +1918,36 @@ fn serve_http_loop(server: tiny_http::Server, state: GatewayState) {
         let method = request.method().to_string().to_uppercase();
         let url = request.url().to_string();
         let path = url.split('?').next().unwrap_or("/").to_string();
+        // Reflect the caller's Origin and the headers its CORS preflight asks
+        // for. Browser clients (Open WebUI calls tools from the page) may send
+        // credentials, and `*` is forbidden with credentials, so echo the origin
+        // and allow them. This is loopback-only and unauthenticated anyway.
+        let origin = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Origin"))
+            .map(|h| h.value.as_str().to_string())
+            .unwrap_or_else(|| "*".to_string());
+        let allow_headers = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Access-Control-Request-Headers"))
+            .map(|h| h.value.as_str().to_string())
+            .unwrap_or_else(|| "Content-Type, Authorization".to_string());
+        eprintln!("conduit-gateway http: {method} {path} (origin: {origin})");
         let mut body = String::new();
         if method == "POST" {
             let _ = request.as_reader().read_to_string(&mut body);
         }
         let (status, ctype, payload) = handle_http(&state, &mut guard, &method, &path, &body);
-        // Browser clients (Open WebUI fetches OpenAPI tool specs and calls tools
-        // from the page) need permissive CORS, the endpoint is unauthenticated
-        // and loopback-only, so `*` is fine here.
-        let cors: [(&[u8], &[u8]); 4] = [
-            (b"Content-Type", ctype.as_bytes()),
-            (b"Access-Control-Allow-Origin", b"*"),
-            (b"Access-Control-Allow-Methods", b"GET, POST, OPTIONS"),
-            (b"Access-Control-Allow-Headers", b"Content-Type, Authorization"),
-        ];
         let mut response = tiny_http::Response::from_string(payload).with_status_code(status);
+        let cors: [(&[u8], &[u8]); 5] = [
+            (b"Content-Type", ctype.as_bytes()),
+            (b"Access-Control-Allow-Origin", origin.as_bytes()),
+            (b"Access-Control-Allow-Credentials", b"true"),
+            (b"Access-Control-Allow-Methods", b"GET, POST, OPTIONS"),
+            (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
+        ];
         for (name, value) in cors {
             response = response
                 .with_header(tiny_http::Header::from_bytes(name, value).expect("static header"));
@@ -2069,6 +2232,52 @@ mod tests {
         // Agent-control tools stay hidden unless the registry opts in.
         assert!(!paths.contains_key("/conduit_enable_server"));
         assert_eq!(spec.get("openapi").unwrap(), "3.1.0");
+    }
+
+    #[test]
+    fn detects_invented_placeholders_but_not_real_values() {
+        for p in [
+            "your_team_id",
+            "<team_id>",
+            "{{teamId}}",
+            "REPLACE_ME",
+            "team_id_here",
+            "string",
+            "TODO",
+        ] {
+            assert!(looks_like_placeholder(p), "should flag {p:?}");
+        }
+        for real in ["team_aBc123XYZ", "acme-prod", "my real project", "", "  "] {
+            assert!(!looks_like_placeholder(real), "should NOT flag {real:?}");
+        }
+    }
+
+    #[test]
+    fn find_placeholder_arg_picks_the_bad_value() {
+        let args = json!({ "teamId": "your_team_id", "limit": 10 });
+        let (k, v) = find_placeholder_arg(&args).unwrap();
+        assert_eq!(k, "teamId");
+        assert_eq!(v, "your_team_id");
+        assert!(find_placeholder_arg(&json!({ "teamId": "team_real123" })).is_none());
+    }
+
+    #[test]
+    fn source_hints_find_sibling_list_get_tools_same_server() {
+        let catalog = vec![
+            json!({ "name": "vercel__list_teams" }),
+            json!({ "name": "vercel__get_project" }),
+            json!({ "name": "vercel__create_deployment" }),
+            json!({ "name": "resend__list_domains" }),
+        ];
+        // Missing a teamId -> the team tool should rank first.
+        let hits = source_tool_hints(&catalog, "vercel", Some("team"), 5);
+        assert_eq!(hits.first().unwrap(), "vercel__list_teams");
+        assert!(hits.contains(&"vercel__get_project".to_string()));
+        // Not the write tool, and not the other server.
+        assert!(!hits.contains(&"vercel__create_deployment".to_string()));
+        assert!(!hits.iter().any(|h| h.starts_with("resend")));
+        assert_eq!(resource_stem("teamId"), "team");
+        assert_eq!(resource_stem("account_id"), "account");
     }
 
     #[test]
