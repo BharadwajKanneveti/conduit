@@ -26,64 +26,52 @@ pub fn sanitize_segment(s: &str) -> String {
         .collect()
 }
 
-/// Inline internal `$ref` pointers (`#/$defs/X`, `#/definitions/X`) into a JSON
-/// Schema so downstream consumers that can't resolve refs get a self-contained
-/// schema. mcpo (the MCP-to-OpenAPI proxy OpenWebUI uses) aborts on an unresolved
-/// `$ref` ("Custom field not found"), so a single server whose tool schema uses
-/// `$defs` (e.g. revenuecat) would otherwise break the entire full-mode bridge.
-/// Recursive refs are left in place to avoid infinite expansion.
+/// Inline local `$ref` pointers into a self-contained JSON Schema, so a downstream
+/// consumer that can't resolve refs gets a complete schema. Handles `#/$defs/X`,
+/// `#/definitions/X`, AND any in-document JSON Pointer (`#/properties/a/b`, which
+/// real servers like revenuecat use to share subschemas). mcpo (the MCP-to-OpenAPI
+/// proxy OpenWebUI uses) aborts with "Custom field not found" on an unresolved
+/// `$ref`, so one such server would otherwise break the whole full-discovery bridge.
+/// Refs resolve against a snapshot of the original schema; recursive refs are left
+/// in place (cycle guard) to avoid infinite expansion.
 pub fn inline_refs(schema: &mut Value) {
-    let defs = collect_defs(schema);
-    if defs.is_empty() {
+    if !has_ref(schema) {
         return;
     }
+    let root = schema.clone();
     let mut active = HashSet::new();
-    inline_node(schema, &defs, &mut active);
+    inline_node(schema, &root, &mut active);
     if let Some(obj) = schema.as_object_mut() {
         obj.remove("$defs");
         obj.remove("definitions");
     }
 }
 
-/// Collect the root `$defs` and `definitions` maps as name -> subschema.
-fn collect_defs(schema: &Value) -> HashMap<String, Value> {
-    let mut out = HashMap::new();
-    for key in ["$defs", "definitions"] {
-        if let Some(map) = schema.get(key).and_then(|v| v.as_object()) {
-            for (name, sub) in map {
-                out.insert(name.clone(), sub.clone());
-            }
-        }
+/// True if `node` contains a `$ref` anywhere, so we can skip the clone otherwise.
+fn has_ref(node: &Value) -> bool {
+    match node {
+        Value::Object(map) => map.contains_key("$ref") || map.values().any(has_ref),
+        Value::Array(arr) => arr.iter().any(has_ref),
+        _ => false,
     }
-    out
 }
 
-/// The def name in a local ref like `#/$defs/Foo`; `None` for external or
-/// sub-path refs we can't inline by simple substitution.
-fn ref_name(r: &str) -> Option<String> {
-    for p in ["#/$defs/", "#/definitions/"] {
-        if let Some(rest) = r.strip_prefix(p) {
-            if !rest.is_empty() && !rest.contains('/') {
-                return Some(rest.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Replace a `{"$ref": "#/$defs/X"}` node with a copy of def X (itself inlined).
-/// `active` holds the refs currently expanding, so a cycle stops instead of
-/// recursing forever.
-fn inline_node(node: &mut Value, defs: &HashMap<String, Value>, active: &mut HashSet<String>) {
-    let ref_target = node.get("$ref").and_then(|v| v.as_str()).and_then(ref_name);
-    if let Some(name) = ref_target {
-        if !active.contains(&name) {
-            if let Some(def) = defs.get(&name) {
-                let mut resolved = def.clone();
-                active.insert(name.clone());
-                inline_node(&mut resolved, defs, active);
-                active.remove(&name);
-                *node = resolved;
+/// Replace a `{"$ref": "#/..."}` node with a copy of what that JSON Pointer resolves
+/// to in `root` (itself inlined). `active` holds the ref strings currently expanding,
+/// so a cycle stops instead of recursing forever; external refs (no `#` prefix) and
+/// unresolvable pointers are left as-is.
+fn inline_node(node: &mut Value, root: &Value, active: &mut HashSet<String>) {
+    let ref_str = node.get("$ref").and_then(|v| v.as_str()).map(str::to_string);
+    if let Some(r) = ref_str {
+        if let Some(ptr) = r.strip_prefix('#') {
+            if !active.contains(&r) {
+                if let Some(target) = root.pointer(ptr).cloned() {
+                    let mut resolved = target;
+                    active.insert(r.clone());
+                    inline_node(&mut resolved, root, active);
+                    active.remove(&r);
+                    *node = resolved;
+                }
             }
         }
         return;
@@ -91,12 +79,12 @@ fn inline_node(node: &mut Value, defs: &HashMap<String, Value>, active: &mut Has
     match node {
         Value::Object(map) => {
             for v in map.values_mut() {
-                inline_node(v, defs, active);
+                inline_node(v, root, active);
             }
         }
         Value::Array(arr) => {
             for v in arr.iter_mut() {
-                inline_node(v, defs, active);
+                inline_node(v, root, active);
             }
         }
         _ => {}
@@ -388,6 +376,22 @@ mod tests {
         let before = schema.clone();
         inline_refs(&mut schema);
         assert_eq!(schema, before);
+    }
+
+    #[test]
+    fn inline_refs_resolves_json_pointer_into_properties() {
+        // revenuecat-style: a property $refs another property by JSON Pointer.
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string", "minLength": 1 },
+                "alias": { "$ref": "#/properties/name" }
+            }
+        });
+        inline_refs(&mut schema);
+        assert_eq!(schema["properties"]["alias"]["type"], "string");
+        assert_eq!(schema["properties"]["alias"]["minLength"], 1);
+        assert!(!serde_json::to_string(&schema).unwrap().contains("$ref"));
     }
     use crate::downstream::{DownstreamServer, Transport};
 
