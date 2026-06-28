@@ -79,6 +79,10 @@ enum Format {
     /// `command`/`args` (stdio) or `url` (http/sse), with optional `headers`,
     /// `timeout`, `connect_timeout`, etc. The file also holds user model/config.
     YamlMcpServers,
+    /// YAML with a top-level `mcpServers` list (Continue).
+    /// Each entry is a server object with fields like `name`, `command`,
+    /// `args`, `env`, `type`, `url`, etc.
+    YamlMcpServersList,
 }
 
 struct ClientDef {
@@ -436,6 +440,10 @@ fn hermes_path() -> Option<PathBuf> {
     client_config_path("hermes")
 }
 
+fn continue_path() -> Option<PathBuf> {
+    Some(home()?.join(".continue").join("config.yaml"))
+}
+
 fn cursor_plugins_dir() -> Option<PathBuf> {
     Some(home()?.join(".cursor").join("plugins").join("cache"))
 }
@@ -658,6 +666,14 @@ fn defs() -> Vec<ClientDef> {
             format: Format::YamlMcpServers,
             uses_connectors: false,
             path: hermes_path,
+            plugin_scan: None,
+        },
+        ClientDef {
+            id: "continue",
+            name: "Continue",
+            format: Format::YamlMcpServersList,
+            uses_connectors: false,
+            path: continue_path,
             plugin_scan: None,
         },
     ]
@@ -993,6 +1009,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         Format::TomlMcpServers => parse_toml(&content),
         Format::YamlExtensions => parse_yaml_extensions(&content),
         Format::YamlMcpServers => parse_hermes_yaml_servers(&content),
+        Format::YamlMcpServersList => parse_continue_yaml_servers(&content),
     };
 
     match parsed {
@@ -1347,6 +1364,151 @@ fn edit_yaml_gateway(path: &Path, install: bool, profile: Option<&str>) -> Resul
     atomic_write(path, &out)
 }
 
+/// Parse Continue's `mcpServers` list into servers. Each entry carries
+/// `command`/`args`/`env` in YAML list form.
+fn parse_continue_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> {
+    if content.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let value: serde_yaml::Value = serde_yaml::from_str(content).map_err(|e| e.to_string())?;
+
+    let servers = match value.get("mcpServers").and_then(|v| v.as_sequence()) {
+        Some(s) => s,
+        None => return Ok(Vec::new()),
+    };
+
+    let mut servers: Vec<McpServer> = servers
+        .iter()
+        .filter_map(|server| {
+            let def = server.as_mapping()?;
+
+            let str_of = |key: &str| {
+                def.get(serde_yaml::Value::String(key.into()))
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            };
+
+            let name = str_of("name")?;
+
+            let command = str_of("command").filter(|s| !s.is_empty());
+
+            let args = def
+                .get(serde_yaml::Value::String("args".into()))
+                .and_then(|v| v.as_sequence())
+                .map(|seq| {
+                    seq.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            let env_keys = def
+                .get(serde_yaml::Value::String("env".into()))
+                .and_then(|v| v.as_mapping())
+                .map(|m| {
+                    m.keys()
+                        .filter_map(|k| k.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            Some(McpServer {
+                name,
+                transport: "stdio".into(),
+                command,
+                args,
+                env_keys,
+                url: None,
+            })
+        })
+        .collect();
+
+    servers.sort_by_key(|s| s.name.to_lowercase());
+
+    Ok(servers)
+}
+
+/// Build a Continue stdio MCP server record for a server entry.
+fn entry_to_continue_yaml(entry: &ServerEntry) -> serde_yaml::Value {
+    let env: serde_json::Map<String, serde_json::Value> = entry
+        .env
+        .iter()
+        .filter_map(|e| {
+            e.value
+                .as_ref()
+                .map(|v| (e.key.clone(), serde_json::Value::String(v.clone())))
+        })
+        .collect();
+
+    let v = serde_json::json!({
+        "name": entry.name,
+        "command": entry.command.clone().unwrap_or_default(),
+        "args": entry.args,
+        "env": env,
+    });
+
+    serde_yaml::to_value(&v).unwrap_or(serde_yaml::Value::Null)
+}
+
+fn continue_servers_mut(root: &mut serde_yaml::Value) -> &mut Vec<serde_yaml::Value> {
+    if !root.is_mapping() {
+        *root = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
+    }
+
+    let map = root.as_mapping_mut().unwrap();
+
+    let key = serde_yaml::Value::String("mcpServers".into());
+
+    if !map.get(&key).map(|v| v.is_sequence()).unwrap_or(false) {
+        map.insert(key.clone(), serde_yaml::Value::Sequence(Vec::new()));
+    }
+
+    map.get_mut(&key).unwrap().as_sequence_mut().unwrap()
+}
+
+fn write_continue_yaml_servers(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
+    let mut root = read_existing_yaml(path)?;
+
+    let list = continue_servers_mut(&mut root);
+
+    list.clear();
+
+    for server in servers {
+        list.push(entry_to_continue_yaml(server));
+    }
+
+    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
+
+    atomic_write(path, &out)
+}
+
+fn edit_continue_yaml_gateway(
+    path: &Path,
+    install: bool,
+    profile: Option<&str>,
+) -> Result<(), String> {
+    let mut root = read_existing_yaml(path)?;
+
+    let servers = continue_servers_mut(&mut root);
+
+    servers.retain(|server| {
+        server
+            .as_mapping()
+            .and_then(|m| m.get(serde_yaml::Value::String("name".into())))
+            .and_then(|v| v.as_str())
+            != Some(GATEWAY_ENTRY_NAME)
+    });
+
+    if install {
+        servers.push(entry_to_continue_yaml(&gateway_entry(profile)?));
+    }
+
+    let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
+
+    atomic_write(path, &out)
+}
+
 // ---------------------------------------------------------------------------
 // Hermes (YAML `mcp_servers:` map).
 //
@@ -1543,6 +1705,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
         Format::TomlMcpServers => write_toml(&path, servers)?,
         Format::YamlExtensions => write_yaml_extensions(&path, servers)?,
         Format::YamlMcpServers => write_hermes_yaml_servers(&path, servers)?,
+        Format::YamlMcpServersList => write_continue_yaml_servers(&path, servers)?,
     }
     Ok(WriteOutcome {
         path: path.display().to_string(),
@@ -1746,6 +1909,7 @@ fn install_or_remove(
         Format::TomlMcpServers => edit_toml_gateway(&path, install, profile)?,
         Format::YamlExtensions => edit_yaml_gateway(&path, install, profile)?,
         Format::YamlMcpServers => edit_hermes_yaml_gateway(&path, install, profile)?,
+        Format::YamlMcpServersList => edit_continue_yaml_gateway(&path, install, profile)?,
     }
     Ok(WriteOutcome {
         path: path.display().to_string(),

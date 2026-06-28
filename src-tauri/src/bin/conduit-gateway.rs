@@ -1784,10 +1784,11 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
-        assert_eq!(names.len(), 3);
+        assert_eq!(names.len(), 4);
         assert!(names.contains(&"conduit_status"));
         assert!(names.contains(&"conduit_search_tools"));
         assert!(names.contains(&"conduit_call_tool"));
+        assert!(names.contains(&"conduit_fetch_result"));
         assert!(!names.contains(&"resend__send_email"));
     }
 
