@@ -24,6 +24,16 @@ pub const DEFAULT_BUDGET_BYTES: usize = 48 * 1024;
 /// How long a cached full result stays fetchable.
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 
+/// Cap on the number of cached shaped results. A burst of large tool calls would
+/// otherwise grow process memory without bound between lazy TTL sweeps. Oldest
+/// entries (by insertion time) are evicted first.
+const MAX_CACHE_ENTRIES: usize = 64;
+
+/// Cap on total cached body bytes. Evict oldest until a new body fits, or the
+/// cache is empty (then one over-cap body is kept rather than dropping the result
+/// the caller just produced).
+const MAX_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
 /// Resolve the byte budget from the env override, falling back to the default.
 /// 0 disables shaping (every result is treated as under budget).
 pub fn budget() -> usize {
@@ -80,6 +90,38 @@ fn text_result(text: String, is_error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
 }
 
+/// The longest char-boundary prefix of `s` whose UTF-8 length is at most
+/// `max_bytes`. Truncating by char COUNT alone would let a multi-byte body (CJK,
+/// emoji) emit several times the byte budget; this honors the byte budget exactly
+/// while never splitting a code point.
+fn head_within_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = 0;
+    for (i, ch) in s.char_indices() {
+        let next = i + ch.len_utf8();
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+    &s[..end]
+}
+
+/// True if every content block is text, so the text projection in [`extract_body`]
+/// represents the result losslessly. A block with no `text` field is non-text
+/// (image, audio, resource, resource_link); shaping would silently drop it, so such
+/// results are left whole.
+fn is_text_representable(result: &Value) -> bool {
+    match result.get("content").and_then(|c| c.as_array()) {
+        Some(blocks) => blocks
+            .iter()
+            .all(|b| b.get("text").and_then(|t| t.as_str()).is_some()),
+        None => true,
+    }
+}
+
 /// If `result` serializes to more than `budget` bytes, cache its full body, replace
 /// it with a truncated head + a stamped cursor marker, and return `true` (shaped).
 /// A `budget` of 0 disables shaping. Lossless: the full body stays fetchable via
@@ -93,11 +135,21 @@ pub fn shape_result(result: &mut Value, budget: usize) -> bool {
         return false;
     }
 
+    // Only shape what we can represent losslessly as a text head. If the result has
+    // non-text blocks, or its size is dominated by non-body envelope (the text
+    // projection captures under half the bytes), shaping would drop data and its
+    // "nothing was lost" claim would be false. Pass those through untouched.
     let body = extract_body(result);
+    if !is_text_representable(result) || body.len() < size / 2 {
+        return false;
+    }
+
     let total = body.chars().count();
-    // Reserve room for the marker, then show the head of the body.
-    let head_chars = budget.saturating_sub(512).max(256).min(total);
-    let head: String = body.chars().take(head_chars).collect();
+    // Reserve room for the marker, then show as much of the body head as fits the
+    // BYTE budget (not a char count, or multi-byte text would blow past it).
+    let head_byte_limit = budget.saturating_sub(512).max(256);
+    let head = head_within_bytes(&body, head_byte_limit).to_string();
+    let head_chars = head.chars().count();
     let is_error = result
         .get("isError")
         .and_then(|v| v.as_bool())
@@ -105,8 +157,19 @@ pub fn shape_result(result: &mut Value, budget: usize) -> bool {
 
     let cursor = next_cursor();
     {
-        let mut map = cache().lock().unwrap();
+        let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
         sweep(&mut map);
+        // Bound memory: evict oldest until the entry count and total bytes leave
+        // room for this body (or the cache empties, keeping one over-cap body).
+        while !map.is_empty()
+            && (map.len() >= MAX_CACHE_ENTRIES
+                || map.values().map(|c| c.body.len()).sum::<usize>() + body.len() > MAX_CACHE_BYTES)
+        {
+            let Some(oldest) = map.iter().min_by_key(|(_, c)| c.at).map(|(k, _)| k.clone()) else {
+                break;
+            };
+            map.remove(&oldest);
+        }
         map.insert(
             cursor.clone(),
             Cached {
@@ -135,7 +198,7 @@ pub fn shape_result(result: &mut Value, budget: usize) -> bool {
 /// Return the next slice of a cached shaped result, by cursor + character offset.
 /// `len` of 0 means "use the current budget".
 pub fn fetch_result(cursor: &str, offset: usize, len: usize) -> Value {
-    let mut map = cache().lock().unwrap();
+    let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
     sweep(&mut map);
     let Some(c) = map.get(cursor) else {
         return text_result(
@@ -225,5 +288,78 @@ mod tests {
     fn fetch_unknown_cursor_is_an_error() {
         let v = fetch_result("nope", 0, 100);
         assert_eq!(v["isError"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn multibyte_head_respects_byte_budget() {
+        // 3-byte chars: truncating by char COUNT would emit ~3x the budget in bytes.
+        let mut r = json!({
+            "content": [{ "type": "text", "text": "€".repeat(5_000) }],
+            "isError": false
+        });
+        assert!(shape_result(&mut r, 2048));
+        let text = r["content"][0]["text"].as_str().unwrap();
+        let head = text.split("\n\n[Conduit shaped").next().unwrap();
+        assert!(
+            head.len() <= 2048,
+            "head was {} bytes, over the 2048 budget",
+            head.len()
+        );
+    }
+
+    #[test]
+    fn fetch_past_end_reports_nothing_more() {
+        let mut r = big_text_result(10_000);
+        shape_result(&mut r, 2048);
+        let text = r["content"][0]["text"].as_str().unwrap();
+        let cursor = text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap()
+            .to_string();
+        let past = fetch_result(&cursor, 999_999, 100);
+        let pt = past["content"][0]["text"].as_str().unwrap();
+        assert!(pt.contains("past the end"));
+        assert_eq!(past["isError"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn non_text_result_is_not_shaped() {
+        // A large image block would be dropped by shaping, so it must pass through.
+        let mut r = json!({
+            "content": [{ "type": "image", "data": "A".repeat(10_000), "mimeType": "image/png" }],
+            "isError": false
+        });
+        assert!(!shape_result(&mut r, 2048));
+        assert_eq!(r["content"][0]["type"].as_str(), Some("image"));
+    }
+
+    #[test]
+    fn envelope_heavy_result_is_not_shaped() {
+        // Size is dominated by a non-body field the text projection can't capture,
+        // so shaping would lose it; leave the result whole.
+        let mut r = json!({
+            "content": [{ "type": "text", "text": "small" }],
+            "annotations": { "blob": "Z".repeat(10_000) },
+            "isError": false
+        });
+        assert!(!shape_result(&mut r, 2048));
+        assert_eq!(r["content"][0]["text"].as_str(), Some("small"));
+    }
+
+    #[test]
+    fn cache_is_bounded() {
+        // Insert well past the cap; the cache must never exceed MAX_CACHE_ENTRIES.
+        for _ in 0..(MAX_CACHE_ENTRIES + 20) {
+            let mut r = big_text_result(5_000);
+            shape_result(&mut r, 1024);
+        }
+        let map = cache().lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            map.len() <= MAX_CACHE_ENTRIES,
+            "cache grew to {} entries",
+            map.len()
+        );
     }
 }
