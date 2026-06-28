@@ -1373,61 +1373,84 @@ fn parse_continue_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> 
         return Ok(Vec::new());
     }
 
-    let value: serde_yaml::Value = serde_yaml::from_str(content).map_err(|e| e.to_string())?;
+    let value: serde_yaml::Value =
+        serde_yaml::from_str(content).map_err(|e| e.to_string())?;
 
-    let servers = match value.get("mcpServers").and_then(|v| v.as_sequence()) {
-        Some(s) => s,
+    let entries = match value.get("mcpServers") {
         None => return Ok(Vec::new()),
+        Some(v) if v.is_sequence() => v.as_sequence().unwrap(),
+        Some(_) => {
+            return Err(
+                "'mcpServers' must be a sequence of server definitions".into(),
+            );
+        }
     };
 
-    let mut servers: Vec<McpServer> = servers
-        .iter()
-        .filter_map(|server| {
-            let def = server.as_mapping()?;
+    let mut malformed = Vec::new();
+    let mut servers = Vec::new();
 
-            let str_of = |key: &str| {
-                def.get(serde_yaml::Value::String(key.into()))
-                    .and_then(|v| v.as_str())
-                    .map(String::from)
-            };
+    for (idx, server) in entries.iter().enumerate() {
+        let Some(def) = server.as_mapping() else {
+            malformed.push(format!("mcpServers[{idx}]"));
+            continue;
+        };
 
-            let name = str_of("name")?;
+        let str_of = |key: &str| {
+            def.get(serde_yaml::Value::String(key.into()))
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        };
 
-            let command = str_of("command").filter(|s| !s.is_empty());
+        // Try to identify the entry by name.
+        let name = match str_of("name") {
+            Some(name) => name,
+            None => {
+                malformed.push(format!("mcpServers[{idx}]"));
+                continue;
+            }
+        };
 
-            let args = def
-                .get(serde_yaml::Value::String("args".into()))
-                .and_then(|v| v.as_sequence())
-                .map(|seq| {
-                    seq.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
+        let command = str_of("command").filter(|s| !s.is_empty());
 
-            let env_keys = def
-                .get(serde_yaml::Value::String("env".into()))
-                .and_then(|v| v.as_mapping())
-                .map(|m| {
-                    m.keys()
-                        .filter_map(|k| k.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            Some(McpServer {
-                name,
-                transport: "stdio".into(),
-                command,
-                args,
-                env_keys,
-                url: None,
+        let args = def
+            .get(serde_yaml::Value::String("args".into()))
+            .and_then(|v| v.as_sequence())
+            .map(|seq| {
+                seq.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
             })
-        })
-        .collect();
+            .unwrap_or_default();
+
+        let env_keys = def
+            .get(serde_yaml::Value::String("env".into()))
+            .and_then(|v| v.as_mapping())
+            .map(|m| {
+                m.keys()
+                    .filter_map(|k| k.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        servers.push(McpServer {
+            name,
+            transport: "stdio".into(),
+            command,
+            args,
+            env_keys,
+            url: None,
+        });
+    }
+
+    if !malformed.is_empty() {
+        malformed.sort();
+        return Err(format!(
+            "malformed 'mcpServers' entry (expected a mapping): {}",
+            malformed.join(", ")
+        ));
+    }
 
     servers.sort_by_key(|s| s.name.to_lowercase());
-
     Ok(servers)
 }
 
@@ -2326,6 +2349,35 @@ bad = "not-a-table"
         assert!(matches!(d.format, Format::YamlExtensions));
         assert!((d.path)().is_some());
     }
+
+  
+   
+   #[test]
+    fn continue_yaml_parses_stdio_server() {
+        let content = "mcpServers:\n  - name: fetch\n    command: uvx\n    args:\n      - mcp-server-fetch\n    env:\n      TOKEN: abc123\n";
+
+        let parsed = parse_continue_yaml_servers(content).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "fetch");
+        assert_eq!(parsed[0].command.as_deref(), Some("uvx"));
+        assert_eq!(parsed[0].transport, "stdio");
+        assert_eq!(parsed[0].args, vec!["mcp-server-fetch"]);
+        assert_eq!(parsed[0].env_keys, vec!["TOKEN".to_string()]);
+    }
+
+    #[test]
+    fn continue_yaml_malformed_entry_returns_error() {
+        let content = "mcpServers:\n  - name: fetch\n    command: uvx\n  - not-a-mapping\n";
+
+        let err = parse_continue_yaml_servers(content).unwrap_err();
+
+        assert!(
+            err.contains("mcpServers[1]"),
+            "error should identify the malformed entry: {err}"
+        );
+        assert!(err.contains("malformed 'mcpServers' entry"));
+}
 
     #[test]
     fn hermes_yaml_round_trip_preserves_config() {
