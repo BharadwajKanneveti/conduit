@@ -35,6 +35,9 @@ sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
 urlencoding = "2"
+# Minimal synchronous HTTP server for the gateway's native HTTP/OpenAPI mode
+# (first-class Open WebUI and any OpenAPI tool client, no external bridge).
+tiny_http = "0.12"
 
 # OS keychain, with the native backend per platform.
 [target.'cfg(target_os = "windows")'.dependencies]

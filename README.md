@@ -161,11 +161,11 @@ below for you, so you never have to edit these by hand.
 
 ### Open WebUI and other HTTP/OpenAPI consumers
 
-Open WebUI consumes MCP over HTTP/OpenAPI rather than a stdio config file, so it
-isn't auto-configured like the clients above, but it works with zero gateway changes:
-run [`mcpo`](https://github.com/open-webui/mcpo) in front of the gateway and add it as
-an OpenAPI tool server. See [docs/openwebui.md](docs/openwebui.md). The same bridge
-serves any HTTP/OpenAPI MCP consumer (n8n, LibreChat, custom agents).
+The gateway speaks HTTP/OpenAPI natively, so Open WebUI (and any OpenAPI tool
+client) connects straight to Conduit, no bridge or proxy. Start it with
+`conduit-gateway --http 8765` and add `http://localhost:8765` as an OpenAPI tool
+server. See [docs/openwebui.md](docs/openwebui.md). The same endpoint serves any
+HTTP/OpenAPI MCP consumer (n8n, LibreChat, custom agents).
 
 ## Configuration
 
