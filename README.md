@@ -159,6 +159,14 @@ below for you, so you never have to edit these by hand.
 
 `<config>` is your OS application-config dir (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config` on Linux); `<data>` is the data dir (`~/.local/share` on Linux, the same as `<config>` elsewhere). Zed and Goose paths vary slightly by OS; Conduit resolves the right one automatically.
 
+### Open WebUI and other HTTP/OpenAPI consumers
+
+Open WebUI consumes MCP over HTTP/OpenAPI rather than a stdio config file, so it
+isn't auto-configured like the clients above, but it works with zero gateway changes:
+run [`mcpo`](https://github.com/open-webui/mcpo) in front of the gateway and add it as
+an OpenAPI tool server. See [docs/openwebui.md](docs/openwebui.md). The same bridge
+serves any HTTP/OpenAPI MCP consumer (n8n, LibreChat, custom agents).
+
 ## Configuration
 
 Lazy discovery, the destructive-tool block, and agent control are global settings,
