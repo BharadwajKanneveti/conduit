@@ -139,9 +139,8 @@ pub fn connect(server_url: &str, invite_code: &str, member_name: Option<&str>) -
     save_token(&joined.member_token)?;
     // The token is now in the keychain. Any failure past this point must clear it,
     // or we'd orphan a live bearer token with no local record of the connection.
-    finish_connect(server_url, member_name, joined).map_err(|e| {
+    finish_connect(server_url, member_name, joined).inspect_err(|_| {
         let _ = clear_token();
-        e
     })
 }
 

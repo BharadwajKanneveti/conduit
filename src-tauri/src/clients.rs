@@ -612,13 +612,6 @@ fn json_server(name: &str, def: &serde_json::Value) -> McpServer {
     }
 }
 
-/// Parse a JSON value tolerantly: plain JSON first, then JSON5 (comments and
-/// trailing commas, as in Zed's settings.json) as a fallback. None only if even
-/// JSON5 can't read it. Used so a commented config is never mistaken for corrupt.
-fn read_json_lenient(content: &str) -> Option<serde_json::Value> {
-    parse_json_value(content).ok()
-}
-
 /// Parse JSON or JSON5, returning a syntax error with line/column when possible.
 fn parse_json_value(content: &str) -> Result<serde_json::Value, String> {
     if content.trim().is_empty() {
