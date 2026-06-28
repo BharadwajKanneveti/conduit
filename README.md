@@ -183,6 +183,10 @@ gateway entry, written for you when you connect a client:
   stable per-user path so packaged and unpackaged clients agree.
 - `CONDUIT_RESULT_BUDGET=<bytes>` - cap oversized tool results at this many bytes
   (0 disables it). Optional; off by default.
+- `CONDUIT_HTTP=<port>` (with optional `CONDUIT_HTTP_HOST`, default `127.0.0.1`) -
+  run the gateway in HTTP/OpenAPI mode instead of stdio, for Open WebUI and other
+  OpenAPI clients (see above). The in-app Settings -> Integrations toggle sets this
+  for you.
 
 **Semantic search (optional).** Lazy discovery ranks tools lexically by default. Point it
 at any `/v1/embeddings` endpoint (LM Studio, Ollama, or a cloud provider) to blend in
@@ -202,17 +206,19 @@ namespaced per server, so the two never collide even in the same profile.
 
 Prebuilt installers are published on the
 [Releases](https://github.com/tsouth89/conduit/releases) page. Conduit runs on
-**Windows and macOS** (the macOS build is signed and notarized), with **Linux**
-in beta. On Linux, prefer the **`.deb`** (it links your system's WebKitGTK and is
+**Windows and macOS** (both builds are code-signed; macOS is also notarized), with
+**Linux** in beta. On Linux, prefer the **`.deb`** (it links your system's WebKitGTK and is
 the most reliable package); the **AppImage** is a portable, no-root fallback but
 can clash with very new or virtualized graphics stacks (see Troubleshooting). To
 run from source, see Development below.
 
 Both the **Windows** and **macOS** installers are code-signed (macOS is also
-notarized), so they install without a SmartScreen or Gatekeeper warning. Windows
-SmartScreen reputation still accrues with downloads, but the "unknown publisher"
-block is gone. The **Linux** packages are unsigned, as is typical. See
-[docs/SIGNING.md](docs/SIGNING.md) for details.
+notarized). macOS installs cleanly through Gatekeeper. On Windows the installer is
+signed with your validated publisher name (no "unknown publisher"), but because it
+uses a standard certificate rather than EV, SmartScreen reputation still builds with
+downloads, so an early install may still show "Windows protected your PC", click
+**More info -> Run anyway** to continue. The **Linux** packages are unsigned, as is
+typical. See [docs/SIGNING.md](docs/SIGNING.md) for details.
 
 **Updating and uninstalling on Linux.** There is no graphical uninstaller, use the
 terminal. The package name is `conduit`.

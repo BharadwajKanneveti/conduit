@@ -47,6 +47,10 @@ That's it. Ask for something one of your servers does ("list my recent emails",
   is best for capable models. For a weaker local model, `CONDUIT_DISCOVERY=full`
   scoped to a small profile exposes the tools directly (no search step) so the
   tool count stays manageable.
+- **Multi-step calls resolve themselves.** If a tool needs an identifier the model
+  doesn't have yet (e.g. a Vercel `teamId`), the gateway refuses an invented
+  placeholder and points the model at the right list/get tool to fetch the real
+  value first, so chained calls work even with smaller models.
 - **Plays well with other tools.** `conduit_search_tools` is written to be the
   model's first stop for any external action, so it competes well against other
   tools you may have installed, no need to disable them.

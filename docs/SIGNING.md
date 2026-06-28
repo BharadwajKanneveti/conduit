@@ -13,7 +13,7 @@ self-signed certificate does not help end users.
 
 | Option | Cost | Notes |
 |---|---|---|
-| **Azure Trusted Signing** | ~$10/month | Cheapest real option. Cloud-based, no cert file to manage. Requires an Azure account and identity verification; orgs need 3+ years of history (individuals are eligible). Builds SmartScreen reputation immediately on a trusted root. |
+| **Azure Trusted Signing** | ~$10/month | Cheapest real option. Cloud-based, no cert file to manage. Requires an Azure account and identity verification; orgs need 3+ years of history (individuals are eligible). Chains to a Microsoft-operated trusted root and shows your validated publisher name. It is **standard, not EV**, signing, so SmartScreen reputation still accrues with downloads and an early install may still warn. |
 | **OV certificate** (Sectigo, DigiCert, etc.) | ~$100 to $400/year | Standard cert. SmartScreen reputation builds over time/downloads, so early downloads may still warn briefly. Usually requires a hardware token (or cloud HSM) now. |
 | **EV certificate** | ~$300 to $600/year | Instant SmartScreen reputation, no warning from day one. Hardware token required. |
 | **Ship unsigned (interim)** | free | Fine for an early beta. Users click "More info → Run anyway". Document the bypass in release notes. |
