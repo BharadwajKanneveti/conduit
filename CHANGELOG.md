@@ -3,6 +3,37 @@
 All notable changes to Conduit are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 
+## [0.7.0] - 2026-06-28
+
+### Added
+- **Native HTTP/OpenAPI transport.** Run the gateway with `conduit-gateway --http <port>`
+  (or `CONDUIT_HTTP=<port>`) and it serves an OpenAPI spec plus a POST endpoint per tool,
+  so Open WebUI and any OpenAPI tool client connect straight to Conduit with no mcpo,
+  proxy, or Python bridge. It uses the same request path as stdio (one code path, two
+  transports), binds both IPv4 and IPv6 loopback, and sends CORS headers so browser
+  clients work. See [docs/openwebui.md](docs/openwebui.md).
+- **One-click Open WebUI / HTTP endpoint toggle** in Settings -> Integrations. The app
+  supervises the gateway, shows the URL to paste, verifies it actually started, and shuts
+  it down when you quit.
+- **Self-resolving multi-step tool calls.** When a model invents a placeholder identifier
+  (e.g. `teamId: "your_team_id"`), the gateway refuses it before the downstream call and
+  points the model at the right list/get tool on the same server to source the real value
+  (resource-aware: a missing `teamId` suggests the team-listing tool first). The same
+  recovery hint is appended whenever a call fails.
+
+### Security
+- **The HTTP endpoint now requires a bearer token.** The app auto-generates one, shows it
+  in Settings -> Integrations, and you paste it into the client (Open WebUI: the tool
+  server's API key / Bearer auth). This closes a credential-CSRF: the `localhost` bind does
+  not stop a web page open in your browser from POSTing to the port and running your tools,
+  but the token does. The gateway also refuses to bind a non-loopback host
+  (`CONDUIT_HTTP_HOST=0.0.0.0`) without a token, caps request bodies, and sanitizes
+  reflected headers so a crafted request can't inject or crash a listener.
+
+### Changed
+- **Windows installers are now code-signed** via Azure Trusted Signing (publisher name
+  shows; SmartScreen reputation still builds with downloads).
+
 ## [0.6.0] - 2026-06-27
 
 ### Changed

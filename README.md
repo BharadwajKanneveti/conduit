@@ -159,6 +159,15 @@ below for you, so you never have to edit these by hand.
 
 `<config>` is your OS application-config dir (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config` on Linux); `<data>` is the data dir (`~/.local/share` on Linux, the same as `<config>` elsewhere). Zed and Goose paths vary slightly by OS; Conduit resolves the right one automatically.
 
+### Open WebUI and other HTTP/OpenAPI consumers
+
+The gateway speaks HTTP/OpenAPI natively, so Open WebUI (and any OpenAPI tool
+client) connects straight to Conduit, no bridge or proxy. Flip on **Settings ->
+Integrations -> Open WebUI / HTTP endpoint** in the app (or run
+`conduit-gateway --http 8765`), then add `http://localhost:8765` as an OpenAPI
+tool server. See [docs/openwebui.md](docs/openwebui.md). The same endpoint serves
+any HTTP/OpenAPI MCP consumer (n8n, LibreChat, custom agents).
+
 ## Configuration
 
 Lazy discovery, the destructive-tool block, and agent control are global settings,
@@ -174,6 +183,11 @@ gateway entry, written for you when you connect a client:
   stable per-user path so packaged and unpackaged clients agree.
 - `CONDUIT_RESULT_BUDGET=<bytes>` - cap oversized tool results at this many bytes
   (0 disables it). Optional; off by default.
+- `CONDUIT_HTTP=<port>` (with optional `CONDUIT_HTTP_HOST`, default `127.0.0.1`,
+  and `CONDUIT_HTTP_TOKEN` for the required bearer token) - run the gateway in
+  HTTP/OpenAPI mode instead of stdio, for Open WebUI and other OpenAPI clients (see
+  above). The in-app Settings -> Integrations toggle sets these for you, and the
+  gateway refuses a non-loopback bind without a token.
 
 **Semantic search (optional).** Lazy discovery ranks tools lexically by default. Point it
 at any `/v1/embeddings` endpoint (LM Studio, Ollama, or a cloud provider) to blend in
@@ -193,17 +207,19 @@ namespaced per server, so the two never collide even in the same profile.
 
 Prebuilt installers are published on the
 [Releases](https://github.com/tsouth89/conduit/releases) page. Conduit runs on
-**Windows and macOS** (the macOS build is signed and notarized), with **Linux**
-in beta. On Linux, prefer the **`.deb`** (it links your system's WebKitGTK and is
+**Windows and macOS** (both builds are code-signed; macOS is also notarized), with
+**Linux** in beta. On Linux, prefer the **`.deb`** (it links your system's WebKitGTK and is
 the most reliable package); the **AppImage** is a portable, no-root fallback but
 can clash with very new or virtualized graphics stacks (see Troubleshooting). To
 run from source, see Development below.
 
 Both the **Windows** and **macOS** installers are code-signed (macOS is also
-notarized), so they install without a SmartScreen or Gatekeeper warning. Windows
-SmartScreen reputation still accrues with downloads, but the "unknown publisher"
-block is gone. The **Linux** packages are unsigned, as is typical. See
-[docs/SIGNING.md](docs/SIGNING.md) for details.
+notarized). macOS installs cleanly through Gatekeeper. On Windows the installer is
+signed with your validated publisher name (no "unknown publisher"), but because it
+uses a standard certificate rather than EV, SmartScreen reputation still builds with
+downloads, so an early install may still show "Windows protected your PC", click
+**More info -> Run anyway** to continue. The **Linux** packages are unsigned, as is
+typical. See [docs/SIGNING.md](docs/SIGNING.md) for details.
 
 **Updating and uninstalling on Linux.** There is no graphical uninstaller, use the
 terminal. The package name is `conduit`.

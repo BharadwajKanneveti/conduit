@@ -18,7 +18,7 @@
 //!   model searches and calls on demand, keeping context flat.
 //! - Records every tool call to a local audit log.
 
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -56,49 +56,35 @@ fn status_tool_def() -> Value {
 
 /// The two meta-tools that power lazy discovery: search then call. In lazy mode
 /// these (plus conduit_status) are the ONLY tools advertised, so the client's
-/// context holds 3 tool defs instead of hundreds - the model discovers the real
-/// tool on demand and dispatches through `conduit_call_tool`.
-/// Unique connected-server prefixes from the catalog (e.g. "github, resend, stripe,
-/// vercel"), advertised in the search tool so the model knows which capabilities are
-/// reachable through Conduit and reaches for it over a narrower, unrelated tool.
-fn server_prefixes(catalog: &[Value]) -> String {
-    let mut set = std::collections::BTreeSet::new();
-    for t in catalog {
-        if let Some(name) = t.get("name").and_then(|n| n.as_str()) {
-            if let Some((prefix, _)) = name.split_once("__") {
-                set.insert(prefix);
-            }
-        }
-    }
-    set.into_iter().collect::<Vec<_>>().join(", ")
-}
-
-fn search_tool_def(servers: &str) -> Value {
-    let connected = if servers.is_empty() {
-        String::new()
-    } else {
-        format!(" Connected servers (search any of these): {servers}.")
-    };
-    let description = format!(
-        "Your single gateway to every connected MCP server and ALL their tools. Try this FIRST for \
-         ANY external action or data the user asks for - sending or listing email, deployments, \
-         payments, databases, repos, issues, files, web search, etc. Do NOT reach for an unrelated \
-         tool or tell the user a capability is unavailable until you have searched here; if the \
-         service is connected, its tool is here.{connected} Returns matching tools with their exact \
-         name, description, and input schema; call one with conduit_call_tool. Once a result matches \
-         what you need, call it - do NOT keep searching for a better one (the first result includes \
-         its full schema and is ready to call). Pass `server` (a name/prefix like \"resend\") to \
-         scope to one server, and pass an EMPTY `query` with `server` to list ALL of that server's \
-         tools. If the result says more tools matched than were shown, narrow with `server` or raise \
-         `limit` before concluding a capability is missing - many servers expose a generic API bridge \
-         (a single write/create tool), so search by capability, not just an exact operation name. \
-         conduit_status lists every server prefix and its tool count. Large input schemas may be \
-         omitted from broad results (flagged schemaOmitted) to keep responses small - search a tool's \
-         exact name to get its full schema."
-    );
+/// context holds a handful of tool defs instead of hundreds - the model discovers
+/// the real tool on demand and dispatches through `conduit_call_tool`.
+///
+/// The description leads with a directive plus GENERIC capability examples (email,
+/// payments, deployments, ...) so the model treats Conduit as the front door for any
+/// external action rather than grabbing a loosely-matched competitor tool or giving
+/// up. We intentionally do NOT list the user's specific connected servers here: that
+/// would scale the description with server count, go stale, and leak the user's stack
+/// into a (possibly remote) model's context on every request. The generic examples
+/// carry the routing without any of that; `conduit_status` names the actual servers
+/// on demand if the model needs them.
+fn search_tool_def() -> Value {
     json!({
         "name": "conduit_search_tools",
-        "description": description,
+        "description": "Your single gateway to every connected MCP server and ALL their tools. \
+            Try this FIRST for ANY external action or data the user asks for - sending or listing \
+            email, deployments, payments, databases, repos, issues, files, web search, etc. Do NOT \
+            reach for an unrelated tool or tell the user a capability is unavailable until you have \
+            searched here; if the service is connected, its tool is here. Returns matching tools with \
+            their exact name, description, and input schema; call one with conduit_call_tool. Once a \
+            result matches what you need, call it - do NOT keep searching for a better one (the first \
+            result includes its full schema and is ready to call). Pass `server` (a name/prefix like \
+            \"resend\") to scope to one server, and pass an EMPTY `query` with `server` to list ALL of \
+            that server's tools. If the result says more tools matched than were shown, narrow with \
+            `server` or raise `limit` before concluding a capability is missing - many servers expose \
+            a generic API bridge (a single write/create tool), so search by capability, not just an \
+            exact operation name. conduit_status lists every server prefix and its tool count. Large \
+            input schemas may be omitted from broad results (flagged schemaOmitted) to keep responses \
+            small - search a tool's exact name to get its full schema.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -117,7 +103,10 @@ fn call_tool_def() -> Value {
         "name": "conduit_call_tool",
         "description": "Invoke a tool discovered via conduit_search_tools. Pass the tool's exact \
             `name` (as returned by the search) and put ALL of that tool's parameters INSIDE the \
-            `arguments` object (matching its input schema) - not at the top level next to `name`.",
+            `arguments` object (matching its input schema) - not at the top level next to `name`. \
+            Never invent or guess an identifier (teamId, accountId, projectId, etc.): if a required \
+            value isn't known, first call a list or get tool on the SAME server to obtain it, then \
+            call this with the real value.",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -752,6 +741,113 @@ struct SearchGuard {
 /// model is stuck on one need, so return only that tool and command the call.
 const SEARCH_REPEAT_LIMIT: u32 = 3;
 
+/// True if a string argument value looks like an LLM-invented placeholder
+/// rather than a real value (e.g. "your_team_id", "<team_id>", "REPLACE_ME").
+/// Deliberately conservative so it never blocks a legitimate value.
+fn looks_like_placeholder(v: &str) -> bool {
+    let s = v.trim();
+    if s.is_empty() {
+        return false;
+    }
+    if (s.starts_with('<') && s.ends_with('>')) || (s.starts_with("{{") && s.ends_with("}}")) {
+        return true;
+    }
+    let low = s.to_ascii_lowercase();
+    low.starts_with("your_")
+        || low.starts_with("your-")
+        || low.starts_with("your ")
+        || low.ends_with("_here")
+        || low.ends_with("-here")
+        || matches!(
+            low.as_str(),
+            "string"
+                | "placeholder"
+                | "replace_me"
+                | "replaceme"
+                | "changeme"
+                | "change_me"
+                | "example"
+                | "todo"
+                | "tbd"
+                | "xxx"
+                | "xxxx"
+                | "team_id"
+                | "teamid"
+                | "account_id"
+                | "project_id"
+                | "api_key"
+                | "your_api_key"
+        )
+}
+
+/// Find the first argument whose string value looks like a placeholder.
+fn find_placeholder_arg(arguments: &Value) -> Option<(String, String)> {
+    arguments.as_object().and_then(|obj| {
+        obj.iter().find_map(|(k, v)| {
+            v.as_str()
+                .filter(|s| looks_like_placeholder(s))
+                .map(|s| (k.clone(), s.to_string()))
+        })
+    })
+}
+
+/// The resource a parameter identifies, derived from its name: "teamId" ->
+/// "team", "account_id" -> "account". Used to prefer the right source tool.
+fn resource_stem(param: &str) -> String {
+    let low = param.to_ascii_lowercase();
+    let stem = low
+        .strip_suffix("_id")
+        .or_else(|| low.strip_suffix("id"))
+        .unwrap_or(&low);
+    stem.trim_end_matches('_').to_string()
+}
+
+/// Sibling tools on the same server that look like they return resources or
+/// identifiers (list/get/search/retrieve verbs), to point the model at a source
+/// for a value it's missing. When `resource` is given (e.g. "team" for a missing
+/// teamId), tools whose name mentions it rank first. General across every
+/// server; only the gateway can do this because it holds the whole catalog.
+fn source_tool_hints(catalog: &[Value], server: &str, resource: Option<&str>, max: usize) -> Vec<String> {
+    let prefix = format!("{server}__");
+    let mut hits: Vec<(bool, String)> = catalog
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .filter(|n| n.starts_with(&prefix))
+        .filter_map(|n| {
+            let bare = n[prefix.len()..].to_ascii_lowercase();
+            let is_source = bare.starts_with("list")
+                || bare.starts_with("get")
+                || bare.starts_with("retrieve")
+                || bare.contains("_list")
+                || bare.contains("search");
+            if !is_source {
+                return None;
+            }
+            let on_resource = resource
+                .map(|r| !r.is_empty() && bare.contains(r))
+                .unwrap_or(false);
+            Some((on_resource, n.to_string()))
+        })
+        .collect();
+    // Resource-matching tools first, then alphabetical for stability.
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    hits.into_iter().map(|(_, n)| n).take(max).collect()
+}
+
+/// A one-line recovery hint naming sibling list/get tools, appended when a call
+/// fails so the model can source a missing/invalid identifier and retry.
+fn recovery_hint(catalog: &[Value], server: &str) -> String {
+    let hints = source_tool_hints(catalog, server, None, 3);
+    if hints.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " If a required identifier was missing or wrong, get valid values from one of these on '{server}', then retry: {}.",
+            hints.join(", ")
+        )
+    }
+}
+
 fn handle_request(
     req: &Value,
     reg: &Registry,
@@ -793,20 +889,9 @@ fn handle_request(
             // holds a handful of tool defs instead of the whole catalog. The model
             // finds real tools via conduit_search_tools and runs conduit_call_tool.
             if lazy {
-                // The connected catalog (cached if available, else the live router).
-                // Used to advertise the server list in the search tool's description so
-                // the model knows what's reachable, and to record what lazy discovery
-                // kept out of the client's context (the savings) below.
-                let agg;
-                let catalog: &[Value] = if cached.is_empty() {
-                    agg = router.aggregated_tools();
-                    &agg
-                } else {
-                    cached
-                };
                 let mut tools = vec![
                     status_tool_def(),
-                    search_tool_def(&server_prefixes(catalog)),
+                    search_tool_def(),
                     call_tool_def(),
                     fetch_result_tool_def(),
                 ];
@@ -816,6 +901,17 @@ fn handle_request(
                     tools.push(enable_server_tool_def());
                     tools.push(disable_server_tool_def());
                 }
+                // Record what lazy discovery kept out of the client's context: the
+                // full catalog we'd otherwise serve (status + every downstream tool)
+                // minus these 3 meta-tools. Estimating over the cached slice avoids
+                // cloning the whole catalog on a serve.
+                let agg;
+                let catalog: &[Value] = if cached.is_empty() {
+                    agg = router.aggregated_tools();
+                    &agg
+                } else {
+                    cached
+                };
                 let status = status_tool_def();
                 let full_tokens = savings::estimate_tokens(catalog)
                     + savings::estimate_tokens(std::slice::from_ref(&status));
@@ -824,7 +920,10 @@ fn handle_request(
                     savings::estimate_tokens(&tools),
                     catalog.len() as u64 + 1,
                 );
-                gtrace("tools/list -> 3 tools (lazy discovery)");
+                gtrace(&format!(
+                    "tools/list -> {} meta-tools (lazy discovery)",
+                    tools.len()
+                ));
                 return Some(success(id, json!({ "tools": tools })));
             }
             let mut tools = vec![status_tool_def(), fetch_result_tool_def()];
@@ -1015,6 +1114,30 @@ fn handle_request(
             let name = name.as_str();
 
             let (srv, tool) = name.split_once("__").unwrap_or(("?", name));
+
+            // Pre-call guard: a model that invents an identifier (e.g.
+            // teamId = "your_team_id") would otherwise waste a downstream call
+            // and get a confusing failure. Catch obvious placeholders and point
+            // it at where to source the real value. General across every server.
+            if let Some((param, value)) = find_placeholder_arg(&arguments) {
+                let resource = resource_stem(&param);
+                let hints = source_tool_hints(cached, srv, Some(&resource), 3);
+                let source = if hints.is_empty() {
+                    format!("call a list or get tool on the '{srv}' server")
+                } else {
+                    format!("call one of these on the '{srv}' server first: {}", hints.join(", "))
+                };
+                let msg = format!(
+                    "Conduit: \"{value}\" for \"{param}\" looks like a placeholder, not a real \
+                     value, and was not sent. Don't invent identifiers. To get a real \"{param}\", \
+                     {source}, then call {name} again with the value it returns."
+                );
+                return Some(success(
+                    id,
+                    json!({ "content": [{ "type": "text", "text": msg }], "isError": true }),
+                ));
+            }
+
             let started = Instant::now();
             match router.route_call(name, arguments) {
                 Ok(mut result) => {
@@ -1039,15 +1162,29 @@ fn handle_request(
                         .map(|&b| b as usize)
                         .unwrap_or_else(shaping::budget);
                     shaping::shape_result(&mut result, budget);
+                    // Recover from a downstream failure: point the model at
+                    // sibling list/get tools that can supply a missing/invalid
+                    // identifier. Appended after shaping so it's never truncated.
+                    if !ok {
+                        let hint = recovery_hint(cached, srv);
+                        if !hint.is_empty() {
+                            if let Some(arr) =
+                                result.get_mut("content").and_then(|c| c.as_array_mut())
+                            {
+                                arr.push(json!({ "type": "text", "text": hint.trim() }));
+                            }
+                        }
+                    }
                     Some(success(id, result))
                 }
                 Err(e) => {
                     let ms = started.elapsed().as_millis() as u64;
                     audit::record_timed(srv, tool, false, Some(ms));
+                    let recovery = recovery_hint(cached, srv);
                     Some(success(
                         id,
                         json!({
-                            "content": [{ "type": "text", "text": format!("Conduit: {e}") }],
+                            "content": [{ "type": "text", "text": format!("Conduit: {e}.{recovery}") }],
                             "isError": true
                         }),
                     ))
@@ -1400,6 +1537,511 @@ fn watch_registry(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Shared request processing + native HTTP/OpenAPI transport.
+//
+// First-class HTTP consumers (Open WebUI and any OpenAPI tool client) connect
+// straight to the gateway with no external bridge: set `CONDUIT_HTTP=<port>`
+// and the gateway serves `/openapi.json` plus a POST endpoint per tool, routing
+// each call through the exact same `handle_request` as stdio. One code path,
+// two transports, so behavior can never drift between them.
+// ---------------------------------------------------------------------------
+
+/// Thread-safe gateway state shared by both transports (cheap Arc clones).
+#[derive(Clone)]
+struct GatewayState {
+    registry: Arc<Mutex<Registry>>,
+    router: Arc<Mutex<Router>>,
+    cached_tools: Arc<Mutex<Vec<Value>>>,
+    stdout: Arc<Mutex<std::io::Stdout>>,
+    ready: Arc<AtomicBool>,
+    downstream_dirty: Arc<AtomicBool>,
+    lazy: bool,
+    profile: Option<String>,
+}
+
+/// One request in, one response out: wait for a cold cache / live router when
+/// the method needs it, self-heal an empty router on a call, then dispatch.
+/// Shared by the stdio loop and the HTTP server so they can't diverge.
+fn process_request(state: &GatewayState, req: &Value, guard: &mut SearchGuard) -> Option<Value> {
+    let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
+
+    let wait = match method {
+        "tools/list" => state
+            .cached_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "tools/call" | "resources/list" | "resources/read" | "prompts/list" | "prompts/get" => true,
+        _ => false,
+    };
+    if wait {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while !state.ready.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    // Self-heal: a call with no live downstream servers means the startup read
+    // found none (transient) or a server was authed after we built. Reload and
+    // rebuild once so the call can route instead of failing.
+    if method == "tools/call"
+        && state
+            .router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .server_count()
+            == 0
+    {
+        let reg = state
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let built = build_router(&reg, state.profile.as_deref(), &state.downstream_dirty);
+        if built.server_count() > 0 {
+            let tools = built.aggregated_tools();
+            *state
+                .router
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = built;
+            if !tools.is_empty() {
+                *state
+                    .cached_tools
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = tools.clone();
+                save_tool_cache(&tools, state.profile.as_deref());
+            }
+            glog(&format!(
+                "self-heal: rebuilt router ({} servers, {} tools)",
+                state
+                    .router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .server_count(),
+                tools.len()
+            ));
+            notify_tools_changed(&state.stdout);
+        }
+    }
+
+    let cache_snapshot = state
+        .cached_tools
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    let reg = state
+        .registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut r = state
+        .router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    handle_request(
+        req,
+        &reg,
+        &mut r,
+        &cache_snapshot,
+        state.lazy,
+        state.profile.as_deref(),
+        guard,
+    )
+}
+
+/// Resolve the HTTP port. `--http [port]` on the command line wins; otherwise
+/// `CONDUIT_HTTP=<port>` is the direct env form, and a truthy `CONDUIT_HTTP`
+/// falls back to `CONDUIT_HTTP_PORT` or 8765. Absent everywhere -> stdio mode.
+fn http_port() -> Option<u16> {
+    // CLI flag: `conduit-gateway --http` (default 8765) or `--http 9000`.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(i) = args.iter().position(|a| a == "--http") {
+        let port = args
+            .get(i + 1)
+            .and_then(|p| p.parse::<u16>().ok())
+            .filter(|p| *p > 0)
+            .unwrap_or(8765);
+        return Some(port);
+    }
+    let v = std::env::var("CONDUIT_HTTP").ok()?;
+    let v = v.trim();
+    if v.is_empty() {
+        return None;
+    }
+    if let Ok(p) = v.parse::<u16>() {
+        if p > 0 {
+            return Some(p);
+        }
+    }
+    if matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes") {
+        return std::env::var("CONDUIT_HTTP_PORT")
+            .ok()
+            .and_then(|p| p.trim().parse::<u16>().ok())
+            .filter(|p| *p > 0)
+            .or(Some(8765));
+    }
+    None
+}
+
+/// The tools the HTTP surface exposes, mirroring `tools/list`: the meta-tools
+/// in lazy mode, or status + fetch + the full namespaced catalog in full mode.
+/// Agent-control tools appear only when the registry opts in.
+fn http_tool_defs(state: &GatewayState) -> Vec<Value> {
+    let allow_agent = state
+        .registry
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .allow_agent_control;
+    if state.lazy {
+        let mut tools = vec![
+            status_tool_def(),
+            search_tool_def(),
+            call_tool_def(),
+            fetch_result_tool_def(),
+        ];
+        if allow_agent {
+            tools.push(enable_server_tool_def());
+            tools.push(disable_server_tool_def());
+        }
+        tools
+    } else {
+        let mut tools = vec![status_tool_def(), fetch_result_tool_def()];
+        let cached = state
+            .cached_tools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if cached.is_empty() {
+            tools.extend(
+                state
+                    .router
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .aggregated_tools(),
+            );
+        } else {
+            tools.extend(cached);
+        }
+        tools
+    }
+}
+
+/// Build an OpenAPI 3.1 document describing the exposed tools as POST
+/// operations, each carrying the tool's input schema as its request body. This
+/// is what an OpenAPI tool client (Open WebUI) reads to learn the tools.
+fn openapi_spec(state: &GatewayState) -> Value {
+    let defs = http_tool_defs(state);
+    let mut paths = serde_json::Map::new();
+    for t in &defs {
+        let name = match t.get("name").and_then(|v| v.as_str()) {
+            Some(n) if !n.is_empty() => n,
+            _ => continue,
+        };
+        let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
+        let schema = t
+            .get("inputSchema")
+            .cloned()
+            .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
+        let summary: String = desc.lines().next().unwrap_or(name).chars().take(80).collect();
+        paths.insert(
+            format!("/{name}"),
+            json!({
+                "post": {
+                    "summary": summary,
+                    "description": desc,
+                    "operationId": name,
+                    "requestBody": {
+                        "required": true,
+                        "content": { "application/json": { "schema": schema } }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Tool result",
+                            "content": { "application/json": { "schema": { "type": "string" } } }
+                        }
+                    }
+                }
+            }),
+        );
+    }
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "Conduit gateway",
+            "description": "Conduit MCP gateway as OpenAPI for HTTP tool clients (Open WebUI and any OpenAPI consumer). Search with conduit_search_tools, then call by name with conduit_call_tool.",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "paths": Value::Object(paths)
+    })
+}
+
+/// Pull the human-facing text out of a tools/call result, joining text blocks.
+/// Matches what an OpenAPI bridge returns: the tool's text as a JSON string.
+fn result_text(resp: &Value) -> String {
+    let result = match resp.get("result") {
+        Some(r) => r,
+        None => return String::new(),
+    };
+    if let Some(content) = result.get("content").and_then(|c| c.as_array()) {
+        let mut out = String::new();
+        for item in content {
+            if let Some(t) = item.get("text").and_then(|t| t.as_str()) {
+                if !out.is_empty() {
+                    out.push('\n');
+                }
+                out.push_str(t);
+            }
+        }
+        if !out.is_empty() {
+            return out;
+        }
+    }
+    serde_json::to_string(result).unwrap_or_default()
+}
+
+/// Map one HTTP request to (status, content-type, body).
+fn handle_http(
+    state: &GatewayState,
+    guard: &mut SearchGuard,
+    method: &str,
+    path: &str,
+    body: &str,
+) -> (u16, &'static str, String) {
+    match (method, path) {
+        // CORS preflight: browsers (Open WebUI fetches tool specs client-side)
+        // send OPTIONS before a cross-origin POST. Answer it so the real request
+        // is allowed through. The CORS headers themselves are added to every
+        // response in serve_http_loop.
+        ("OPTIONS", _) => (204, "text/plain", String::new()),
+        ("GET", "/openapi.json") => (200, "application/json", openapi_spec(state).to_string()),
+        ("GET", "/") | ("GET", "/docs") => (
+            200,
+            "text/plain; charset=utf-8",
+            "Conduit gateway (HTTP/OpenAPI mode). OpenAPI at /openapi.json. POST a tool name with a JSON body, e.g. POST /conduit_search_tools {\"query\":\"...\"}."
+                .to_string(),
+        ),
+        ("POST", p) => {
+            let name = p.trim_start_matches('/');
+            if name.is_empty() {
+                return (
+                    404,
+                    "application/json",
+                    json!({ "error": "missing tool name" }).to_string(),
+                );
+            }
+            let args: Value = if body.trim().is_empty() {
+                json!({})
+            } else {
+                match serde_json::from_str(body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return (
+                            400,
+                            "application/json",
+                            json!({ "error": format!("invalid JSON body: {e}") }).to_string(),
+                        )
+                    }
+                }
+            };
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": name, "arguments": args }
+            });
+            match process_request(state, &req, guard) {
+                Some(resp) => {
+                    if let Some(err) = resp.get("error") {
+                        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("error");
+                        return (400, "application/json", json!({ "error": msg }).to_string());
+                    }
+                    (
+                        200,
+                        "application/json",
+                        serde_json::to_string(&result_text(&resp)).unwrap_or_else(|_| "\"\"".into()),
+                    )
+                }
+                None => (
+                    500,
+                    "application/json",
+                    json!({ "error": "no response" }).to_string(),
+                ),
+            }
+        }
+        _ => (
+            404,
+            "application/json",
+            json!({ "error": "not found" }).to_string(),
+        ),
+    }
+}
+
+/// Run the blocking HTTP/OpenAPI server. Binds 127.0.0.1 by default (local
+/// only); set `CONDUIT_HTTP_HOST=0.0.0.0` to expose it (unauthenticated, so
+/// only on a trusted network).
+/// Cap on an inbound HTTP request body. Tool arguments are tiny; this just stops
+/// an unauthenticated caller from forcing the gateway to buffer a huge body.
+const MAX_HTTP_BODY: u64 = 4 * 1024 * 1024;
+
+/// Parse a `Bearer <token>` Authorization value. Pure, so it's unit-testable.
+fn parse_bearer(auth_value: &str) -> Option<&str> {
+    let mut parts = auth_value.splitn(2, ' ');
+    let scheme = parts.next()?;
+    let tok = parts.next()?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| tok.trim())
+}
+
+/// Strip control characters and bound the length of a header value we reflect
+/// back (the caller-controlled Origin / requested headers), so a crafted value
+/// can't inject a header or make `Header::from_bytes` reject and panic.
+fn sanitize_header_value(v: &str) -> String {
+    v.chars().filter(|c| !c.is_control()).take(512).collect()
+}
+
+fn serve_http(state: GatewayState, port: u16) {
+    let host = std::env::var("CONDUIT_HTTP_HOST")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+    // A bearer token, when set, is required on every request. The desktop app
+    // always sets one (auto-generated) and shows it for the user to paste into
+    // their client; manual `--http` users can set it themselves.
+    let token = std::env::var("CONDUIT_HTTP_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty());
+
+    let loopback = matches!(host.as_str(), "127.0.0.1" | "::1" | "localhost");
+    // Fail closed: a non-loopback endpoint runs the user's credentials for
+    // anyone who can reach the port, so refuse to bind one without a token.
+    if !loopback && token.is_none() {
+        eprintln!(
+            "conduit-gateway: refusing to bind {host}:{port} without CONDUIT_HTTP_TOKEN. \
+             A non-loopback HTTP endpoint would be unauthenticated. Set a token, or bind 127.0.0.1."
+        );
+        std::process::exit(1);
+    }
+    if token.is_none() {
+        eprintln!(
+            "conduit-gateway: WARNING - HTTP endpoint has no token; any local process (including a \
+             web page open in your browser) can call your tools. Set CONDUIT_HTTP_TOKEN to require auth."
+        );
+    }
+
+    // When binding the default IPv4 loopback, ALSO listen on the IPv6 loopback
+    // (best-effort). Many systems resolve "localhost" to ::1 first, and clients
+    // like Open WebUI try ::1 and don't fall back to 127.0.0.1, so an IPv4-only
+    // listener makes `http://localhost:<port>` fail even though 127.0.0.1 works.
+    if host == "127.0.0.1" {
+        if let Ok(server6) = tiny_http::Server::http(("::1", port)) {
+            let state6 = state.clone();
+            let token6 = token.clone();
+            std::thread::spawn(move || serve_http_loop(server6, state6, token6));
+            glog(&format!("HTTP/OpenAPI also listening on http://[::1]:{port}"));
+        }
+    }
+
+    let server = match tiny_http::Server::http((host.as_str(), port)) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("conduit-gateway: could not bind HTTP {host}:{port}: {e}");
+            std::process::exit(1);
+        }
+    };
+    glog(&format!(
+        "HTTP/OpenAPI mode on http://{host}:{port} (auth={})",
+        token.is_some()
+    ));
+    eprintln!("conduit-gateway: HTTP/OpenAPI on http://localhost:{port}  (OpenAPI spec at /openapi.json)");
+    serve_http_loop(server, state, token);
+}
+
+/// The blocking accept loop for one listener. Each listener keeps its own
+/// SearchGuard; they share the gateway state, so the IPv4 and IPv6 loopback
+/// sockets serve identically.
+fn serve_http_loop(server: tiny_http::Server, state: GatewayState, token: Option<String>) {
+    let mut guard = SearchGuard::default();
+    for mut request in server.incoming_requests() {
+        let method = request.method().to_string().to_uppercase();
+        let url = request.url().to_string();
+        let path = url.split('?').next().unwrap_or("/").to_string();
+        // Reflect the caller's (sanitized) Origin and requested headers so the
+        // CORS preflight passes for browser clients. The bearer token, not CORS,
+        // is what actually authorizes a call.
+        let origin = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Origin"))
+            .map(|h| sanitize_header_value(h.value.as_str()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "*".to_string());
+        let allow_headers = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Access-Control-Request-Headers"))
+            .map(|h| sanitize_header_value(h.value.as_str()))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "Content-Type, Authorization".to_string());
+
+        // Auth gate: when a token is configured it's required on every request
+        // except the CORS preflight (browsers send OPTIONS without auth). A bad
+        // or missing token is rejected before we read the body or route anything.
+        let provided = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Authorization"))
+            .map(|h| h.value.as_str().to_string());
+        let authorized = match &token {
+            None => true,
+            Some(t) => {
+                method == "OPTIONS"
+                    || provided.as_deref().and_then(parse_bearer) == Some(t.as_str())
+            }
+        };
+
+        let (status, ctype, payload): (u16, &str, String) = if !authorized {
+            (
+                401,
+                "application/json",
+                json!({ "error": "missing or invalid bearer token" }).to_string(),
+            )
+        } else {
+            let mut body = String::new();
+            if method == "POST" {
+                let _ = request
+                    .as_reader()
+                    .take(MAX_HTTP_BODY)
+                    .read_to_string(&mut body);
+            }
+            // A panic in a handler must return 500, not kill the listener thread.
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handle_http(&state, &mut guard, &method, &path, &body)
+            }))
+            .unwrap_or((
+                500,
+                "application/json",
+                "{\"error\":\"internal error\"}".to_string(),
+            ))
+        };
+
+        let mut response = tiny_http::Response::from_string(payload).with_status_code(status);
+        let cors: [(&[u8], &[u8]); 5] = [
+            (b"Content-Type", ctype.as_bytes()),
+            (b"Access-Control-Allow-Origin", origin.as_bytes()),
+            (b"Access-Control-Allow-Credentials", b"true"),
+            (b"Access-Control-Allow-Methods", b"GET, POST, OPTIONS"),
+            (b"Access-Control-Allow-Headers", allow_headers.as_bytes()),
+        ];
+        for (name, value) in cors {
+            // Skip a header that won't encode rather than panicking the thread.
+            if let Ok(h) = tiny_http::Header::from_bytes(name, value) {
+                response = response.with_header(h);
+            }
+        }
+        let _ = request.respond(response);
+    }
+}
+
 fn main() {
     // Diagnostic: `conduit-gateway --selftest-secrets` reads every vaulted secret
     // from THIS (gateway) process and reports. Used to validate the macOS keychain
@@ -1571,6 +2213,26 @@ fn main() {
         });
     }
 
+    let state = GatewayState {
+        registry: Arc::clone(&registry),
+        router: Arc::clone(&router),
+        cached_tools: Arc::clone(&cached_tools),
+        stdout: Arc::clone(&stdout),
+        ready: Arc::clone(&ready),
+        downstream_dirty: Arc::clone(&downstream_dirty),
+        lazy,
+        profile: profile.clone(),
+    };
+
+    // Native HTTP/OpenAPI transport: a first-class path for HTTP tool clients
+    // (Open WebUI and any OpenAPI consumer) with no external bridge. Standalone,
+    // so it replaces the stdio loop; the background build + registry watcher
+    // started above still keep the router and cache live underneath it.
+    if let Some(port) = http_port() {
+        serve_http(state, port);
+        return;
+    }
+
     let stdin = std::io::stdin();
     let mut search_guard = SearchGuard::default();
     for line in stdin.lock().lines() {
@@ -1586,64 +2248,16 @@ fn main() {
             Ok(v) => v,
             Err(_) => continue,
         };
-        let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        gtrace(&format!("request: {method}"));
-
-        // tools/list answers from cache instantly; only block on a cold cache
-        // (first ever run). tools/call waits for live downstream connections.
-        let wait = match method {
-            "tools/list" => cached_tools.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty(),
-            // These have no disk cache, so they need the live router connected.
-            "tools/call" | "resources/list" | "resources/read" | "prompts/list"
-            | "prompts/get" => true,
-            _ => false,
-        };
-        if wait {
-            let deadline = Instant::now() + Duration::from_secs(30);
-            while !ready.load(Ordering::SeqCst) && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-        }
-
-        // Self-heal: a tools/call with no live downstream servers means either the
-        // startup read found none (transient) or a server was authed after we
-        // built. Reload the registry and rebuild once so the call can route,
-        // instead of failing with "no connected server".
-        if method == "tools/call" && router.lock().unwrap_or_else(std::sync::PoisonError::into_inner).server_count() == 0 {
-            let reg = registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-            let built = build_router(&reg, profile.as_deref(), &downstream_dirty);
-            if built.server_count() > 0 {
-                let tools = built.aggregated_tools();
-                *router.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = built;
-                if !tools.is_empty() {
-                    *cached_tools.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = tools.clone();
-                    save_tool_cache(&tools, profile.as_deref());
-                }
-                glog(&format!(
-                    "self-heal: rebuilt router ({} servers, {} tools)",
-                    router.lock().unwrap_or_else(std::sync::PoisonError::into_inner).server_count(),
-                    tools.len()
-                ));
-                notify_tools_changed(&stdout);
-            }
-        }
-
-        let cache_snapshot = cached_tools.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        let response = {
-            let reg = registry.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut r = router.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            handle_request(
-                &req,
-                &reg,
-                &mut r,
-                &cache_snapshot,
-                lazy,
-                profile.as_deref(),
-                &mut search_guard,
-            )
-        };
+        gtrace(&format!(
+            "request: {}",
+            req.get("method").and_then(|m| m.as_str()).unwrap_or("")
+        ));
+        let response = process_request(&state, &req, &mut search_guard);
         if let Some(resp) = response {
-            let mut out = stdout.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut out = state
+                .stdout
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if writeln!(out, "{resp}").is_err() {
                 break;
             }
@@ -1658,6 +2272,129 @@ mod tests {
 
     fn router() -> Router {
         Router::new()
+    }
+
+    fn http_state(lazy: bool) -> GatewayState {
+        GatewayState {
+            registry: Arc::new(Mutex::new(Registry::default())),
+            router: Arc::new(Mutex::new(Router::new())),
+            cached_tools: Arc::new(Mutex::new(Vec::new())),
+            stdout: Arc::new(Mutex::new(std::io::stdout())),
+            ready: Arc::new(AtomicBool::new(true)),
+            downstream_dirty: Arc::new(AtomicBool::new(false)),
+            lazy,
+            profile: None,
+        }
+    }
+
+    #[test]
+    fn result_text_joins_text_blocks() {
+        let resp = json!({
+            "jsonrpc": "2.0", "id": 1,
+            "result": { "content": [
+                { "type": "text", "text": "hello" },
+                { "type": "text", "text": "world" }
+            ] }
+        });
+        assert_eq!(result_text(&resp), "hello\nworld");
+        // No result (e.g. an error envelope) -> empty string, never a panic.
+        assert_eq!(result_text(&json!({ "jsonrpc": "2.0", "id": 1 })), "");
+    }
+
+    #[test]
+    fn openapi_exposes_meta_tools_as_post_paths() {
+        let spec = openapi_spec(&http_state(true));
+        let paths = spec.get("paths").unwrap().as_object().unwrap();
+        // The lazy meta-tools are each a POST path.
+        assert!(paths.contains_key("/conduit_search_tools"));
+        assert!(paths.contains_key("/conduit_call_tool"));
+        assert!(paths.contains_key("/conduit_status"));
+        let op = paths
+            .get("/conduit_search_tools")
+            .and_then(|p| p.get("post"))
+            .unwrap();
+        assert_eq!(op.get("operationId").unwrap(), "conduit_search_tools");
+        assert!(op.get("requestBody").is_some());
+        // Agent-control tools stay hidden unless the registry opts in.
+        assert!(!paths.contains_key("/conduit_enable_server"));
+        assert_eq!(spec.get("openapi").unwrap(), "3.1.0");
+    }
+
+    #[test]
+    fn detects_invented_placeholders_but_not_real_values() {
+        for p in [
+            "your_team_id",
+            "<team_id>",
+            "{{teamId}}",
+            "REPLACE_ME",
+            "team_id_here",
+            "string",
+            "TODO",
+        ] {
+            assert!(looks_like_placeholder(p), "should flag {p:?}");
+        }
+        for real in ["team_aBc123XYZ", "acme-prod", "my real project", "", "  "] {
+            assert!(!looks_like_placeholder(real), "should NOT flag {real:?}");
+        }
+    }
+
+    #[test]
+    fn find_placeholder_arg_picks_the_bad_value() {
+        let args = json!({ "teamId": "your_team_id", "limit": 10 });
+        let (k, v) = find_placeholder_arg(&args).unwrap();
+        assert_eq!(k, "teamId");
+        assert_eq!(v, "your_team_id");
+        assert!(find_placeholder_arg(&json!({ "teamId": "team_real123" })).is_none());
+    }
+
+    #[test]
+    fn source_hints_find_sibling_list_get_tools_same_server() {
+        let catalog = vec![
+            json!({ "name": "vercel__list_teams" }),
+            json!({ "name": "vercel__get_project" }),
+            json!({ "name": "vercel__create_deployment" }),
+            json!({ "name": "resend__list_domains" }),
+        ];
+        // Missing a teamId -> the team tool should rank first.
+        let hits = source_tool_hints(&catalog, "vercel", Some("team"), 5);
+        assert_eq!(hits.first().unwrap(), "vercel__list_teams");
+        assert!(hits.contains(&"vercel__get_project".to_string()));
+        // Not the write tool, and not the other server.
+        assert!(!hits.contains(&"vercel__create_deployment".to_string()));
+        assert!(!hits.iter().any(|h| h.starts_with("resend")));
+        assert_eq!(resource_stem("teamId"), "team");
+        assert_eq!(resource_stem("account_id"), "account");
+    }
+
+    #[test]
+    fn parse_bearer_extracts_token_case_insensitively() {
+        assert_eq!(parse_bearer("Bearer abc123"), Some("abc123"));
+        assert_eq!(parse_bearer("bearer  spaced  "), Some("spaced"));
+        assert_eq!(parse_bearer("Basic abc"), None);
+        assert_eq!(parse_bearer("abc"), None);
+        assert_eq!(parse_bearer(""), None);
+    }
+
+    #[test]
+    fn sanitize_header_value_strips_control_chars() {
+        assert_eq!(sanitize_header_value("http://localhost:8080"), "http://localhost:8080");
+        // CR/LF injection attempt is stripped to a flat value.
+        assert_eq!(
+            sanitize_header_value("evil\r\nSet-Cookie: x=1"),
+            "evilSet-Cookie: x=1"
+        );
+        assert!(sanitize_header_value(&"a".repeat(9999)).len() <= 512);
+    }
+
+    #[test]
+    fn http_options_preflight_is_answered() {
+        // Browsers preflight a cross-origin POST; we must answer OPTIONS so the
+        // real request goes through (CORS headers themselves are added per-response).
+        let state = http_state(true);
+        let (status, _, body) =
+            handle_http(&state, &mut SearchGuard::default(), "OPTIONS", "/conduit_search_tools", "");
+        assert_eq!(status, 204);
+        assert!(body.is_empty());
     }
 
     #[test]
@@ -1784,6 +2521,8 @@ mod tests {
             .iter()
             .filter_map(|t| t["name"].as_str())
             .collect();
+        // Default registry has agent control off, so it's the four core
+        // meta-tools: status, search, call, fetch_result (no downstream tools).
         assert_eq!(names.len(), 4);
         assert!(names.contains(&"conduit_status"));
         assert!(names.contains(&"conduit_search_tools"));

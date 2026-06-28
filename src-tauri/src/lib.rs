@@ -23,6 +23,39 @@ use registry::{Registry, ServerEntry};
 
 type RegistryState = Mutex<Registry>;
 
+/// Tracks the optional `conduit-gateway --http` child the app supervises so
+/// HTTP/OpenAPI clients (Open WebUI and the like) can connect with one click,
+/// no terminal. Only one runs at a time; the app kills it on exit.
+#[derive(Default)]
+struct HttpBridge {
+    child: Option<std::process::Child>,
+    port: Option<u16>,
+    token: Option<String>,
+}
+type HttpBridgeState = Mutex<HttpBridge>;
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HttpBridgeStatus {
+    running: bool,
+    port: Option<u16>,
+    url: Option<String>,
+    /// The bearer token the client must send (Authorization: Bearer ...). Shown
+    /// in the UI to copy; required on every request to the endpoint.
+    token: Option<String>,
+}
+
+impl HttpBridgeStatus {
+    fn new(port: Option<u16>, token: Option<String>) -> Self {
+        HttpBridgeStatus {
+            running: port.is_some(),
+            url: port.map(|p| format!("http://localhost:{p}")),
+            port,
+            token,
+        }
+    }
+}
+
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProbeResult {
@@ -1018,6 +1051,114 @@ fn watch_registry_for_app(handle: tauri::AppHandle) {
     }
 }
 
+/// Reap the child if it has already exited; returns true if it is still alive.
+fn http_bridge_alive(bridge: &mut HttpBridge) -> bool {
+    let alive = match bridge.child.as_mut() {
+        Some(child) => !matches!(child.try_wait(), Ok(Some(_))),
+        None => false,
+    };
+    if !alive {
+        bridge.child = None;
+        bridge.port = None;
+        bridge.token = None;
+    }
+    alive
+}
+
+/// Start `conduit-gateway --http <port>` as a supervised child so HTTP/OpenAPI
+/// clients can connect. Idempotent: if it's already running, returns the current
+/// status; otherwise spawns the bundled gateway binary and tracks it.
+#[tauri::command]
+fn start_http_bridge(
+    state: State<HttpBridgeState>,
+    port: Option<u16>,
+) -> Result<HttpBridgeStatus, String> {
+    let port = port.unwrap_or(8765);
+    let mut bridge = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if http_bridge_alive(&mut bridge) {
+        return Ok(HttpBridgeStatus::new(bridge.port, bridge.token.clone()));
+    }
+    // Fail fast if the port is already taken (another instance, or a stray
+    // gateway). Otherwise the child would just exit on the bind error and we'd
+    // wrongly report success while the user is actually talking to whatever
+    // already owns the port.
+    if std::net::TcpListener::bind(("127.0.0.1", port)).is_err() {
+        return Err(format!(
+            "Port {port} is already in use. Stop whatever is using it, then try again."
+        ));
+    }
+    let bin = clients::resolve_gateway_path()
+        .ok_or_else(|| "conduit-gateway binary not found next to the app".to_string())?;
+    // Auto-generate a bearer token the client must send on every request.
+    // Without it, any local process (including a web page open in the user's
+    // browser) could POST to the port and run their tools.
+    let mut tok = [0u8; 24];
+    getrandom::getrandom(&mut tok).map_err(|e| format!("could not generate a token: {e}"))?;
+    let token: String = tok.iter().map(|b| format!("{b:02x}")).collect();
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("--http")
+        .arg(port.to_string())
+        .env("CONDUIT_HTTP_TOKEN", &token)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    // Don't flash a console window on Windows.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not start the HTTP bridge: {e}"))?;
+    // Confirm it actually came up rather than dying on startup (bind race,
+    // bad binary, etc.). Poll the port; if the child exits or never answers,
+    // surface a real error instead of a false success.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(format!(
+                "The HTTP endpoint exited on startup ({status}). Is port {port} already in use?"
+            ));
+        }
+        if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            break; // it's listening
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            return Err(format!(
+                "The HTTP endpoint did not come up on port {port} within 5s."
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    bridge.child = Some(child);
+    bridge.port = Some(port);
+    bridge.token = Some(token.clone());
+    Ok(HttpBridgeStatus::new(Some(port), Some(token)))
+}
+
+/// Stop the supervised HTTP bridge child, if any.
+#[tauri::command]
+fn stop_http_bridge(state: State<HttpBridgeState>) -> Result<HttpBridgeStatus, String> {
+    let mut bridge = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(mut child) = bridge.child.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    bridge.port = None;
+    bridge.token = None;
+    Ok(HttpBridgeStatus::new(None, None))
+}
+
+/// Report whether the HTTP bridge is running, reaping it if it has exited.
+#[tauri::command]
+fn http_bridge_status(state: State<HttpBridgeState>) -> Result<HttpBridgeStatus, String> {
+    let mut bridge = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    http_bridge_alive(&mut bridge);
+    Ok(HttpBridgeStatus::new(bridge.port, bridge.token.clone()))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let registry = registry::load().unwrap_or_default();
@@ -1069,6 +1210,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(Mutex::new(registry))
+        .manage(Mutex::new(HttpBridge::default()))
         .invoke_handler(tauri::generate_handler![
             detect_clients,
             get_registry,
@@ -1119,6 +1261,9 @@ pub fn run() {
             import_config,
             read_setup_file,
             preview_import,
+            start_http_bridge,
+            stop_http_bridge,
+            http_bridge_status,
         ])
         .setup(|app| {
             // Mirror external registry changes (an agent toggling a server through
@@ -1127,8 +1272,23 @@ pub fn run() {
             std::thread::spawn(move || watch_registry_for_app(handle));
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app_handle, event| {
+            // Never orphan the HTTP bridge: kill the supervised child on exit.
+            if matches!(
+                event,
+                tauri::RunEvent::Exit | tauri::RunEvent::ExitRequested { .. }
+            ) {
+                if let Some(state) = app_handle.try_state::<HttpBridgeState>() {
+                    let mut bridge =
+                        state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if let Some(mut child) = bridge.child.take() {
+                        let _ = child.kill();
+                    }
+                }
+            }
+        });
 }
 
 #[cfg(test)]

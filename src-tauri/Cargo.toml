@@ -1,6 +1,6 @@
 [package]
 name = "conduit"
-version = "0.6.0"
+version = "0.7.0"
 description = "Local MCP gateway: manage all your MCP servers in one place, set up once and shared by every AI client, with ~90% fewer tokens per request"
 authors = ["South Forge AI"]
 edition = "2021"
@@ -35,6 +35,9 @@ sha2 = "0.10"
 base64 = "0.22"
 getrandom = "0.2"
 urlencoding = "2"
+# Minimal synchronous HTTP server for the gateway's native HTTP/OpenAPI mode
+# (first-class Open WebUI and any OpenAPI tool client, no external bridge).
+tiny_http = "0.12"
 
 # OS keychain, with the native backend per platform.
 [target.'cfg(target_os = "windows")'.dependencies]

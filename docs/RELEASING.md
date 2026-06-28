@@ -34,5 +34,8 @@ gh release create v0.2.0 \
 
 ## Signing
 
-macOS installers are signed and notarized. Windows installers are currently
-unsigned (SmartScreen warning). See [SIGNING.md](SIGNING.md) for details.
+macOS installers are signed and notarized, and Windows installers are signed via
+Azure Trusted Signing (when the `AZURE_*` secrets/variables are set; otherwise the
+Windows build falls back to unsigned). Windows uses a standard certificate, so
+SmartScreen reputation still accrues with downloads. See [SIGNING.md](SIGNING.md)
+for details.
