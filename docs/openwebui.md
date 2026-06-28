@@ -7,15 +7,14 @@ server you've connected through Conduit, including chained multi-step tool flows
 
 ## The recipe
 
-**1. Start the gateway in HTTP mode.**
+**1. Turn on the HTTP endpoint.** In the Conduit app: **Settings ->
+Integrations -> "Open WebUI / HTTP endpoint"**, flip it on, and copy the URL it
+shows (`http://localhost:8765`). The app supervises the gateway for you and
+shuts it down when you quit.
 
-```bash
-conduit-gateway --http 8765
-```
-
-(equivalently, set `CONDUIT_HTTP=8765`). It serves an OpenAPI spec at
-`http://localhost:8765/openapi.json` and a POST endpoint per tool. The
-`conduit-gateway` binary ships inside the Conduit app install.
+> Prefer the command line? `conduit-gateway --http 8765` (or `CONDUIT_HTTP=8765`)
+> does the same thing. Either way it serves an OpenAPI spec at
+> `http://localhost:8765/openapi.json` and a POST endpoint per tool.
 
 **2. Add it to Open WebUI.** Settings -> Tools -> add an OpenAPI tool server
 pointing at `http://localhost:8765`. The `conduit_*` tools appear.
