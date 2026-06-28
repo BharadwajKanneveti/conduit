@@ -137,6 +137,9 @@ impl Platform {
         }
     }
 
+    // Names every variant, so a single-platform build doesn't see MacOs/Linux as
+    // "never constructed"; the cross-platform path tests iterate it.
+    #[allow(dead_code)]
     const ALL: [Platform; 3] = [Platform::Windows, Platform::MacOs, Platform::Linux];
 }
 
