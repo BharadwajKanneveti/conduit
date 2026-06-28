@@ -1731,6 +1731,19 @@ fn serve_http(state: GatewayState, port: u16) {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    // When binding the default IPv4 loopback, ALSO listen on the IPv6 loopback
+    // (best-effort). Many systems resolve "localhost" to ::1 first, and clients
+    // like Open WebUI try ::1 and don't fall back to 127.0.0.1, so an IPv4-only
+    // listener makes `http://localhost:<port>` fail even though 127.0.0.1 works.
+    if host == "127.0.0.1" {
+        if let Ok(server6) = tiny_http::Server::http(("::1", port)) {
+            let state6 = state.clone();
+            std::thread::spawn(move || serve_http_loop(server6, state6));
+            glog(&format!("HTTP/OpenAPI also listening on http://[::1]:{port}"));
+        }
+    }
+
     let server = match tiny_http::Server::http((host.as_str(), port)) {
         Ok(s) => s,
         Err(e) => {
@@ -1739,7 +1752,14 @@ fn serve_http(state: GatewayState, port: u16) {
         }
     };
     glog(&format!("HTTP/OpenAPI mode on http://{host}:{port}"));
-    eprintln!("conduit-gateway: HTTP/OpenAPI on http://{host}:{port}  (OpenAPI spec at /openapi.json)");
+    eprintln!("conduit-gateway: HTTP/OpenAPI on http://localhost:{port}  (OpenAPI spec at /openapi.json)");
+    serve_http_loop(server, state);
+}
+
+/// The blocking accept loop for one listener. Each listener keeps its own
+/// SearchGuard; they share the gateway state, so the IPv4 and IPv6 loopback
+/// sockets serve identically.
+fn serve_http_loop(server: tiny_http::Server, state: GatewayState) {
     let mut guard = SearchGuard::default();
     for mut request in server.incoming_requests() {
         let method = request.method().to_string().to_uppercase();
