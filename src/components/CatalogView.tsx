@@ -3,8 +3,8 @@ import { Check, ExternalLink, Loader2, Plus, Search, ShieldCheck } from "lucide-
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { addServer, popularCatalog, searchCatalog } from "@/lib/api";
-import type { CatalogEntry, Registry, ServerEntry } from "@/lib/types";
+import { addServer, listStacks, popularCatalog, searchCatalog } from "@/lib/api";
+import type { CatalogEntry, Registry, ServerEntry, Stack } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { TransportPill } from "@/components/TransportPill";
@@ -32,8 +32,16 @@ export function CatalogView({ registry, onAdded }: Props) {
   const [busy, setBusy] = useState<string | null>(null);
   const [popularLoading, setPopularLoading] = useState(true);
   const [popularError, setPopularError] = useState(false);
+  const [stacks, setStacks] = useState<Stack[]>([]);
+  const [stackBusy, setStackBusy] = useState<string | null>(null);
 
   const have = new Set((registry?.servers ?? []).map((s) => s.name.toLowerCase()));
+
+  useEffect(() => {
+    listStacks()
+      .then(setStacks)
+      .catch(() => {});
+  }, []);
 
   const reloadPopular = useCallback(() => {
     setPopularLoading(true);
@@ -98,6 +106,49 @@ export function CatalogView({ registry, onAdded }: Props) {
       toastError(`Couldn't add ${entry.name}: ${e}`);
     } finally {
       setBusy(null);
+    }
+  }
+
+  /** Add every server in a stack that isn't already in Conduit, then point the
+   * user at the credential steps for the ones that need them. */
+  async function setupStack(stack: Stack) {
+    setStackBusy(stack.id);
+    const existing = new Set(
+      (registry?.servers ?? []).map((s) => s.name.toLowerCase()),
+    );
+    let added = 0;
+    let needCreds = 0;
+    try {
+      for (const entry of stack.servers) {
+        if (existing.has(entry.name.toLowerCase())) continue;
+        const server: ServerEntry = {
+          id: "",
+          name: entry.name,
+          transport: entry.transport,
+          command: entry.command,
+          args: entry.args,
+          env: entry.envKeys.map((key) => ({ key, value: null, secret: true })),
+          url: entry.url,
+          source: `catalog:${entry.source}`,
+        };
+        onAdded(await addServer(server));
+        added++;
+        if (entry.credentialsUrl || entry.envKeys.length > 0) needCreds++;
+      }
+      if (added === 0) {
+        toast.success(`${stack.name}: every server is already in Conduit`);
+      } else {
+        toast.success(`Added ${added} server${added === 1 ? "" : "s"} from ${stack.name}`, {
+          description:
+            needCreds > 0
+              ? `${needCreds} need credentials. Open "Setup steps" for the links.`
+              : "Enable them under Servers.",
+        });
+      }
+    } catch (e) {
+      toastError(`Couldn't finish setting up ${stack.name}: ${e}`);
+    } finally {
+      setStackBusy(null);
     }
   }
 
@@ -190,6 +241,14 @@ export function CatalogView({ registry, onAdded }: Props) {
         )
       ) : browsing ? (
         <div className="flex flex-col gap-6">
+          {stacks.length > 0 && (
+            <StacksSection
+              stacks={stacks}
+              haveNames={have}
+              busyId={stackBusy}
+              onSetup={setupStack}
+            />
+          )}
           {byCategory.map(([cat, entries]) => (
             <section key={cat}>
               <h2 className="mb-2 flex items-center gap-2 text-xs font-medium tracking-wide text-muted-foreground uppercase">
@@ -205,6 +264,131 @@ export function CatalogView({ registry, onAdded }: Props) {
       ) : (
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           {shown.map(card)}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** "Quick start" stacks: role-based bundles you can add in one click, with the
+ * credential steps spelled out per server. */
+function StacksSection({
+  stacks,
+  haveNames,
+  busyId,
+  onSetup,
+}: {
+  stacks: Stack[];
+  haveNames: Set<string>;
+  busyId: string | null;
+  onSetup: (s: Stack) => void;
+}) {
+  return (
+    <section>
+      <h2 className="mb-2 flex items-center gap-2 text-xs font-medium tracking-wide text-muted-foreground uppercase">
+        Stacks
+        <span className="font-normal text-muted-foreground/60 normal-case">
+          one-click bundles for a use case
+        </span>
+      </h2>
+      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
+        {stacks.map((s) => (
+          <StackCard
+            key={s.id}
+            stack={s}
+            haveNames={haveNames}
+            busy={busyId === s.id}
+            onSetup={() => onSetup(s)}
+          />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function StackCard({
+  stack,
+  haveNames,
+  busy,
+  onSetup,
+}: {
+  stack: Stack;
+  haveNames: Set<string>;
+  busy: boolean;
+  onSetup: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const missing = stack.servers.filter((e) => !haveNames.has(e.name.toLowerCase()));
+  const allAdded = missing.length === 0;
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border border-ring/20 bg-muted/20 p-3">
+      <div className="flex items-start justify-between gap-2">
+        <span className="text-sm font-medium">{stack.name}</span>
+        <span className="shrink-0 text-[11px] text-muted-foreground">
+          {stack.servers.length} servers
+        </span>
+      </div>
+      <p className="min-h-8 text-xs text-muted-foreground">{stack.description}</p>
+      <div className="flex flex-wrap gap-1">
+        {stack.servers.map((e) => (
+          <span
+            key={e.name}
+            className={`rounded px-1.5 py-0.5 text-[11px] ${
+              haveNames.has(e.name.toLowerCase())
+                ? "bg-success/10 text-success"
+                : "bg-muted text-muted-foreground"
+            }`}
+          >
+            {e.name}
+          </span>
+        ))}
+      </div>
+      <div className="mt-auto flex items-center justify-between gap-2 pt-1">
+        <button
+          onClick={() => setOpen((o) => !o)}
+          className="text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          {open ? "Hide setup steps" : "Setup steps"}
+        </button>
+        {allAdded ? (
+          <span className="inline-flex items-center gap-1 text-xs text-success">
+            <Check className="size-3" />
+            all added
+          </span>
+        ) : (
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-7 px-2 text-xs"
+            disabled={busy}
+            onClick={onSetup}
+          >
+            {busy ? (
+              <Loader2 className="size-3 animate-spin" />
+            ) : (
+              <Plus className="size-3" />
+            )}
+            Add {missing.length}
+          </Button>
+        )}
+      </div>
+      {open && (
+        <div className="mt-1 flex flex-col gap-1.5 border-t pt-2">
+          {stack.servers.map((e) => (
+            <div key={e.name} className="text-[11px] leading-snug">
+              <span className="font-medium text-foreground">{e.name}</span>
+              {e.setupHint && <span className="text-muted-foreground">: {e.setupHint}</span>}
+              {e.credentialsUrl && (
+                <button
+                  onClick={() => openUrl(e.credentialsUrl!)}
+                  className="ml-1 inline-flex items-center gap-0.5 text-info hover:underline"
+                >
+                  get credential
+                  <ExternalLink className="size-2.5" />
+                </button>
+              )}
+            </div>
+          ))}
         </div>
       )}
     </div>

@@ -15,6 +15,7 @@ pub mod savings;
 pub mod semantic;
 pub mod shaping;
 pub mod secrets;
+pub mod stacks;
 pub mod teams;
 pub mod vendors;
 
@@ -947,6 +948,13 @@ fn popular_catalog() -> Vec<catalog::CatalogEntry> {
     catalog::popular()
 }
 
+/// Curated stacks: role-based bundles of catalog servers (each resolved to full
+/// entries with credential hints) for the guided one-flow setup.
+#[tauri::command]
+fn list_stacks() -> Vec<stacks::Stack> {
+    stacks::stacks()
+}
+
 /// Search the official MCP Registry for servers to add. Network call, so it runs
 /// on a blocking worker. Empty query returns popular/recent servers.
 #[tauri::command]
@@ -1386,6 +1394,7 @@ pub fn run() {
             authenticate_oauth,
             probe_auth,
             popular_catalog,
+            list_stacks,
             search_catalog,
             open_data_dir,
             set_all_enabled,

@@ -37,6 +37,14 @@ pub struct CatalogEntry {
     /// and user entries, which surface flat in search results.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub category: String,
+    /// Direct link to where the user creates this server's credential (e.g. the
+    /// provider's API-token page). Powers the guided "go get your creds" step in
+    /// Stacks (and the normal add flow). Curated entries only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credentials_url: Option<String>,
+    /// One-line hint on what credential to create (scopes, what to paste).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_hint: Option<String>,
 }
 
 /// Browse-view grouping for a curated server, keyed by name. Keeps the verified
@@ -58,6 +66,51 @@ fn category_for(name: &str) -> &'static str {
     }
 }
 
+/// Where to create the credential for a curated server, and a one-line hint, for
+/// the guided "go get your creds" step in Stacks. Returns `(url, hint)`; an empty
+/// `url` means there's no single page (a connection string you supply, OAuth, or
+/// no auth) so only the hint shows. `None` = unknown / no guidance.
+fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
+    Some(match name {
+        // Token-based: the agent gets an API key Conduit vaults.
+        "Linode" => (
+            "https://cloud.linode.com/profile/tokens",
+            "Create a Personal Access Token with read/write on the resources you need (Linodes, Volumes, Databases).",
+        ),
+        "AWS" => (
+            "https://console.aws.amazon.com/iam/home#/security_credentials",
+            "Create an access key (ID + secret) for an IAM user scoped to what the agent should touch.",
+        ),
+        "MongoDB" => (
+            "https://cloud.mongodb.com",
+            "Paste your MongoDB connection string (Atlas: Database > Connect > Drivers).",
+        ),
+        "Exa" => ("https://dashboard.exa.ai/api-keys", "Create an API key."),
+        "Perplexity" => (
+            "https://www.perplexity.ai/settings/api",
+            "Create an API key (needs a small credit balance).",
+        ),
+        // Config you supply (no single token page).
+        "PostgreSQL" => (
+            "",
+            "Add your Postgres connection string (postgres://user:pass@host/db) to the server's arguments.",
+        ),
+        "Kubernetes" => ("", "Uses your local kubeconfig (~/.kube/config); nothing to paste."),
+        "Filesystem" => (
+            "",
+            "No credential. After adding, point it at the directories the agent may access.",
+        ),
+        // OAuth: authorize in the browser, no manual token.
+        "GitHub" | "Vercel" | "Sentry" | "Notion" => (
+            "",
+            "OAuth: click Authenticate when prompted; no manual token needed.",
+        ),
+        // No auth at all.
+        "Fetch" | "Context7" => ("", "No credential needed."),
+        _ => return None,
+    })
+}
+
 /// The hand-verified popular set. Hosted (URL) servers are favored here because
 /// their endpoints are far more stable than package names. The live registry
 /// covers the long tail; this set is what most people reach for first.
@@ -76,6 +129,8 @@ pub fn curated() -> Vec<CatalogEntry> {
         homepage: Some(home.to_string()),
         publisher: None,
         category: String::new(),
+        credentials_url: None,
+        setup_hint: None,
     };
     // Local (stdio) servers: `command` + args, with any required secret env keys.
     let cmd =
@@ -92,6 +147,8 @@ pub fn curated() -> Vec<CatalogEntry> {
                 homepage: Some(home.to_string()),
                 publisher: None,
                 category: String::new(),
+                credentials_url: None,
+                setup_hint: None,
             }
         };
 
@@ -149,6 +206,10 @@ pub fn curated() -> Vec<CatalogEntry> {
     ];
     for e in &mut list {
         e.category = category_for(&e.name).to_string();
+        if let Some((url, hint)) = credentials_for(&e.name) {
+            e.credentials_url = (!url.is_empty()).then(|| url.to_string());
+            e.setup_hint = Some(hint.to_string());
+        }
     }
     list
 }
@@ -264,6 +325,8 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
                 homepage,
                 publisher,
                 category: String::new(),
+                credentials_url: None,
+                setup_hint: None,
             });
         }
     }
@@ -322,6 +385,8 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
             homepage,
             publisher,
             category: String::new(),
+            credentials_url: None,
+            setup_hint: None,
         });
     }
 

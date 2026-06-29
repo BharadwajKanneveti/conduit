@@ -15,12 +15,18 @@ import type {
   SavingsSummary,
   ServerEntry,
   ToolCallResult,
+  Stack,
   WriteOutcome,
 } from "./types";
 
 /** The hand-verified popular catalog (offline, instant). */
 export function popularCatalog(): Promise<CatalogEntry[]> {
   return invoke<CatalogEntry[]>("popular_catalog");
+}
+
+/** Curated stacks: role-based server bundles for one-flow setup (offline). */
+export function listStacks(): Promise<Stack[]> {
+  return invoke<Stack[]>("list_stacks");
 }
 
 /** Search the catalog (your picks + curated, then the MCP Registry). */

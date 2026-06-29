@@ -186,6 +186,19 @@ export interface CatalogEntry {
   publisher?: string | null;
   /** Curated browse-view grouping (e.g. "Databases"); absent for registry/user. */
   category?: string;
+  /** Direct link to create this server's credential (provider token page). */
+  credentialsUrl?: string;
+  /** One-line hint on what credential to create (scopes, what to paste). */
+  setupHint?: string;
+}
+
+/** A curated "stack": a role-based bundle of catalog servers for guided setup. */
+export interface Stack {
+  id: string;
+  name: string;
+  description: string;
+  /** The stack's servers, resolved to full catalog entries (with cred hints). */
+  servers: CatalogEntry[];
 }
 
 /** A server merged across every client that has it configured. */
