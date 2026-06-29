@@ -43,7 +43,7 @@ pub struct CatalogEntry {
 /// entry list itself untouched; the UI orders the sections, not the arm order here.
 fn category_for(name: &str) -> &'static str {
     match name {
-        "GitHub" | "Vercel" | "Sentry" | "Cloudflare Docs" | "AWS" | "Kubernetes" => {
+        "GitHub" | "Vercel" | "Sentry" | "Cloudflare Docs" | "AWS" | "Kubernetes" | "Linode" => {
             "Code & infrastructure"
         }
         "Supabase" | "Neon" | "PostgreSQL" | "MongoDB" | "Elasticsearch" => "Databases",
@@ -105,6 +105,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         http("Cloudflare Docs", "Search Cloudflare's documentation.", "https://docs.mcp.cloudflare.com/mcp", "https://developers.cloudflare.com/agents/model-context-protocol/"),
         cmd("AWS", "AWS APIs, docs, and best practices via AWS Labs MCP.", "uvx", &["awslabs.core-mcp-server@latest"], &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"], "https://github.com/awslabs/mcp"),
         cmd("Kubernetes", "Inspect and manage Kubernetes clusters via your kubeconfig.", "npx", &["-y", "mcp-server-kubernetes"], &[], "https://github.com/Flux159/mcp-server-kubernetes"),
+        cmd("Linode", "Manage Linode (Akamai) cloud: instances, volumes, NodeBalancers, databases, and networking.", "npx", &["-y", "@takashito/linode-mcp-server"], &["LINODE_API_TOKEN"], "https://github.com/takashito/linode-mcp-server"),
         // --- Databases ---
         http("Supabase", "Query and manage your Supabase projects.", "https://mcp.supabase.com/mcp", "https://supabase.com/docs/guides/getting-started/mcp"),
         http("Neon", "Serverless Postgres: branches, queries, projects.", "https://mcp.neon.tech/mcp", "https://neon.tech/docs/ai/neon-mcp-server"),
