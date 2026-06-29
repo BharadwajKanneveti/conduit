@@ -1003,10 +1003,16 @@ fn export_config(
     state: State<RegistryState>,
     name: Option<String>,
     description: Option<String>,
+    server_names: Option<Vec<String>>,
 ) -> Result<String, String> {
     let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    serde_json::to_string_pretty(&build_export(&reg, name.as_deref(), description.as_deref()))
-        .map_err(|e| e.to_string())
+    serde_json::to_string_pretty(&build_export(
+        &reg,
+        name.as_deref(),
+        description.as_deref(),
+        server_names.as_deref(),
+    ))
+    .map_err(|e| e.to_string())
 }
 
 /// Write a shareable setup to a file on disk (the path comes from a save dialog).
@@ -1017,11 +1023,17 @@ fn export_config_to_path(
     path: String,
     name: Option<String>,
     description: Option<String>,
+    server_names: Option<Vec<String>>,
 ) -> Result<(), String> {
     let json = {
         let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        serde_json::to_string_pretty(&build_export(&reg, name.as_deref(), description.as_deref()))
-            .map_err(|e| e.to_string())?
+        serde_json::to_string_pretty(&build_export(
+            &reg,
+            name.as_deref(),
+            description.as_deref(),
+            server_names.as_deref(),
+        ))
+        .map_err(|e| e.to_string())?
     };
     std::fs::write(&path, json).map_err(|e| format!("Couldn't write the file: {e}"))
 }
@@ -1102,11 +1114,22 @@ fn build_export(
     reg: &Registry,
     name: Option<&str>,
     description: Option<&str>,
+    server_names: Option<&[String]>,
 ) -> serde_json::Value {
+    // When a selection is given, share only those servers (by name); otherwise
+    // share them all. Lets a user share a focused "stack" instead of everything.
+    let include: Option<std::collections::HashSet<&str>> =
+        server_names.map(|names| names.iter().map(String::as_str).collect());
     let servers: Vec<ServerEntry> = reg
         .servers
         .iter()
         .filter(|s| !clients::is_gateway_server(s))
+        .filter(|s| {
+            include
+                .as_ref()
+                .map(|set| set.contains(s.name.as_str()))
+                .unwrap_or(true)
+        })
         .map(|s| {
             let mut s = s.clone();
             s.id = String::new();
@@ -1472,7 +1495,7 @@ mod tests {
             disabled_tools: vec![],
         });
 
-        let doc = build_export(&reg, Some("Team setup"), Some("Our shared servers"));
+        let doc = build_export(&reg, Some("Team setup"), Some("Our shared servers"), None);
         let serialized = serde_json::to_string(&doc).unwrap();
         // The secret value must never appear in a shared setup.
         assert!(!serialized.contains("sk-live-xyz"));
@@ -1483,6 +1506,14 @@ mod tests {
         // Optional label is carried through.
         assert_eq!(doc["name"], "Team setup");
         assert_eq!(doc["description"], "Our shared servers");
+
+        // Selective share: a name filter includes only the matching servers, so a
+        // user can share a focused stack instead of their whole setup.
+        let shared_name = servers[0]["name"].as_str().unwrap().to_string();
+        let subset = build_export(&reg, None, None, Some(&[shared_name]));
+        assert_eq!(subset["servers"].as_array().unwrap().len(), 1);
+        let empty = build_export(&reg, None, None, Some(&["does-not-exist".to_string()]));
+        assert_eq!(empty["servers"].as_array().unwrap().len(), 0);
     }
 
     #[test]

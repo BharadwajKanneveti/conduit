@@ -15,11 +15,12 @@ import { open as openFile, save } from "@tauri-apps/plugin-dialog";
 import {
   exportConfig,
   exportConfigToPath,
+  getRegistry,
   importConfig,
   previewImport,
   readSetupFile,
 } from "@/lib/api";
-import type { ImportItem, Registry } from "@/lib/types";
+import { isGatewayServer, type ImportItem, type Registry } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -58,13 +59,37 @@ export function ShareDialog({ trigger, onImported }: Props) {
   // When set, the dialog shows the review-and-confirm view for `pendingJson`.
   const [preview, setPreview] = useState<ImportItem[] | null>(null);
   const [pendingJson, setPendingJson] = useState("");
+  // The user's servers and which to include in the shared stack (default all).
+  const [servers, setServers] = useState<{ name: string; transport: string }[]>([]);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+
+  // Load the server list on open so the user can choose a subset to share.
+  useEffect(() => {
+    if (!open) return;
+    getRegistry()
+      .then((reg) => {
+        const list = reg.servers
+          .filter((s) => !isGatewayServer(s))
+          .map((s) => ({ name: s.name, transport: s.transport }));
+        setServers(list);
+        setSelected(new Set(list.map((s) => s.name)));
+      })
+      .catch(() => {});
+  }, [open]);
+
+  // Selection passed to the backend: undefined = share everything (also the
+  // pre-load state), otherwise just the chosen subset.
+  const allSelected = servers.length > 0 && selected.size === servers.length;
+  const shareFilter =
+    servers.length === 0 || allSelected ? undefined : Array.from(selected);
 
   useEffect(() => {
     if (!open) return;
-    exportConfig(name, description)
+    exportConfig(name, description, shareFilter)
       .then(setExported)
       .catch(() => setExported(""));
-  }, [open, name, description]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, name, description, selected, servers]);
 
   function onOpenChange(next: boolean) {
     setOpen(next);
@@ -94,7 +119,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
         filters: [{ name: "Conduit setup", extensions: ["json"] }],
       });
       if (!path) return;
-      await exportConfigToPath(path, name, description);
+      await exportConfigToPath(path, name, description, shareFilter);
       toast.success("Saved setup to file");
     } catch (e) {
       toastError(`Couldn't save: ${e}`);
@@ -212,6 +237,59 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   className="h-8 text-sm"
                 />
               </div>
+
+              {servers.length > 0 && (
+                <div className="flex flex-col gap-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs text-muted-foreground">
+                      Servers to include ({selected.size}/{servers.length})
+                    </span>
+                    <div className="flex gap-2 text-[11px]">
+                      <button
+                        type="button"
+                        className="text-muted-foreground hover:text-foreground"
+                        onClick={() => setSelected(new Set(servers.map((s) => s.name)))}
+                      >
+                        All
+                      </button>
+                      <button
+                        type="button"
+                        className="text-muted-foreground hover:text-foreground"
+                        onClick={() => setSelected(new Set())}
+                      >
+                        None
+                      </button>
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-1.5">
+                    {servers.map((s) => {
+                      const on = selected.has(s.name);
+                      return (
+                        <button
+                          key={s.name}
+                          type="button"
+                          onClick={() =>
+                            setSelected((prev) => {
+                              const next = new Set(prev);
+                              if (on) next.delete(s.name);
+                              else next.add(s.name);
+                              return next;
+                            })
+                          }
+                          className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
+                            on
+                              ? "border-success/50 bg-success/10 text-success"
+                              : "text-muted-foreground hover:bg-accent"
+                          }`}
+                        >
+                          {s.name}
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
+
               <Textarea
                 readOnly
                 aria-label="Exported setup"
@@ -225,7 +303,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   variant="outline"
                   className="h-8"
                   onClick={copy}
-                  disabled={!exported}
+                  disabled={!exported || (servers.length > 0 && selected.size === 0)}
                 >
                   {copied ? (
                     <>
@@ -242,7 +320,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   variant="outline"
                   className="h-8"
                   onClick={saveToFile}
-                  disabled={!exported}
+                  disabled={!exported || (servers.length > 0 && selected.size === 0)}
                 >
                   <FileDown className="size-3.5" /> Save to file
                 </Button>

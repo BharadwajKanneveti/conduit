@@ -306,10 +306,12 @@ export function openDataDir(): Promise<void> {
 export function exportConfig(
   name?: string,
   description?: string,
+  serverNames?: string[],
 ): Promise<string> {
   return invoke<string>("export_config", {
     name: name ?? null,
     description: description ?? null,
+    serverNames: serverNames ?? null,
   });
 }
 
@@ -318,11 +320,13 @@ export function exportConfigToPath(
   path: string,
   name?: string,
   description?: string,
+  serverNames?: string[],
 ): Promise<void> {
   return invoke<void>("export_config_to_path", {
     path,
     name: name ?? null,
     description: description ?? null,
+    serverNames: serverNames ?? null,
   });
 }
 
