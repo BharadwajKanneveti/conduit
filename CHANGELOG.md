@@ -8,6 +8,9 @@ All notable changes to Conduit are documented here. Format loosely follows
 ## [0.9.1] - 2026-06-29
 
 ### Added
+- **New stack: Web scraping & automation.** An eighth role bundle (Firecrawl,
+  Tavily, Playwright, Browserbase, Apify) for agents that search, scrape, and
+  drive real browsers.
 - **Share a stack as a link.** The Share dialog turns your selected servers into
   a `conduitmcp.app/s/...` link. The page unfolds the stack with a rich preview
   card, and its "Open in Conduit" button deep-links straight into the import

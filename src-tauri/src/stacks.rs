@@ -82,6 +82,12 @@ pub fn stacks() -> Vec<Stack> {
             "Ship and run a small SaaS: payments, deploys, code, email, and issues.",
             &["Stripe", "Vercel", "GitHub", "Resend", "Linear"],
         ),
+        make(
+            "web-automation",
+            "Web scraping & automation",
+            "Pull data from any site and drive real browsers: search, scrape, extract, and automate.",
+            &["Firecrawl", "Tavily", "Playwright", "Browserbase", "Apify"],
+        ),
     ]
 }
 
@@ -93,7 +99,7 @@ mod tests {
     fn every_stack_resolves_all_its_servers() {
         // The intended reference count, kept in sync with `stacks()` above. If a
         // server name is mistyped, it silently drops and this total falls short.
-        let intended = 5 + 5 + 5 + 5 + 5 + 4 + 5;
+        let intended = 5 + 5 + 5 + 5 + 5 + 4 + 5 + 5;
         let resolved: usize = stacks().iter().map(|s| s.servers.len()).sum();
         assert_eq!(resolved, intended, "a stack references a server name not in the catalog");
         // Every stack is non-empty and has a stable id + name.
