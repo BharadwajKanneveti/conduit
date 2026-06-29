@@ -488,6 +488,21 @@ mod tests {
     }
 
     #[test]
+    fn filter_catalog_multiword_uses_all_terms_fallback() {
+        let c = curated();
+        // "serverless postgres" is not a contiguous substring of Neon's text
+        // ("Serverless Postgres: ..."), but both terms appear, so the all-terms
+        // fallback must still surface it.
+        let hits = filter_catalog(c.clone(), "serverless postgres");
+        assert!(
+            hits.iter().any(|e| e.name == "Neon"),
+            "all-terms fallback should match Neon"
+        );
+        // A term present nowhere yields nothing.
+        assert!(filter_catalog(c, "zzzznotacatalogword").is_empty());
+    }
+
+    #[test]
     fn maps_a_remote_server() {
         // Shape taken from a real registry.modelcontextprotocol.io response.
         let server = json!({

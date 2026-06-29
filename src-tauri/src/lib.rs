@@ -1737,6 +1737,40 @@ mod tests {
     }
 
     #[test]
+    fn secret_arg_never_survives_export_then_import() {
+        // End-to-end invariant: a credential pasted into args must not leak
+        // through the full share path (export -> serialize -> import elsewhere).
+        let mut reg = Registry::default();
+        reg.add_server(ServerEntry {
+            id: "pg".into(),
+            name: "PostgreSQL".into(),
+            transport: "stdio".into(),
+            command: Some("npx".into()),
+            args: vec![
+                "-y".into(),
+                "postgresql://admin:hunter2@db.example.com/app".into(),
+            ],
+            env: vec![],
+            url: None,
+            source: None,
+            disabled_tools: vec![],
+        });
+        let json = serde_json::to_string(&build_export(&reg, None, None, None)).unwrap();
+        let mut recipient = Registry::default();
+        apply_import(&mut recipient, &json).unwrap();
+        let imported = recipient
+            .servers
+            .iter()
+            .find(|s| s.name == "PostgreSQL")
+            .expect("server imported");
+        assert!(
+            imported.args.iter().all(|a| !a.contains("hunter2")),
+            "secret leaked through export+import"
+        );
+        assert!(imported.args.iter().any(|a| a == "<redacted>"));
+    }
+
+    #[test]
     fn import_dedups_by_name_and_nulls_secrets() {
         let mut reg = Registry::default();
         reg.add_server(github_with_secret());
