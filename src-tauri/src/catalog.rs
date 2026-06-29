@@ -54,7 +54,7 @@ fn category_for(name: &str) -> &'static str {
         "GitHub" | "Vercel" | "Sentry" | "Cloudflare Docs" | "AWS" | "Kubernetes" | "Linode" => {
             "Code & infrastructure"
         }
-        "Supabase" | "Neon" | "PostgreSQL" | "MongoDB" | "Elasticsearch" => "Databases",
+        "Supabase" | "Neon" | "PostgreSQL" | "MongoDB" | "Elasticsearch" | "Qdrant" => "Databases",
         "Context7" | "DeepWiki" | "Hugging Face" | "OpenRouter" | "Brave Search" | "Exa"
         | "Tavily" | "Perplexity" => "Search & knowledge",
         "Firecrawl" | "Apify" | "Browserbase" => "Web & automation",
@@ -90,6 +90,24 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
             "https://www.perplexity.ai/settings/api",
             "Create an API key (needs a small credit balance).",
         ),
+        "OpenRouter" => ("https://openrouter.ai/keys", "Create an API key."),
+        "Qdrant" => (
+            "https://cloud.qdrant.io",
+            "Create a free cluster, then copy its URL and an API key (Cluster > API Keys).",
+        ),
+        "Hugging Face" => (
+            "https://huggingface.co/settings/tokens",
+            "Authenticate when prompted, or paste a read token.",
+        ),
+        "Resend" => ("https://resend.com/api-keys", "Create an API key with send access."),
+        "Figma" => (
+            "https://www.figma.com/settings",
+            "Create a personal access token (Settings > Security > Personal access tokens).",
+        ),
+        "Slack" => (
+            "https://api.slack.com/apps",
+            "Create a Slack app, add a bot token (xoxb-...), and grab your team id.",
+        ),
         // Config you supply (no single token page).
         "PostgreSQL" => (
             "",
@@ -101,7 +119,7 @@ fn credentials_for(name: &str) -> Option<(&'static str, &'static str)> {
             "No credential. After adding, point it at the directories the agent may access.",
         ),
         // OAuth: authorize in the browser, no manual token.
-        "GitHub" | "Vercel" | "Sentry" | "Notion" => (
+        "GitHub" | "Vercel" | "Sentry" | "Notion" | "Linear" | "Stripe" => (
             "",
             "OAuth: click Authenticate when prompted; no manual token needed.",
         ),
@@ -169,6 +187,7 @@ pub fn curated() -> Vec<CatalogEntry> {
         cmd("PostgreSQL", "Query a Postgres database (add your connection string to args).", "npx", &["-y", "@modelcontextprotocol/server-postgres"], &[], "https://github.com/modelcontextprotocol/servers"),
         cmd("MongoDB", "Query and manage MongoDB databases.", "npx", &["-y", "mongodb-mcp-server"], &["MDB_MCP_CONNECTION_STRING"], "https://github.com/mongodb-js/mongodb-mcp-server"),
         cmd("Elasticsearch", "Search and analytics over your Elasticsearch cluster.", "npx", &["-y", "@elastic/mcp-server-elasticsearch"], &["ES_URL", "ES_API_KEY"], "https://github.com/elastic/mcp-server-elasticsearch"),
+        cmd("Qdrant", "Vector search and memory for RAG: store and query embeddings in Qdrant.", "uvx", &["mcp-server-qdrant"], &["QDRANT_URL", "QDRANT_API_KEY"], "https://github.com/qdrant/mcp-server-qdrant"),
         // --- Project management & docs ---
         http("Notion", "Search and edit Notion pages and databases.", "https://mcp.notion.com/mcp", "https://developers.notion.com"),
         http("Composio", "Connect AI agents to 1,000+ apps (Gmail, Slack, GitHub, Notion, Linear, and more).", "https://connect.composio.dev/mcp", "https://composio.dev"),

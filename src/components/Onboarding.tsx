@@ -15,16 +15,17 @@ import {
   addCatalogServer,
   importServers,
   installGateway,
-  popularCatalog,
+  listStacks,
 } from "@/lib/api";
 import {
   importableServers,
   isGatewayServer,
-  type CatalogEntry,
   type DetectedClient,
   type ProbeResult,
   type Registry,
+  type Stack,
 } from "@/lib/types";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 
@@ -74,6 +75,7 @@ export function Onboarding({
     <Welcome key="welcome" present={present} onNext={() => setStep(1)} />,
     <AddServers
       key="add"
+      registry={registry}
       importable={importable}
       onImport={onRegistryChange}
       onBrowseCatalog={onBrowseCatalog}
@@ -175,11 +177,13 @@ function Welcome({
 }
 
 function AddServers({
+  registry,
   importable,
   onImport,
   onBrowseCatalog,
   onNext,
 }: {
+  registry: Registry;
   importable: number;
   onImport: (r: Registry) => void;
   onBrowseCatalog: () => void;
@@ -187,30 +191,20 @@ function AddServers({
 }) {
   const [busy, setBusy] = useState(false);
   const [imported, setImported] = useState<number | null>(null);
-  const [starters, setStarters] = useState<CatalogEntry[]>([]);
-  const [adding, setAdding] = useState<string | null>(null);
-  const [added, setAdded] = useState<Set<string>>(new Set());
-  const [startersFailed, setStartersFailed] = useState(false);
+  const [stacks, setStacks] = useState<Stack[]>([]);
+  const [selected, setSelected] = useState<string | null>(null);
+  const [applying, setApplying] = useState(false);
+  // True once the user has added a stack or imported, so "Next" replaces "later".
+  const [touched, setTouched] = useState(false);
 
-  // A few popular servers for a one-click start, zero-config (no keys) first so
-  // the user gets something that works immediately.
   useEffect(() => {
-    let alive = true;
-    popularCatalog()
-      .then((all) => {
-        if (!alive) return;
-        const sorted = [...all].sort(
-          (a, b) => a.envKeys.length - b.envKeys.length,
-        );
-        setStarters(sorted.slice(0, 4));
-      })
-      .catch(() => {
-        if (alive) setStartersFailed(true);
-      });
-    return () => {
-      alive = false;
-    };
+    listStacks()
+      .then(setStacks)
+      .catch(() => {});
   }, []);
+
+  const have = new Set(registry.servers.map((s) => s.name.toLowerCase()));
+  const stack = stacks.find((s) => s.id === selected) ?? null;
 
   async function doImport() {
     setBusy(true);
@@ -218,6 +212,7 @@ function AddServers({
       const next = await importServers();
       onImport(next);
       setImported(next.servers.filter((s) => !isGatewayServer(s)).length);
+      setTouched(true);
       toast.success("Imported servers from your clients");
     } catch (e) {
       toastError(`Import failed: ${e}`);
@@ -226,29 +221,112 @@ function AddServers({
     }
   }
 
-  async function addStarter(entry: CatalogEntry) {
-    setAdding(entry.name);
+  /** Add every server in the chosen stack that isn't already in Conduit. */
+  async function applyStack(s: Stack) {
+    setApplying(true);
+    const existing = new Set(registry.servers.map((x) => x.name.toLowerCase()));
+    let last = registry;
+    let added = 0;
+    let needCreds = 0;
     try {
-      onImport(await addCatalogServer(entry));
-      setAdded((prev) => new Set(prev).add(entry.name));
-      toast.success(`Added ${entry.name}`);
+      for (const entry of s.servers) {
+        if (existing.has(entry.name.toLowerCase())) continue;
+        last = await addCatalogServer(entry);
+        added++;
+        if (entry.credentialsUrl || entry.envKeys.length > 0) needCreds++;
+      }
+      onImport(last);
+      setTouched(true);
+      toast.success(
+        added > 0
+          ? `Added ${added} server${added === 1 ? "" : "s"} from ${s.name}`
+          : `${s.name}: every server is already in Conduit`,
+        {
+          description:
+            needCreds > 0
+              ? `${needCreds} need credentials. Use the "get key" links, then enable them.`
+              : "Enable them next.",
+        },
+      );
     } catch (e) {
-      toastError(`Couldn't add ${entry.name}: ${e}`);
+      toastError(`Couldn't set up ${s.name}: ${e}`);
     } finally {
-      setAdding(null);
+      setApplying(false);
     }
   }
 
   return (
     <>
       <StepHeader icon={<Download className="size-5" />} title="Add your first servers">
-        Pull in the servers you've already set up in other tools, or browse the
-        catalog to add new ones.
+        Pick what you work on and Conduit sets up a matching stack. You can also
+        import from your other tools or browse the full catalog.
       </StepHeader>
 
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-3">
+        {/* Role picker: each stack is a use case / role. */}
+        {stacks.length > 0 && (
+          <div className="flex flex-col gap-1.5">
+            <span className="text-xs text-muted-foreground">What do you work on?</span>
+            <div className="flex flex-wrap gap-1.5">
+              {stacks.map((s) => (
+                <button
+                  key={s.id}
+                  onClick={() => setSelected(s.id === selected ? null : s.id)}
+                  className={`rounded-full border px-2.5 py-1 text-xs transition-colors ${
+                    s.id === selected
+                      ? "border-success/50 bg-success/10 text-success"
+                      : "hover:bg-accent"
+                  }`}
+                >
+                  {s.name}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* The recommended stack for the chosen role. */}
+        {stack && (
+          <div className="flex flex-col gap-2 rounded-md border bg-muted/20 p-2.5">
+            <p className="text-xs text-muted-foreground">{stack.description}</p>
+            <div className="flex flex-col gap-1">
+              {stack.servers.map((e) => (
+                <div key={e.name} className="flex items-center gap-1.5 text-[11px]">
+                  {have.has(e.name.toLowerCase()) ? (
+                    <Check className="size-3 shrink-0 text-success" />
+                  ) : (
+                    <span className="inline-block size-3 shrink-0" />
+                  )}
+                  <span className="font-medium text-foreground">{e.name}</span>
+                  {e.credentialsUrl && (
+                    <button
+                      onClick={() => openUrl(e.credentialsUrl!)}
+                      className="text-info hover:underline"
+                    >
+                      get key
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+            <Button
+              size="sm"
+              className="self-start"
+              disabled={applying}
+              onClick={() => applyStack(stack)}
+            >
+              {applying ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Plus className="size-3.5" />
+              )}
+              Add this stack
+            </Button>
+          </div>
+        )}
+
         {importable > 0 && imported === null && (
-          <Button onClick={doImport} disabled={busy}>
+          <Button variant="outline" onClick={doImport} disabled={busy}>
             {busy ? (
               <Loader2 className="size-4 animate-spin" />
             ) : (
@@ -265,56 +343,14 @@ function AddServers({
           </div>
         )}
 
-        {starters.length > 0 && (
-          <div className="flex flex-col gap-1.5">
-            <span className="text-xs text-muted-foreground">
-              Or add a popular one:
-            </span>
-            <div className="flex flex-wrap gap-1.5">
-              {starters.map((s) => {
-                const isAdded = added.has(s.name);
-                return (
-                  <button
-                    key={s.name}
-                    onClick={() => !isAdded && addStarter(s)}
-                    disabled={adding === s.name || isAdded}
-                    title={s.description}
-                    className={`flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs transition-colors ${
-                      isAdded
-                        ? "border-success/40 text-success"
-                        : "hover:bg-accent disabled:opacity-60"
-                    }`}
-                  >
-                    {adding === s.name ? (
-                      <Loader2 className="size-3 animate-spin" />
-                    ) : isAdded ? (
-                      <Check className="size-3" />
-                    ) : (
-                      <Plus className="size-3" />
-                    )}
-                    {s.name}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
-        )}
-
-        {startersFailed && (
-          <p className="text-xs text-muted-foreground">
-            Couldn't load popular servers (are you offline?). You can still import
-            or browse the catalog.
-          </p>
-        )}
-
         <Button variant="outline" onClick={onBrowseCatalog}>
           <Store className="size-4" />
-          Browse the catalog
+          Browse the full catalog
         </Button>
       </div>
 
       <Button variant="ghost" onClick={onNext} className="self-start">
-        {imported !== null || added.size > 0 ? "Next" : "I'll add servers later"}
+        {touched ? "Next" : "I'll add servers later"}
         <ArrowRight className="size-4" />
       </Button>
     </>
