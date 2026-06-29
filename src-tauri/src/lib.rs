@@ -1038,6 +1038,36 @@ fn export_config_to_path(
     std::fs::write(&path, json).map_err(|e| format!("Couldn't write the file: {e}"))
 }
 
+/// Public endpoint that turns a shared setup into a `conduitmcp.app/s/<id>` link.
+const SHARE_ENDPOINT: &str = "https://conduitmcp.app/api/share";
+
+/// POST a shareable setup (the secret-stripped JSON from `export_config`) to the
+/// share service and return the short link to copy. The service stores it with a
+/// 90-day TTL and renders a preview page; secrets are never in the payload.
+#[tauri::command]
+async fn share_stack(setup_json: String) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        use std::io::Read;
+        let resp = ureq::post(SHARE_ENDPOINT)
+            .timeout(std::time::Duration::from_secs(20))
+            .set("content-type", "application/json")
+            .send_string(&setup_json)
+            .map_err(|e| format!("couldn't reach the share service: {e}"))?;
+        let mut buf = Vec::new();
+        resp.into_reader()
+            .take(64 * 1024)
+            .read_to_end(&mut buf)
+            .map_err(|e| e.to_string())?;
+        let body: serde_json::Value = serde_json::from_slice(&buf).map_err(|e| e.to_string())?;
+        body.get("url")
+            .and_then(|u| u.as_str())
+            .map(str::to_string)
+            .ok_or_else(|| "the share service did not return a link".to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Import a shared setup. Adds servers not already present (by name); secret
 /// values are never included, so each new server is left for the user to vault.
 #[tauri::command]
@@ -1423,6 +1453,7 @@ pub fn run() {
             set_all_enabled,
             export_config,
             export_config_to_path,
+            share_stack,
             import_config,
             read_setup_file,
             preview_import,

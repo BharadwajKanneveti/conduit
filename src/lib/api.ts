@@ -330,6 +330,11 @@ export function exportConfigToPath(
   });
 }
 
+/** Turn a shareable setup (from exportConfig) into a conduitmcp.app/s/<id> link. */
+export function shareStack(setupJson: string): Promise<string> {
+  return invoke<string>("share_stack", { setupJson });
+}
+
 /** Import a shared setup, adding servers not already present. */
 export function importConfig(json: string): Promise<Registry> {
   return invoke<Registry>("import_config", { json });

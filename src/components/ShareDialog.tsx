@@ -5,6 +5,7 @@ import {
   Copy,
   FileDown,
   FileUp,
+  Link2,
   Loader2,
   ShieldAlert,
   Upload,
@@ -19,6 +20,7 @@ import {
   importConfig,
   previewImport,
   readSetupFile,
+  shareStack,
 } from "@/lib/api";
 import { isGatewayServer, type ImportItem, type Registry } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -62,6 +64,9 @@ export function ShareDialog({ trigger, onImported }: Props) {
   // The user's servers and which to include in the shared stack (default all).
   const [servers, setServers] = useState<{ name: string; transport: string }[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  // A generated share link (conduitmcp.app/s/...), cleared when the export changes.
+  const [shareLink, setShareLink] = useState("");
+  const [linking, setLinking] = useState(false);
 
   // Load the server list on open so the user can choose a subset to share.
   useEffect(() => {
@@ -85,6 +90,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
 
   useEffect(() => {
     if (!open) return;
+    setShareLink(""); // the export changed, so any prior link is stale
     exportConfig(name, description, shareFilter)
       .then(setExported)
       .catch(() => setExported(""));
@@ -98,6 +104,20 @@ export function ShareDialog({ trigger, onImported }: Props) {
       setCopied(false);
       setPreview(null);
       setPendingJson("");
+    }
+  }
+
+  async function createLink() {
+    setLinking(true);
+    try {
+      const url = await shareStack(exported);
+      setShareLink(url);
+      navigator.clipboard.writeText(url).catch(() => {});
+      toast.success("Share link created and copied");
+    } catch (e) {
+      toastError(`Couldn't create a link: ${e}`);
+    } finally {
+      setLinking(false);
     }
   }
 
@@ -300,6 +320,24 @@ export function ShareDialog({ trigger, onImported }: Props) {
               <div className="flex flex-wrap gap-2">
                 <Button
                   size="sm"
+                  className="h-8"
+                  onClick={createLink}
+                  disabled={
+                    linking || !exported || (servers.length > 0 && selected.size === 0)
+                  }
+                >
+                  {linking ? (
+                    <>
+                      <Loader2 className="size-3.5 animate-spin" /> Creating link…
+                    </>
+                  ) : (
+                    <>
+                      <Link2 className="size-3.5" /> Create share link
+                    </>
+                  )}
+                </Button>
+                <Button
+                  size="sm"
                   variant="outline"
                   className="h-8"
                   onClick={copy}
@@ -325,6 +363,22 @@ export function ShareDialog({ trigger, onImported }: Props) {
                   <FileDown className="size-3.5" /> Save to file
                 </Button>
               </div>
+              {shareLink && (
+                <div className="flex items-center gap-2 rounded-md border bg-muted/40 px-2.5 py-1.5">
+                  <Link2 className="size-3.5 shrink-0 text-success" />
+                  <code className="min-w-0 flex-1 truncate text-xs">{shareLink}</code>
+                  <button
+                    type="button"
+                    title="Copy link"
+                    onClick={() => {
+                      navigator.clipboard.writeText(shareLink).catch(() => {});
+                    }}
+                    className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  >
+                    <Copy className="size-3.5" />
+                  </button>
+                </div>
+              )}
             </div>
 
             <div className="flex flex-col gap-2 border-t pt-4">
