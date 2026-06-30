@@ -45,6 +45,11 @@ pub struct CatalogEntry {
     /// One-line hint on what credential to create (scopes, what to paste).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup_hint: Option<String>,
+    /// Placeholder text for the URL field when the server is self-hosted or
+    /// needs a user-specific endpoint. When present, the catalog UI opens
+    /// ServerDialog instead of immediate-add so the user can enter their URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_hint: Option<String>,
 }
 
 /// Browse-view grouping for a curated server, keyed by name. Keeps the verified
@@ -58,7 +63,8 @@ fn category_for(name: &str) -> &'static str {
         | "Tavily" | "Perplexity" | "DataForSEO" => "Search & knowledge",
         "Firecrawl" | "Apify" | "Browserbase" => "Web & automation",
         "Stripe" | "Notion" | "Composio" | "Linear" | "Atlassian" | "Asana" | "Airtable"
-        | "Todoist" | "Slack" | "Resend" | "Figma" | "Postiz" | "Twilio" => "Apps & productivity",
+        | "Todoist" | "Slack" | "Resend" | "Figma" | "Postiz" | "Twilio" | "n8n"
+        | "Langfuse" => "Apps & productivity",
         "Filesystem" | "Fetch" | "Git" | "Playwright" | "Sequential Thinking" | "Memory"
         | "Time" | "Chrome DevTools" => "Local tools",
         _ => "",
@@ -160,26 +166,47 @@ pub fn curated() -> Vec<CatalogEntry> {
         category: String::new(),
         credentials_url: None,
         setup_hint: None,
+        url_hint: None,
+    };
+    // Self-hosted server: the user supplies the URL (shown as placeholder).
+    // transport is http because the server speaks MCP over HTTP, but the URL
+    // is None — the catalog UI opens ServerDialog so the user enters their
+    // instance endpoint before the server is created.
+    let self_hosted = |name: &str, desc: &str, url_hint: &str, home: &str| CatalogEntry {
+        name: name.to_string(),
+        description: desc.to_string(),
+        transport: "http".to_string(),
+        command: None,
+        args: vec![],
+        url: None,
+        env_keys: vec![],
+        source: "curated".to_string(),
+        homepage: Some(home.to_string()),
+        publisher: None,
+        category: String::new(),
+        credentials_url: None,
+        setup_hint: None,
+        url_hint: Some(url_hint.to_string()),
     };
     // Local (stdio) servers: `command` + args, with any required secret env keys.
-    let cmd =
-        |name: &str, desc: &str, command: &str, args: &[&str], env: &[&str], home: &str| {
-            CatalogEntry {
-                name: name.to_string(),
-                description: desc.to_string(),
-                transport: "stdio".to_string(),
-                command: Some(command.to_string()),
-                args: args.iter().map(|s| s.to_string()).collect(),
-                url: None,
-                env_keys: env.iter().map(|s| s.to_string()).collect(),
-                source: "curated".to_string(),
-                homepage: Some(home.to_string()),
-                publisher: None,
-                category: String::new(),
-                credentials_url: None,
-                setup_hint: None,
-            }
-        };
+    let cmd = |name: &str, desc: &str, command: &str, args: &[&str], env: &[&str], home: &str| {
+        CatalogEntry {
+            name: name.to_string(),
+            description: desc.to_string(),
+            transport: "stdio".to_string(),
+            command: Some(command.to_string()),
+            args: args.iter().map(|s| s.to_string()).collect(),
+            url: None,
+            env_keys: env.iter().map(|s| s.to_string()).collect(),
+            source: "curated".to_string(),
+            homepage: Some(home.to_string()),
+            publisher: None,
+            category: String::new(),
+            credentials_url: None,
+            setup_hint: None,
+            url_hint: None,
+        }
+    };
 
     let mut list = vec![
         // --- Payments & commerce ---
@@ -230,6 +257,9 @@ pub fn curated() -> Vec<CatalogEntry> {
         cmd("Figma", "Turn Figma designs into code (Framelink).", "npx", &["-y", "figma-developer-mcp", "--stdio"], &["FIGMA_API_KEY"], "https://github.com/GLips/Figma-Context-MCP"),
         // --- Email ---
         cmd("Resend", "Send transactional email through Resend.", "npx", &["-y", "resend-mcp"], &["RESEND_API_KEY"], "https://resend.com/docs"),
+        // --- Self-hosted (user supplies URL) ---
+        self_hosted("n8n", "Trigger, manage, and edit n8n workflows via MCP.", "https://your-instance.com/mcp-server/http", "https://n8n.io"),
+        self_hosted("Langfuse", "Prompt management and observability for LLM apps.", "https://your-langfuse.com/mcp", "https://langfuse.com"),
         // --- Local utilities (no account needed) ---
         cmd("Filesystem", "Read and write files in directories you allow.", "npx", &["-y", "@modelcontextprotocol/server-filesystem"], &[], "https://github.com/modelcontextprotocol/servers"),
         cmd("Fetch", "Fetch a URL and return its content as markdown.", "uvx", &["mcp-server-fetch"], &[], "https://github.com/modelcontextprotocol/servers"),
@@ -362,6 +392,7 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
                 category: String::new(),
                 credentials_url: None,
                 setup_hint: None,
+                url_hint: None,
             });
         }
     }
@@ -395,7 +426,15 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
         }
         let (command, args) = match registry_type {
             "pypi" => ("uvx".to_string(), vec![spec]),
-            "oci" | "docker" => ("docker".to_string(), vec!["run".to_string(), "-i".to_string(), "--rm".to_string(), spec]),
+            "oci" | "docker" => (
+                "docker".to_string(),
+                vec![
+                    "run".to_string(),
+                    "-i".to_string(),
+                    "--rm".to_string(),
+                    spec,
+                ],
+            ),
             _ => ("npx".to_string(), vec!["-y".to_string(), spec]),
         };
         let env_keys = pkg
@@ -422,6 +461,7 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
             category: String::new(),
             credentials_url: None,
             setup_hint: None,
+            url_hint: None,
         });
     }
 
@@ -483,8 +523,13 @@ mod tests {
         assert!(c.len() >= 20);
         for e in &c {
             assert!(!e.name.is_empty());
-            // Each entry is either a remote (url) or a command, never neither.
-            assert!(e.url.is_some() || e.command.is_some(), "{} has no target", e.name);
+            // Each entry has a target: a URL, a command, or a url_hint
+            // (self-hosted servers where the user supplies the URL at add time).
+            assert!(
+                e.url.is_some() || e.command.is_some() || e.url_hint.is_some(),
+                "{} has no target",
+                e.name
+            );
             // Every curated entry must land in a browse-view category.
             assert!(!e.category.is_empty(), "{} has no category", e.name);
         }
@@ -498,7 +543,9 @@ mod tests {
         assert_eq!(vercel.len(), 1);
         assert_eq!(vercel[0].name, "Vercel");
         // Description matches too (Postgres -> Neon/Supabase).
-        assert!(filter_catalog(curated(), "postgres").iter().any(|e| e.name == "Neon"));
+        assert!(filter_catalog(curated(), "postgres")
+            .iter()
+            .any(|e| e.name == "Neon"));
         // Empty query returns the full set.
         assert_eq!(filter_catalog(curated(), "").len(), curated().len());
     }
@@ -568,14 +615,23 @@ mod tests {
         // Leading-dash identifier (flag injection into npx) is dropped.
         let flag = json!({ "name": "io.x/y", "title": "Y",
             "packages": [{ "registryType": "npm", "identifier": "--unsafe-flag" }] });
-        assert!(map_server(&flag).is_none(), "flag-injection identifier must be dropped");
+        assert!(
+            map_server(&flag).is_none(),
+            "flag-injection identifier must be dropped"
+        );
         // Shell metacharacters in the version are dropped.
         let meta = json!({ "name": "io.x/z", "title": "Z",
             "packages": [{ "registryType": "npm", "identifier": "pkg", "version": "1; rm -rf /" }] });
-        assert!(map_server(&meta).is_none(), "shell metachars must be dropped");
+        assert!(
+            map_server(&meta).is_none(),
+            "shell metachars must be dropped"
+        );
         // A non-http(s) remote URL is dropped.
         let scheme = json!({ "name": "io.x/w", "title": "W",
             "remotes": [{ "type": "streamable-http", "url": "file:///etc/passwd" }] });
-        assert!(map_server(&scheme).is_none(), "non-http remote must be dropped");
+        assert!(
+            map_server(&scheme).is_none(),
+            "non-http remote must be dropped"
+        );
     }
 }
