@@ -165,7 +165,7 @@ function Welcome({
     <>
       <StepHeader icon={<Waypoints className="size-5" />} title="Welcome to Conduit">
         One local gateway for all your MCP servers, shared by every AI tool, so your
-        agent loads 3 tools instead of hundreds (about 90% fewer tokens) and every
+        agent loads 3 tools instead of hundreds (up to 91% fewer tokens) and every
         server is watched for tampering and prompt injection.
         {" "}
         {found}
@@ -497,7 +497,7 @@ function Done({
             {serverCount === 1 ? "" : "s"} across {connectedCount} connected tool
             {connectedCount === 1 ? "" : "s"}. Toggle one on or off and your clients
             update live, no restart. Each client loads 3 search tools instead of
-            every tool, about 90% fewer tokens at the same task. And Conduit watches
+            every tool, up to 91% fewer tokens at the same task success. And Conduit watches
             every server for tampering and prompt injection, see Activity.
           </>
         ) : (

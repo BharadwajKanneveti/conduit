@@ -151,7 +151,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           denyDestructive,
           "text-warning",
           "Block destructive tools",
-          "Hide every destructiveHint tool from all clients",
+          "Hide any tool the server marks as able to delete or change data, from every client",
           apply(setDenyDestructive),
         )}
         {toggle(
@@ -159,7 +159,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           confirmDestructive,
           "text-info",
           "Confirm destructive tools",
-          "Intercept each destructive call with a preview; agent must confirm via conduit_confirm",
+          "Hold each destructive call for the agent to confirm before it runs",
           apply(setConfirmDestructive),
         )}
         {toggle(
