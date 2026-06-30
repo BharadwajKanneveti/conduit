@@ -634,4 +634,88 @@ mod tests {
             "non-http remote must be dropped"
         );
     }
+
+    // Self-hosted catalog coverage (url_hint / setup_hint invariants), contributed by
+    // @bradhallett (salvaged from PR #62 onto current main).
+    #[test]
+    fn self_hosted_entries_have_url_hint_not_url() {
+        let c = curated();
+        for e in &c {
+            if e.url_hint.is_some() {
+                // Self-hosted entries must NOT have a fixed URL (user supplies it).
+                assert!(e.url.is_none(), "{} has both url and url_hint", e.name);
+                // And must have transport http (they speak MCP over HTTP).
+                assert_eq!(
+                    e.transport, "http",
+                    "{} has url_hint but transport is not http",
+                    e.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn url_hint_round_trips_through_serialization() {
+        let e = curated()
+            .into_iter()
+            .find(|e| e.url_hint.is_some())
+            .unwrap();
+        let original_hint = e.url_hint.clone().unwrap();
+        let json = serde_json::to_string(&e).unwrap();
+        // url_hint is serialized (not skipped — it's present).
+        assert!(json.contains("urlHint"), "url_hint should appear in JSON");
+        let back: CatalogEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.url_hint.as_deref(), Some(original_hint.as_str()));
+    }
+
+    #[test]
+    fn n8n_and_langfuse_are_in_catalog() {
+        let c = curated();
+        assert!(
+            c.iter().any(|e| e.name == "n8n"),
+            "n8n missing from catalog"
+        );
+        assert!(
+            c.iter().any(|e| e.name == "Langfuse"),
+            "Langfuse missing from catalog"
+        );
+    }
+
+    #[test]
+    fn n8n_and_langfuse_have_categories() {
+        let c = curated();
+        for e in c.iter().filter(|e| e.name == "n8n" || e.name == "Langfuse") {
+            assert!(!e.category.is_empty(), "{} has no category", e.name);
+        }
+    }
+
+    #[test]
+    fn self_hosted_entries_have_credential_hints() {
+        // n8n and Langfuse should guide the user on their URL + credentials. On current
+        // main that guidance lives in url_hint (adapted from Brad's setup_hint check).
+        let c = curated();
+        for name in ["n8n", "Langfuse"] {
+            let e = c.iter().find(|e| e.name == name).unwrap();
+            let hint = e.url_hint.as_deref().or(e.setup_hint.as_deref());
+            assert!(
+                hint.map(|h| !h.is_empty()).unwrap_or(false),
+                "{name} should have a credential/setup hint"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_entries_have_no_url_hint() {
+        // map_server (the MCP registry mapper) should never set url_hint.
+        let server = json!({
+            "name": "io.test/example",
+            "title": "Example",
+            "packages": [{ "registryType": "npm", "identifier": "example-mcp" }]
+        });
+        let entry = map_server(&server).unwrap();
+        assert!(
+            entry.url_hint.is_none(),
+            "registry entries should not have url_hint"
+        );
+    }
 }
