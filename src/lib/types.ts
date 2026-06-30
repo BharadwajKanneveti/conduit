@@ -65,6 +65,8 @@ export interface AuditEntry {
   durationMs?: number;
   /** Short failure message for a failed call (never args or result data). */
   error?: string;
+  /** A destructive call held for confirmation (not a success and not an error). */
+  held?: boolean;
 }
 
 export interface ProbeResult {

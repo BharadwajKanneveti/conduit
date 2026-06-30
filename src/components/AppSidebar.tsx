@@ -15,6 +15,7 @@ import {
   Share2,
   Store,
   Users,
+  Zap,
 } from "lucide-react";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -25,9 +26,10 @@ import {
   importableServers,
   type DetectedClient,
   type Registry,
+  type SavingsSummary,
   type View,
 } from "@/lib/types";
-import { gatherDiagnostics, openDataDir } from "@/lib/api";
+import { gatherDiagnostics, getSavingsSummary, openDataDir } from "@/lib/api";
 import { checkForUpdate, installUpdate } from "@/lib/updater";
 import { Button } from "@/components/ui/button";
 import {
@@ -398,9 +400,32 @@ export function AppSidebar({
   onReplayOnboarding,
 }: Props) {
   const [showMissing, setShowMissing] = useState(false);
+  const [savings, setSavings] = useState<SavingsSummary | null>(null);
   const sorted = sortClients(clients);
   const detectedClients = sorted.filter((c) => statusOf(c) !== "missing");
   const missingClients = sorted.filter((c) => statusOf(c) === "missing");
+
+  // Surface the running token savings in the sidebar so the headline number isn't
+  // hidden one click away in Activity. Refresh on a light interval as calls flow.
+  useEffect(() => {
+    let alive = true;
+    const load = () =>
+      getSavingsSummary()
+        .then((s) => alive && setSavings(s))
+        .catch(() => {});
+    load();
+    const id = setInterval(load, 60_000);
+    return () => {
+      alive = false;
+      clearInterval(id);
+    };
+  }, []);
+  const fmtTokens = (n: number) =>
+    n >= 1_000_000
+      ? `${(n / 1_000_000).toFixed(1)}M`
+      : n >= 1_000
+        ? `${Math.round(n / 1_000)}K`
+        : `${n}`;
 
   // One sidebar nav row. The active row gets the accent background, a foreground
   // icon (not muted), and aria-current so screen readers announce the selection.
@@ -479,6 +504,19 @@ export function AppSidebar({
             onSelectView("settings"),
           )}
         </nav>
+
+        {savings && savings.tokensSaved > 0 && (
+          <button
+            onClick={() => onSelectView("activity")}
+            className="mx-3 mt-2 flex items-center gap-2 rounded-lg border border-success/30 bg-success/5 px-3 py-2 text-left text-xs transition-colors hover:bg-success/10"
+            title="Tool-definition tokens lazy discovery has kept out of your agent's context. Click for the breakdown."
+          >
+            <Zap className="size-3.5 shrink-0 text-success" />
+            <span className="text-muted-foreground">
+              <span className="font-semibold text-foreground">{fmtTokens(savings.tokensSaved)}</span> tokens saved
+            </span>
+          </button>
+        )}
 
         <div className="px-3 pt-3">
           <div className="px-2.5 pb-1.5 text-xs font-medium tracking-wide text-muted-foreground uppercase">

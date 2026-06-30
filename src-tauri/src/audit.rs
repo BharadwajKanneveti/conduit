@@ -60,20 +60,41 @@ pub fn record_timed(
             }
         }
     }
-    if let Some(path) = audit_path() {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            let _ = writeln!(file, "{entry}");
-        }
-        // File handle dropped above; safe to rewrite the path now.
-        rotate_if_large(&path);
+    write_line(&entry);
+}
+
+/// Record a destructive call that was held for confirmation. This is the
+/// confirm-destructive feature working, not a failure, so `ok: true` keeps it out of
+/// the error rate; the `held` flag lets the UI mark it as held rather than as a
+/// (misleading) successful destructive call.
+pub fn record_held(server: &str, tool: &str) {
+    write_line(&json!({
+        "ts": epoch_millis() as u64,
+        "server": server,
+        "tool": tool,
+        "ok": true,
+        "held": true,
+    }));
+}
+
+/// Append one entry as a single JSON line. A single `write_all` (not `writeln!`, which
+/// can issue several write syscalls) keeps the many client-spawned gateways that share
+/// this file from interleaving each other's bytes into corrupt JSON.
+fn write_line(entry: &Value) {
+    let Some(path) = audit_path() else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
     }
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        let _ = file.write_all(format!("{entry}\n").as_bytes());
+    }
+    rotate_if_large(&path);
 }
 
 /// Trim the audit log to its most recent `KEEP_LINES` lines once it exceeds the
