@@ -32,10 +32,14 @@ interface Props {
   initial?: ServerEntry;
   /** Names of servers that already exist, to warn on a duplicate name. */
   existingNames?: string[];
+  /** Open the dialog automatically on mount (used by catalog configure-add). */
+  autoOpen?: boolean;
+  /** Called when the dialog closes without saving (dismiss/cancel). */
+  onClose?: () => void;
 }
 
-export function ServerDialog({ trigger, onSaved, editId, initial, existingNames }: Props) {
-  const [open, setOpen] = useState(false);
+export function ServerDialog({ trigger, onSaved, editId, initial, existingNames, autoOpen, onClose }: Props) {
+  const [open, setOpen] = useState(autoOpen ?? false);
   const [form, setForm] = useState({
     name: initial?.name ?? "",
     transport: (initial?.transport ?? "stdio") as Transport,
@@ -70,6 +74,10 @@ export function ServerDialog({ trigger, onSaved, editId, initial, existingNames 
   // button), so reset the form each time it opens - otherwise it keeps the last
   // entry's values instead of starting blank (or re-deriving from `initial`).
   function onOpenChange(next: boolean) {
+    if (!next && onClose) {
+      onClose();
+      return;
+    }
     if (next) {
       setForm({
         name: initial?.name ?? "",

@@ -8,6 +8,7 @@ import type { CatalogEntry, Registry, ServerEntry, Stack } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { TransportPill } from "@/components/TransportPill";
+import { ServerDialog } from "@/components/ServerDialog";
 
 /** Section order for the browse view; categories not listed fall to the end. */
 const CATEGORY_ORDER = [
@@ -34,6 +35,7 @@ export function CatalogView({ registry, onAdded }: Props) {
   const [popularError, setPopularError] = useState(false);
   const [stacks, setStacks] = useState<Stack[]>([]);
   const [stackBusy, setStackBusy] = useState<string | null>(null);
+  const [configEntry, setConfigEntry] = useState<CatalogEntry | null>(null);
 
   const have = new Set((registry?.servers ?? []).map((s) => s.name.toLowerCase()));
 
@@ -85,7 +87,25 @@ export function CatalogView({ registry, onAdded }: Props) {
     };
   }, [query]);
 
+  /** Returns true if the entry needs the ServerDialog (has credentials, a
+   * user-supplied URL, or args the user should review). False = safe to
+   * immediate-add with no configuration. */
+  function needsConfig(entry: CatalogEntry): boolean {
+    return (
+      entry.urlHint != null ||
+      entry.envKeys.length > 0 ||
+      entry.args.length > 0
+    );
+  }
+
   async function add(entry: CatalogEntry) {
+    // Self-hosted servers or entries with credentials/args: open the dialog
+    // so the user can enter their URL, paste API keys, or adjust args before
+    // the server is created.
+    if (needsConfig(entry)) {
+      setConfigEntry(entry);
+      return;
+    }
     setBusy(entry.name);
     try {
       const server: ServerEntry = {
@@ -265,6 +285,32 @@ export function CatalogView({ registry, onAdded }: Props) {
         <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
           {shown.map(card)}
         </div>
+      )}
+      {configEntry && (
+        <ServerDialog
+          onSaved={(reg) => {
+            onAdded(reg);
+            setConfigEntry(null);
+          }}
+          onClose={() => setConfigEntry(null)}
+          initial={{
+            id: "",
+            name: configEntry.name,
+            transport: configEntry.transport,
+            command: configEntry.command,
+            args: configEntry.args,
+            env: configEntry.envKeys.map((key) => ({
+              key,
+              value: null,
+              secret: true,
+            })),
+            url: configEntry.url,
+            source: `catalog:${configEntry.source}`,
+          }}
+          existingNames={(registry?.servers ?? []).map((s) => s.name)}
+          autoOpen
+          trigger={<span className="hidden" />}
+        />
       )}
     </div>
   );
