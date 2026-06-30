@@ -46,6 +46,64 @@ mod platform {
 
     use super::{account, SERVICE};
 
+    /// Reserved keychain account for the single 32-byte master key that encrypts
+    /// the file backend (`secrets.enc`). Distinct from every server-secret account
+    /// (which is `server_id::key`), so it never collides with a real secret. This
+    /// is the ONLY keychain item Conduit creates once the file backend is the
+    /// default on macOS — per-server secrets then live only in `secrets.enc`.
+    pub const MASTER_KEY_ACCOUNT: &str = "__conduit_master_key__";
+
+    /// Read the 32-byte master key from the keychain, if present.
+    ///
+    /// Returns `Ok(None)` when no master-key item exists yet (`errSecItemNotFound`,
+    /// -25300) — the signal that the file backend is not yet the default. Returns
+    /// `Err` on a stored value that isn't exactly 32 bytes after base64-decode
+    /// (corrupt item) or any other keychain failure. This is **read-only**: both
+    /// the app and the gateway call it. Only the app ever creates the key (via
+    /// `ensure_master_key`).
+    pub fn read_master_key() -> Result<Option<[u8; 32]>, String> {
+        use base64::Engine;
+        match get_generic_password(SERVICE, MASTER_KEY_ACCOUNT) {
+            Ok(bytes) => {
+                let encoded = String::from_utf8(bytes).map_err(|e| e.to_string())?;
+                let raw = base64::engine::general_purpose::STANDARD
+                    .decode(encoded.trim())
+                    .map_err(|e| e.to_string())?;
+                if raw.len() != 32 {
+                    return Err(format!(
+                        "master key in keychain is {} bytes, expected 32",
+                        raw.len()
+                    ));
+                }
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&raw);
+                Ok(Some(key))
+            }
+            Err(e) if e.code() == -25300 /* errSecItemNotFound */ => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    /// Return the master key, creating it if it doesn't exist yet.
+    ///
+    /// If a key is already stored, returns it. Otherwise generates 32 random bytes
+    /// and stores them base64-encoded via the EXISTING `add_with_shared_access`
+    /// path, so the shared-access ACL lets BOTH the app and the separately-signed
+    /// gateway read the master key with no prompt. **Only the app's startup calls
+    /// this** — the gateway is read-only and must never create the key (it calls
+    /// `read_master_key` instead).
+    pub fn ensure_master_key() -> Result<[u8; 32], String> {
+        use base64::Engine;
+        if let Some(key) = read_master_key()? {
+            return Ok(key);
+        }
+        let mut key = [0u8; 32];
+        getrandom::getrandom(&mut key).map_err(|e| e.to_string())?;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(key);
+        add_with_shared_access(MASTER_KEY_ACCOUNT, &encoded)?;
+        Ok(key)
+    }
+
     pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
         let acct = account(server_id, key);
         // Preferred path: create the item WITH a shared-access ACL (this app + the
@@ -251,6 +309,64 @@ mod platform {
         })
     }
 
+    /// Migrate per-server secrets OUT of individual keychain items and INTO the
+    /// encrypted file backend (`secrets.enc`), so they stop living as separate
+    /// ACL'd keychain items that prompt on every app update.
+    ///
+    /// Per-key flow (no secret loss, with rollback):
+    /// 1. **Read** the value from the OLD keychain item (`get_generic_password`).
+    /// 2. **Write** it into the file backend (`super::file::set_secret`).
+    /// 3. **Verify** by reading it back from the file backend; the round-tripped
+    ///    value must equal the original.
+    /// 4. **Only then delete** the old keychain item (`delete_entry_by_account`).
+    ///
+    /// On ANY failure for a key (read/write/verify error, or a verify mismatch),
+    /// the old keychain item is LEFT IN PLACE — no data loss — and the key is
+    /// counted as `failed`. `errSecItemNotFound` is counted as `not_found`
+    /// (expected for reserved keys on servers that don't use them).
+    ///
+    /// Requires the master key to already exist (so `super::file::active()` is
+    /// true); the caller ensures that before invoking this.
+    pub fn migrate_keychain_to_file(
+        keys: &[(String, String)],
+    ) -> Result<super::MigrationReport, String> {
+        let mut migrated = 0;
+        let mut failed = 0;
+        let mut not_found = 0;
+
+        for (server_id, key) in keys {
+            let acct = account(server_id, key);
+            match get_generic_password(SERVICE, &acct) {
+                Ok(bytes) => match String::from_utf8(bytes) {
+                    Ok(value) => {
+                        // write -> verify -> delete. Leave the keychain item in
+                        // place on any failure so no secret is lost.
+                        let moved = super::file::set_secret(server_id, key, &value).is_ok()
+                            && matches!(
+                                super::file::get_secret_result(server_id, key),
+                                Ok(Some(ref v)) if *v == value
+                            );
+                        if moved {
+                            let _ = delete_entry_by_account(&acct);
+                            migrated += 1;
+                        } else {
+                            failed += 1;
+                        }
+                    }
+                    Err(_) => failed += 1, // non-UTF-8 value — can't round-trip
+                },
+                Err(e) if e.code() == -25300 => not_found += 1, // expected for reserved keys
+                Err(_) => failed += 1,                          // locked keychain, denied access
+            }
+        }
+
+        Ok(super::MigrationReport {
+            migrated,
+            failed,
+            not_found,
+        })
+    }
+
     /// Delete all generic-password entries matching a specific account string.
     /// Uses an account-filtered ref search + FFI `SecKeychainItemDelete` — the
     /// only API that can reliably remove legacy file-based items (`SecItemDelete`
@@ -346,16 +462,38 @@ mod file {
     /// account -> secret value.
     type Store = BTreeMap<String, String>;
 
-    /// The 32-byte key derived from `CONDUIT_SECRET_KEY`, or None when it's unset/empty
-    /// (the signal to use the OS keychain instead).
+    /// The 32-byte key that encrypts `secrets.enc`, or None when the file backend
+    /// is inactive (the signal to use the OS keychain directly).
+    ///
+    /// Precedence:
+    /// 1. `CONDUIT_SECRET_KEY` set + non-empty -> SHA-256 of it (headless path,
+    ///    unchanged; must match for both the app and the gateway).
+    /// 2. macOS only -> the keychain master key, **read-only** (never generated
+    ///    here). The app's startup creates it via `platform::ensure_master_key`;
+    ///    once it exists this returns it, so `active()` becomes true and the file
+    ///    backend is the default on macOS desktop. The gateway also reads it here,
+    ///    so it needs no call changes.
+    /// 3. Otherwise None (Windows/Linux keep the OS keyring unless
+    ///    `CONDUIT_SECRET_KEY` is set).
     fn key_material() -> Option<[u8; 32]> {
-        let secret = std::env::var("CONDUIT_SECRET_KEY").ok()?;
-        if secret.is_empty() {
-            return None;
+        if let Ok(secret) = std::env::var("CONDUIT_SECRET_KEY") {
+            if !secret.is_empty() {
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&Sha256::digest(secret.as_bytes()));
+                return Some(key);
+            }
         }
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&Sha256::digest(secret.as_bytes()));
-        Some(key)
+        #[cfg(target_os = "macos")]
+        {
+            // Read-only: do NOT generate the key here. If reading fails (locked
+            // keychain), fall through to None so the keychain path is used rather
+            // than encrypting with a phantom key.
+            return super::platform::read_master_key().ok().flatten();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
     }
 
     pub fn active() -> bool {
@@ -473,10 +611,18 @@ pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
 // once on upgrade so EXISTING secrets are rewritten WITH the shared-access ACL,
 // not just legacy keyring-API entries.
 
-/// Marker file name in the Conduit data directory. Only the macOS migration reads
-/// it, so it's cfg-gated to avoid a dead-code warning on Windows/Linux builds.
+/// Marker file name for the legacy ACL migration (keychain -> ACL-free keychain).
+/// Left untouched for backward compatibility, but the current macOS path migrates
+/// secrets into the file backend instead (see `FILE_MIGRATION_MARKER`).
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 const MIGRATION_MARKER: &str = ".keychain-acl-migrated";
+
+/// Marker file name for the keychain -> encrypted-file migration. A NEW name so
+/// the migration runs exactly once on upgrade to the file-backend-by-default
+/// build, even on installs that already ran the older ACL migration.
+#[cfg(target_os = "macos")]
+const FILE_MIGRATION_MARKER: &str = ".secrets-file-migrated";
 
 /// Result of the one-time keychain migration.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -492,35 +638,54 @@ pub struct MigrationReport {
     pub not_found: usize,
 }
 
-/// Run the one-time legacy keychain migration. For each secret key the registry
-/// knows about, reads the current value, deletes the entry, and re-creates it
-/// via the ACL-free `SecItemAdd` path. Guarded by a marker file so it runs
-/// exactly once. Only call from the UI app (not the gateway).
+/// Run the one-time macOS secret migration to the encrypted file backend.
+///
+/// On macOS this:
+/// 1. **Ensures the master key** (`platform::ensure_master_key`) FIRST, so the
+///    file backend becomes active (`file::active()` is true). If ensuring the
+///    key fails (e.g. the keychain is locked), it logs and returns the default
+///    report WITHOUT writing the marker, so the whole thing retries next launch.
+/// 2. If the file-migration marker is absent, **moves each secret** from its old
+///    per-server keychain item into `secrets.enc` via
+///    `platform::migrate_keychain_to_file` (read -> write-file -> verify -> only
+///    then delete the keychain item; on any failure the keychain item is left in
+///    place so nothing is lost). The marker is written ONLY when that pass
+///    returns `Ok`.
+///
+/// Only call from the UI app (not the gateway): the gateway is read-only and
+/// must never create the master key or rewrite entries.
 ///
 /// `secret_keys` is a list of `(server_id, key)` pairs for every secret env var
-/// in the registry (and `HTTP_AUTH_KEY` for remote servers).
-///
-/// The marker file is **only** written when the platform migration returns `Ok`.
-/// If it returns `Err` (e.g. the keychain was locked so the search failed), the
-/// marker is not written and the migration retries on the next launch.
+/// in the registry (and reserved keys like `HTTP_AUTH_KEY` for remote servers).
 pub fn migrate_legacy_entries(secret_keys: &[(String, String)]) -> MigrationReport {
     #[cfg(target_os = "macos")]
     {
-        if migration_marker_exists() {
+        // 1. Ensure the master key exists before anything else. This is what
+        //    flips the file backend on for this install. If it fails (locked
+        //    keychain), don't write the marker — retry on the next launch.
+        if let Err(e) = platform::ensure_master_key() {
+            eprintln!(
+                "conduit: could not ensure secrets master key, will retry next launch ({e})"
+            );
             return MigrationReport::default();
         }
 
-        let report = match platform::migrate_legacy_entries(secret_keys) {
+        // 2. One-time migration of per-server secrets into the file backend.
+        if file_migration_marker_exists() {
+            return MigrationReport::default();
+        }
+
+        let report = match platform::migrate_keychain_to_file(secret_keys) {
             Ok(report) => report,
             Err(e) => {
                 // Don't write the marker — the migration didn't run, so it
                 // should retry on the next launch.
-                eprintln!("conduit: keychain migration skipped, will retry next launch ({e})");
+                eprintln!("conduit: secret migration skipped, will retry next launch ({e})");
                 return MigrationReport::default();
             }
         };
 
-        let _ = create_migration_marker();
+        let _ = create_file_migration_marker();
         report
     }
     #[cfg(not(target_os = "macos"))]
@@ -530,40 +695,145 @@ pub fn migrate_legacy_entries(secret_keys: &[(String, String)]) -> MigrationRepo
     }
 }
 
-/// Check whether the migration marker file exists in the Conduit data directory.
+/// Whether the keychain -> file migration marker exists in the Conduit data dir.
 #[cfg(target_os = "macos")]
-fn migration_marker_exists() -> bool {
+fn file_migration_marker_exists() -> bool {
     crate::registry::conduit_dir()
-        .map(|d| d.join(MIGRATION_MARKER))
+        .map(|d| d.join(FILE_MIGRATION_MARKER))
         .map(|p| p.exists())
         .unwrap_or(false)
 }
 
-/// Create the migration marker file. Returns `true` on success.
+/// Create the keychain -> file migration marker file. Returns `true` on success.
 #[cfg(target_os = "macos")]
-fn create_migration_marker() -> bool {
+fn create_file_migration_marker() -> bool {
     let Some(dir) = crate::registry::conduit_dir() else {
         return false;
     };
     let _ = std::fs::create_dir_all(&dir);
-    std::fs::write(dir.join(MIGRATION_MARKER), b"1").is_ok()
+    std::fs::write(dir.join(FILE_MIGRATION_MARKER), b"1").is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that read or mutate the process-global `CONDUIT_SECRET_KEY`
+    /// env var (and thus `file::active()`). Without this, a test that sets the var
+    /// races with a sibling that assumes the keychain path, causing spurious
+    /// failures under the default multi-threaded test runner.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     // Round-trips through the real OS keychain. Headless Linux CI has no Secret
     // Service (D-Bus), so skip it there; it still runs on macOS and Windows.
     #[test]
     #[cfg_attr(target_os = "linux", ignore = "no Secret Service in headless CI")]
     fn set_get_delete_round_trip() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let sid = "conduit-test-server";
         let key = "CONDUIT_TEST_KEY";
         set_secret(sid, key, "s3cr3t").unwrap();
         assert_eq!(get_secret(sid, key).as_deref(), Some("s3cr3t"));
         delete_secret(sid, key).unwrap();
         assert_eq!(get_secret(sid, key), None);
+    }
+
+    /// Cross-platform: setting `CONDUIT_SECRET_KEY` activates the file backend.
+    /// Runs on every OS (the env-var precedence is platform-independent).
+    ///
+    /// NOTE: mutates a process-global env var, so it's `#[serial]`-free but kept
+    /// self-contained — it sets and then unsets the var, restoring prior state.
+    #[test]
+    fn file_active_when_env_key_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("CONDUIT_SECRET_KEY").ok();
+        std::env::set_var("CONDUIT_SECRET_KEY", "unit-test-passphrase");
+        assert!(
+            file::active(),
+            "file backend must be active when CONDUIT_SECRET_KEY is set"
+        );
+        // Restore prior state so other tests aren't affected.
+        match prev {
+            Some(v) => std::env::set_var("CONDUIT_SECRET_KEY", v),
+            None => std::env::remove_var("CONDUIT_SECRET_KEY"),
+        }
+    }
+
+    /// macOS: ensuring the master key returns 32 bytes and is idempotent — a
+    /// second `ensure` returns the SAME key, and a plain `read` returns it too.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn master_key_ensure_then_read_is_idempotent() {
+        let first = platform::ensure_master_key().expect("ensure should succeed");
+        assert_eq!(first.len(), 32);
+        let second = platform::ensure_master_key().expect("ensure should be idempotent");
+        assert_eq!(first, second, "ensure must return the same key each time");
+        let read = platform::read_master_key()
+            .expect("read should succeed")
+            .expect("master key should exist after ensure");
+        assert_eq!(first, read, "read must return the ensured key");
+    }
+
+    /// macOS: once the master key exists, the file backend is selected
+    /// (`active()` is true) even without `CONDUIT_SECRET_KEY`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn file_active_once_master_key_exists() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Make sure the env var is not what's activating it.
+        let prev = std::env::var("CONDUIT_SECRET_KEY").ok();
+        std::env::remove_var("CONDUIT_SECRET_KEY");
+        platform::ensure_master_key().expect("ensure should succeed");
+        assert!(
+            file::active(),
+            "file backend must be active once the master key exists"
+        );
+        if let Some(v) = prev {
+            std::env::set_var("CONDUIT_SECRET_KEY", v);
+        }
+    }
+
+    /// macOS: the keychain -> file migration moves a value into the file backend
+    /// and the value reads back from the file backend afterward.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn migrate_keychain_to_file_moves_value() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var("CONDUIT_SECRET_KEY").ok();
+        std::env::remove_var("CONDUIT_SECRET_KEY");
+
+        // Master key must exist so the file backend is active.
+        platform::ensure_master_key().expect("ensure should succeed");
+
+        let sid = "conduit-file-migrate-test";
+        let key = "FILE_MIGRATE_KEY";
+        let original = "value-moved-into-file-backend";
+
+        // Seed an OLD per-server keychain item directly.
+        platform::set_secret(sid, key, original).unwrap();
+
+        // Run the keychain -> file migration for this key.
+        let keys = vec![(sid.to_string(), key.to_string())];
+        let report =
+            platform::migrate_keychain_to_file(&keys).expect("file migration should succeed");
+        assert_eq!(report.migrated, 1, "one entry should have been migrated");
+        assert_eq!(report.failed, 0, "no entries should have failed");
+
+        // The value now reads back from the FILE backend.
+        assert_eq!(
+            file::get_secret_result(sid, key).unwrap().as_deref(),
+            Some(original),
+            "migrated value must be readable from the file backend"
+        );
+        // And the top-level dispatcher (which routes through file::active()) too.
+        assert_eq!(get_secret(sid, key).as_deref(), Some(original));
+
+        // Clean up the file-backend entry.
+        let _ = file::delete_secret(sid, key);
+        if let Some(v) = prev {
+            std::env::set_var("CONDUIT_SECRET_KEY", v);
+        }
     }
 
     #[test]
@@ -594,8 +864,11 @@ mod tests {
         let key = "MIGRATE_PRESERVE_KEY";
         let original = "s3cr3t-value-to-preserve";
 
-        // Pre-create the entry so the migration has something to migrate.
-        set_secret(sid, key, original).unwrap();
+        // Pre-create the entry in the KEYCHAIN directly (this test exercises the
+        // ACL-free keychain migration, not the file-backend dispatcher — so seed
+        // and read via `platform::` to stay backend-agnostic even when a master
+        // key has made the file backend the default).
+        platform::set_secret(sid, key, original).unwrap();
 
         // Run the full platform migration for this one key.
         let keys = vec![(sid.to_string(), key.to_string())];
@@ -607,13 +880,13 @@ mod tests {
 
         // The value must survive the read-delete-rewrite cycle intact.
         assert_eq!(
-            get_secret(sid, key).as_deref(),
+            platform::get_secret_result(sid, key).unwrap().as_deref(),
             Some(original),
             "secret value must survive migration"
         );
 
         // Clean up.
-        delete_secret(sid, key).unwrap();
+        platform::delete_secret(sid, key).unwrap();
     }
 
     /// The migration correctly reports `not_found` for keys that don't exist in
@@ -625,8 +898,9 @@ mod tests {
         let sid = "conduit-missing-test";
         let key = "THIS_KEY_DOES_NOT_EXIST";
 
-        // Ensure the entry doesn't exist.
-        let _ = delete_secret(sid, key);
+        // Ensure the keychain entry doesn't exist (delete via `platform::` so we
+        // target the keychain the migration reads, not the file backend).
+        let _ = platform::delete_secret(sid, key);
 
         let keys = vec![(sid.to_string(), key.to_string())];
         let report = platform::migrate_legacy_entries(&keys).expect("migration should succeed");
