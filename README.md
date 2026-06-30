@@ -328,10 +328,24 @@ latency/error stats, resources + prompts proxying, and a tool playground. See
   the Windows or macOS builds. We are tracking the upstream move to a glib-0.20 stack
   and will apply a `[patch.crates-io]` backport if Linux crashes surface before then.
 
+## Conduit Teams
+
+Want one shared, governed MCP server set across your whole team? **Conduit Teams** is a
+self-hostable server: an admin defines the team's servers once, every member's Conduit
+syncs them, and each member's keys still never leave their own machine.
+
+- **Free for up to 4 people** — self-host with one Docker command
+  (`docker pull ghcr.io/tsouth89/conduit-teams`).
+- **$20/seat/month** beyond that; the first 4 seats stay free.
+- Central destructive-tool policy, an exportable audit trail, and per-member opt-in for
+  local-command servers (a team config can never silently run code on a member's machine).
+
+Pricing, the self-host quickstart, and checkout are all at
+**[conduitmcp.app/teams](https://conduitmcp.app/teams)**.
+
 ## License
 
 [MIT](LICENSE), and the local app and gateway always will be. Conduit follows an
-open-core model: the desktop app and `conduit-gateway` are free and open source,
-and a separate commercial product, Conduit Teams (shared/hosted gateway, RBAC/SSO,
-policy, audit export, secret-vault integrations), funds the free app. Anything you
-contribute here is MIT and benefits everyone, see [CONTRIBUTING.md](CONTRIBUTING.md).
+open-core model: the desktop app and `conduit-gateway` are free and open source, and
+Conduit Teams (above) funds the free app. Anything you contribute here is MIT and
+benefits everyone, see [CONTRIBUTING.md](CONTRIBUTING.md).
