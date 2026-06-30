@@ -1346,7 +1346,7 @@ fn apply_import(reg: &mut Registry, json: &str) -> Result<(), String> {
 /// app and clobbered by its next save. Polls mtime (the gateway uses the same
 /// approach) and skips identical touches so an mtime-only bump doesn't churn the UI.
 fn watch_registry_for_app(handle: tauri::AppHandle) {
-    let Some(path) = registry::registry_path() else {
+    let Some(path) = registry::resolved_path() else {
         return;
     };
     let mtime = |p: &std::path::Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());

@@ -631,12 +631,11 @@ pub fn save_to(path: &Path, registry: &Registry) -> Result<(), String> {
 }
 
 pub fn load() -> Result<Registry, String> {
-    let path = registry_path().ok_or("Could not resolve registry path")?;
-    load_from(&path)
+    load_resolved()
 }
 
 pub fn save(registry: &Registry) -> Result<(), String> {
-    let path = registry_path().ok_or("Could not resolve registry path")?;
+    let path = resolved_path().ok_or("Could not resolve registry path")?;
     save_to(&path, registry)
 }
 
@@ -864,6 +863,39 @@ mod tests {
         path.push(format!("conduit-test-{}.json", std::process::id()));
         save_to(&path, &r).unwrap();
         let loaded = load_from(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(loaded.servers, r.servers);
+        assert_eq!(loaded.profiles, r.profiles);
+        assert_eq!(loaded.active_profile_id, r.active_profile_id);
+    }
+
+    #[test]
+    fn load_and_save_resolved_honor_registry_override() {
+        static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        let _guard = ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap();
+
+        let mut path = std::env::temp_dir();
+        path.push(format!("conduit-registry-override-{}.json", std::process::id()));
+        let previous = std::env::var_os("CONDUIT_REGISTRY");
+        struct RestoreEnv(Option<std::ffi::OsString>);
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var("CONDUIT_REGISTRY", value),
+                    None => std::env::remove_var("CONDUIT_REGISTRY"),
+                }
+            }
+        }
+        let _restore = RestoreEnv(previous);
+        std::env::set_var("CONDUIT_REGISTRY", &path);
+
+        let mut r = Registry::default();
+        let id = r.add_server(sample_server("oauth"));
+        r.set_server_enabled("default", &id, true).unwrap();
+        save(&r).unwrap();
+
+        let loaded = load().unwrap();
         std::fs::remove_file(&path).ok();
 
         assert_eq!(loaded.servers, r.servers);
