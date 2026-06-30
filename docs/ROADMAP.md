@@ -65,11 +65,12 @@ HTTP/security surface). Ordered by impact within each track. (S/M/L = effort.)
       authenticates to Conduit, shows up in the app, you assign which servers it
       sees. Profiles already do half. This is Sigiz's explicit ask AND the proper
       long-term auth model for the HTTP bridge. The real moat. (L)
-- [ ] **Block-on-drift / quarantine + re-approval for high-risk tools.**
-      Detection-only stays the default, but an opt-in mode quarantines a changed
-      tool until re-approval, defaulting ON for destructive/auth-bearing tools
-      (keyed off destructiveHint). From a Reddit thread; extends the existing
-      rug-pull detection. (M)
+- [x] **Block-on-drift / quarantine + re-approval for high-risk tools.** SHIPPED
+      2026-06-30 (on main, unreleased): opt-in `quarantine_on_drift` blocks a
+      high-risk drift (a poisoned definition, or a destructive tool whose definition
+      changed/appeared) until the user re-approves it; detection-only stays the
+      default. Settings toggle + re-approve list in the app. Auth-bearing dimension
+      (drift on a credential-bearing server) deferred to a later pass.
 - [ ] **Local-small-model UX.** 7B models still struggle with the lazy
       search-then-call chain (the multi-step guard helped, didn't solve). This is
       Open WebUI's core audience. (L)
