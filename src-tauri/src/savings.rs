@@ -63,7 +63,9 @@ pub fn record(full_tokens: u64, meta_tokens: u64, catalog_tools: u64) {
             .append(true)
             .open(&path)
         {
-            let _ = writeln!(file, "{entry}");
+            // Single write_all (not writeln!) so concurrent client-spawned gateways
+            // can't interleave bytes into corrupt JSON lines.
+            let _ = file.write_all(format!("{entry}\n").as_bytes());
         }
         rotate_if_large(&path);
     }

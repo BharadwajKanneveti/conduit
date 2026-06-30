@@ -488,7 +488,9 @@ fn record_event(event: &Value) {
             let _ = std::fs::create_dir_all(parent);
         }
         if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-            let _ = writeln!(file, "{event}");
+            // Single write_all (not writeln!, which issues several syscalls) so the many
+            // client-spawned gateways sharing this file can't interleave into corrupt JSON.
+            let _ = file.write_all(format!("{event}\n").as_bytes());
         }
         rotate_if_large(&path);
     }
