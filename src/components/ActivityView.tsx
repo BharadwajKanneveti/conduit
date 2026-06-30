@@ -121,6 +121,28 @@ function securityKey(e: SecurityEvent): string {
   return `${e.type}:${e.server ?? ""}:${e.tool ?? ""}:${e.ts}:${e.change}`;
 }
 
+/** Each connected client runs its own gateway process, so a single server tool change
+ * is flagged once PER client against the shared baseline, producing identical notices.
+ * Collapse those: keep only the newest of any (type, server, tool, change) seen within a
+ * short window, so genuinely-separate changes over time are preserved. */
+function dedupeSecurity(events: SecurityEvent[]): SecurityEvent[] {
+  const WINDOW_MS = 10 * 60 * 1000;
+  const newestFirst = [...events].sort((a, b) => b.ts - a.ts);
+  const kept: SecurityEvent[] = [];
+  for (const e of newestFirst) {
+    const dupe = kept.some(
+      (k) =>
+        k.type === e.type &&
+        k.server === e.server &&
+        k.tool === e.tool &&
+        k.change === e.change &&
+        Math.abs(k.ts - e.ts) <= WINDOW_MS,
+    );
+    if (!dupe) kept.push(e);
+  }
+  return kept;
+}
+
 function loadDismissed(): Set<string> {
   try {
     const raw = localStorage.getItem(SECURITY_DISMISSED_KEY);
@@ -419,7 +441,9 @@ function CallRow({ e }: { e: AuditEntry }) {
         ) : (
           <span className="inline-block size-3.5 shrink-0" />
         )}
-        {e.ok ? (
+        {e.held ? (
+          <ShieldAlert className="size-4 shrink-0 text-warning" />
+        ) : e.ok ? (
           <CheckCircle2 className="size-4 shrink-0 text-success" />
         ) : (
           <XCircle className="size-4 shrink-0 text-destructive" />
@@ -527,7 +551,7 @@ export function ActivityView({ refreshKey }: { refreshKey: number }) {
     };
   }, [refreshKey]);
 
-  const liveSecurity = security.filter((e) => !dismissed.has(securityKey(e)));
+  const liveSecurity = dedupeSecurity(security).filter((e) => !dismissed.has(securityKey(e)));
   const dismissSecurity = (e: SecurityEvent) => {
     setDismissed((prev) => {
       const next = new Set(prev);

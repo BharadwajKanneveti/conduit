@@ -1589,13 +1589,9 @@ fn handle_request(
                          The token expires in 60 seconds. The original arguments will be replayed \
                          exactly."
                     );
-                    audit::record_timed(
-                        srv,
-                        tool,
-                        false,
-                        None,
-                        Some("destructive call intercepted — awaiting confirmation"),
-                    );
+                    // Held for confirmation, not a failure: record as held (ok), so the
+                    // confirm-destructive feature doesn't inflate the error rate.
+                    audit::record_held(srv, tool);
                     return Some(success(
                         id,
                         json!({
@@ -1894,7 +1890,7 @@ fn glog(msg: &str) {
         .append(true)
         .open(&path)
     {
-        let _ = writeln!(f, "{msg}");
+        let _ = f.write_all(format!("{msg}\n").as_bytes());
     }
     trim_log_if_large(&path);
 }
