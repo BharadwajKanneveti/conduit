@@ -467,10 +467,9 @@ mod platform {
     /// returns `errSecMissingEntitlement` (-34018) on an unsigned binary, so this
     /// can only succeed on a signed build with the embedded provisioning profile.
     ///
-    /// Not yet wired into app startup — Phase 1 ships the function + the
-    /// `DPK_MIGRATION_MARKER`; a later phase flips the dispatcher precedence and
-    /// calls it once behind the marker. `#[allow(dead_code)]` until then.
-    #[allow(dead_code)]
+    /// Wired into app startup via `migrate_secrets_to_dpk`, which guards it behind
+    /// `DPK_MIGRATION_MARKER` so it runs once per install. The app process is the
+    /// only caller (the gateway is read-only).
     pub fn migrate_legacy_to_dpk(
         keys: &[(String, String)],
     ) -> Result<super::MigrationReport, String> {
@@ -668,35 +667,25 @@ mod file {
     /// The 32-byte key that encrypts `secrets.enc`, or None when the file backend
     /// is inactive (the signal to use the OS keychain directly).
     ///
-    /// Precedence:
-    /// 1. `CONDUIT_SECRET_KEY` set + non-empty -> SHA-256 of it (headless path,
-    ///    unchanged; must match for both the app and the gateway).
-    /// 2. macOS only -> the keychain master key, **read-only** (never generated
-    ///    here). The app's startup creates it via `platform::ensure_master_key`;
-    ///    once it exists this returns it, so `active()` becomes true and the file
-    ///    backend is the default on macOS desktop. The gateway also reads it here,
-    ///    so it needs no call changes.
-    /// 3. Otherwise None (Windows/Linux keep the OS keyring unless
-    ///    `CONDUIT_SECRET_KEY` is set).
+    /// The file backend is **headless-only**: it activates IFF `CONDUIT_SECRET_KEY`
+    /// is set + non-empty (the key is SHA-256 of it; the app and gateway must agree
+    /// on the env var). On every desktop OS this returns None, so secrets live in
+    /// the OS keychain — on macOS that is the *data-protection* keychain under the
+    /// team-scoped shared access group (`platform`), which keeps keys off disk and
+    /// lets the separately-signed gateway read them with no prompt.
+    ///
+    /// We deliberately do NOT derive the key from a keychain master item on
+    /// desktop. Doing so would activate `secrets.enc` on disk and shadow the
+    /// data-protection keychain — the "keys never on disk" property we sell — and
+    /// reading that master item across an app update is itself a prompt source.
     fn key_material() -> Option<[u8; 32]> {
-        if let Ok(secret) = std::env::var("CONDUIT_SECRET_KEY") {
-            if !secret.is_empty() {
-                let mut key = [0u8; 32];
-                key.copy_from_slice(&Sha256::digest(secret.as_bytes()));
-                return Some(key);
-            }
+        let secret = std::env::var("CONDUIT_SECRET_KEY").ok()?;
+        if secret.is_empty() {
+            return None;
         }
-        #[cfg(target_os = "macos")]
-        {
-            // Read-only: do NOT generate the key here. If reading fails (locked
-            // keychain), fall through to None so the keychain path is used rather
-            // than encrypting with a phantom key.
-            return super::platform::read_master_key().ok().flatten();
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            None
-        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&Sha256::digest(secret.as_bytes()));
+        Some(key)
     }
 
     pub fn active() -> bool {
@@ -832,7 +821,6 @@ const FILE_MIGRATION_MARKER: &str = ".secrets-file-migrated";
 /// markers are left untouched) so this runs exactly once on upgrade to the
 /// data-protection-keychain build. App-only; written only on a clean pass.
 #[cfg(target_os = "macos")]
-#[allow(dead_code)]
 const DPK_MIGRATION_MARKER: &str = ".keychain-dpk-migrated";
 
 /// Result of the one-time keychain migration.
@@ -925,6 +913,69 @@ fn create_file_migration_marker() -> bool {
     std::fs::write(dir.join(FILE_MIGRATION_MARKER), b"1").is_ok()
 }
 
+/// Run the one-time macOS migration of per-server secrets from the legacy
+/// file-based keychain INTO the data-protection keychain (the team-scoped shared
+/// access group), guarded by `DPK_MIGRATION_MARKER` so it runs once per install.
+///
+/// This is the migration that replaces the old ACL / encrypted-file paths: after
+/// it runs, every secret lives in the data-protection keychain, which the
+/// separately-signed gateway reads with NO prompt across app updates.
+///
+/// Only the UI app calls this (the gateway is read-only and must never rewrite
+/// entries). Best-effort and lossless: `migrate_legacy_to_dpk` reads each legacy
+/// item, writes + verifies the data-protection copy, then deletes the legacy item;
+/// an item it can't move is left in the legacy keychain. The marker is written
+/// only on a fully clean pass (`failed == 0`), so a transient denial or locked
+/// keychain is retried on the next launch rather than stranding a secret.
+pub fn migrate_secrets_to_dpk(secret_keys: &[(String, String)]) -> MigrationReport {
+    #[cfg(target_os = "macos")]
+    {
+        if dpk_migration_marker_exists() {
+            return MigrationReport::default();
+        }
+        let report = match platform::migrate_legacy_to_dpk(secret_keys) {
+            Ok(report) => report,
+            Err(e) => {
+                eprintln!(
+                    "conduit: data-protection keychain migration skipped, will retry next launch ({e})"
+                );
+                return MigrationReport::default();
+            }
+        };
+        // Only mark complete once nothing failed, so a denied prompt or locked
+        // keychain gets another chance next launch instead of being marked done.
+        if report.failed == 0 {
+            let _ = create_dpk_migration_marker();
+        }
+        report
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = secret_keys;
+        MigrationReport::default()
+    }
+}
+
+/// Whether the legacy -> data-protection keychain migration marker exists.
+#[cfg(target_os = "macos")]
+fn dpk_migration_marker_exists() -> bool {
+    crate::registry::conduit_dir()
+        .map(|d| d.join(DPK_MIGRATION_MARKER))
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+/// Create the legacy -> data-protection keychain migration marker. Returns `true`
+/// on success.
+#[cfg(target_os = "macos")]
+fn create_dpk_migration_marker() -> bool {
+    let Some(dir) = crate::registry::conduit_dir() else {
+        return false;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(dir.join(DPK_MIGRATION_MARKER), b"1").is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -995,68 +1046,22 @@ mod tests {
         assert_eq!(first, read, "read must return the ensured key");
     }
 
-    /// macOS: once the master key exists, the file backend is selected
-    /// (`active()` is true) even without `CONDUIT_SECRET_KEY`.
+    /// macOS: the file backend is headless-only. Without `CONDUIT_SECRET_KEY`,
+    /// `active()` stays false even after a keychain master key exists, so desktop
+    /// secrets route to the data-protection keychain, never to `secrets.enc`.
     #[cfg(target_os = "macos")]
     #[test]
-    fn file_active_once_master_key_exists() {
+    fn master_key_does_not_activate_file_backend() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // Make sure the env var is not what's activating it.
         let prev = std::env::var("CONDUIT_SECRET_KEY").ok();
         std::env::remove_var("CONDUIT_SECRET_KEY");
-        platform::ensure_master_key().expect("ensure should succeed");
+        // Creating a master key must NOT flip the file backend on (best-effort:
+        // the create may no-op on an unsigned build, which is fine for this test).
+        let _ = platform::ensure_master_key();
         assert!(
-            file::active(),
-            "file backend must be active once the master key exists"
+            !file::active(),
+            "file backend must stay inactive on desktop without CONDUIT_SECRET_KEY"
         );
-        if let Some(v) = prev {
-            std::env::set_var("CONDUIT_SECRET_KEY", v);
-        }
-    }
-
-    /// macOS: the keychain -> file migration moves a value into the file backend
-    /// and the value reads back from the file backend afterward.
-    ///
-    /// Seeds the source item via `platform::set_secret`, which now writes to the
-    /// DATA-PROTECTION keychain (errSecMissingEntitlement -34018 on an unsigned
-    /// binary), so this is signed-build-only: run only on a signed build with the
-    /// embedded provisioning profile (see Phase 7).
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "data-protection keychain needs a signed build w/ provisioning profile (Phase 7)"]
-    fn migrate_keychain_to_file_moves_value() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let prev = std::env::var("CONDUIT_SECRET_KEY").ok();
-        std::env::remove_var("CONDUIT_SECRET_KEY");
-
-        // Master key must exist so the file backend is active.
-        platform::ensure_master_key().expect("ensure should succeed");
-
-        let sid = "conduit-file-migrate-test";
-        let key = "FILE_MIGRATE_KEY";
-        let original = "value-moved-into-file-backend";
-
-        // Seed an OLD per-server keychain item directly.
-        platform::set_secret(sid, key, original).unwrap();
-
-        // Run the keychain -> file migration for this key.
-        let keys = vec![(sid.to_string(), key.to_string())];
-        let report =
-            platform::migrate_keychain_to_file(&keys).expect("file migration should succeed");
-        assert_eq!(report.migrated, 1, "one entry should have been migrated");
-        assert_eq!(report.failed, 0, "no entries should have failed");
-
-        // The value now reads back from the FILE backend.
-        assert_eq!(
-            file::get_secret_result(sid, key).unwrap().as_deref(),
-            Some(original),
-            "migrated value must be readable from the file backend"
-        );
-        // And the top-level dispatcher (which routes through file::active()) too.
-        assert_eq!(get_secret(sid, key).as_deref(), Some(original));
-
-        // Clean up the file-backend entry.
-        let _ = file::delete_secret(sid, key);
         if let Some(v) = prev {
             std::env::set_var("CONDUIT_SECRET_KEY", v);
         }
