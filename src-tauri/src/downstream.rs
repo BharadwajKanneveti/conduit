@@ -281,8 +281,9 @@ pub fn screen_spawn_command(command: &str, args: &[String]) -> Result<(), String
         "sh" | "bash" | "zsh" | "dash" | "ash" | "fish" | "ksh" | "pwsh" | "powershell" => {
             first_flag(args, &["-c", "-command", "/c", "/command"])
         }
-        // Container runtimes: host mounts, privileged mode, capability/device
-        // passthrough, and host-namespace sharing all reach past the container.
+        // Container runtimes: privileged mode, capability/device passthrough, and
+        // host-namespace sharing escalate past a normal host process (a plain `-v`
+        // mount does not, and stays allowed; see container_escape_flag).
         "docker" | "podman" | "nerdctl" => container_escape_flag(args),
         _ => None,
     };
@@ -317,15 +318,19 @@ fn first_flag<'a>(args: &'a [String], flags: &[&str]) -> Option<&'a str> {
     }).map(|a| a.as_str())
 }
 
-/// Docker/Podman args that grant host access or escape the container. Host mounts,
-/// privileged mode, and capability/device passthrough are always dangerous;
-/// namespace flags (`--pid`, `--net`, ...) only when their value is `host`, in
-/// either `--pid=host` or `--pid host` form (so `--network mynet` stays allowed).
+/// Docker/Podman args that ESCALATE beyond what a normal host process already has:
+/// privileged mode, added capabilities, device passthrough, and host-namespace
+/// sharing. Plain host mounts (`-v` / `--volume` / `--mount`) are intentionally NOT
+/// blocked: Conduit already runs npx/uvx/binary servers with full host-filesystem
+/// access, so a docker volume mount is no more dangerous than the servers we run
+/// unrestricted, and blocking it would false-positive on legitimate dockerized MCP
+/// servers. Namespace flags (`--pid`, `--net`, ...) trip only when their value is
+/// `host`, in either `--pid=host` or `--pid host` form (so `--network mynet` is fine).
 fn container_escape_flag(args: &[String]) -> Option<&str> {
     for (i, a) in args.iter().enumerate() {
         let al = a.to_ascii_lowercase();
         let head = al.split('=').next().unwrap_or(&al);
-        if matches!(head, "--privileged" | "-v" | "--volume" | "--mount" | "--cap-add" | "--device") {
+        if matches!(head, "--privileged" | "--cap-add" | "--device") {
             return Some(a.as_str());
         }
         if matches!(head, "--pid" | "--ipc" | "--uts" | "--net" | "--network" | "--userns") {
@@ -925,14 +930,22 @@ mod tests {
 
     #[test]
     fn spawn_guard_blocks_container_escape() {
+        // Privilege escalation beyond a normal host process is blocked.
         assert!(screen_spawn_command("docker", &argv(&["run", "--privileged", "img"])).is_err());
-        assert!(screen_spawn_command("docker", &argv(&["run", "-v", "/:/host", "img"])).is_err());
-        assert!(screen_spawn_command("docker", &argv(&["run", "--mount", "type=bind,src=/,dst=/h", "img"])).is_err());
         assert!(screen_spawn_command("podman", &argv(&["run", "--cap-add", "SYS_ADMIN", "img"])).is_err());
         assert!(screen_spawn_command("docker", &argv(&["run", "--device", "/dev/kmsg", "img"])).is_err());
         // Host namespaces in both `=host` and space forms.
         assert!(screen_spawn_command("docker", &argv(&["run", "--network=host", "img"])).is_err());
         assert!(screen_spawn_command("docker", &argv(&["run", "--pid", "host", "img"])).is_err());
+    }
+
+    #[test]
+    fn spawn_guard_allows_docker_volume_mounts() {
+        // A plain host mount is NOT an escalation beyond the full host access npx/binary
+        // servers already have, so it must not false-positive on legit docker servers.
+        assert!(screen_spawn_command("docker", &argv(&["run", "-v", "/data:/data", "img"])).is_ok());
+        assert!(screen_spawn_command("docker", &argv(&["run", "--volume", "/data:/data", "img"])).is_ok());
+        assert!(screen_spawn_command("docker", &argv(&["run", "--mount", "type=bind,src=/data,dst=/d", "img"])).is_ok());
     }
 
     #[test]
