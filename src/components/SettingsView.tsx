@@ -216,7 +216,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           allowAgentControl,
           "text-success",
           "Allow agent control",
-          "Let an agent turn servers on/off (the block above stays yours)",
+          "Let an agent turn servers on/off; your destructive-tool block always stays yours",
           apply(setAllowAgentControl),
         )}
         {toggle(

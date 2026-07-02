@@ -4,6 +4,18 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
+## [1.0.1] - 2026-07-02
+
+### Fixed
+- **Windows: upgraders now show "Toolport" in the Start menu.** After the rename, an
+  in-place update from Conduit left the old "Conduit" shortcut and green icon behind
+  (the bundle identifier is intentionally unchanged so your data and secrets carry
+  over). The installer now removes that stale shortcut so the Start-menu entry and
+  icon match the app.
+- **Settings: clearer "Allow agent control" note.** It now states your destructive-tool
+  block always stays yours, instead of referencing a toggle by position (which had
+  since moved).
+
 ## [1.0.0] - 2026-07-02
 
 - **Renamed Conduit to Toolport.** Visible names, the app title, and the meta-tools
