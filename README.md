@@ -41,7 +41,7 @@ eat your context window).
 | | | |
 |:---:|:---:|:---:|
 | ![Lazy discovery surfaces only the tools a task needs](docs/feature-lazy.png) | ![One gateway, every AI client](docs/feature-clients.png) | ![Flags rug-pulls and poisoned tools before a client can call them](docs/feature-security.png) |
-| **Fewer tokens** — lazy discovery keeps context flat no matter how many servers you connect | **One config, every client** — set up a server once, every AI tool shares it | **Supply-chain security** — rug-pull and tool-poisoning detection on the path |
+| **Fewer tokens** - lazy discovery keeps context flat no matter how many servers you connect | **One config, every client** - set up a server once, every AI tool shares it | **Supply-chain security** - rug-pull and tool-poisoning detection on the path |
 
 <!-- TODO(toolport): add product screenshots + a demo video, re-captured from the rebranded (Toolport) build, after the release is cut. -->
 
@@ -71,8 +71,8 @@ fixes both.
 - **Set up once, use everywhere.** Each client points at one gateway. Add and
   authenticate a server a single time and it appears in every client.
 - **Paste from any client's docs.** Copy a server config snippet straight from
-  an MCP server's installation instructions — Cursor JSON, Codex TOML, VS Code,
-  Zed, Claude Code CLI, or any other supported client — and paste it into the Add
+  an MCP server's installation instructions (Cursor JSON, Codex TOML, VS Code,
+  Zed, Claude Code CLI, or any other supported client) and paste it into the Add
   Server dialog. Toolport auto-detects the format and pre-fills the fields,
   including environment variable values.
 - **Per-agent scoping.** Give each client only the servers it should see. A coding
@@ -350,7 +350,7 @@ Want one shared, governed MCP server set across your whole team? **Toolport Team
 self-hostable server: an admin defines the team's servers once, every member's Toolport
 syncs them, and each member's keys still never leave their own machine.
 
-- **Free for up to 4 people** — self-host with one Docker command
+- **Free for up to 4 people**: self-host with one Docker command
   (`docker pull ghcr.io/tsouth89/conduit-teams`).
 - **$12/seat/month** beyond that; the first 4 seats stay free.
 - Central destructive-tool policy, an exportable audit trail, and per-member opt-in for
