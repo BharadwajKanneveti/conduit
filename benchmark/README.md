@@ -1,6 +1,6 @@
-# Conduit token benchmark
+# Toolport token benchmark
 
-Quantifies Conduit's core claim, that lazy discovery (3 meta-tools the agent
+Quantifies Toolport's core claim, that lazy discovery (3 meta-tools the agent
 searches) keeps context flat where flat tool exposure (every server's tools loaded
 into every request) does not, by running the **same agent tasks** against your
 local LLM under both modes and measuring tokens, tool calls, and completion.
@@ -13,7 +13,7 @@ every schema into context.
 ## No-model catalog report (`token-cost.mjs`)
 
 Want the headline numbers without standing up a local LLM? `token-cost.mjs` reads
-the catalog Conduit already built and reports, deterministically: per-server
+the catalog Toolport already built and reports, deterministically: per-server
 definition tokens, the per-tool size distribution, how much of each model's context
 window the definitions eat, the reduction-vs-tool-count scaling curve, and monthly
 dollar cost across request volumes.
@@ -23,7 +23,7 @@ node benchmark/token-cost.mjs            # auto-reads the active profile's cache
 node benchmark/token-cost.mjs <path>     # or point at a specific tool-cache JSON
 ```
 
-With no argument it resolves Conduit's data dir for you (Windows `%APPDATA%\Conduit`,
+With no argument it resolves Toolport's data dir for you (Windows `%APPDATA%\Conduit`,
 macOS `~/Library/Application Support/Conduit`, Linux `~/.config/Conduit`). A
 profile-scoped client writes `tool-cache-<profile>.json`; the unscoped default is
 `tool-cache.json`, which is what the auto-path uses.
@@ -34,7 +34,7 @@ profile-scoped client writes `tool-cache-<profile>.json`; the unscoped default i
 # 1. Build the gateway
 npm run build:gateway        # or: cargo build --release --bin conduit-gateway
 
-# 2. Connect a few servers in Conduit, and edit the TASKS in bench.js to match them.
+# 2. Connect a few servers in Toolport, and edit the TASKS in bench.js to match them.
 
 # 3. Start a local OpenAI-compatible LLM
 #    LM Studio: load a model and start the server (default http://localhost:1234)

@@ -1,4 +1,4 @@
-// Conduit token benchmark.
+// Toolport token benchmark.
 //
 // Quantifies the headline claim ("hundreds of tool defs collapse to 3, context
 // stays flat") by running the SAME agent tasks against your local LLM twice:
@@ -13,7 +13,7 @@
 //
 // Prereqs:
 //   1. Build the gateway:   npm run build:gateway   (or: cargo build --release --bin conduit-gateway)
-//   2. Connect some servers in Conduit (the tasks below should match what you have).
+//   2. Connect some servers in Toolport (the tasks below should match what you have).
 //   3. Run a local OpenAI-compatible LLM:
 //        - LM Studio: start the server (default http://localhost:1234)
 //        - Ollama:    OLLAMA_HOST has an OpenAI-compatible /v1 endpoint on :11434

@@ -4,7 +4,7 @@
 // The token benchmark (bench-sweep.mjs) shows lazy discovery is cheap and works on
 // DIRECT lookups. This measures the harder, separate question behind the "the agent
 // never misses a tool" claim: when you describe a need in natural language, does
-// `conduit_search_tools` actually surface the right tool, and how highly does it
+// `toolport_search_tools` actually surface the right tool, and how highly does it
 // rank it? That is recall, and it is the thing that, if weak, both hurts accuracy
 // AND adds wasted search round-trips (eroding the token win).
 //
@@ -103,7 +103,7 @@ class Gateway {
     await new Promise((r) => setTimeout(r, CONNECT_WAIT_MS));
   }
   async search(query, limit) {
-    const r = await this.rpc("tools/call", { name: "conduit_search_tools", arguments: { query, limit } });
+    const r = await this.rpc("tools/call", { name: "toolport_search_tools", arguments: { query, limit } });
     const text = r.result?.content?.[0]?.text ?? "";
     // The result embeds the matches as a JSON-ish block; pull tool names in order.
     return [...text.matchAll(/"name"\s*:\s*"([^"]+)"/g)].map((m) => m[1]);

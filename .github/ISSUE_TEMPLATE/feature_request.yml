@@ -6,14 +6,14 @@ body:
     id: problem
     attributes:
       label: What problem does this solve?
-      description: What are you trying to do, and where does Conduit get in the way today?
+      description: What are you trying to do, and where does Toolport get in the way today?
     validations:
       required: true
   - type: textarea
     id: solution
     attributes:
       label: Proposed solution
-      description: What would you like Conduit to do?
+      description: What would you like Toolport to do?
     validations:
       required: true
   - type: textarea

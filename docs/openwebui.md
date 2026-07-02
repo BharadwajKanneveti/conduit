@@ -1,13 +1,13 @@
-# Using Conduit with Open WebUI
+# Using Toolport with Open WebUI
 
-Conduit speaks **HTTP/OpenAPI natively**, so [Open WebUI](https://github.com/open-webui/open-webui)
+Toolport speaks **HTTP/OpenAPI natively**, so [Open WebUI](https://github.com/open-webui/open-webui)
 (and any OpenAPI tool client) connects straight to the gateway. No bridge, no
 proxy, no Python. Validated end to end: a model in Open WebUI reaches every
-server you've connected through Conduit, including chained multi-step tool flows.
+server you've connected through Toolport, including chained multi-step tool flows.
 
 ## The recipe
 
-**1. Turn on the HTTP endpoint.** In the Conduit app: **Settings ->
+**1. Turn on the HTTP endpoint.** In the Toolport app: **Settings ->
 Integrations -> "Open WebUI / HTTP endpoint"**, flip it on, and copy the **URL**
 (`http://localhost:8765`) and the **token** it shows. The app supervises the
 gateway for you and shuts it down when you quit.
@@ -19,7 +19,7 @@ gateway for you and shuts it down when you quit.
 
 **2. Add it to Open WebUI.** Settings -> Tools -> add an OpenAPI tool server
 pointing at `http://localhost:8765`, and paste the **token** as its API key
-(Bearer auth). The `conduit_*` tools appear. The token matters: without it, any
+(Bearer auth). The `toolport_*` tools appear. The token matters: without it, any
 web page open in your browser could call your tools, so the endpoint requires it.
 
 **3. Set Function Calling to Native (per chat).** This is the setting that
@@ -38,7 +38,7 @@ including chained multi-step flows. Small local models (a 7B, say) tend to
 struggle with the search-then-call chain.
 
 That's it. Ask for something one of your servers does ("list my recent emails",
-"show my Vercel projects") and it routes through Conduit.
+"show my Vercel projects") and it routes through Toolport.
 
 ## Notes
 
@@ -54,7 +54,7 @@ That's it. Ask for something one of your servers does ("list my recent emails",
   doesn't have yet (e.g. a Vercel `teamId`), the gateway refuses an invented
   placeholder and points the model at the right list/get tool to fetch the real
   value first, so chained calls work even with smaller models.
-- **Plays well with other tools.** `conduit_search_tools` is written to be the
+- **Plays well with other tools.** `toolport_search_tools` is written to be the
   model's first stop for any external action, so it competes well against other
   tools you may have installed, no need to disable them.
 - **Any HTTP/OpenAPI consumer.** The same endpoint works for n8n, LibreChat,

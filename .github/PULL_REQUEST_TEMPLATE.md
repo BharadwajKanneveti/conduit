@@ -1,4 +1,4 @@
-<!-- Thanks for contributing to Conduit. Keep PRs focused and small where you can. -->
+<!-- Thanks for contributing to Toolport. Keep PRs focused and small where you can. -->
 
 ## What and why
 

@@ -1,10 +1,17 @@
 # Changelog
 
-All notable changes to Conduit are documented here. Format loosely follows
+All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
+Entries before the rename below shipped under the project's former name, Conduit.
 
 ## [Unreleased]
 
+- **Renamed Conduit to Toolport.** Visible names, the app title, and the meta-tools
+  (`toolport_status`, `toolport_search_tools`, `toolport_call_tool`, ...) are now
+  Toolport; the old `conduit_*` meta-tool names keep working as aliases. Internal
+  identifiers (the `conduit-gateway` binary, the data directory, keychain entries, and
+  `CONDUIT_*` environment variables) are unchanged, so existing installs upgrade with no
+  loss of servers or saved secrets.
 - **Security: confidence scoring + new injection categories.** The tool-poisoning /
   content-defense scanner now combines signals into a weighted confidence score
   (surfaced on security events) and adds three detection categories (role-jailbreak,

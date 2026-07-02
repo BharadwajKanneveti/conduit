@@ -1,8 +1,8 @@
-# Conduit roadmap
+# Toolport roadmap
 
-Conduit is a local MCP gateway for AI coding tools (Claude Desktop, Cursor,
+Toolport is a local MCP gateway for AI coding tools (Claude Desktop, Cursor,
 VS Code, Windsurf, Codex CLI). Every server you connect dumps its whole tool list
-into the agent's context on every request; Conduit routes them through one gateway
+into the agent's context on every request; Toolport routes them through one gateway
 that exposes 3 meta-tools the agent searches on demand, so context stays flat:
 measured ~90% fewer tokens at the same task success. This document is the working
 spec, capturing the architecture decision and the build order.
@@ -90,7 +90,7 @@ The 2026-07-01 block above supersedes the ordering; these remain the detailed ba
 - [ ] **Add-server form saves broken servers silently** (empty command/URL);
       require + inline-validate before enabling Add. (S)
 - [ ] ClientDetail throws Connect / Import / Move at a first-timer before teaching
-      that Conduit is the gateway; lead with the mental model. (M)
+      that Toolport is the gateway; lead with the mental model. (M)
 - [ ] Jargon + dead ends: rename "Move config in", tooltip "Add to catalog", helper
       text on transports, make the Settings "See docs/openwebui.md" a real link,
       default Activity "Recent calls" filter off, Playground "0 tools" state,
@@ -110,7 +110,7 @@ The 2026-07-01 block above supersedes the ordering; these remain the detailed ba
 
 ### Strategic / differentiators (what makes it amazing)
 - [ ] **OAuth client registration + per-client server scoping.** A client
-      authenticates to Conduit, shows up in the app, you assign which servers it
+      authenticates to Toolport, shows up in the app, you assign which servers it
       sees. Profiles already do half. This is Sigiz's explicit ask AND the proper
       long-term auth model for the HTTP bridge. The real moat. (L)
 - [x] **Block-on-drift / quarantine + re-approval for high-risk tools.** SHIPPED
@@ -123,13 +123,13 @@ The 2026-07-01 block above supersedes the ordering; these remain the detailed ba
       search-then-call chain (the multi-step guard helped, didn't solve). This is
       Open WebUI's core audience. (L)
 - [ ] **Live call-inspection in Activity** (real request/response bytes) folds MCP
-      Peek's value into Conduit, since we're already on the path. (M)
+      Peek's value into Toolport, since we're already on the path. (M)
 - [ ] Result-shaping Tier 2: per-server fidelity policy, projection, code-execution
       handoff; end-to-end "does the model actually page" validation. (M-L)
 - [ ] Showcase server (`conduit-openapi-mcp`: any OpenAPI spec -> an MCP server; npm
       publish pending) as the funnel + a demo of lazy discovery + result-shaping.
 
-## The core decision: Conduit is a gateway, not a file editor
+## The core decision: Toolport is a gateway, not a file editor
 
 A tool that only edits each client's MCP JSON config is a dead end:
 
@@ -139,8 +139,8 @@ A tool that only edits each client's MCP JSON config is a dead end:
    effect, so "toggle a server on/off without reloading the app" is impossible
    with the file-editor approach.
 
-Conduit instead runs a **local MCP gateway**. Each client points at Conduit
-once (as a local stdio server and/or a custom connector URL). Conduit holds the
+Toolport instead runs a **local MCP gateway**. Each client points at Toolport
+once (as a local stdio server and/or a custom connector URL). Toolport holds the
 real registry of servers and routes to them. This unlocks the headline win and
 flips every weakness:
 
@@ -152,10 +152,10 @@ flips every weakness:
   tool list via the MCP `notifications/tools/list_changed`; supporting clients
   update live. The client's own config never changed, so nothing reloads.
 - **No plaintext secrets in client configs.** The gateway holds keys in the OS
-  keychain and injects them at runtime. Client config only says "talk to Conduit."
+  keychain and injects them at runtime. Client config only says "talk to Toolport."
 - **Audit log for free.** Every tool call flows through the gateway. That log is
   the governance/MSP product.
-- **Routes around the connector migration.** Conduit registers as one custom
+- **Routes around the connector migration.** Toolport registers as one custom
   connector in Claude; all managed servers appear through it.
 
 ## Spike findings (2026-06-18)
@@ -176,7 +176,7 @@ flips every weakness:
 **Verdict:** local read-only *inventory* of connector names is possible but
 fragile and operationally awkward (locked DBs, undocumented schema, account-side
 truth). It is NOT a foundation to build *management* on. This confirms the
-gateway architecture: Conduit cannot manage Claude's connectors directly, so it
+gateway architecture: Toolport cannot manage Claude's connectors directly, so it
 becomes one connector that fans out to everything it manages. A best-effort,
 read-only "connectors detected (view-only)" panel is worth showing for the
 governance inventory story, clearly labeled as not-managed.
@@ -185,7 +185,7 @@ governance inventory story, clearly labeled as not-managed.
 
 - Spike 40 (live toggle): confirm `tools/list_changed` actually refreshes the
   tool list without restart in each client. Determines how universal hot-toggle is.
-- Spike 41 (Claude as connector): confirm Conduit can register as a custom
+- Spike 41 (Claude as connector): confirm Toolport can register as a custom
   connector / local server in current Claude Desktop and expose downstream tools.
 
 These require driving real client UIs and were deferred (user asleep; not safe to
@@ -196,7 +196,7 @@ mutate their live client setup unattended).
 Phase 0 - Foundation
 - [x] Tauri + React + Rust scaffold, 0 vulns
 - [x] Client adapter readers (import/discovery): detect clients, parse JSON/TOML
-- [x] Conduit registry: own source-of-truth store (servers, profiles, enabled)
+- [x] Toolport registry: own source-of-truth store (servers, profiles, enabled)
 - [x] Profiles: named server sets, switchable
 - [x] Write-back adapters with auto-backup (fixture-tested)
 - [x] Frontend: profiles, toggles, import, add-server
@@ -220,7 +220,7 @@ Phase 1.5 - Remote auth
       vendor hints, live propagation to connected clients
 
 Phase 2 - Client integration
-- [x] "Install Conduit into client X" (surgical, backs up, preserves others)
+- [x] "Install Toolport into client X" (surgical, backs up, preserves others)
 - [x] Uninstall (surgical remove)
 - [x] Client detail reframed as connect + import sources
 - [x] Migrate-on-connect: import a client's servers, leave it gateway-only
@@ -261,7 +261,7 @@ Tier 2 - feature completeness (in progress)
       wrap flagged content with a "data, not instructions" provenance marker before the
       agent sees it. Detection + labeling, never blocks, on by default. See
       `docs/specs/content-defense.md`.
-- [ ] Security, next: a Security page mapping Conduit's controls to the MCP attack
+- [ ] Security, next: a Security page mapping Toolport's controls to the MCP attack
       taxonomy; opt-in lossy result shaping / dangerous-call gating (content-defense Tier 2).
 
 Tier 3 - launch prep
@@ -285,7 +285,7 @@ Tier 4 - teams / enterprise (paid)
 ## Security invariants (do not regress)
 
 - Backend never sends secret *values* to the UI; env var names only.
-- Secrets live in the OS keychain, never in Conduit's registry file or any
+- Secrets live in the OS keychain, never in Toolport's registry file or any
   client config.
 - Snapshot every client config before modifying it; modifications are reversible.
 - Never read or decrypt another app's OAuth tokens.

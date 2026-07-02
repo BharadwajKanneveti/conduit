@@ -1,31 +1,34 @@
 <div align="center">
 
-<img src="docs/logo.svg" alt="Conduit" width="84" />
+<img src="docs/hero.png" alt="Toolport" width="720" />
 
-# Conduit
+# Toolport
 
-**One local gateway for all your MCP servers, shared by every AI client, with far fewer tokens.**
+**Every tool. One port.** One local gateway for all your MCP servers, shared by
+every AI client, with far fewer tokens.
 
-[![CI](https://github.com/tsouth89/conduit/actions/workflows/ci.yml/badge.svg)](https://github.com/tsouth89/conduit/actions/workflows/ci.yml)
-[![Latest release](https://img.shields.io/github/v/release/tsouth89/conduit?label=release)](https://github.com/tsouth89/conduit/releases)
+[![CI](https://github.com/tsouth89/toolport/actions/workflows/ci.yml/badge.svg)](https://github.com/tsouth89/toolport/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/tsouth89/toolport?label=release)](https://github.com/tsouth89/toolport/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/Xsn27MxdBA)
 
 </div>
 
-![Conduit: every tool from all your servers, collapsed to the 3 your agent loads](docs/feature.png)
+![Toolport: every tool from all your servers, collapsed to the 3 your agent loads](docs/feature.svg)
 
-![Conduit demo: add a server, connect it to every AI tool, and the agent uses it](docs/demo.gif)
+<!-- TODO(toolport): re-capture the product demo GIF from the rebranded (Toolport) build before publicizing. Old docs/demo.gif shows the pre-rename UI.
+![Toolport demo: add a server, connect it to every AI tool, and the agent uses it](docs/demo.gif)
+-->
 
-Conduit is a local MCP (Model Context Protocol) gateway. You set up and
+Toolport is a local MCP (Model Context Protocol) gateway. You set up and
 authenticate each server once, and every AI client (Claude, Cursor, Codex, and
-the rest) points at Conduit and shares them, so you stop configuring the same
+the rest) points at Toolport and shares them, so you stop configuring the same
 servers separately in each app.
 
 It also fixes what those servers cost your agent. Every MCP server you connect
 dumps all of its tools into context on every single request, and it adds up fast:
 just 3 servers (62 tools) cost ~24,000 tokens of definitions before you've asked
-anything. Conduit advertises 3 meta-tools the agent searches on demand instead,
+anything. Toolport advertises 3 meta-tools the agent searches on demand instead,
 so it pays ~660 tokens.
 
 **Measured on a frontier model: up to 91% fewer total tokens at the same task
@@ -35,29 +38,30 @@ catalog (see [BENCHMARK.md](BENCHMARK.md)). That holds whether you run one AI to
 or five, on cloud models (where tokens are your bill) or local ones (where tool defs
 eat your context window).
 
-## Screenshots
+| | | |
+|:---:|:---:|:---:|
+| ![Lazy discovery surfaces only the tools a task needs](docs/feature-lazy.png) | ![One gateway, every AI client](docs/feature-clients.png) | ![Flags rug-pulls and poisoned tools before a client can call them](docs/feature-security.png) |
+| **Fewer tokens** — lazy discovery keeps context flat no matter how many servers you connect | **One config, every client** — set up a server once, every AI tool shares it | **Supply-chain security** — rug-pull and tool-poisoning detection on the path |
 
-| Servers | Catalog | Activity |
-|---|---|---|
-| ![Every server in one dense list with health, secrets, and per-tool toggles](docs/screenshots/servers.png) | ![A curated catalog of MCP servers grouped by category](docs/screenshots/catalog.png) | ![Per-server latency, error rates, token savings, and tool-security notices](docs/screenshots/activity.png) |
+<!-- TODO(toolport): add product screenshots + a demo video, re-captured from the rebranded (Toolport) build, after the release is cut. -->
 
 ## Why
 
 Every MCP server you connect dumps its full tool list into your agent's context on
 every request, and most AI clients also want their own separate configuration. So you
-pay a token tax on every call and reconfigure the same servers in every app. Conduit
+pay a token tax on every call and reconfigure the same servers in every app. Toolport
 fixes both.
 
 ### Fewer tokens
 
 - **~90% fewer tokens.** In lazy-discovery mode the gateway advertises three meta-tools
-  (`conduit_status`, `conduit_search_tools`, `conduit_call_tool`) instead of the full
+  (`toolport_status`, `toolport_search_tools`, `toolport_call_tool`) instead of the full
   catalog, and the agent searches and calls on demand, so context stays flat no matter
   how many servers you connect. Benchmarked, graded for correct answers: up to 91% fewer
   total tokens at the same task success, 97% less tool-definition overhead per request,
-  99.6% at a real 415-tool catalog ([BENCHMARK.md](BENCHMARK.md)). Ask `conduit_status`
+  99.6% at a real 415-tool catalog ([BENCHMARK.md](BENCHMARK.md)). Ask `toolport_status`
   for what it has saved you so far.
-- **Search by intent, not just keywords.** `conduit_search_tools` ranks by relevance
+- **Search by intent, not just keywords.** `toolport_search_tools` ranks by relevance
   across every server, and no tool is ever hidden, any server's full set is one call
   away. Optional semantic re-ranking (a local or hosted embeddings endpoint) surfaces
   paraphrased needs like "charge a card"; off by default, pure lexical otherwise.
@@ -69,26 +73,26 @@ fixes both.
 - **Paste from any client's docs.** Copy a server config snippet straight from
   an MCP server's installation instructions — Cursor JSON, Codex TOML, VS Code,
   Zed, Claude Code CLI, or any other supported client — and paste it into the Add
-  Server dialog. Conduit auto-detects the format and pre-fills the fields,
+  Server dialog. Toolport auto-detects the format and pre-fills the fields,
   including environment variable values.
 - **Per-agent scoping.** Give each client only the servers it should see. A coding
   agent literally cannot call a billing tool that isn't in its profile.
 - **Obvious auth.** OAuth or API key, stored once in the OS keychain, a single click per
   server. Newly-authed servers propagate to connected clients without a restart.
-- **No secrets in client configs.** Clients only ever say "talk to Conduit." Keys live
+- **No secrets in client configs.** Clients only ever say "talk to Toolport." Keys live
   in the OS keychain and are injected at runtime.
 - **A catalog to grow.** Add popular servers from a curated list of 40+, or search the
   official MCP Registry, then authenticate through the same flow.
 
 ### Security, because the gateway is on the path
 
-- **Tool integrity (rug-pull + poisoning detection).** Conduit fingerprints each tool
+- **Tool integrity (rug-pull + poisoning detection).** Toolport fingerprints each tool
   when you connect a server and flags it if the definition later changes or a server
   quietly adds one (a "rug pull"), or if a description or schema carries injection-like
   content ("tool poisoning"). Detection only, on by default, entirely local
   ([details](docs/specs/mcp-integrity.md)).
 - **Content defense (anti-agentjacking).** When a tool *returns* untrusted content (a
-  Sentry error, a web page, an issue body) with injection-like instructions, Conduit
+  Sentry error, a web page, an issue body) with injection-like instructions, Toolport
   flags it and marks it as external data, not instructions, the separation that blunts
   indirect prompt injection. Never blocks, on by default
   ([details](docs/specs/content-defense.md)).
@@ -99,7 +103,7 @@ fixes both.
 ### Control and extras
 
 - **Agent control, on your terms.** Optionally let an agent enable or disable servers
-  through the gateway (`conduit_enable_server` / `conduit_disable_server`), reflected in
+  through the gateway (`toolport_enable_server` / `toolport_disable_server`), reflected in
   the app live. Off by default, and the destructive-tool switch always stays yours.
 - **Full MCP, not just tools.** Tools, resources, and prompts are all proxied.
 - **Test before you wire it up.** A built-in playground invokes any tool with a form
@@ -110,12 +114,12 @@ fixes both.
 
 ## How it works
 
-Conduit has two pieces:
+Toolport has two pieces:
 
 1. **The desktop app** (Tauri + React) where you manage servers, profiles,
    credentials, and which clients are connected.
 2. **The gateway binary** (`conduit-gateway`) that each AI client launches over
-   stdio. It reads Conduit's registry, connects to the enabled downstream servers
+   stdio. It reads Toolport's registry, connects to the enabled downstream servers
    (stdio or remote HTTP/SSE), and routes tool calls to the right one. Tool names
    are namespaced per server (`stripe__list_charges`) so they never collide.
 
@@ -131,12 +135,12 @@ AI client (Cursor / Claude / Codex / Antigravity / ...)
 
 The registry is the shared source of truth; the gateway watches it and rebuilds
 live, so toggles and new credentials take effect without restarting the client.
-If a connected server changes its own tool set mid-session, Conduit picks that up
+If a connected server changes its own tool set mid-session, Toolport picks that up
 and refreshes too.
 
 ## Supported clients
 
-Conduit auto-detects these **20 AI clients**, installs the gateway into each with one
+Toolport auto-detects these **20 AI clients**, installs the gateway into each with one
 click, and can import a client's existing servers. It writes the config file shown
 below for you, so you never have to edit these by hand.
 
@@ -163,23 +167,23 @@ below for you, so you never have to edit these by hand.
 | Goose | `~/.config/goose/config.yaml` | YAML (`extensions`) |
 | Hermes | `~/.hermes/config.yaml` | YAML (`mcp_servers`) |
 
-`<config>` is your OS application-config dir (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config` on Linux); `<data>` is the data dir (`~/.local/share` on Linux, the same as `<config>` elsewhere). Zed and Goose paths vary slightly by OS; Conduit resolves the right one automatically.
+`<config>` is your OS application-config dir (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config` on Linux); `<data>` is the data dir (`~/.local/share` on Linux, the same as `<config>` elsewhere). Zed and Goose paths vary slightly by OS; Toolport resolves the right one automatically.
 
 ### Codex setup walkthrough
 
 Use this when Codex has already created its `~/.codex/` directory.
 
-1. In Conduit, add or enable the MCP servers you want Codex to use.
-2. Open **Clients**, select **Codex**, optionally choose a profile, and click **Connect to Conduit**.
-3. Conduit updates `~/.codex/config.toml` with a single `[mcp_servers.conduit]` entry. That entry runs the resolved `conduit-gateway` binary; existing Codex TOML keys and other MCP servers are preserved, and an existing config is backed up before the write.
-4. Start a new Codex session so it re-reads the config. In Conduit, the Codex row changes to **connected to Conduit**; in Codex, Conduit-managed tools are served through the one `conduit` MCP server. With lazy discovery enabled, Codex gets Conduit's compact search tools instead of every downstream tool up front.
+1. In Toolport, add or enable the MCP servers you want Codex to use.
+2. Open **Clients**, select **Codex**, optionally choose a profile, and click **Connect to Toolport**.
+3. Toolport updates `~/.codex/config.toml` with a single `[mcp_servers.conduit]` entry. That entry runs the resolved `conduit-gateway` binary; existing Codex TOML keys and other MCP servers are preserved, and an existing config is backed up before the write.
+4. Start a new Codex session so it re-reads the config. In Toolport, the Codex row changes to **connected to Toolport**; in Codex, Toolport-managed tools are served through the one `conduit` MCP server. With lazy discovery enabled, Codex gets Toolport's compact search tools instead of every downstream tool up front.
 
-Gotcha: when running Conduit from source, build the gateway first with `npm run build:gateway`. The desktop dev server does not build the separate binary that Codex spawns, so Codex will report the gateway as missing until that binary exists.
+Gotcha: when running Toolport from source, build the gateway first with `npm run build:gateway`. The desktop dev server does not build the separate binary that Codex spawns, so Codex will report the gateway as missing until that binary exists.
 
 ### Open WebUI and other HTTP/OpenAPI consumers
 
 The gateway speaks HTTP/OpenAPI natively, so Open WebUI (and any OpenAPI tool
-client) connects straight to Conduit, no bridge or proxy. Flip on **Settings ->
+client) connects straight to Toolport, no bridge or proxy. Flip on **Settings ->
 Integrations -> Open WebUI / HTTP endpoint** in the app (or run
 `conduit-gateway --http 8765`), then add `http://localhost:8765` as an OpenAPI
 tool server. See [docs/openwebui.md](docs/openwebui.md). The same endpoint serves
@@ -223,7 +227,7 @@ namespaced per server, so the two never collide even in the same profile.
 ## Install
 
 Prebuilt installers are published on the
-[Releases](https://github.com/tsouth89/conduit/releases) page. Conduit runs on
+[Releases](https://github.com/tsouth89/toolport/releases) page. Toolport runs on
 **Windows and macOS** (both builds are code-signed; macOS is also notarized), with
 **Linux** in beta. On Linux, prefer the **`.deb`** (it links your system's WebKitGTK and is
 the most reliable package); the **AppImage** is a portable, no-root fallback but
@@ -239,22 +243,22 @@ downloads, so an early install may still show "Windows protected your PC", click
 typical. See [docs/SIGNING.md](docs/SIGNING.md) for details.
 
 **Updating and uninstalling on Linux.** There is no graphical uninstaller, use the
-terminal. The package name is `conduit`.
+terminal. The package name is `toolport`.
 
 ```bash
 # Update to a newer version: just install the new .deb, it upgrades in place.
-sudo apt install ./Conduit_0.6.0_amd64.deb
+sudo apt install ./Toolport_1.0.0_amd64.deb
 
 # Uninstall (keeps your config + saved secrets).
-sudo apt remove conduit
+sudo apt remove toolport
 
 # Uninstall and wipe app config too (secrets in the keyring stay).
-sudo apt purge conduit
+sudo apt purge toolport
 ```
 
 If you used the **AppImage**, there's nothing to uninstall, just delete the
 `.AppImage` file. (On Windows use Add or Remove Programs; on macOS drag
-**Conduit.app** to the Trash.)
+**Toolport.app** to the Trash.)
 
 ## Development
 
@@ -301,27 +305,27 @@ The frontend is typechecked with `npx tsc --noEmit`.
 - **"could not read/store secret" on Linux.** Secret storage uses the freedesktop
   Secret Service (libsecret), provided by GNOME Keyring, KWallet, or similar. A
   headless box or a session without a running keyring daemon has nowhere to store
-  secrets. Run Conduit in a desktop session, or install and unlock a keyring
+  secrets. Run Toolport in a desktop session, or install and unlock a keyring
   (e.g. `gnome-keyring`).
 - **macOS keychain and the gateway (v0.9.3+).** The app and the separately-signed
   gateway share a team-scoped keychain access group, so the gateway reads the
   secrets the app saved with no prompt, even across app updates. (Earlier releases
   showed a one-time "Always Allow" prompt; on current signed builds it's gone.)
-- **VS Code: the conduit server doesn't start automatically.** VS Code may require
-  you to click **Start Server** on the conduit MCP entry the first time, that's VS
-  Code's own MCP handling, not Conduit. After that it reconnects on its own.
+- **VS Code: the `conduit` server doesn't start automatically.** VS Code may require
+  you to click **Start Server** on the `conduit` MCP entry the first time, that's VS
+  Code's own MCP handling, not Toolport. After that it reconnects on its own.
 - **Linux: the AppImage won't launch / no window (`EGL_BAD_PARAMETER`).** The
   AppImage bundles its own libraries, which can clash with a very new or
   virtualized graphics stack (e.g. VMware's `vmwgfx` driver, where the default EGL
   display fails). **Use the `.deb` instead**, it links your system's WebKitGTK and
   is the more reliable Linux package. If you must use the AppImage, try
-  `EGL_PLATFORM=surfaceless ./Conduit_*.AppImage`, or in a VM enable 3D
-  acceleration. (This is a packaging/GPU issue, not a Conduit bug; the `.deb` works
+  `EGL_PLATFORM=surfaceless ./Toolport_*.AppImage`, or in a VM enable 3D
+  acceleration. (This is a packaging/GPU issue, not a Toolport bug; the `.deb` works
   where the AppImage doesn't.)
 
 ## Status
 
-Conduit is in active development. Working end to end: the
+Toolport is in active development. Working end to end: the
 gateway, lazy discovery, per-agent scoping, OAuth/key auth with live propagation,
 the catalog, client import/migrate, per-tool and destructive-tool governance, a global
 Settings view, tool-integrity and content-defense detection, an audit log with
@@ -336,14 +340,14 @@ latency/error stats, resources + prompts proxying, and a tool playground. See
   binding line, which is what Tauri 2 uses on Linux, hard-pins `glib = "^0.18"`, so
   the patched release cannot be selected without moving the whole webview stack. The
   bug is a soundness/null-deref crash (not remote code execution), is confined to the
-  webview binding layer (Conduit never calls `VariantStrIter`), and does not affect
+  webview binding layer (Toolport never calls `VariantStrIter`), and does not affect
   the Windows or macOS builds. We are tracking the upstream move to a glib-0.20 stack
   and will apply a `[patch.crates-io]` backport if Linux crashes surface before then.
 
-## Conduit Teams
+## Toolport Teams
 
-Want one shared, governed MCP server set across your whole team? **Conduit Teams** is a
-self-hostable server: an admin defines the team's servers once, every member's Conduit
+Want one shared, governed MCP server set across your whole team? **Toolport Teams** is a
+self-hostable server: an admin defines the team's servers once, every member's Toolport
 syncs them, and each member's keys still never leave their own machine.
 
 - **Free for up to 4 people** — self-host with one Docker command
@@ -353,11 +357,11 @@ syncs them, and each member's keys still never leave their own machine.
   local-command servers (a team config can never silently run code on a member's machine).
 
 Pricing, the self-host quickstart, and checkout are all at
-**[conduitmcp.app/teams](https://conduitmcp.app/teams)**.
+**[toolport.app/teams](https://toolport.app/teams)**.
 
 ## License
 
-[MIT](LICENSE), and the local app and gateway always will be. Conduit follows an
+[MIT](LICENSE), and the local app and gateway always will be. Toolport follows an
 open-core model: the desktop app and `conduit-gateway` are free and open source, and
-Conduit Teams (above) funds the free app. Anything you contribute here is MIT and
+Toolport Teams (above) funds the free app. Anything you contribute here is MIT and
 benefits everyone, see [CONTRIBUTING.md](CONTRIBUTING.md).

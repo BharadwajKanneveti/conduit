@@ -1,6 +1,6 @@
-# Contributing to Conduit
+# Contributing to Toolport
 
-Thanks for your interest. Conduit is a local-first MCP gateway and manager: a
+Thanks for your interest. Toolport is a local-first MCP gateway and manager: a
 Tauri desktop app (Rust backend + React/TypeScript frontend) plus a separate
 `conduit-gateway` binary that AI clients spawn.
 
@@ -57,7 +57,7 @@ notification path.
 ### Debugging
 
 **Gateway verbose logging:** the gateway writes an always-on log (connection
-lifecycle events) to a file in Conduit's data directory. Set `CONDUIT_DEBUG=1`
+lifecycle events) to a file in Toolport's data directory. Set `CONDUIT_DEBUG=1`
 to also capture per-request traces (tool-call arguments, routing decisions,
 downstream responses). "Copy diagnostics" in the app bundles this log with
 version info and a registry summary for bug reports.
@@ -93,7 +93,7 @@ For end-user troubleshooting (OAuth, AppImage, VS Code), see the
 - `src/` - React/TypeScript frontend (the app UI).
 - `src-tauri/src/` - Rust backend:
   - `lib.rs` - Tauri commands (the bridge between UI and backend).
-  - `registry.rs` - the server/profile registry (Conduit's source of truth).
+  - `registry.rs` - the server/profile registry (Toolport's source of truth).
   - `clients.rs` - detecting and editing AI client configs.
   - `downstream.rs` - talking to MCP servers (stdio + http transports).
   - `router.rs` - aggregating tools/resources and routing calls.
@@ -169,12 +169,12 @@ The catalog tests verify every curated entry has a non-empty name, a valid
 target (URL or command), and a browse-view category — your new entry will be
 checked automatically.
 
-**Reference PR:** [#19](https://github.com/tsouth89/conduit/pull/19) (Firecrawl
+**Reference PR:** [#19](https://github.com/tsouth89/toolport/pull/19) (Firecrawl
 catalog entry — a single `cmd()` line + category).
 
 ## Adding a new client
 
-Clients are AI tools that store MCP server configs on disk. Conduit detects each
+Clients are AI tools that store MCP server configs on disk. Toolport detects each
 client, reads its servers, and can install/write the gateway entry. All of this
 is in `src-tauri/src/clients.rs`.
 
@@ -256,12 +256,12 @@ cargo test --manifest-path src-tauri/Cargo.toml clients
 npm run tauri dev   # check the client appears in the sidebar
 ```
 
-**Reference PR:** [#18](https://github.com/tsouth89/conduit/pull/18) (BoltAI
+**Reference PR:** [#18](https://github.com/tsouth89/toolport/pull/18) (BoltAI
 client — a path resolver, one `ClientDef`, and a registration test).
 
 ## Sign your commits (DCO)
 
-Conduit uses the [Developer Certificate of Origin](https://developercertificate.org/)
+Toolport uses the [Developer Certificate of Origin](https://developercertificate.org/)
 (DCO): a lightweight way to state that you wrote the contribution and have the
 right to submit it. There is **no copyright assignment**, you keep ownership of
 your work.
@@ -276,12 +276,12 @@ That line means you agree to the DCO. That's all there is to it.
 
 ## Reporting issues
 
-Bugs and ideas are welcome in [Issues](https://github.com/tsouth89/conduit/issues).
+Bugs and ideas are welcome in [Issues](https://github.com/tsouth89/toolport/issues).
 For security problems, see [SECURITY.md](SECURITY.md) (report privately, please).
 
 ## License
 
 By contributing you agree your contributions are licensed under the repository's
 [MIT license](LICENSE), which is and will remain the license for this repo (the
-app and gateway). Conduit is open-core: the separate commercial Conduit Teams
+app and gateway). Toolport is open-core: the separate commercial Toolport Teams
 server, under its own license, is what funds this free and open core.

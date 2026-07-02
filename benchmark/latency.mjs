@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// Measures the latency Conduit's gateway adds, in milliseconds.
+// Measures the latency Toolport's gateway adds, in milliseconds.
 //
 // Spawns the gateway against the mock downstream (instant responses) so we isolate
-// Conduit's OWN overhead, then times the handshake and the steady-state per-call
+// Toolport's OWN overhead, then times the handshake and the steady-state per-call
 // round-trip for the lazy meta-tools over N iterations (median + p95). Also calls
-// the mock directly, so the difference on the tool-call path is purely what Conduit
+// the mock directly, so the difference on the tool-call path is purely what Toolport
 // adds. Deterministic and offline: no model, no network, no API keys.
 //
 //   node benchmark/latency.mjs [iterations]      (default 200)
@@ -139,11 +139,11 @@ async function main() {
   for (let k = 0; k < 15; k++) await g.call("tools/list", {}); // warm up
   const list = await loop(() => g.call("tools/list", {}), N);
   const search = await loop(
-    () => g.call("tools/call", { name: "conduit_search_tools", arguments: { query: "a", limit: 25 } }),
+    () => g.call("tools/call", { name: "toolport_search_tools", arguments: { query: "a", limit: 25 } }),
     N,
   );
   const gwCall = await loop(
-    () => g.call("tools/call", { name: "conduit_call_tool", arguments: { name: `mock__${bare}`, arguments: {} } }),
+    () => g.call("tools/call", { name: "toolport_call_tool", arguments: { name: `mock__${bare}`, arguments: {} } }),
     N,
   );
 
@@ -155,15 +155,15 @@ async function main() {
 
   const row = (label, x) =>
     `  ${label.padEnd(28)}${x.median.toFixed(2).padStart(6)} ms   (p95 ${x.p95.toFixed(2)})`;
-  console.log(`\nConduit gateway latency  (mock downstream, ${N} iterations, median)\n`);
+  console.log(`\nToolport gateway latency  (mock downstream, ${N} iterations, median)\n`);
   console.log(`  ${"handshake (one-time)".padEnd(28)}${handshake.toFixed(2).padStart(6)} ms`);
   console.log(row("tools/list (lazy, 3 tools)", list));
-  console.log(row("conduit_search_tools", search));
-  console.log(row("conduit_call_tool -> mock", gwCall));
+  console.log(row("toolport_search_tools", search));
+  console.log(row("toolport_call_tool -> mock", gwCall));
   console.log(row("mock tool call (direct)", direct));
   const overhead = gwCall.median - direct.median;
   console.log(
-    `\n  => Conduit adds ~${overhead.toFixed(2)} ms per tool call vs calling the server directly.`,
+    `\n  => Toolport adds ~${overhead.toFixed(2)} ms per tool call vs calling the server directly.`,
   );
   console.log(
     `     Real servers take tens to hundreds of ms each, so that overhead is noise,`,

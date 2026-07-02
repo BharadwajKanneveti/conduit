@@ -101,7 +101,7 @@ Include this in release notes so users aren't scared off:
 
 # macOS (signing + notarization)
 
-An unsigned `.dmg` triggers Gatekeeper ("Conduit is damaged and can't be
+An unsigned `.dmg` triggers Gatekeeper ("Toolport is damaged and can't be
 opened"). To ship a clean install, sign with a **Developer ID Application**
 certificate and notarize with Apple. One **Apple Developer Program** membership
 ($99/yr) covers this, the same account used for iOS works; you just create the
@@ -146,7 +146,7 @@ step for it in the workflow.
 
 ## Gatekeeper bypass (for an unsigned interim build)
 
-> macOS may say Conduit "is damaged and can't be opened" because the app isn't
+> macOS may say Toolport "is damaged and can't be opened" because the app isn't
 > notarized yet. Right-click the app and choose **Open**, or run
-> `xattr -dr com.apple.quarantine /Applications/Conduit.app`. Notarization is
+> `xattr -dr com.apple.quarantine /Applications/Toolport.app`. Notarization is
 > coming.

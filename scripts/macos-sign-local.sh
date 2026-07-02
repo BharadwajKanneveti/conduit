@@ -5,13 +5,13 @@
 # LOCAL macOS sign + package flow for the keychain-access-group wrapper (Phase 2).
 #
 # What it does:
-#   1. Finds the bare conduit-gateway binary inside a built Conduit.app.
+#   1. Finds the bare conduit-gateway binary inside a built Toolport.app.
 #   2. Rebuilds it as a nested helper bundle:
-#        Conduit.app/Contents/Helpers/ConduitGateway.app
+#        Toolport.app/Contents/Helpers/ConduitGateway.app
 #      so the gateway can carry its OWN embedded provisioning profile (a bare
 #      Mach-O cannot embed a .provisionprofile; only a bundle can).
 #   3. Leaves a symlink at the OLD bare path
-#        Conduit.app/Contents/MacOS/conduit-gateway
+#        Toolport.app/Contents/MacOS/conduit-gateway
 #      pointing at the nested binary, so existing client configs that spawn the
 #      old path keep working.
 #   4. Codesigns inside-out (no --deep): gateway bundle first, then the outer app,
@@ -34,7 +34,7 @@ set -euo pipefail
 # Parameters (override via env or positional args).
 #   $1 = APP path, $2 = IDENTITY, $3 = APP_PROFILE, $4 = GW_PROFILE
 # ---------------------------------------------------------------------------
-APP="${1:-${APP:-src-tauri/target/release/bundle/macos/Conduit.app}}"
+APP="${1:-${APP:-src-tauri/target/release/bundle/macos/Toolport.app}}"
 IDENTITY="${2:-${IDENTITY:-Developer ID Application: Brandon SOuth (V4YZPC7T6G)}}"
 APP_PROFILE="${3:-${APP_PROFILE:-$HOME/Downloads/Conduit_Developer_ID.provisionprofile}}"
 GW_PROFILE="${4:-${GW_PROFILE:-$HOME/Downloads/Conduit_Gateway_Developer_ID.provisionprofile}}"
@@ -88,7 +88,7 @@ require_tool security
 require_tool plutil
 [[ -x /usr/libexec/PlistBuddy ]] || die "PlistBuddy not found at /usr/libexec/PlistBuddy (expected on every macOS)"
 
-bold "== Conduit macOS local sign + package =="
+bold "== Toolport macOS local sign + package =="
 echo "APP          = $APP"
 echo "IDENTITY     = $IDENTITY"
 echo "APP_PROFILE  = $APP_PROFILE"

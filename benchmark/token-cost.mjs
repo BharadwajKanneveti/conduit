@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 // Measures the per-request token cost of a real MCP tool catalog: the tool
 // definitions an agent loads into context on every request without lazy
-// discovery, broken down by server, plus the savings from Conduit's 3-meta-tool
+// discovery, broken down by server, plus the savings from Toolport's 3-meta-tool
 // lazy mode and what it means in context window, dollars, and scaling.
 //
 // Usage:
 //   node token-cost.mjs [path-to-tool-cache.json] [lazyFloorTokens]
 //
-// With no path it auto-resolves the active profile's cache in Conduit's data dir
+// With no path it auto-resolves the active profile's cache in Toolport's data dir
 // (Windows %APPDATA%\Conduit, macOS ~/Library/Application Support/Conduit,
-// Linux ~/.config/Conduit). The cache is the aggregated catalog Conduit builds
+// Linux ~/.config/Conduit). The cache is the aggregated catalog Toolport builds
 // (an array of tool objects with namespaced `server__tool` names). The token
 // estimate mirrors the gateway's own: serialized JSON length / 4.
 
@@ -17,7 +17,7 @@ import { readFileSync, existsSync } from "node:fs";
 import { homedir, platform } from "node:os";
 import { join } from "node:path";
 
-// Conduit's data dir, matching the gateway's registry::conduit_dir().
+// Toolport's data dir, matching the gateway's registry::conduit_dir().
 function conduitDir() {
   if (platform() === "win32") return join(homedir(), "AppData", "Roaming", "Conduit");
   if (platform() === "darwin") return join(homedir(), "Library", "Application Support", "Conduit");
@@ -81,8 +81,8 @@ for (const r of rows) {
   );
 }
 console.log("");
-console.log(`Without Conduit:  ${fmt(total)} tokens / request`);
-console.log(`With Conduit:     ${fmt(LAZY_FLOOR)} tokens / request (3 meta-tools, flat)`);
+console.log(`Without Toolport:  ${fmt(total)} tokens / request`);
+console.log(`With Toolport:     ${fmt(LAZY_FLOOR)} tokens / request (3 meta-tools, flat)`);
 console.log(`Reduction:        ${reduction}%`);
 
 // --- 2. Per-tool distribution ---

@@ -1,13 +1,13 @@
 # Code of Conduct
 
-Conduit adopts the [Contributor Covenant](https://www.contributor-covenant.org/),
+Toolport adopts the [Contributor Covenant](https://www.contributor-covenant.org/),
 version 2.1, as its code of conduct. The full text is published at:
 
 https://www.contributor-covenant.org/version/2/1/code_of_conduct/
 
 ## In short
 
-Everyone interacting in Conduit's spaces (the repository, issues, pull requests,
+Everyone interacting in Toolport's spaces (the repository, issues, pull requests,
 and discussions) is expected to be respectful, welcoming, and constructive.
 Harassment and exclusionary behavior of any kind are not tolerated.
 

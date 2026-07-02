@@ -1,6 +1,6 @@
-# Conduit token benchmark
+# Toolport token benchmark
 
-**Routing MCP servers through Conduit's lazy discovery cut total tokens 74-91% at the
+**Routing MCP servers through Toolport's lazy discovery cut total tokens 74-91% at the
 SAME task success rate**, measured on a frontier model and graded for *correct answers*,
 not just completion. Every task completed correctly in both modes, and the savings grow
 as you add servers. The reduction comes from not loading every tool's schema into the
@@ -12,8 +12,8 @@ Reproduce it yourself: [`benchmark/`](benchmark/).
 
 - **Two modes**, same tasks, same model:
   - **flat**, every downstream tool exposed directly (`CONDUIT_DISCOVERY=full`), the normal MCP setup.
-  - **lazy**, Conduit advertises 3 meta-tools (`conduit_status`, `conduit_search_tools`,
-    `conduit_call_tool`) and the agent searches/calls on demand (`CONDUIT_DISCOVERY=lazy`).
+  - **lazy**, Toolport advertises 3 meta-tools (`toolport_status`, `toolport_search_tools`,
+    `toolport_call_tool`) and the agent searches/calls on demand (`CONDUIT_DISCOVERY=lazy`).
 - **Model:** GPT-5.5 (frontier, via the Vercel AI Gateway), so model capability is not the
   variable, both modes can actually complete every task.
 - **Tasks (5 runs each):** list Stripe products; list Neon projects; list Vercel projects
@@ -51,14 +51,14 @@ more tools you connect and the more calls a task takes, the wider the gap.
 ## Measured on a real 14-server catalog
 
 The 62-tool test above is deliberately small. Point [`benchmark/token-cost.mjs`](benchmark/token-cost.mjs)
-at a real Conduit catalog (no model needed, it just measures the tool definitions)
+at a real Toolport catalog (no model needed, it just measures the tool definitions)
 and the gap widens fast. On a live 14-server setup of **415 tools**, the definitions
 an agent loads on **every request** measure:
 
 | | Per request |
 |---|---|
-| Without Conduit (all 415 tools) | **164,880 tokens** |
-| With Conduit (3 meta-tools, flat) | **660 tokens** |
+| Without Toolport (all 415 tools) | **164,880 tokens** |
+| With Toolport (3 meta-tools, flat) | **660 tokens** |
 | Reduction | **99.6%** |
 
 The cost is dominated by a few large servers:
@@ -77,28 +77,28 @@ The cost is dominated by a few large servers:
 At ~165k tokens of definitions *per request*, that catalog barely fits in most
 models' context alongside real work. At 200 agent requests/day it's roughly
 **$3,000/month** in input tokens at Claude Sonnet prices (about $5,000 at Opus),
-spent entirely on re-sending tool schemas. Conduit's meta-tools stay flat at 3 no
+spent entirely on re-sending tool schemas. Toolport's meta-tools stay flat at 3 no
 matter how many servers you add, which is why the reduction *grows* with your setup
 (90% at 62 tools, 99.6% at 415).
 
 The measured average here is ~397 tokens per tool, consistent with the ~387 the
-public [calculator](https://conduitmcp.app/calculator) uses.
+public [calculator](https://toolport.app/calculator) uses.
 
 ## Latency: the gateway is not the bottleneck
 
 Tokens are the headline, but a gateway adds a hop, so does it cost you time? Measure
 it with [`benchmark/latency.mjs`](benchmark/latency.mjs), which spawns the gateway
-against an instant mock downstream so the number is purely Conduit's own overhead
+against an instant mock downstream so the number is purely Toolport's own overhead
 (no model, no network, no API keys):
 
 | Operation | Median |
 |---|---|
 | Handshake (one-time, per gateway start) | ~21 ms |
 | `tools/list` (lazy, 3 tools) | ~0.2 ms |
-| `conduit_search_tools` | ~0.1 ms |
-| A tool call through Conduit vs. calling the server directly | **+~0.75 ms** |
+| `toolport_search_tools` | ~0.1 ms |
+| A tool call through Toolport vs. calling the server directly | **+~0.75 ms** |
 
-Conduit adds well under a millisecond to a tool call. Real MCP servers take tens to
+Toolport adds well under a millisecond to a tool call. Real MCP servers take tens to
 hundreds of ms each (a process or a network API), so that overhead is noise, and it
 buys the ~90% token reduction above. (Numbers from a dev laptop over 200 iterations;
 run it on yours: `node benchmark/latency.mjs`.)

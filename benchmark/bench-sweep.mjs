@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Conduit token benchmark, swept across catalog size.
+// Toolport token benchmark, swept across catalog size.
 //
 // Answers the question the static token-cost.mjs can't: as you ENABLE MORE
 // SERVERS, what happens to the *end-to-end* agent loop, in both modes, on the
@@ -20,7 +20,7 @@
 //
 // Prereqs:
 //   1. Build the gateway:   npm run build:gateway
-//   2. Auth the servers used by TASKS + the "noise" servers in Conduit (one-time).
+//   2. Auth the servers used by TASKS + the "noise" servers in Toolport (one-time).
 //   3. Run a local OpenAI-compatible LLM (LM Studio :1234 or Ollama :11434).
 //
 // Run:
@@ -100,7 +100,7 @@ function conduitDir() {
 function loadRealRegistry() {
   const p = process.env.CONDUIT_REGISTRY || join(conduitDir(), "registry.json");
   if (!existsSync(p)) {
-    console.error(`No registry at ${p}. Set CONDUIT_REGISTRY or run Conduit once.`);
+    console.error(`No registry at ${p}. Set CONDUIT_REGISTRY or run Toolport once.`);
     process.exit(1);
   }
   return { path: p, reg: JSON.parse(readFileSync(p, "utf8")) };

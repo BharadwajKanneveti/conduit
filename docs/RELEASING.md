@@ -28,8 +28,8 @@ If you'd rather build locally:
 ```bash
 npm run tauri:bundle
 gh release create v0.2.0 \
-  "src-tauri/target/release/bundle/nsis/conduit_0.2.0_x64-setup.exe" \
-  --title "Conduit v0.2.0" --generate-notes
+  "src-tauri/target/release/bundle/nsis/Toolport_0.2.0_x64-setup.exe" \
+  --title "Toolport v0.2.0" --generate-notes
 ```
 
 ## Signing

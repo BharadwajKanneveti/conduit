@@ -30,8 +30,8 @@ From the repo root:
 npx tauri build --config src-tauri/tauri.bundle.conf.json
 ```
 
-This produces `src-tauri/target/release/bundle/macos/Conduit.app` with the bare
-gateway at `Conduit.app/Contents/MacOS/conduit-gateway`.
+This produces `src-tauri/target/release/bundle/macos/Toolport.app` with the bare
+gateway at `Toolport.app/Contents/MacOS/conduit-gateway`.
 
 ## (b) Sign + package (wrap the gateway as a nested .app)
 
@@ -39,16 +39,16 @@ gateway at `Conduit.app/Contents/MacOS/conduit-gateway`.
 ./scripts/macos-sign-local.sh
 ```
 
-Defaults: APP = `src-tauri/target/release/bundle/macos/Conduit.app`, IDENTITY =
+Defaults: APP = `src-tauri/target/release/bundle/macos/Toolport.app`, IDENTITY =
 `Developer ID Application: Brandon SOuth (V4YZPC7T6G)`, profiles from `~/Downloads`.
 Override positionally or via env if needed:
 
 ```
-APP=/path/to/Conduit.app ./scripts/macos-sign-local.sh
+APP=/path/to/Toolport.app ./scripts/macos-sign-local.sh
 ```
 
 The script:
-- moves the gateway into `Conduit.app/Contents/Helpers/ConduitGateway.app`,
+- moves the gateway into `Toolport.app/Contents/Helpers/ConduitGateway.app`,
 - embeds the gateway provisioning profile there,
 - leaves a symlink at the old bare path for backward compat,
 - signs inside-out and prints the `keychain-access-groups` entitlement plus each
@@ -59,10 +59,10 @@ It is idempotent: re-running rebuilds the helper bundle and re-signs.
 Confirm the layout:
 
 ```
-ls -l "src-tauri/target/release/bundle/macos/Conduit.app/Contents/MacOS/conduit-gateway"
+ls -l "src-tauri/target/release/bundle/macos/Toolport.app/Contents/MacOS/conduit-gateway"
 # -> a symlink: conduit-gateway -> ../Helpers/ConduitGateway.app/Contents/MacOS/conduit-gateway
 
-file "src-tauri/target/release/bundle/macos/Conduit.app/Contents/Helpers/ConduitGateway.app/Contents/MacOS/conduit-gateway"
+file "src-tauri/target/release/bundle/macos/Toolport.app/Contents/Helpers/ConduitGateway.app/Contents/MacOS/conduit-gateway"
 # -> Mach-O ... (the real binary)
 ```
 
@@ -72,7 +72,7 @@ Launch the signed app (Gatekeeper should accept it since it is Developer ID +
 hardened runtime):
 
 ```
-open "src-tauri/target/release/bundle/macos/Conduit.app"
+open "src-tauri/target/release/bundle/macos/Toolport.app"
 ```
 
 In the app, add an MCP server that has a secret (an API key). Saving it writes the
@@ -89,7 +89,7 @@ entitlements + embedded profile that authorize the same access group, the read
 must succeed silently (no keychain password dialog).
 
 ```
-GW="src-tauri/target/release/bundle/macos/Conduit.app/Contents/Helpers/ConduitGateway.app/Contents/MacOS/conduit-gateway"
+GW="src-tauri/target/release/bundle/macos/Toolport.app/Contents/Helpers/ConduitGateway.app/Contents/MacOS/conduit-gateway"
 
 # Spawn it the way a client does (stdio MCP). Either point a real client at it,
 # or drive a quick MCP handshake. The point is that the gateway resolves the
