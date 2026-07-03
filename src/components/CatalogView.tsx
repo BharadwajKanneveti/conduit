@@ -91,11 +91,7 @@ export function CatalogView({ registry, onAdded }: Props) {
    * user-supplied URL, or args the user should review). False = safe to
    * immediate-add with no configuration. */
   function needsConfig(entry: CatalogEntry): boolean {
-    return (
-      entry.urlHint != null ||
-      entry.envKeys.length > 0 ||
-      entry.args.length > 0
-    );
+    return entry.urlHint != null || entry.envKeys.length > 0 || entry.args.length > 0;
   }
 
   async function add(entry: CatalogEntry) {
@@ -133,9 +129,7 @@ export function CatalogView({ registry, onAdded }: Props) {
    * user at the credential steps for the ones that need them. */
   async function setupStack(stack: Stack) {
     setStackBusy(stack.id);
-    const existing = new Set(
-      (registry?.servers ?? []).map((s) => s.name.toLowerCase()),
-    );
+    const existing = new Set((registry?.servers ?? []).map((s) => s.name.toLowerCase()));
     let added = 0;
     let needCreds = 0;
     try {
@@ -158,12 +152,15 @@ export function CatalogView({ registry, onAdded }: Props) {
       if (added === 0) {
         toast.success(`${stack.name}: every server is already in Toolport`);
       } else {
-        toast.success(`Added ${added} server${added === 1 ? "" : "s"} from ${stack.name}`, {
-          description:
-            needCreds > 0
-              ? `${needCreds} need credentials. Open "Setup steps" for the links.`
-              : "Enable them under Servers.",
-        });
+        toast.success(
+          `Added ${added} server${added === 1 ? "" : "s"} from ${stack.name}`,
+          {
+            description:
+              needCreds > 0
+                ? `${needCreds} need credentials. Open "Setup steps" for the links.`
+                : "Enable them under Servers.",
+          },
+        );
       }
     } catch (e) {
       toastError(`Couldn't finish setting up ${stack.name}: ${e}`);
@@ -235,17 +232,12 @@ export function CatalogView({ registry, onAdded }: Props) {
         browsing && popularLoading ? (
           <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
             {Array.from({ length: 6 }).map((_, i) => (
-              <div
-                key={i}
-                className="h-28 animate-pulse rounded-lg border bg-muted/30"
-              />
+              <div key={i} className="h-28 animate-pulse rounded-lg border bg-muted/30" />
             ))}
           </div>
         ) : browsing && popularError ? (
           <div className="flex flex-col items-center gap-3 py-20 text-center">
-            <p className="text-sm text-muted-foreground">
-              Couldn't load the catalog.
-            </p>
+            <p className="text-sm text-muted-foreground">Couldn't load the catalog.</p>
             <Button variant="outline" size="sm" onClick={reloadPopular}>
               Try again
             </Button>
@@ -282,9 +274,7 @@ export function CatalogView({ registry, onAdded }: Props) {
           ))}
         </div>
       ) : (
-        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
-          {shown.map(card)}
-        </div>
+        <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-3">{shown.map(card)}</div>
       )}
       {configEntry && (
         <ServerDialog
@@ -424,7 +414,9 @@ function StackCard({
           {stack.servers.map((e) => (
             <div key={e.name} className="text-[11px] leading-snug">
               <span className="font-medium text-foreground">{e.name}</span>
-              {e.setupHint && <span className="text-muted-foreground">: {e.setupHint}</span>}
+              {e.setupHint && (
+                <span className="text-muted-foreground">: {e.setupHint}</span>
+              )}
               {e.credentialsUrl && (
                 <button
                   onClick={() => openUrl(e.credentialsUrl!)}
@@ -456,9 +448,7 @@ function Provenance({ entry }: { entry: CatalogEntry }) {
       <ShieldCheck className={`size-3 shrink-0 ${tier.cls}`} />
       <span className={tier.cls}>{tier.label}</span>
       {entry.publisher && (
-        <span className="truncate text-muted-foreground/70">
-          · {entry.publisher}
-        </span>
+        <span className="truncate text-muted-foreground/70">· {entry.publisher}</span>
       )}
     </div>
   );
@@ -494,14 +484,16 @@ function CatalogCard({
           )}
         </div>
         <div className="flex shrink-0 items-center gap-1">
-
           <TransportPill transport={entry.transport} />
         </div>
       </div>
       <p className="line-clamp-2 min-h-8 text-xs text-muted-foreground">
         {entry.description}
       </p>
-      <code title={target} className="truncate font-mono text-[11px] text-muted-foreground/70">
+      <code
+        title={target}
+        className="truncate font-mono text-[11px] text-muted-foreground/70"
+      >
         {target}
       </code>
       <Provenance entry={entry} />

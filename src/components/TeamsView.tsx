@@ -1,12 +1,26 @@
 import { useEffect, useState } from "react";
-import { RefreshCw, LogOut, Upload, ShieldCheck, Users, Server, AlertTriangle } from "lucide-react";
+import {
+  RefreshCw,
+  LogOut,
+  Upload,
+  ShieldCheck,
+  Users,
+  Server,
+  AlertTriangle,
+} from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Callout } from "@/components/Callout";
 import { TransportPill } from "@/components/TransportPill";
 import { Input } from "@/components/ui/input";
-import { teamConnect, teamSync, teamDisconnect, teamPush, setServerEnabled } from "@/lib/api";
+import {
+  teamConnect,
+  teamSync,
+  teamDisconnect,
+  teamPush,
+  setServerEnabled,
+} from "@/lib/api";
 import { isEnabled, activeProfile } from "@/lib/types";
 import type { Registry } from "@/lib/types";
 
@@ -29,7 +43,9 @@ export function TeamsView({
 }) {
   const team = registry?.team ?? null;
   const isAdmin = team?.role === "admin";
-  const teamServers = (registry?.servers ?? []).filter((s) => s.source?.startsWith("team:"));
+  const teamServers = (registry?.servers ?? []).filter((s) =>
+    s.source?.startsWith("team:"),
+  );
 
   const [serverUrl, setServerUrl] = useState(HOSTED_TEAMS_URL);
   const [inviteCode, setInviteCode] = useState("");
@@ -80,7 +96,11 @@ export function TeamsView({
       if (!serverUrl.trim() || !inviteCode.trim()) {
         throw new Error("Server URL and invite code are both required.");
       }
-      const r = await teamConnect(serverUrl.trim(), inviteCode.trim(), memberName.trim() || undefined);
+      const r = await teamConnect(
+        serverUrl.trim(),
+        inviteCode.trim(),
+        memberName.trim() || undefined,
+      );
       onRegistryChange(r);
       setInviteCode("");
       setNotice("Connected. The team's servers were added to your active profile.");
@@ -141,9 +161,9 @@ export function TeamsView({
         <div className="rounded-xl border bg-card p-5">
           <h3 className="text-sm font-medium">Connect to a team</h3>
           <p className="mt-1 mb-4 max-w-prose text-sm text-muted-foreground">
-            Paste your team's Toolport Teams server URL and an invite code from your admin.
-            The team's MCP servers will appear in your active profile. Your keys never leave
-            your machine, you'll add each server's secrets locally afterward.
+            Paste your team's Toolport Teams server URL and an invite code from your
+            admin. The team's MCP servers will appear in your active profile. Your keys
+            never leave your machine, you'll add each server's secrets locally afterward.
           </p>
           <div className="grid gap-3">
             <label className="grid gap-1 text-sm">
@@ -192,14 +212,22 @@ export function TeamsView({
                     {team.role}
                   </span>
                 </div>
-                <p className="mt-1 truncate text-sm text-muted-foreground">{team.serverUrl}</p>
+                <p className="mt-1 truncate text-sm text-muted-foreground">
+                  {team.serverUrl}
+                </p>
                 <p className="mt-0.5 text-xs text-muted-foreground">
-                  Team {team.teamId} · config v{team.lastVersion ?? 0} · {teamServers.length}{" "}
-                  shared {teamServers.length === 1 ? "server" : "servers"}
+                  Team {team.teamId} · config v{team.lastVersion ?? 0} ·{" "}
+                  {teamServers.length} shared{" "}
+                  {teamServers.length === 1 ? "server" : "servers"}
                 </p>
               </div>
               <div className="flex shrink-0 gap-2">
-                <Button variant="outline" size="sm" onClick={onSync} disabled={busy !== null}>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={onSync}
+                  disabled={busy !== null}
+                >
                   <RefreshCw className="size-3.5" />
                   {busy === "sync" ? "Syncing…" : "Sync now"}
                 </Button>
@@ -226,7 +254,8 @@ export function TeamsView({
                     <ShieldCheck className="size-3.5 text-success" /> Admin
                   </div>
                   <p className="text-xs text-muted-foreground">
-                    Push your current server set to the team. Secret values are never sent.
+                    Push your current server set to the team. Secret values are never
+                    sent.
                   </p>
                 </div>
                 <Button size="sm" onClick={onPush} disabled={busy !== null}>
@@ -241,7 +270,8 @@ export function TeamsView({
             <h3 className="mb-1 text-sm font-medium">Shared servers</h3>
             {teamServers.length === 0 ? (
               <p className="text-sm text-muted-foreground">
-                No servers from the team yet. An admin pushes the set, then Sync brings it here.
+                No servers from the team yet. An admin pushes the set, then Sync brings it
+                here.
               </p>
             ) : (
               <>
@@ -251,7 +281,7 @@ export function TeamsView({
                     const isLocal = s.transport === "stdio" || !!s.command;
                     const detail = s.command
                       ? [s.command, ...(s.args ?? [])].join(" ")
-                      : s.url ?? "";
+                      : (s.url ?? "");
                     return (
                       <li
                         key={s.id}
@@ -285,7 +315,12 @@ export function TeamsView({
                             </div>
                             <ConfirmDialog
                               trigger={
-                                <Button size="sm" variant="outline" disabled={busy !== null} className="shrink-0">
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  disabled={busy !== null}
+                                  className="shrink-0"
+                                >
                                   Enable
                                 </Button>
                               }
@@ -305,7 +340,8 @@ export function TeamsView({
                   })}
                 </ul>
                 <p className="mt-3 text-xs text-muted-foreground">
-                  Add each server's secrets in the Servers tab, they stay in your OS keychain.
+                  Add each server's secrets in the Servers tab, they stay in your OS
+                  keychain.
                 </p>
               </>
             )}

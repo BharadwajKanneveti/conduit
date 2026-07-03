@@ -20,7 +20,8 @@ import { join } from "node:path";
 // Toolport's data dir, matching the gateway's registry::conduit_dir().
 function conduitDir() {
   if (platform() === "win32") return join(homedir(), "AppData", "Roaming", "Conduit");
-  if (platform() === "darwin") return join(homedir(), "Library", "Application Support", "Conduit");
+  if (platform() === "darwin")
+    return join(homedir(), "Library", "Application Support", "Conduit");
   return join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "Conduit");
 }
 
@@ -82,7 +83,9 @@ for (const r of rows) {
 }
 console.log("");
 console.log(`Without Toolport:  ${fmt(total)} tokens / request`);
-console.log(`With Toolport:     ${fmt(LAZY_FLOOR)} tokens / request (3 meta-tools, flat)`);
+console.log(
+  `With Toolport:     ${fmt(LAZY_FLOOR)} tokens / request (3 meta-tools, flat)`,
+);
 console.log(`Reduction:        ${reduction}%`);
 
 // --- 2. Per-tool distribution ---
@@ -103,23 +106,29 @@ const WINDOWS = [
   ["Gemini 2.5 (1M)", 1000000],
 ];
 console.log("");
-console.log(`Context window eaten by ${fmt(total)} tokens of definitions, before any real work:`);
+console.log(
+  `Context window eaten by ${fmt(total)} tokens of definitions, before any real work:`,
+);
 for (const [name, w] of WINDOWS) {
   const pct = (total / w) * 100;
-  console.log(`  ${name.padEnd(24)} ${pct > 100 ? ">100%  (OVERFLOWS, can't even load the tools)" : pct.toFixed(1) + "%"}`);
+  console.log(
+    `  ${name.padEnd(24)} ${pct > 100 ? ">100%  (OVERFLOWS, can't even load the tools)" : pct.toFixed(1) + "%"}`,
+  );
 }
 
 // --- 4. Scaling: reduction grows with tool count ---
 // Uses the measured mean tokens/tool from THIS catalog, so the curve is grounded
 // in real schemas. Lazy's floor is fixed at 3 meta-tools no matter the size.
 console.log("");
-console.log(`Scaling (def-overhead reduction vs tool count, at ${fmt(meanPerTool)} tok/tool measured here):`);
+console.log(
+  `Scaling (def-overhead reduction vs tool count, at ${fmt(meanPerTool)} tok/tool measured here):`,
+);
 console.log("  tools    flat tokens    lazy    reduction");
 for (const n of [3, 10, 25, 50, 100, 200, tools.length]) {
   const flat = Math.round(n * meanPerTool);
   const red = (1 - LAZY_FLOOR / flat) * 100;
   console.log(
-    `  ${String(n).padStart(5)}    ${fmt(flat).padStart(10)}    ${fmt(LAZY_FLOOR).padStart(4)}    ${(red > 0 ? red.toFixed(1) : "0.0")}%`,
+    `  ${String(n).padStart(5)}    ${fmt(flat).padStart(10)}    ${fmt(LAZY_FLOOR).padStart(4)}    ${red > 0 ? red.toFixed(1) : "0.0"}%`,
   );
 }
 const breakeven = Math.ceil(LAZY_FLOOR / meanPerTool);
@@ -135,7 +144,9 @@ const PRICES = [
 ];
 const VOLUMES = [50, 200, 1000];
 console.log("");
-console.log(`Monthly $ saved (re-sending ${fmt(saved)} tokens/request that lazy mode doesn't):`);
+console.log(
+  `Monthly $ saved (re-sending ${fmt(saved)} tokens/request that lazy mode doesn't):`,
+);
 console.log("  model".padEnd(28) + VOLUMES.map((v) => `${v}/day`.padStart(12)).join(""));
 for (const [label, price] of PRICES) {
   let line = "  " + label.padEnd(26);

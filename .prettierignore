@@ -1,0 +1,13 @@
+# Build artifacts
+dist/
+src-tauri/target/
+src-tauri/binaries/
+
+# Dependencies
+node_modules/
+
+# Lockfile (formatting churn with no value)
+package-lock.json
+
+# Generated/external
+src-tauri/gen/

@@ -2,11 +2,7 @@ import { useState } from "react";
 import { Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
-import {
-  createProfile,
-  deleteProfile,
-  setActiveProfile,
-} from "@/lib/api";
+import { createProfile, deleteProfile, setActiveProfile } from "@/lib/api";
 import type { Registry } from "@/lib/types";
 import {
   Select,
@@ -119,8 +115,8 @@ export function ProfileBar({ registry, onChange }: Props) {
           </DialogHeader>
           <p className="text-xs text-muted-foreground">
             A profile is a set of servers a client can see. Credentials live on each
-            server, not the profile, so to keep separate work and personal accounts,
-            add the server twice and put one in each profile.
+            server, not the profile, so to keep separate work and personal accounts, add
+            the server twice and put one in each profile.
           </p>
           <div className="flex flex-col gap-2 py-2">
             <Label htmlFor="profile-name">Name</Label>

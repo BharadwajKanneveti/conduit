@@ -11,12 +11,7 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
-import {
-  addCatalogServer,
-  importServers,
-  installGateway,
-  listStacks,
-} from "@/lib/api";
+import { addCatalogServer, importServers, installGateway, listStacks } from "@/lib/api";
 import {
   importableServers,
   isGatewayServer,
@@ -149,13 +144,7 @@ function StepHeader({
   );
 }
 
-function Welcome({
-  present,
-  onNext,
-}: {
-  present: DetectedClient[];
-  onNext: () => void;
-}) {
+function Welcome({ present, onNext }: { present: DetectedClient[]; onNext: () => void }) {
   const names = present.map((c) => c.name);
   const found =
     names.length === 0
@@ -164,11 +153,9 @@ function Welcome({
   return (
     <>
       <StepHeader icon={<Waypoints className="size-5" />} title="Welcome to Toolport">
-        One local gateway for all your MCP servers, shared by every AI tool, so your
-        agent loads 3 tools instead of hundreds (up to 91% fewer tokens) and every
-        server is watched for tampering and prompt injection.
-        {" "}
-        {found}
+        One local gateway for all your MCP servers, shared by every AI tool, so your agent
+        loads 3 tools instead of hundreds (up to 91% fewer tokens) and every server is
+        watched for tampering and prompt injection. {found}
       </StepHeader>
       <Button onClick={onNext} className="self-start">
         Get started
@@ -260,8 +247,8 @@ function AddServers({
   return (
     <>
       <StepHeader icon={<Download className="size-5" />} title="Add your first servers">
-        Pick what you work on and Toolport sets up a matching stack. You can also
-        import from your other tools or browse the full catalog.
+        Pick what you work on and Toolport sets up a matching stack. You can also import
+        from your other tools or browse the full catalog.
       </StepHeader>
 
       <div className="flex flex-col gap-3">
@@ -388,14 +375,14 @@ function ConnectClients({
   return (
     <>
       <StepHeader icon={<Link2 className="size-5" />} title="Connect a client">
-        Point a tool at Toolport. It connects once, then sees every server you
-        enable here, no per-tool setup.
+        Point a tool at Toolport. It connects once, then sees every server you enable
+        here, no per-tool setup.
       </StepHeader>
 
       {present.length === 0 ? (
         <p className="rounded-md bg-muted/50 px-3 py-2 text-sm text-muted-foreground">
-          No clients detected yet. Install Claude Desktop, Cursor, VS Code, or
-          another supported tool, then connect it from the sidebar.
+          No clients detected yet. Install Claude Desktop, Cursor, VS Code, or another
+          supported tool, then connect it from the sidebar.
         </p>
       ) : (
         <div className="flex flex-col gap-2">
@@ -474,8 +461,7 @@ function Done({
     };
   }, [serverCount, onProbe]);
 
-  const nameFor = (id: string) =>
-    registry.servers.find((s) => s.id === id)?.name ?? id;
+  const nameFor = (id: string) => registry.servers.find((s) => s.id === id)?.name ?? id;
   const broken = (health ?? []).filter((r) => !r.ok && !r.authRequired);
 
   const ready = serverCount > 0 && connectedCount > 0;
@@ -496,15 +482,14 @@ function Done({
             Toolport now manages {serverCount} server
             {serverCount === 1 ? "" : "s"} across {connectedCount} connected tool
             {connectedCount === 1 ? "" : "s"}. Toggle one on or off and your clients
-            update live, no restart. Each client loads 3 search tools instead of
-            every tool, up to 91% fewer tokens at the same task success. And Toolport watches
+            update live, no restart. Each client loads 3 search tools instead of every
+            tool, up to 91% fewer tokens at the same task success. And Toolport watches
             every server for tampering and prompt injection, see Activity.
           </>
         ) : (
           <>
-            You haven't {missing} yet. You can do both any time from the main
-            screen: add or import servers, then connect a client so your tools share
-            them.
+            You haven't {missing} yet. You can do both any time from the main screen: add
+            or import servers, then connect a client so your tools share them.
           </>
         )}
       </StepHeader>
@@ -516,8 +501,8 @@ function Done({
             {broken.map((r) => nameFor(r.serverId)).join(", ")}
           </span>
           <span className="text-xs text-muted-foreground">
-            They likely need a runtime that isn't installed (Node/npx or Python/uvx),
-            or the command needs a fix. Retry from each server's card once it's sorted.
+            They likely need a runtime that isn't installed (Node/npx or Python/uvx), or
+            the command needs a fix. Retry from each server's card once it's sorted.
           </span>
         </div>
       )}

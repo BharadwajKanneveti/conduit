@@ -1,8 +1,23 @@
 import { useState, type ReactNode } from "react";
-import { AlertTriangle, CheckCircle2, ChevronDown, ChevronRight, ClipboardPaste, Loader2, Plus, X } from "lucide-react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  ClipboardPaste,
+  Loader2,
+  Plus,
+  X,
+} from "lucide-react";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
-import { addServer, parseServerSnippet, setSecret, testServer, updateServer } from "@/lib/api";
+import {
+  addServer,
+  parseServerSnippet,
+  setSecret,
+  testServer,
+  updateServer,
+} from "@/lib/api";
 import type { Registry, ServerEntry, Transport } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import {
@@ -42,7 +57,16 @@ interface Props {
   urlHint?: string;
 }
 
-export function ServerDialog({ trigger, onSaved, editId, initial, existingNames, autoOpen, onClose, urlHint }: Props) {
+export function ServerDialog({
+  trigger,
+  onSaved,
+  editId,
+  initial,
+  existingNames,
+  autoOpen,
+  onClose,
+  urlHint,
+}: Props) {
   const [open, setOpen] = useState(autoOpen ?? false);
   const [form, setForm] = useState({
     name: initial?.name ?? "",
@@ -230,9 +254,7 @@ export function ServerDialog({ trigger, onSaved, editId, initial, existingNames,
       // Vault any values the user entered now. setSecret keys by server id. For a
       // new server, add_server appends it, so it's the last entry - resolving by
       // name would pick the wrong one if two servers share a name.
-      const id = editing
-        ? editId
-        : result.servers[result.servers.length - 1]?.id;
+      const id = editing ? editId : result.servers[result.servers.length - 1]?.id;
       if (id) {
         for (const r of declared) {
           if (r.value) result = await setSecret(id, r.key.trim(), r.value);
@@ -277,7 +299,9 @@ export function ServerDialog({ trigger, onSaved, editId, initial, existingNames,
               <div className="flex flex-col gap-2 border-t px-3 pb-3 pt-2">
                 <textarea
                   className="min-h-[100px] w-full resize-y rounded-md bg-muted/50 p-2 font-mono text-xs"
-                  placeholder={"Paste a config snippet from any client:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Windsurf/Antigravity: {\"mcpServers\": ...}\n• VS Code: {\"servers\": ...}\n• Codex: [mcp_servers.name]\n• Zed: {\"context_servers\": ...}"}
+                  placeholder={
+                    'Paste a config snippet from any client:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Windsurf/Antigravity: {"mcpServers": ...}\n• VS Code: {"servers": ...}\n• Codex: [mcp_servers.name]\n• Zed: {"context_servers": ...}'
+                  }
                   value={pasteText}
                   onChange={(e) => setPasteText(e.target.value)}
                 />
@@ -367,8 +391,8 @@ export function ServerDialog({ trigger, onSaved, editId, initial, existingNames,
             <Label>Environment variables</Label>
             <p className="-mt-1 text-xs text-muted-foreground">
               API keys and other secrets the server needs (e.g.{" "}
-              <code className="font-mono">RESEND_API_KEY</code>). Values are stored
-              in your OS keychain, never in the config.
+              <code className="font-mono">RESEND_API_KEY</code>). Values are stored in
+              your OS keychain, never in the config.
             </p>
             {envRows.map((row, i) => (
               <div key={i} className="flex items-center gap-2">
@@ -380,7 +404,9 @@ export function ServerDialog({ trigger, onSaved, editId, initial, existingNames,
                 />
                 <Input
                   type="password"
-                  placeholder={initial?.env.some((e) => e.key === row.key) ? "•••• (saved)" : "value"}
+                  placeholder={
+                    initial?.env.some((e) => e.key === row.key) ? "•••• (saved)" : "value"
+                  }
                   value={row.value}
                   onChange={(e) => setEnvRow(i, "value", e.target.value)}
                 />
@@ -406,7 +432,10 @@ export function ServerDialog({ trigger, onSaved, editId, initial, existingNames,
             </Button>
           </div>
 
-          {(errors.length > 0 || duplicateName || test.status === "ok" || test.status === "fail") && (
+          {(errors.length > 0 ||
+            duplicateName ||
+            test.status === "ok" ||
+            test.status === "fail") && (
             <div className="flex flex-col gap-1.5 text-xs">
               {errors.map((msg) => (
                 <p key={msg} className="text-destructive">
@@ -417,8 +446,8 @@ export function ServerDialog({ trigger, onSaved, editId, initial, existingNames,
                 <p className="flex items-start gap-1.5 text-amber-600 dark:text-amber-500">
                   <AlertTriangle className="mt-0.5 size-3.5 shrink-0" />
                   <span>
-                    Another server is already named "{nameTrim}". That's fine for multiple accounts;
-                    it'll be saved as a separate entry.
+                    Another server is already named "{nameTrim}". That's fine for multiple
+                    accounts; it'll be saved as a separate entry.
                   </span>
                 </p>
               )}

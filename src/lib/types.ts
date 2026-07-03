@@ -2,12 +2,7 @@ export type Transport = "stdio" | "http" | "sse" | "unknown";
 
 /** The main content views, selected from the sidebar. */
 export type View =
-  | "servers"
-  | "activity"
-  | "catalog"
-  | "playground"
-  | "teams"
-  | "settings";
+  "servers" | "activity" | "catalog" | "playground" | "teams" | "settings";
 
 export interface McpServer {
   name: string;
@@ -453,11 +448,8 @@ export function importableServers(
   client: DetectedClient,
   registry: Registry | null,
 ): McpServer[] {
-  const have = new Set(
-    (registry?.servers ?? []).map((s) => s.name.toLowerCase()),
-  );
+  const have = new Set((registry?.servers ?? []).map((s) => s.name.toLowerCase()));
   return [...client.servers, ...client.pluginServers].filter(
-    (s) =>
-      s.name.toLowerCase() !== "conduit" && !have.has(s.name.toLowerCase()),
+    (s) => s.name.toLowerCase() !== "conduit" && !have.has(s.name.toLowerCase()),
   );
 }

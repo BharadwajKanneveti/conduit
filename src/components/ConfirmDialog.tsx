@@ -54,20 +54,13 @@ export function ConfirmDialog({
   return (
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogTrigger asChild>{trigger}</DialogTrigger>
-      <DialogContent
-        className="sm:max-w-sm"
-        onClick={(e) => e.stopPropagation()}
-      >
+      <DialogContent className="sm:max-w-sm" onClick={(e) => e.stopPropagation()}>
         <DialogHeader>
           <DialogTitle>{title}</DialogTitle>
           {description && <DialogDescription>{description}</DialogDescription>}
         </DialogHeader>
         <DialogFooter>
-          <Button
-            variant="ghost"
-            onClick={() => setOpen(false)}
-            disabled={busy}
-          >
+          <Button variant="ghost" onClick={() => setOpen(false)} disabled={busy}>
             {cancelLabel}
           </Button>
           <Button

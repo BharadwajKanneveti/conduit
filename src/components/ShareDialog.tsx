@@ -242,9 +242,8 @@ export function ShareDialog({ trigger, onImported }: Props) {
         {preview ? (
           <div className="flex flex-col gap-4 py-1">
             <p className="text-xs text-muted-foreground">
-              These servers come from a shared file. Each runs the command shown when
-              you enable it, so review them before importing. You'll add your own keys
-              after.
+              These servers come from a shared file. Each runs the command shown when you
+              enable it, so review them before importing. You'll add your own keys after.
             </p>
             <div className="flex max-h-72 flex-col gap-2 overflow-y-auto">
               {preview.map((item, i) => (
@@ -252,11 +251,18 @@ export function ShareDialog({ trigger, onImported }: Props) {
               ))}
             </div>
             <div className="flex items-center justify-between gap-2 border-t pt-3">
-              <Button variant="ghost" onClick={() => setPreview(null)} disabled={busyAction !== null}>
+              <Button
+                variant="ghost"
+                onClick={() => setPreview(null)}
+                disabled={busyAction !== null}
+              >
                 <ArrowLeft className="size-4" />
                 Back
               </Button>
-              <Button onClick={confirmImport} disabled={busyAction !== null || newCount === 0}>
+              <Button
+                onClick={confirmImport}
+                disabled={busyAction !== null || newCount === 0}
+              >
                 {busyAction === "import" ? (
                   <>
                     <Loader2 className="size-4 animate-spin" />
@@ -446,7 +452,11 @@ export function ShareDialog({ trigger, onImported }: Props) {
                     </>
                   )}
                 </Button>
-                <Button variant="outline" onClick={loadFromFile} disabled={busyAction !== null}>
+                <Button
+                  variant="outline"
+                  onClick={loadFromFile}
+                  disabled={busyAction !== null}
+                >
                   {busyAction === "preview-file" ? (
                     <>
                       <Loader2 className="size-4 animate-spin" />
@@ -471,9 +481,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
 /** One reviewable server: name, what it runs, and a flag if it spawns a shell. */
 function ImportRow({ item }: { item: ImportItem }) {
   const runs =
-    item.command != null
-      ? [item.command, ...item.args].join(" ")
-      : (item.url ?? "");
+    item.command != null ? [item.command, ...item.args].join(" ") : (item.url ?? "");
   const shell = runsShell(item.command);
   const privateHost = isPrivateHostUrl(item.url);
   return (
@@ -488,9 +496,7 @@ function ImportRow({ item }: { item: ImportItem }) {
         )}
       </div>
       {runs && (
-        <p className="mt-1 font-mono text-xs break-all text-muted-foreground">
-          {runs}
-        </p>
+        <p className="mt-1 font-mono text-xs break-all text-muted-foreground">{runs}</p>
       )}
       {shell && (
         <p className="mt-1.5 flex items-center gap-1.5 text-xs text-warning">

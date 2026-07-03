@@ -58,10 +58,10 @@ And the summary line: tools exposed (flat vs 3), total-token delta as a percent,
 
 ## Reading the results honestly
 
-- **Small sample.** A handful of tasks and single runs are noisy. Run it a few times; treat the *direction* as the signal, not the exact percentage.
+- **Small sample.** A handful of tasks and single runs are noisy. Run it a few times; treat the _direction_ as the signal, not the exact percentage.
 - **The trade-off is real and intentional.** Lazy mode trades extra tool calls (search → call) for fewer total tokens. The table shows both so you're not hiding the round-trip cost.
 - **Flat mode may error** on small models, dumping every tool schema can overflow the context window. That's a finding, not a bug: it's exactly the failure lazy discovery avoids. The harness records it as an error rather than crashing.
-- **Savings concentrate on smaller models** (mcpico saw ~60% on a 9B, ~8% on a 35B). Run it on a small *and* a mid model to show that, it's the local-model story.
+- **Savings concentrate on smaller models** (mcpico saw ~60% on a 9B, ~8% on a 35B). Run it on a small _and_ a mid model to show that, it's the local-model story.
 
 ## Caveats
 

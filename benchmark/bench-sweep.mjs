@@ -69,9 +69,25 @@ const OUT_DIR = process.env.OUT_DIR || HERE;
 // string, so "done" can't hide a wrong or "I couldn't do it" answer. No local file =
 // tasks run ungraded (correct shows as n/a).
 const TASKS = [
-  { name: "stripe-products", required: "stripe", expect: [], prompt: "List my Stripe products (just the names)." },
-  { name: "neon-projects", required: "neon", expect: [], prompt: "List my Neon projects (just the names)." },
-  { name: "vercel-projects", required: "vercel", expect: [], prompt: "List my Vercel projects. If a team id is required, find it first, then use it." },
+  {
+    name: "stripe-products",
+    required: "stripe",
+    expect: [],
+    prompt: "List my Stripe products (just the names).",
+  },
+  {
+    name: "neon-projects",
+    required: "neon",
+    expect: [],
+    prompt: "List my Neon projects (just the names).",
+  },
+  {
+    name: "vercel-projects",
+    required: "vercel",
+    expect: [],
+    prompt:
+      "List my Vercel projects. If a team id is required, find it first, then use it.",
+  },
 ];
 
 // Fill `expect` from the local, gitignored ground-truth file if it exists.
@@ -93,7 +109,8 @@ function defaultGateway() {
 
 function conduitDir() {
   if (platform() === "win32") return join(homedir(), "AppData", "Roaming", "Conduit");
-  if (platform() === "darwin") return join(homedir(), "Library", "Application Support", "Conduit");
+  if (platform() === "darwin")
+    return join(homedir(), "Library", "Application Support", "Conduit");
   return join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "Conduit");
 }
 
@@ -122,7 +139,9 @@ function planSweep(reg) {
     .map((x) => Number(x.trim()))
     .filter((n) => Number.isFinite(n) && n > 0);
   const maxN = required.length + noise.length;
-  const counts = (want.length ? want : [required.length, required.length + 3, required.length + 7, maxN])
+  const counts = (
+    want.length ? want : [required.length, required.length + 3, required.length + 7, maxN]
+  )
     .map((n) => Math.min(maxN, Math.max(required.length, n)))
     .filter((n, i, a) => a.indexOf(n) === i)
     .sort((a, b) => a - b);
@@ -151,11 +170,18 @@ function writeTempRegistry(dir, reg, serverIds, lazy) {
 class Gateway {
   constructor(regPath, discovery) {
     this.proc = spawn(GATEWAY, [], {
-      env: { ...process.env, CONDUIT_REGISTRY: regPath, CONDUIT_PROFILE: "sweep", CONDUIT_DISCOVERY: discovery },
+      env: {
+        ...process.env,
+        CONDUIT_REGISTRY: regPath,
+        CONDUIT_PROFILE: "sweep",
+        CONDUIT_DISCOVERY: discovery,
+      },
       stdio: ["pipe", "pipe", "ignore"],
     });
     this.proc.on("error", (e) => {
-      console.error(`\nCould not start gateway at ${GATEWAY}: ${e.message}\nBuild it: npm run build:gateway`);
+      console.error(
+        `\nCould not start gateway at ${GATEWAY}: ${e.message}\nBuild it: npm run build:gateway`,
+      );
       process.exit(1);
     });
     this.rl = createInterface({ input: this.proc.stdout });
@@ -163,35 +189,66 @@ class Gateway {
     this.id = 0;
     this.rl.on("line", (line) => {
       let msg;
-      try { msg = JSON.parse(line); } catch { return; }
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        return;
+      }
       const cb = msg.id != null && this.pending.get(msg.id);
-      if (cb) { this.pending.delete(msg.id); cb(msg); }
+      if (cb) {
+        this.pending.delete(msg.id);
+        cb(msg);
+      }
     });
   }
   rpc(method, params) {
     const id = ++this.id;
     return new Promise((resolve) => {
       this.pending.set(id, resolve);
-      this.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      this.proc.stdin.write(
+        JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n",
+      );
     });
   }
   async init() {
-    await this.rpc("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "conduit-sweep", version: "1" } });
+    await this.rpc("initialize", {
+      protocolVersion: "2024-11-05",
+      capabilities: {},
+      clientInfo: { name: "conduit-sweep", version: "1" },
+    });
     await new Promise((r) => setTimeout(r, CONNECT_WAIT_MS));
   }
-  async tools() { return (await this.rpc("tools/list", {})).result?.tools || []; }
-  async call(name, args) { const r = await this.rpc("tools/call", { name, arguments: args || {} }); return r.result ?? r.error ?? {}; }
-  stop() { try { this.proc.kill(); } catch {} }
+  async tools() {
+    return (await this.rpc("tools/list", {})).result?.tools || [];
+  }
+  async call(name, args) {
+    const r = await this.rpc("tools/call", { name, arguments: args || {} });
+    return r.result ?? r.error ?? {};
+  }
+  stop() {
+    try {
+      this.proc.kill();
+    } catch {}
+  }
 }
 
 function normalizeParams(schema) {
-  const s = schema && typeof schema === "object" && !Array.isArray(schema) ? { ...schema } : {};
+  const s =
+    schema && typeof schema === "object" && !Array.isArray(schema) ? { ...schema } : {};
   if (!s.type) s.type = "object";
-  if (s.type === "object" && (s.properties == null || typeof s.properties !== "object")) s.properties = {};
+  if (s.type === "object" && (s.properties == null || typeof s.properties !== "object"))
+    s.properties = {};
   return s;
 }
 const toOpenAITools = (mcp) =>
-  mcp.map((t) => ({ type: "function", function: { name: t.name, description: t.description || "", parameters: normalizeParams(t.inputSchema) } }));
+  mcp.map((t) => ({
+    type: "function",
+    function: {
+      name: t.name,
+      description: t.description || "",
+      parameters: normalizeParams(t.inputSchema),
+    },
+  }));
 
 async function chat(messages, tools) {
   const headers = {
@@ -206,25 +263,43 @@ async function chat(messages, tools) {
   // stale completion (it's recomputed at temperature 0), so leaving it on just
   // makes a token-heavy flat run much cheaper. Set BENCH_NOCACHE=1 only if you want
   // to force fully independent samples (e.g. for variance analysis).
-  const noCache = ["1", "true", "yes", "on"].includes((process.env.BENCH_NOCACHE || "").toLowerCase());
+  const noCache = ["1", "true", "yes", "on"].includes(
+    (process.env.BENCH_NOCACHE || "").toLowerCase(),
+  );
   let res;
   for (let attempt = 0; ; attempt++) {
     const msgs =
       noCache && messages[0]?.role === "system"
-        ? [{ ...messages[0], content: `${messages[0].content}\n[uncached: ${randomUUID()}]` }, ...messages.slice(1)]
+        ? [
+            {
+              ...messages[0],
+              content: `${messages[0].content}\n[uncached: ${randomUUID()}]`,
+            },
+            ...messages.slice(1),
+          ]
         : messages;
-    const body = JSON.stringify({ model: MODEL, messages: msgs, tools, tool_choice: "auto", temperature: 0 });
+    const body = JSON.stringify({
+      model: MODEL,
+      messages: msgs,
+      tools,
+      tool_choice: "auto",
+      temperature: 0,
+    });
     res = await fetch(LLM_URL, { method: "POST", headers, body });
     if (res.ok) break;
     if ((res.status === 429 || res.status >= 500) && attempt < 6) {
       const ra = Number(res.headers.get("retry-after"));
-      const waitMs = Number.isFinite(ra) && ra > 0 ? ra * 1000 : Math.min(30000, 1000 * 2 ** attempt);
+      const waitMs =
+        Number.isFinite(ra) && ra > 0 ? ra * 1000 : Math.min(30000, 1000 * 2 ** attempt);
       await new Promise((r) => setTimeout(r, waitMs));
       continue;
     }
     break;
   }
-  if (!res.ok) throw new Error(`LLM ${res.status}: ${(await res.text().catch(() => "")).slice(0, 300)}`);
+  if (!res.ok)
+    throw new Error(
+      `LLM ${res.status}: ${(await res.text().catch(() => "")).slice(0, 300)}`,
+    );
   return res.json();
 }
 
@@ -241,10 +316,17 @@ async function measureOverhead(tools) {
 
 async function runTask(gw, oaiTools, prompt) {
   const messages = [
-    { role: "system", content: "You are a helpful assistant. Use the available tools to complete the task, then give a short final answer." },
+    {
+      role: "system",
+      content:
+        "You are a helpful assistant. Use the available tools to complete the task, then give a short final answer.",
+    },
     { role: "user", content: prompt },
   ];
-  let tokens = 0, calls = 0, done = false, error = null;
+  let tokens = 0,
+    calls = 0,
+    done = false,
+    error = null;
   try {
     for (let steps = 0; steps < MAX_STEPS; steps++) {
       const res = await chat(messages, oaiTools);
@@ -253,29 +335,46 @@ async function runTask(gw, oaiTools, prompt) {
       if (!m) break;
       messages.push(m);
       const toolCalls = m.tool_calls || [];
-      if (toolCalls.length === 0) { done = true; break; }
+      if (toolCalls.length === 0) {
+        done = true;
+        break;
+      }
       for (const c of toolCalls) {
         calls++;
         let args = {};
-        try { args = JSON.parse(c.function.arguments || "{}"); } catch {}
+        try {
+          args = JSON.parse(c.function.arguments || "{}");
+        } catch {}
         const result = await gw.call(c.function.name, args);
-        messages.push({ role: "tool", tool_call_id: c.id, content: JSON.stringify(result).slice(0, TOOL_RESULT_CAP) });
+        messages.push({
+          role: "tool",
+          tool_call_id: c.id,
+          content: JSON.stringify(result).slice(0, TOOL_RESULT_CAP),
+        });
       }
     }
   } catch (e) {
     error = e.message;
   }
-  const answer = messages
-    .filter((m) => m.role === "assistant" && typeof m.content === "string" && m.content.trim())
-    .pop()?.content || "";
+  const answer =
+    messages
+      .filter(
+        (m) =>
+          m.role === "assistant" && typeof m.content === "string" && m.content.trim(),
+      )
+      .pop()?.content || "";
   return { tokens, calls, done, error, answer };
 }
 
-const median = (xs) => { const s = [...xs].sort((a, b) => a - b); return s[Math.floor((s.length - 1) / 2)]; };
+const median = (xs) => {
+  const s = [...xs].sort((a, b) => a - b);
+  return s[Math.floor((s.length - 1) / 2)];
+};
 
 // An answer that looks like a failure/apology rather than a result. Used so a
 // "done" agent that gave up ("I couldn't list them") never counts as correct.
-const ERROR_LIKE = /\b(error|failed|unable|couldn'?t|can ?not|can'?t|unauthor|forbidden|denied|no access|not authenticated|don'?t have)\b/i;
+const ERROR_LIKE =
+  /\b(error|failed|unable|couldn'?t|can ?not|can'?t|unauthor|forbidden|denied|no access|not authenticated|don'?t have)\b/i;
 
 // Grade a single answer against the task's ground-truth `expect` list:
 //   true/false when graded, null when the task has no `expect` (ungraded).
@@ -329,7 +428,8 @@ async function benchAt(regPath, count, serverIds, mode) {
   const { reg } = loadRealRegistry();
   const sweep = planSweep(reg);
   console.log("sweep plan (servers always include the task servers):");
-  for (const s of sweep) console.log(`  ${String(s.count).padStart(2)} servers: ${s.serverIds.join(", ")}`);
+  for (const s of sweep)
+    console.log(`  ${String(s.count).padStart(2)} servers: ${s.serverIds.join(", ")}`);
 
   const dir = mkdtempSync(join(tmpdir(), "conduit-sweep-"));
   const results = [];
@@ -376,10 +476,28 @@ async function benchAt(regPath, count, serverIds, mode) {
   mkdirSync(OUT_DIR, { recursive: true });
 
   // --- CSV (one row per server-count x mode x task) ---
-  const csv = ["servers,mode,toolCount,overheadTokens,overflow,task,medianTokens,loTokens,hiTokens,done,correct,graded,runs"];
+  const csv = [
+    "servers,mode,toolCount,overheadTokens,overflow,task,medianTokens,loTokens,hiTokens,done,correct,graded,runs",
+  ];
   for (const r of results)
     for (const t of r.tasks)
-      csv.push([r.count, r.mode, r.toolCount, r.overhead.tokens ?? "", r.overhead.overflow, t.task, t.median, t.lo, t.hi, t.done, t.correct ?? "", t.graded, RUNS].join(","));
+      csv.push(
+        [
+          r.count,
+          r.mode,
+          r.toolCount,
+          r.overhead.tokens ?? "",
+          r.overhead.overflow,
+          t.task,
+          t.median,
+          t.lo,
+          t.hi,
+          t.done,
+          t.correct ?? "",
+          t.graded,
+          RUNS,
+        ].join(","),
+      );
   const csvPath = join(OUT_DIR, "sweep-results.csv");
   writeFileSync(csvPath, csv.join("\n") + "\n");
 
@@ -390,7 +508,9 @@ async function benchAt(regPath, count, serverIds, mode) {
       const grade = t.graded ? ` [${t.correct}/${RUNS} correct]` : " [ungraded]";
       ans.push(`## ${r.count} servers / ${r.mode} / ${t.task}${grade}`);
       if (!t.samples.some((s) => s)) ans.push("(no answer, e.g. context overflow)");
-      t.samples.forEach((s, i) => s && ans.push(`  sample ${i + 1}: ${s.replace(/\s+/g, " ")}`));
+      t.samples.forEach(
+        (s, i) => s && ans.push(`  sample ${i + 1}: ${s.replace(/\s+/g, " ")}`),
+      );
       ans.push("");
     }
   }
@@ -405,7 +525,14 @@ async function benchAt(regPath, count, serverIds, mode) {
     const totalDone = r.tasks.reduce((a, t) => a + t.done, 0);
     const graded = r.tasks.some((t) => t.graded);
     const totalCorrect = r.tasks.reduce((a, t) => a + (t.correct ?? 0), 0);
-    o[r.mode] = { tools: r.toolCount, overhead: r.overhead, totalTok, totalDone, totalCorrect, graded };
+    o[r.mode] = {
+      tools: r.toolCount,
+      overhead: r.overhead,
+      totalTok,
+      totalDone,
+      totalCorrect,
+      graded,
+    };
     byCount.set(r.count, o);
   }
   const denom = TASKS.length * RUNS;
@@ -419,11 +546,17 @@ async function benchAt(regPath, count, serverIds, mode) {
     `|---|---|---|---|---|---|---|---|${anyGraded ? "---|---|" : ""}`,
   ];
   for (const o of [...byCount.values()].sort((a, b) => a.count - b.count)) {
-    const f = o.full, l = o.lazy;
+    const f = o.full,
+      l = o.lazy;
     const fOv = f?.overhead.overflow ? "OVERFLOW" : (f?.overhead.tokens ?? "?");
-    const red = f?.totalTok && l?.totalTok ? `${Math.round((1 - l.totalTok / f.totalTok) * 100)}%` : "—";
+    const red =
+      f?.totalTok && l?.totalTok
+        ? `${Math.round((1 - l.totalTok / f.totalTok) * 100)}%`
+        : "—";
     const correctCols = anyGraded ? ` ${cScore(f)} | ${cScore(l)} |` : "";
-    md.push(`| ${o.count} (${f?.tools ?? "?"} tools) | ${fOv} | ${l?.overhead.tokens ?? "?"} | ${f?.totalTok ?? "—"} | ${l?.totalTok ?? "—"} | ${red} | ${f?.totalDone ?? 0}/${denom} | ${l?.totalDone ?? 0}/${denom} |${correctCols}`);
+    md.push(
+      `| ${o.count} (${f?.tools ?? "?"} tools) | ${fOv} | ${l?.overhead.tokens ?? "?"} | ${f?.totalTok ?? "—"} | ${l?.totalTok ?? "—"} | ${red} | ${f?.totalDone ?? 0}/${denom} | ${l?.totalDone ?? 0}/${denom} |${correctCols}`,
+    );
   }
   const mdPath = join(OUT_DIR, "sweep-summary.md");
   writeFileSync(mdPath, md.join("\n") + "\n");

@@ -34,17 +34,8 @@ import { gatherDiagnostics, getSavingsSummary, openDataDir } from "@/lib/api";
 import { fmtTokens } from "@/lib/utils";
 import { checkForUpdate, installUpdate } from "@/lib/updater";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipTrigger,
-} from "@/components/ui/tooltip";
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ProfileBar } from "@/components/ProfileBar";
 import { ShareDialog } from "@/components/ShareDialog";
 
@@ -124,8 +115,7 @@ function VersionFooter({
         description: "You can download it manually from the releases page.",
         action: {
           label: "Open",
-          onClick: () =>
-            openUrl("https://github.com/tsouth89/toolport/releases/latest"),
+          onClick: () => openUrl("https://github.com/tsouth89/toolport/releases/latest"),
         },
       });
     }
@@ -200,9 +190,7 @@ function VersionFooter({
           onClick={async () => {
             try {
               await navigator.clipboard.writeText(await gatherDiagnostics());
-              toast.success(
-                "Diagnostics copied, paste them into your bug report",
-              );
+              toast.success("Diagnostics copied, paste them into your bug report");
             } catch {
               toastError("Could not copy diagnostics");
             }
@@ -277,8 +265,7 @@ function UpdateNotes({
  * bottom. */
 function sortClients(clients: DetectedClient[]): DetectedClient[] {
   const present = (c: DetectedClient) => (c.appPresent ? 1 : 0);
-  const count = (c: DetectedClient) =>
-    c.servers.length + c.pluginServers.length;
+  const count = (c: DetectedClient) => c.servers.length + c.pluginServers.length;
   return [...clients].sort((a, b) => {
     if (present(a) !== present(b)) return present(b) - present(a);
     if (count(a) !== count(b)) return count(b) - count(a);
@@ -350,9 +337,7 @@ function ClientRow({ client, importCount, selected, onSelect }: RowProps) {
           ) : client.usesConnectors ? (
             <Puzzle className="size-3.5 shrink-0 text-info" />
           ) : (
-            <span
-              className={`size-2 shrink-0 rounded-full ${dotClass[status]}`}
-            />
+            <span className={`size-2 shrink-0 rounded-full ${dotClass[status]}`} />
           )}
           <span className="truncate">{client.name}</span>
           <span className="ml-auto flex shrink-0 items-center gap-1.5">
@@ -388,9 +373,7 @@ function ClientRow({ client, importCount, selected, onSelect }: RowProps) {
             Manages servers as account connectors, outside the config file.
           </p>
         )}
-        {client.error && (
-          <p className="mt-1 text-xs text-warning">{client.error}</p>
-        )}
+        {client.error && <p className="mt-1 text-xs text-warning">{client.error}</p>}
       </TooltipContent>
     </Tooltip>
   );
@@ -488,9 +471,7 @@ export function AppSidebar({
         </svg>
         <div className="leading-tight">
           <div className="font-semibold tracking-tight">Toolport</div>
-          <div className="text-xs text-muted-foreground">
-            MCP control center
-          </div>
+          <div className="text-xs text-muted-foreground">MCP control center</div>
         </div>
       </div>
 
@@ -520,9 +501,7 @@ export function AppSidebar({
           {navItem(ScrollText, "Activity", view === "activity", () =>
             onSelectView("activity"),
           )}
-          {navItem(Users, "Teams", view === "teams", () =>
-            onSelectView("teams"),
-          )}
+          {navItem(Users, "Teams", view === "teams", () => onSelectView("teams"))}
           {navItem(Settings, "Settings", view === "settings", () =>
             onSelectView("settings"),
           )}
@@ -536,7 +515,10 @@ export function AppSidebar({
           >
             <Zap className="size-3.5 shrink-0 text-success" />
             <span className="text-muted-foreground">
-              <span className="font-semibold text-foreground">{fmtTokens(savings.tokensSaved)}</span> tokens saved
+              <span className="font-semibold text-foreground">
+                {fmtTokens(savings.tokensSaved)}
+              </span>{" "}
+              tokens saved
             </span>
           </button>
         )}
@@ -548,8 +530,8 @@ export function AppSidebar({
           <nav className="flex flex-col gap-0.5">
             {clients.length === 0 ? (
               <p className="px-2.5 py-1.5 text-xs text-muted-foreground">
-                No MCP clients found. Install Claude Desktop, Cursor, or another
-                supported tool, then refresh.
+                No MCP clients found. Install Claude Desktop, Cursor, or another supported
+                tool, then refresh.
               </p>
             ) : (
               <>
@@ -558,9 +540,7 @@ export function AppSidebar({
                     key={client.id}
                     client={client}
                     importCount={importableServers(client, registry).length}
-                    selected={
-                      view === "servers" && selectedClientId === client.id
-                    }
+                    selected={view === "servers" && selectedClientId === client.id}
                     onSelect={() => onSelectClient(client.id)}
                   />
                 ))}
@@ -581,12 +561,8 @@ export function AppSidebar({
                         <ClientRow
                           key={client.id}
                           client={client}
-                          importCount={
-                            importableServers(client, registry).length
-                          }
-                          selected={
-                            view === "servers" && selectedClientId === client.id
-                          }
+                          importCount={importableServers(client, registry).length}
+                          selected={view === "servers" && selectedClientId === client.id}
                           onSelect={() => onSelectClient(client.id)}
                         />
                       ))}
@@ -598,10 +574,7 @@ export function AppSidebar({
         </div>
       </div>
 
-      <VersionFooter
-        onImport={onRegistryChange}
-        onReplay={onReplayOnboarding}
-      />
+      <VersionFooter onImport={onRegistryChange} onReplay={onReplayOnboarding} />
     </aside>
   );
 }

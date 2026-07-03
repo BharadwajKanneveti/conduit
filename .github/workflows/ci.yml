@@ -52,6 +52,11 @@ jobs:
 
       - run: npm ci
 
+      # Enforce consistent formatting before anything else — fails fast on
+      # formatting-only issues so the contributor doesn't wait for a full build.
+      - name: Check formatting
+        run: npm run format:check
+
       # Frontend type-check + build (`build` is `tsc && vite build`). Also produces
       # dist/, which tauri-build expects when compiling the Rust crate below.
       - name: Frontend type-check + build

@@ -7,7 +7,14 @@
 // triple (e.g. "x86_64-apple-darwin") to cross-build the gateway for that target.
 // Pass `--debug` to stage a debug build instead.
 import { execSync } from "node:child_process";
-import { mkdirSync, copyFileSync, existsSync, writeFileSync, chmodSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  copyFileSync,
+  existsSync,
+  writeFileSync,
+  chmodSync,
+  rmSync,
+} from "node:fs";
 import { join } from "node:path";
 
 function hostTriple() {
@@ -32,7 +39,9 @@ function gatewayPathFor(triple) {
 
 function buildGateway(triple) {
   const targetArg = triple ? `--target ${triple} ` : "";
-  console.log(`[sidecar] building conduit-gateway (${profile}) ${triple ? "for " + triple : "(host)"}`);
+  console.log(
+    `[sidecar] building conduit-gateway (${profile}) ${triple ? "for " + triple : "(host)"}`,
+  );
   execSync(`cargo build ${debug ? "" : "--release "}${targetArg}--bin conduit-gateway`, {
     cwd: "src-tauri",
     stdio: "inherit",

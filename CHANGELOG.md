@@ -9,6 +9,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 ## [1.2.0] - 2026-07-03
 
 ### Security
+
 - **Closed several bypasses in the stdio spawn guard** (the supply-chain check that
   refuses code-smuggling launch args on a spawned server). Two rounds of adversarial
   review found a booby-trapped (team- or registry-sourced) config could still reach code
@@ -50,7 +51,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   keeps the gateway running, instead of unwinding out and dropping the whole MCP
   connection (defense-in-depth for the primary local transport).
 - **HTTP clients are scoped on resources and prompts too.** A registered HTTP/OpenAPI
-  client scoped to a subset of servers could still read *any* connected server's
+  client scoped to a subset of servers could still read _any_ connected server's
   resources and prompts (`resources/read` / `prompts/get` ignored the scope); they now
   enforce the same allowed-server set as tool calls.
 - **Closed three tool-supply-chain detection gaps** from an internal audit: a tool's
@@ -70,6 +71,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   Realistic results are far under the cap, so detection is unaffected in practice.
 
 ### Added
+
 - **Pi coding agent is now a supported client.** Toolport detects Pi, imports its
   configured MCP servers, and installs/removes the gateway entry in Pi's global config
   (`~/.pi/agent/mcp.json`), the same one-click flow as Cursor and the other clients.
@@ -97,6 +99,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   Local and bounded, and it stores tool names only (never arguments or results).
 
 ### Changed
+
 - **The HTTP gateway now handles requests concurrently.** Each request runs on its
   own worker, so a slow downstream server or a tool call held for human approval (up
   to two minutes) no longer blocks other requests, live setting toggles, or
@@ -114,6 +117,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   scope dropdown was also widened so "All enabled servers" is no longer clipped.
 
 ### Fixed
+
 - **macOS: monochrome menu-bar glyph, and no more Dock-and-menu-bar at once.** The
   tray now uses a template image (the Toolport porthole mark), so macOS tints it to
   match every other menu-bar item instead of showing the full-color app icon. And the
@@ -144,6 +148,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 ## [1.1.0] - 2026-07-02
 
 ### Added
+
 - **Human-in-the-loop tool approval (opt-in).** With "Require human approval" on, Toolport
   holds any destructive or untrusted-server tool call and raises a desktop notification until
   you approve or deny it in the app. Fail-closed: if no decision is made in time, the call is
@@ -155,6 +160,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   (Settings > General).
 
 ### Changed
+
 - **Security notices are tiered by severity, so real threats aren't buried.** Risky
   tool-definition drift (a destructive tool changing, a tool dropping a readOnly/destructive
   safety annotation, or poisoned content) stays a loud, actionable notice; benign vendor
@@ -162,12 +168,14 @@ Entries before the rename below shipped under the project's former name, Conduit
   across restarts, and duplicate notices from multiple clients are collapsed.
 
 ### Fixed
+
 - Cleaned up leftover "Conduit" references in a few spots (the Teams connect URL placeholder,
   the "download from releases" link, and the exported setup filename).
 
 ## [1.0.1] - 2026-07-02
 
 ### Fixed
+
 - **Windows: upgraders now show "Toolport" in the Start menu.** After the rename, an
   in-place update from Conduit left the old "Conduit" shortcut and green icon behind
   (the bundle identifier is intentionally unchanged so your data and secrets carry
@@ -194,11 +202,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 ## [0.9.4] - 2026-07-01
 
 ### Added
+
 - **Registry backup and recovery.** A `registry.json.bak` sibling keeps the
   last-known-good server list; Conduit recovers from it if `registry.json` is deleted
   or corrupted, so a bad write or an accidental wipe no longer loses your servers.
 
 ### Fixed
+
 - **Per-server head-of-line blocking.** The gateway releases the per-server lock during
   a downstream backoff, so one server's 429 rate-limit no longer stalls other concurrent
   calls to that same server.
@@ -206,11 +216,13 @@ Entries before the rename below shipped under the project's former name, Conduit
   cap (10s), so a misconfigured or hostile server can't park a call for minutes.
 
 ### Docs
+
 - Codex setup walkthrough in the README.
 
 ## [0.9.3] - 2026-07-01
 
 ### Security
+
 - **macOS: no more keychain prompts on update.** Secrets now live in the macOS
   data-protection keychain under a team-scoped shared access group, and the gateway
   ships as a nested notarized helper that shares that group. The gateway reads the
@@ -219,17 +231,20 @@ Entries before the rename below shipped under the project's former name, Conduit
   never touch disk.
 
 ### Added
+
 - **Quarantine-on-drift.** High-risk tool-definition changes (a poisoned definition, or
   a destructive tool that changed or newly appeared) are blocked until you re-approve.
 - **Headless encrypted-file secret backend** (`CONDUIT_SECRET_KEY`) for server/self-host
   use where no OS keychain is available.
 
 ### Changed
+
 - Teams pricing is $12/seat (was $20). Smaller initial bundle via code-splitting.
 
 ## [0.9.2] - 2026-06-30
 
 ### Added
+
 - **Catalog: configure-on-add** (enter keys while adding a server), **self-hosted
   servers** (n8n, Langfuse), and more entries (DataForSEO, Chrome DevTools, Railway,
   Twilio, Postiz).
@@ -237,6 +252,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 - **Paste a config snippet** to auto-fill the Add Server dialog.
 
 ### Fixed
+
 - Remote servers refresh an expired OAuth token on a mid-session 401 and retry, no manual
   reconnect.
 - Teams only soft-syncs servers the member opts into (no silent RCE from team config).
@@ -244,6 +260,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 ## [0.9.1] - 2026-06-29
 
 ### Added
+
 - **New stack: Web scraping & automation.** An eighth role bundle (Firecrawl,
   Tavily, Playwright, Browserbase, Apify) for agents that search, scrape, and
   drive real browsers.
@@ -256,6 +273,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 ## [0.9.0] - 2026-06-29
 
 ### Added
+
 - **Stacks: role-based server bundles.** Pick what you work on (full-stack web,
   backend & data, infra & DevOps, AI & ML, product & design, founder, research)
   and Conduit sets up a matching set of MCP servers in one click. Stacks appear at
@@ -271,10 +289,12 @@ Entries before the rename below shipped under the project's former name, Conduit
 - **New catalog servers:** Linode (Akamai) cloud, and Qdrant (vector store for RAG).
 
 ### Fixed
+
 - The scoped-client scope picker in Settings rendered an unthemed white dropdown
   in dark mode; it now uses the app's themed select.
 
 ### Internal
+
 - Groundwork for concurrent tool routing (per-server interior mutability in the
   router; no behavior change yet), and a fix for an XDG env race that could flake
   a path test on CI.
@@ -282,6 +302,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 ## [0.8.0] - 2026-06-28
 
 ### Added
+
 - **Multi-tenant HTTP bridge (per-client scoping).** Register HTTP clients in
   Settings → Integrations, each with its own bearer token and profile. One bridge
   process serves them all and resolves every request's token to its own set of
@@ -305,6 +326,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   scheme, and real error responses, so OpenAPI clients can model auth and failures.
 
 ### Changed
+
 - **HTTP bridge auth tightened.** Once any scoped client is registered, the bridge
   rejects unauthenticated requests even when no global token is set. CORS no longer
   reflects the caller's Origin or sends credentials, and cross-site browser
@@ -314,6 +336,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   call may already have executed.
 
 ### Security
+
 - Constant-time comparison for the bridge bearer token.
 - The SSRF connect-guard now also blocks IPv6 link-local and cloud-metadata
   addresses (including the AWS IPv6 metadata address), not just IPv4 169.254.x.
@@ -325,6 +348,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   "string" on content fields (only identifier-typed params).
 
 ### Removed
+
 - **"Add to catalog" (promote-to-catalog).** It only pinned a server you already had into
   a local discovery view, with no sync or sharing, so it added clutter without real value.
   Browse Catalog still does what matters: discover and add new servers (curated set + live
@@ -333,6 +357,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 ## [0.7.0] - 2026-06-28
 
 ### Added
+
 - **Native HTTP/OpenAPI transport.** Run the gateway with `conduit-gateway --http <port>`
   (or `CONDUIT_HTTP=<port>`) and it serves an OpenAPI spec plus a POST endpoint per tool,
   so Open WebUI and any OpenAPI tool client connect straight to Conduit with no mcpo,
@@ -349,6 +374,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   recovery hint is appended whenever a call fails.
 
 ### Security
+
 - **The HTTP endpoint now requires a bearer token.** The app auto-generates one, shows it
   in Settings -> Integrations, and you paste it into the client (Open WebUI: the tool
   server's API key / Bearer auth). This closes a credential-CSRF: the `localhost` bind does
@@ -358,12 +384,14 @@ Entries before the rename below shipped under the project's former name, Conduit
   reflected headers so a crafted request can't inject or crash a listener.
 
 ### Changed
+
 - **Windows installers are now code-signed** via Azure Trusted Signing (publisher name
   shows; SmartScreen reputation still builds with downloads).
 
 ## [0.6.0] - 2026-06-27
 
 ### Changed
+
 - **The server list is a dense, scannable list now.** The bulky three-column cards are
   replaced by compact grouped rows: toggle, status, name, source, tool count, and
   transport on one line, with the command and per-server actions (secrets, duplicate,
@@ -386,12 +414,14 @@ Entries before the rename below shipped under the project's former name, Conduit
   tool-testing surface.
 
 ### Added
+
 - **Three more catalog servers:** Perplexity, Kubernetes, and Todoist.
 - **A confirmation step before destructive actions.** Removing a server, deleting a
   profile, disconnecting a client, or leaving a team now asks first and says what
   survives (your secrets stay in the keychain, your own servers are untouched).
 
 ### Fixed
+
 - The manual Refresh always confirms now ("Refreshed"), even when a health probe is
   already running, so the click is never silent.
 - Hardened the first-run wizard's resume-after-catalog flow against future regressions.
@@ -413,11 +443,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 ## [0.5.2] - 2026-06-27
 
 ### Added
+
 - **More one-click catalog servers.** Added MongoDB, Elasticsearch, Airtable, Exa,
   Tavily, Apify, Browserbase, and the Sequential Thinking, Memory, and Time reference
   servers, every package name verified.
 
 ### Changed
+
 - **A calmer Servers header.** The duplicate Browse catalog button is gone (it's
   already in the sidebar), Search and Add server stay up front, and the occasional
   actions (Import, Enable/Disable all) move into a `...` overflow menu so the header no
@@ -427,6 +459,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   separate Check health action has been folded into it.
 
 ### Fixed
+
 - **Onboarding no longer drops you mid-setup.** Browsing the catalog from the first-run
   wizard used to end onboarding before the Connect-a-client step; it now resumes there
   when you return, so new users don't silently skip connecting a client.
@@ -437,6 +470,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 ## [0.5.1] - 2026-06-27
 
 ### Fixed
+
 - **macOS: the keychain prompts are gone.** The `conduit-gateway` helper that your
   AI clients launch now reads your vaulted secrets (API keys, OAuth/bearer tokens)
   with no keychain password prompt. Newly saved secrets get this automatically;
@@ -452,11 +486,13 @@ caps and filters what the gateway will fetch and sync, and adds accessibility an
 UI polish.
 
 ### Fixed
+
 - **The sidebar action bar stays put.** It's pinned to the bottom of the server
   list and always visible instead of appearing only when you scroll to the end,
   and undetected clients collapse under a disclosure so the list stays short.
 
 ### Security
+
 - **Hardened the anti-agentjacking scan.** Tool results are normalized before
   scanning (lowercase, invisible/zero-width/bidi stripping, homoglyph and
   full-width folding) and base64-decoded payloads are scanned too, so injection
@@ -480,10 +516,12 @@ UI polish.
   cleanup after a failed connect.
 
 ### Accessibility
+
 - **Respects "reduce motion."** When the OS prefers reduced motion, Conduit zeroes
   out spinners, pulses, dialog and tooltip zooms, and transitions.
 
 ### Internal
+
 - **CI on every PR**: frontend build, Rust library tests, and a gateway build
   check now run on pull requests across the project.
 - **macOS:** newer secrets use the ACL-free SecItem keychain path, with a one-time
@@ -493,11 +531,13 @@ UI polish.
 - Removed leftover Vite/Tauri scaffold files and shipped a real favicon.
 
 ### Thanks
+
 - @bradhallett (#26) for the macOS keychain migration work.
 
 ## [0.4.2] - 2026-06-26
 
 ### Added
+
 - **Conduit Teams (beta), desktop side.** A new Teams tab connects your local Conduit
   to a self-hosted Conduit Teams server and syncs a shared MCP server set into your
   registry. Keys never leave your machine: only the server set syncs, and you
@@ -505,6 +545,7 @@ UI polish.
 - **Composio** in the curated catalog (connect agents to 1,000+ apps via MCP). (#23)
 
 ### Fixed
+
 - **Custom API keys now reach HTTP servers.** A remote/HTTP server that uses a manually
   vaulted secret (e.g. a `BEARER` key) gets it injected as the bearer token, not just
   OAuth tokens, so "Manage secrets" works for HTTP servers. (#22)
@@ -515,6 +556,7 @@ UI polish.
   config round-trips correctly. (#25)
 
 ### Internal
+
 - **macOS secret storage moved to the SecItem keychain API** for new entries, which
   avoids the per-application ACLs behind repeated keychain prompts (#21). If you're on
   macOS and still see prompts, they're from entries created by older versions: clear
@@ -522,11 +564,13 @@ UI polish.
   confirmed prompt-elimination claim is pending validation on signed release builds.
 
 ### Thanks
+
 - @bradhallett (#21, #22, #23, #25) and @BharadwajKanneveti (#24).
 
 ## [0.4.1] - 2026-06-26
 
 ### Changed
+
 - **Windows installers are now code-signed** via Azure Trusted Signing, so the
   SmartScreen "unknown publisher" warning is gone (reputation still accrues with
   downloads). macOS was already signed and notarized; Linux remains unsigned as
@@ -539,6 +583,7 @@ boundary (both tool definitions and tool results), searches by meaning, can be
 driven by the agent on your terms, and supports two more clients.
 
 ### Added
+
 - **Tool-definition integrity (rug-pull + poisoning detection).** The gateway
   fingerprints every tool when a server is first connected and diffs it on each
   refresh. If a previously-approved tool's definition changes, or a known server adds
@@ -547,7 +592,7 @@ driven by the agent on your terms, and supports two more clients.
   jumping) when first seen or when it changes. Both surface as notices in the Activity
   view. Detection only, never blocks; on by default (`integrityCheck`), fully local.
   New `get_security_events` command + `security.jsonl`.
-- **Content defense (anti-agentjacking).** The gateway scans untrusted tool *results*
+- **Content defense (anti-agentjacking).** The gateway scans untrusted tool _results_
   for injection-like content and, on a hit, wraps the offending text with a provenance
   marker ("external data, not instructions") before the agent sees it, plus records a
   security notice. Information-preserving (the original text stays inside the marker),
@@ -559,7 +604,7 @@ driven by the agent on your terms, and supports two more clients.
   OpenAI-compatible `/v1/embeddings` endpoint. Tool embeddings are cached on disk; on
   any failure it falls back to pure lexical, so it can only add signal, never degrade.
   New `benchmark/retrieval.mjs` measures retrieval recall (lexical vs semantic).
-- **Controllable MCP (opt-in agent control).** A new *Allow agent control* switch
+- **Controllable MCP (opt-in agent control).** A new _Allow agent control_ switch
   (off by default) lets an agent enable or disable servers through the gateway
   (`conduit_enable_server` / `conduit_disable_server`). The destructive-tool block
   stays user-only, so granting it can't let an agent escalate past your governance;
@@ -570,6 +615,7 @@ driven by the agent on your terms, and supports two more clients.
   intelligence) were added to the curated catalog.
 
 ### Changed
+
 - Benchmark suite: added a graded server-sweep harness (`bench-sweep.mjs`) that grades
   answers for correctness, not just completion, and expanded `token-cost.mjs`
   (context-window share, scaling curve, per-tool distribution, multi-volume dollar
@@ -577,10 +623,12 @@ driven by the agent on your terms, and supports two more clients.
   tokens at the same graded task success.
 
 ### Fixed
+
 - The Playground policy toggles lay out as an even responsive grid instead of
   orphaning the third switch onto its own row.
 
 ### Internal
+
 - Release pipeline wired for Windows Authenticode signing via Azure Trusted Signing,
   gated and inert until the signing secrets are configured (changes nothing until the
   certificate is ready).
@@ -588,26 +636,31 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.18] - 2026-06-25
 
 ### Added
+
 - **Ask your agent what Conduit is saving you.** `conduit_status` now reports the
   tokens lazy discovery has kept out of context, a dollar estimate at Claude Sonnet
   input rates, the number of tool-list loads, and your biggest catalog collapse.
 
 ### Changed
+
 - The in-app savings model picker and the public calculator group models by provider
   (Anthropic, OpenAI, Google), with a custom-price option on the calculator.
 
 ### Fixed
+
 - Native select dropdowns render readable in the dark theme (no more light text on a
   light popup).
 
 ## [0.3.17] - 2026-06-25
 
 ### Added
+
 - **Token economics card.** The Activity tab shows the dollar value of what lazy
   discovery has saved you, with a model-price selector and a one-click Share that
-  copies a "Conduit saved me ~X tokens (~$Y)" snippet.
+  copies a "Conduit saved me ~~X tokens (~~$Y)" snippet.
 
 ### Security
+
 - Hardened three findings from an internal audit: OAuth PKCE/state generation now
   fails loudly instead of silently returning zeros if the OS RNG is unavailable;
   file writes use a unique atomic-write temp name (no torn writes under concurrent
@@ -616,6 +669,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.16] - 2026-06-25
 
 ### Added
+
 - **Live tool refresh.** When a connected server changes its own tool set
   mid-session (via `tools/list_changed`), Conduit re-queries it in place, so new
   or removed tools reach your agent without a restart.
@@ -629,6 +683,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.15] - 2026-06-23
 
 ### Fixed
+
 - Clean, all-platforms build of the tokens-saved counter. v0.3.14's Linux job was
   OOM-killed mid-compile, leaving no Linux build or updater manifest; the pipeline
   now gives the Linux runner enough disk and swap, so auto-update works on all four
@@ -637,6 +692,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.14] - 2026-06-23
 
 ### Fixed
+
 - The v0.3.12 "tokens saved" counter was missing from the release binaries (a CI
   build cache compiled a stale library from before the command existed). The
   pipeline now builds the workspace from scratch, so the counter ships.
@@ -644,6 +700,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.12] - 2026-06-23
 
 ### Added
+
 - **"Tokens saved" counter in Activity.** A running estimate of the
   tool-definition tokens lazy discovery has kept out of your agent's context, with
   tool-list loads, your biggest catalog collapse, and since-when. No setup.
@@ -651,11 +708,13 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.11] - 2026-06-22
 
 ### Improved
+
 - **Cleaner search index.** The gateway strips boilerplate and stopwords from tool
   descriptions and queries before indexing, so `conduit_search_tools` ranks on the
   words that actually distinguish one tool from another.
 
 ### Added
+
 - **BENCHMARK.md** with a reproducible harness: ~97% less tool-definition overhead
   per request and ~90% fewer total tokens at the same task success rate (3 servers,
   62 tools, local model, repeated runs).
@@ -663,6 +722,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.10] - 2026-06-22
 
 ### Improved
+
 - **Tool search ranks the right tool more often.** When a query mixed a common word
   with a specific one (e.g. "list products"), keyword matching could surface a generic
   "list" tool instead of the products one. Search now tokenizes queries and tools
@@ -674,6 +734,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.9] - 2026-06-22
 
 ### Added
+
 - **Two more clients: Jan and Goose** (17 supported in total). Jan uses the standard
   `mcpServers` JSON; Goose is the first YAML client, its MCP servers live under a
   top-level `extensions:` map in `config.yaml`. Both detect, connect with one click,
@@ -681,6 +742,7 @@ driven by the agent on your terms, and supports two more clients.
   also holds Goose's model settings and built-in extensions).
 
 ### Fixed
+
 - **Required tool parameters now work from grammar-constrained local clients.** Some
   local runtimes (e.g. Jan) force the model's output to match the tool schema, and
   `conduit_call_tool`'s `arguments` declared no properties, so the model could only
@@ -697,6 +759,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.8] - 2026-06-21
 
 ### Improved
+
 - **Faster, more decisive tool search, especially with local models.** Search now
   leads with the single best match and tells the model to call it; the remaining
   results come back as a compact menu (name + a one-line description, no schema)
@@ -713,6 +776,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.7] - 2026-06-21
 
 ### Added
+
 - **Five more clients: Zed, LM Studio, Warp, Amazon Q, and Kiro.** Conduit detects
   each, installs the gateway with one click, and imports its existing servers.
   - Zed keeps MCP servers under `context_servers` in its `settings.json`, which is
@@ -725,6 +789,7 @@ driven by the agent on your terms, and supports two more clients.
     `~/.aws/amazonq/mcp.json`, `~/.kiro/settings/mcp.json`).
 
 ### Fixed
+
 - Client detection now reflects whether an app is actually installed, not merely
   whether an MCP config file happens to exist. The old "config file's parent dir"
   heuristic was wrong for some clients: Claude Code's config lives at `~/.claude.json`
@@ -735,6 +800,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.6] - 2026-06-21
 
 ### Fixed
+
 - Lazy-discovery tool search is far more reliable on multi-server setups. A tool
   that exists could read as missing (so an agent would wrongly conclude a server
   was "read only"): the default result limit was too low with no signal that
@@ -752,6 +818,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.5] - 2026-06-21
 
 ### Security
+
 - Importing a shared setup now previews exactly what it will run (each server's
   command, args, and url) and imports only on confirmation, and flags entries that
   spawn a shell. A shared config can no longer slip an unseen command past you.
@@ -761,6 +828,7 @@ driven by the agent on your terms, and supports two more clients.
 - Set an explicit Content-Security-Policy for the app window.
 
 ### Fixed
+
 - Registry writes are atomic, so a crash mid-write can't corrupt your server set.
 - A corrupt registry no longer silently makes every tool vanish: the gateway keeps
   serving the last good tool list and logs the problem.
@@ -768,6 +836,7 @@ driven by the agent on your terms, and supports two more clients.
   packaged and unpackaged installs.
 
 ### Changed
+
 - Onboarding's final step reflects what you actually set up and explains lazy
   discovery; the empty state offers a "Browse catalog" action; the New Profile
   dialog explains that profiles scope servers, not credentials.
@@ -776,6 +845,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.4] - 2026-06-21
 
 ### Fixed
+
 - Client config writes are now atomic (temp file + rename), so a crash or full
   disk mid-write can't truncate a client's MCP config.
 - One unresponsive stdio server no longer stalls the whole gateway: the connect
@@ -789,6 +859,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.3] - 2026-06-21
 
 ### Added
+
 - First-run onboarding wizard: detect clients, add your first servers (import,
   one-click popular starters, or the catalog), and connect a client. Re-run it
   anytime from the sidebar footer.
@@ -799,6 +870,7 @@ driven by the agent on your terms, and supports two more clients.
 - Per-tool breakdown in the Activity dashboard, plus server and errors-only filters.
 
 ### Changed
+
 - Reliability: gateway recovers from a poisoned lock, the audit log rotates so it
   can't grow unbounded, more tolerant SSE id matching, and a guard against
   overlapping health probes (which curbed macOS keychain prompt storms).
@@ -806,6 +878,7 @@ driven by the agent on your terms, and supports two more clients.
 ## [0.3.2] - 2026-06-20
 
 ### Added
+
 - Signed and notarized macOS builds (Apple Silicon + Intel), alongside Windows
   and Linux, via a tag-triggered release pipeline.
 

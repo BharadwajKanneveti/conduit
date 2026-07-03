@@ -20,11 +20,7 @@ interface Props {
 export function Callout({ variant = "info", className, children }: Props) {
   return (
     <div
-      className={cn(
-        "rounded-lg border px-3 py-2 text-sm",
-        VARIANTS[variant],
-        className,
-      )}
+      className={cn("rounded-lg border px-3 py-2 text-sm", VARIANTS[variant], className)}
     >
       {children}
     </div>

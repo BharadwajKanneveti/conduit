@@ -14,23 +14,24 @@ const TIMEOUT_MS = 120_000;
 type Reason = PendingApproval["reason"];
 
 /** How each gate reason presents: label, badge tone, and an icon. */
-const REASON: Record<Reason, { label: string; className: string; Icon: typeof Trash2 }> = {
-  destructive: {
-    label: "Destructive",
-    className: "bg-destructive/10 text-destructive",
-    Icon: Trash2,
-  },
-  untrusted_source: {
-    label: "Untrusted source",
-    className: "bg-warning/15 text-warning",
-    Icon: Globe,
-  },
-  destructive_and_untrusted: {
-    label: "Destructive · untrusted",
-    className: "bg-destructive/10 text-destructive",
-    Icon: Trash2,
-  },
-};
+const REASON: Record<Reason, { label: string; className: string; Icon: typeof Trash2 }> =
+  {
+    destructive: {
+      label: "Destructive",
+      className: "bg-destructive/10 text-destructive",
+      Icon: Trash2,
+    },
+    untrusted_source: {
+      label: "Untrusted source",
+      className: "bg-warning/15 text-warning",
+      Icon: Globe,
+    },
+    destructive_and_untrusted: {
+      label: "Destructive · untrusted",
+      className: "bg-destructive/10 text-destructive",
+      Icon: Trash2,
+    },
+  };
 
 /**
  * The human-in-the-loop approval queue: tool calls the gateway is holding until you
@@ -145,8 +146,8 @@ export function PendingApprovals() {
         {/* Announce count changes to screen readers without re-announcing on every countdown
          * tick (the visible timer lives elsewhere; this text only changes when the count does). */}
         <div aria-live="assertive" className="sr-only">
-          {pending.length} tool call{pending.length > 1 ? "s" : ""} awaiting your approval. Press
-          Escape to deny.
+          {pending.length} tool call{pending.length > 1 ? "s" : ""} awaiting your
+          approval. Press Escape to deny.
         </div>
         <header className="flex items-center gap-3 border-b border-border/60 px-4 py-3">
           <span className="flex size-8 shrink-0 items-center justify-center rounded-full bg-warning/15 text-warning">
@@ -155,7 +156,8 @@ export function PendingApprovals() {
           <div className="min-w-0">
             <div className="text-sm font-semibold leading-tight">Approval required</div>
             <div className="text-xs text-muted-foreground">
-              {pending.length} tool call{pending.length > 1 ? "s" : ""} held — no decision auto-denies
+              {pending.length} tool call{pending.length > 1 ? "s" : ""} held — no decision
+              auto-denies
             </div>
           </div>
         </header>
@@ -166,9 +168,13 @@ export function PendingApprovals() {
             // Count down to the broker's authoritative deadline; fall back to
             // first-sighting + timeout only if deadlineMs is somehow absent, so the
             // timer is never blank.
-            const deadline = a.deadlineMs || (seenAt.current.get(a.id) ?? now) + TIMEOUT_MS;
+            const deadline =
+              a.deadlineMs || (seenAt.current.get(a.id) ?? now) + TIMEOUT_MS;
             const remaining = Math.max(0, Math.ceil((deadline - now) / 1000));
-            const pct = Math.max(0, Math.min(100, (remaining / (TIMEOUT_MS / 1000)) * 100));
+            const pct = Math.max(
+              0,
+              Math.min(100, (remaining / (TIMEOUT_MS / 1000)) * 100),
+            );
             const urgent = remaining <= 20;
             const isBusy = resolving.has(a.id);
             return (
@@ -178,7 +184,9 @@ export function PendingApprovals() {
                     <div className="flex items-center gap-1.5 font-mono text-sm">
                       <span className="truncate text-muted-foreground">{a.server}</span>
                       <span className="text-muted-foreground/50">/</span>
-                      <span className="truncate font-medium text-foreground">{a.tool}</span>
+                      <span className="truncate font-medium text-foreground">
+                        {a.tool}
+                      </span>
                     </div>
                     {a.client && (
                       <div className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">

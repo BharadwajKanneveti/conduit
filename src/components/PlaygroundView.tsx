@@ -118,7 +118,9 @@ function ToolOverrideEditor({
         className="flex w-full items-center gap-2 px-3 py-2 text-xs text-muted-foreground"
       >
         <Pencil className="size-3.5 shrink-0" />
-        <span className="font-medium text-foreground/80">Override how clients see this tool</span>
+        <span className="font-medium text-foreground/80">
+          Override how clients see this tool
+        </span>
         {hasOverride && (
           <span className="rounded-full bg-info/15 px-1.5 py-0.5 text-[10px] font-medium text-info">
             active
@@ -132,8 +134,8 @@ function ToolOverrideEditor({
         <div className="flex flex-col gap-2.5 border-t border-border/60 px-3 py-3">
           <p className="text-xs text-muted-foreground">
             Rename the tool or replace its description as every client sees it, e.g. to
-            neutralize a misleading or injection-laden description. The call still runs the
-            original server tool.
+            neutralize a misleading or injection-laden description. The call still runs
+            the original server tool.
           </p>
           <label className="flex flex-col gap-1 text-xs">
             <span className="text-muted-foreground">
@@ -150,7 +152,9 @@ function ToolOverrideEditor({
             />
           </label>
           <label className="flex flex-col gap-1 text-xs">
-            <span className="text-muted-foreground">Description (blank keeps the server's)</span>
+            <span className="text-muted-foreground">
+              Description (blank keeps the server's)
+            </span>
             <textarea
               value={description}
               onChange={(e) => setDescription(e.target.value)}
@@ -164,7 +168,12 @@ function ToolOverrideEditor({
               Save override
             </Button>
             {hasOverride && (
-              <Button size="sm" variant="outline" onClick={() => void reset()} disabled={busy}>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => void reset()}
+                disabled={busy}
+              >
                 Reset to original
               </Button>
             )}
@@ -177,7 +186,9 @@ function ToolOverrideEditor({
 
 /** First declared type of a JSON-schema property (schemas may list several). */
 function primaryType(schema: JsonSchemaProp): string {
-  return Array.isArray(schema.type) ? schema.type[0] ?? "string" : schema.type ?? "string";
+  return Array.isArray(schema.type)
+    ? (schema.type[0] ?? "string")
+    : (schema.type ?? "string");
 }
 
 /** Turn a form field's raw value into the JSON type the schema expects. */
@@ -204,7 +215,9 @@ function renderResult(result: ToolCallResult): string {
   const blocks = result.content ?? [];
   if (blocks.length === 0) return JSON.stringify(result, null, 2);
   return blocks
-    .map((b) => (b.type === "text" && b.text != null ? b.text : JSON.stringify(b, null, 2)))
+    .map((b) =>
+      b.type === "text" && b.text != null ? b.text : JSON.stringify(b, null, 2),
+    )
     .join("\n");
 }
 
@@ -465,9 +478,7 @@ function PromptsPanel({ serverId }: { serverId: string }) {
   if (error) return <Callout variant="danger">{error}</Callout>;
   if (!prompts || prompts.length === 0) {
     return (
-      <p className="text-sm text-muted-foreground">
-        This server advertises no prompts.
-      </p>
+      <p className="text-sm text-muted-foreground">This server advertises no prompts.</p>
     );
   }
 
@@ -487,9 +498,7 @@ function PromptsPanel({ serverId }: { serverId: string }) {
                 p.name === selected ? "bg-accent" : "hover:bg-muted/40"
               }`}
             >
-              <span className="truncate font-mono text-sm">
-                {p.title ?? p.name}
-              </span>
+              <span className="truncate font-mono text-sm">{p.title ?? p.name}</span>
               {p.description && (
                 <span className="line-clamp-1 text-xs text-muted-foreground">
                   {p.description}
@@ -513,7 +522,10 @@ function PromptsPanel({ serverId }: { serverId: string }) {
             <div className="flex flex-col gap-4">
               {(prompt.arguments ?? []).map((a) => (
                 <div key={a.name} className="flex flex-col gap-1.5">
-                  <Label htmlFor={`prompt-arg-${a.name}`} className="flex items-center gap-1.5">
+                  <Label
+                    htmlFor={`prompt-arg-${a.name}`}
+                    className="flex items-center gap-1.5"
+                  >
                     <span className="font-mono text-xs">{a.name}</span>
                     {a.required && <span className="text-destructive">*</span>}
                   </Label>
@@ -603,10 +615,7 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
     [tools, selectedTool],
   );
   const props = tool?.inputSchema?.properties ?? {};
-  const required = useMemo(
-    () => new Set(tool?.inputSchema?.required ?? []),
-    [tool],
-  );
+  const required = useMemo(() => new Set(tool?.inputSchema?.required ?? []), [tool]);
 
   const serverEntry = useMemo(
     () => servers.find((s) => s.id === serverId) ?? null,
@@ -683,7 +692,9 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
     }
     const missing = [...required].filter((k) => !(k in out));
     if (missing.length > 0) {
-      return { error: `Fill in required field${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}` };
+      return {
+        error: `Fill in required field${missing.length === 1 ? "" : "s"}: ${missing.join(", ")}`,
+      };
     }
     return out;
   }
@@ -716,8 +727,8 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
         <div>
           <p className="font-medium">No servers to test</p>
           <p className="max-w-md text-sm text-muted-foreground">
-            Add a server to Toolport, then come back here to invoke its tools and
-            see the raw results, without wiring up a client first.
+            Add a server to Toolport, then come back here to invoke its tools and see the
+            raw results, without wiring up a client first.
           </p>
         </div>
       </div>
@@ -777,184 +788,184 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
       {tab === "tools" && (
         <>
           {loadingTools && (
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Loader2 className="size-4 animate-spin" /> Connecting to server…
-        </div>
-      )}
-
-      {toolsError && <Callout variant="danger">{toolsError}</Callout>}
-
-      {/* Tool list: click to test, switch to enable/disable per client */}
-      {tools && tools.length > 0 && (
-        <div className="flex flex-col gap-1.5">
-          <Label className="text-xs text-muted-foreground">
-            Tools ({tools.length})
-          </Label>
-          <div className="flex flex-col divide-y rounded-lg border">
-            {tools.map((t) => {
-              const destructive = isDestructive(t);
-              const exposed = isExposed(t);
-              const selected = t.name === selectedTool;
-              const perToolOff = disabledSet.has(t.name);
-              const pinned = pinnedSet.has(t.name);
-              return (
-                <div
-                  key={t.name}
-                  className={`flex items-center gap-3 px-3 py-2 ${selected ? "bg-accent" : ""}`}
-                >
-                  <button
-                    onClick={() => setSelectedTool(t.name)}
-                    aria-pressed={selected}
-                    className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left"
-                  >
-                    <span className="flex min-w-0 items-center gap-2">
-                      <span className="truncate font-mono text-sm">{t.name}</span>
-                      {destructive && (
-                        <Badge
-                          variant="outline"
-                          className="border-warning/40 text-warning"
-                        >
-                          destructive
-                        </Badge>
-                      )}
-                      {!exposed && (
-                        <span className="text-xs text-muted-foreground">hidden</span>
-                      )}
-                    </span>
-                    {t.description && (
-                      <span className="line-clamp-1 text-xs text-muted-foreground">
-                        {t.description}
-                      </span>
-                    )}
-                  </button>
-                  <button
-                    onClick={() => togglePin(t.name, !pinned)}
-                    disabled={policyBusy}
-                    title={
-                      pinned
-                        ? "Pinned: always surfaced in lazy-discovery search"
-                        : "Pin as a prerequisite (always surfaced in search)"
-                    }
-                    aria-label={pinned ? `Unpin ${t.name}` : `Pin ${t.name}`}
-                    aria-pressed={pinned}
-                    className="shrink-0 rounded p-1 hover:bg-muted disabled:opacity-50"
-                  >
-                    <Pin
-                      className={`size-4 ${
-                        pinned ? "fill-current text-owned" : "text-muted-foreground"
-                      }`}
-                    />
-                  </button>
-                  <Switch
-                    checked={!perToolOff}
-                    onCheckedChange={(on) => toggleTool(t.name, on)}
-                    disabled={policyBusy}
-                    aria-label={`Enable ${t.name}`}
-                  />
-                </div>
-              );
-            })}
-          </div>
-          {denyDestructive && (
-            <p className="text-xs text-muted-foreground">
-              Destructive tools are hidden from clients by the global switch even
-              when individually enabled.
-            </p>
-          )}
-        </div>
-      )}
-
-      {/* Argument form for the selected tool */}
-      {tool && (
-        <div className="flex flex-col gap-4 rounded-lg border bg-card p-4">
-          {tool.description && (
-            <p className="text-sm text-muted-foreground">{tool.description}</p>
-          )}
-          {!isExposed(tool) && (
-            <p className="flex items-center gap-1.5 text-xs text-warning">
-              <ShieldAlert className="size-3.5" />
-              Hidden from clients by policy. You can still test it here.
-            </p>
-          )}
-
-          {serverId && (
-            <ToolOverrideEditor
-              serverId={serverId}
-              tool={tool}
-              registry={registry}
-              onRegistryChange={onRegistryChange}
-            />
-          )}
-
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
-              Arguments
-            </span>
-            <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              Raw JSON
-              <Switch checked={rawMode} onCheckedChange={setRawMode} />
-            </label>
-          </div>
-
-          {rawMode ? (
-            <textarea
-              value={rawJson}
-              onChange={(e) => setRawJson(e.target.value)}
-              rows={6}
-              spellCheck={false}
-              className="w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-sm focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
-            />
-          ) : Object.keys(props).length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              This tool takes no arguments.
-            </p>
-          ) : (
-            <div className="flex flex-col gap-4">
-              {Object.entries(props).map(([name, schema]) => (
-                <ArgField
-                  key={name}
-                  name={name}
-                  schema={schema as JsonSchemaProp}
-                  required={required.has(name)}
-                  value={args[name]}
-                  onChange={(v) => setArgs((a) => ({ ...a, [name]: v }))}
-                />
-              ))}
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <Loader2 className="size-4 animate-spin" /> Connecting to server…
             </div>
           )}
 
-          <div>
-            <Button onClick={run} disabled={calling} size="sm">
-              {calling ? (
-                <Loader2 className="size-4 animate-spin" />
-              ) : (
-                <Play className="size-4" />
+          {toolsError && <Callout variant="danger">{toolsError}</Callout>}
+
+          {/* Tool list: click to test, switch to enable/disable per client */}
+          {tools && tools.length > 0 && (
+            <div className="flex flex-col gap-1.5">
+              <Label className="text-xs text-muted-foreground">
+                Tools ({tools.length})
+              </Label>
+              <div className="flex flex-col divide-y rounded-lg border">
+                {tools.map((t) => {
+                  const destructive = isDestructive(t);
+                  const exposed = isExposed(t);
+                  const selected = t.name === selectedTool;
+                  const perToolOff = disabledSet.has(t.name);
+                  const pinned = pinnedSet.has(t.name);
+                  return (
+                    <div
+                      key={t.name}
+                      className={`flex items-center gap-3 px-3 py-2 ${selected ? "bg-accent" : ""}`}
+                    >
+                      <button
+                        onClick={() => setSelectedTool(t.name)}
+                        aria-pressed={selected}
+                        className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left"
+                      >
+                        <span className="flex min-w-0 items-center gap-2">
+                          <span className="truncate font-mono text-sm">{t.name}</span>
+                          {destructive && (
+                            <Badge
+                              variant="outline"
+                              className="border-warning/40 text-warning"
+                            >
+                              destructive
+                            </Badge>
+                          )}
+                          {!exposed && (
+                            <span className="text-xs text-muted-foreground">hidden</span>
+                          )}
+                        </span>
+                        {t.description && (
+                          <span className="line-clamp-1 text-xs text-muted-foreground">
+                            {t.description}
+                          </span>
+                        )}
+                      </button>
+                      <button
+                        onClick={() => togglePin(t.name, !pinned)}
+                        disabled={policyBusy}
+                        title={
+                          pinned
+                            ? "Pinned: always surfaced in lazy-discovery search"
+                            : "Pin as a prerequisite (always surfaced in search)"
+                        }
+                        aria-label={pinned ? `Unpin ${t.name}` : `Pin ${t.name}`}
+                        aria-pressed={pinned}
+                        className="shrink-0 rounded p-1 hover:bg-muted disabled:opacity-50"
+                      >
+                        <Pin
+                          className={`size-4 ${
+                            pinned ? "fill-current text-owned" : "text-muted-foreground"
+                          }`}
+                        />
+                      </button>
+                      <Switch
+                        checked={!perToolOff}
+                        onCheckedChange={(on) => toggleTool(t.name, on)}
+                        disabled={policyBusy}
+                        aria-label={`Enable ${t.name}`}
+                      />
+                    </div>
+                  );
+                })}
+              </div>
+              {denyDestructive && (
+                <p className="text-xs text-muted-foreground">
+                  Destructive tools are hidden from clients by the global switch even when
+                  individually enabled.
+                </p>
               )}
-              {calling ? "Calling…" : "Call tool"}
-            </Button>
-          </div>
-        </div>
-      )}
+            </div>
+          )}
 
-      {/* Call error (transport / connection failure) */}
-      {callError && <Callout variant="danger">{callError}</Callout>}
+          {/* Argument form for the selected tool */}
+          {tool && (
+            <div className="flex flex-col gap-4 rounded-lg border bg-card p-4">
+              {tool.description && (
+                <p className="text-sm text-muted-foreground">{tool.description}</p>
+              )}
+              {!isExposed(tool) && (
+                <p className="flex items-center gap-1.5 text-xs text-warning">
+                  <ShieldAlert className="size-3.5" />
+                  Hidden from clients by policy. You can still test it here.
+                </p>
+              )}
 
-      {/* Result */}
-      {result && (
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center gap-2 text-sm font-medium">
-            {result.isError ? (
-              <XCircle className="size-4 text-destructive" />
-            ) : (
-              <CheckCircle2 className="size-4 text-success" />
-            )}
-            {result.isError ? "Tool returned an error" : "Result"}
-          </div>
-          <pre className="max-h-96 overflow-auto rounded-lg border bg-muted/40 p-3 font-mono text-xs whitespace-pre-wrap">
-            {renderResult(result)}
-          </pre>
-        </div>
-      )}
+              {serverId && (
+                <ToolOverrideEditor
+                  serverId={serverId}
+                  tool={tool}
+                  registry={registry}
+                  onRegistryChange={onRegistryChange}
+                />
+              )}
+
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
+                  Arguments
+                </span>
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  Raw JSON
+                  <Switch checked={rawMode} onCheckedChange={setRawMode} />
+                </label>
+              </div>
+
+              {rawMode ? (
+                <textarea
+                  value={rawJson}
+                  onChange={(e) => setRawJson(e.target.value)}
+                  rows={6}
+                  spellCheck={false}
+                  className="w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-sm focus-visible:ring-1 focus-visible:ring-ring focus-visible:outline-none"
+                />
+              ) : Object.keys(props).length === 0 ? (
+                <p className="text-sm text-muted-foreground">
+                  This tool takes no arguments.
+                </p>
+              ) : (
+                <div className="flex flex-col gap-4">
+                  {Object.entries(props).map(([name, schema]) => (
+                    <ArgField
+                      key={name}
+                      name={name}
+                      schema={schema as JsonSchemaProp}
+                      required={required.has(name)}
+                      value={args[name]}
+                      onChange={(v) => setArgs((a) => ({ ...a, [name]: v }))}
+                    />
+                  ))}
+                </div>
+              )}
+
+              <div>
+                <Button onClick={run} disabled={calling} size="sm">
+                  {calling ? (
+                    <Loader2 className="size-4 animate-spin" />
+                  ) : (
+                    <Play className="size-4" />
+                  )}
+                  {calling ? "Calling…" : "Call tool"}
+                </Button>
+              </div>
+            </div>
+          )}
+
+          {/* Call error (transport / connection failure) */}
+          {callError && <Callout variant="danger">{callError}</Callout>}
+
+          {/* Result */}
+          {result && (
+            <div className="flex flex-col gap-2">
+              <div className="flex items-center gap-2 text-sm font-medium">
+                {result.isError ? (
+                  <XCircle className="size-4 text-destructive" />
+                ) : (
+                  <CheckCircle2 className="size-4 text-success" />
+                )}
+                {result.isError ? "Tool returned an error" : "Result"}
+              </div>
+              <pre className="max-h-96 overflow-auto rounded-lg border bg-muted/40 p-3 font-mono text-xs whitespace-pre-wrap">
+                {renderResult(result)}
+              </pre>
+            </div>
+          )}
         </>
       )}
     </div>

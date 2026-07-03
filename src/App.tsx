@@ -241,9 +241,7 @@ function App() {
     const h = health[s.id];
     return h && !h.ok ? "attention" : "active";
   };
-  const attentionCount = servers.filter(
-    (s) => groupOf(s) === "attention",
-  ).length;
+  const attentionCount = servers.filter((s) => groupOf(s) === "attention").length;
 
   const q = query.trim().toLowerCase();
   const matches = (s: ServerEntry) =>
@@ -279,10 +277,8 @@ function App() {
   // (which flips gatewayInstalled) doesn't unmount the dialog. Existing users,
   // and anyone who has dismissed it, never see it.
   useEffect(() => {
-    if (onboarded || showOnboarding || resumeAtConnect || loading || !registry)
-      return;
-    const fresh =
-      servers.length === 0 && !clients.some((c) => c.gatewayInstalled);
+    if (onboarded || showOnboarding || resumeAtConnect || loading || !registry) return;
+    const fresh = servers.length === 0 && !clients.some((c) => c.gatewayInstalled);
     if (fresh) setShowOnboarding(true);
   }, [
     onboarded,
@@ -438,9 +434,7 @@ function App() {
                             : loading || !registry
                               ? "Loading…"
                               : `${enabledCount} of ${servers.length} enabled` +
-                                (connectedCount
-                                  ? ` · ${connectedCount} connected`
-                                  : "") +
+                                (connectedCount ? ` · ${connectedCount} connected` : "") +
                                 (attentionCount
                                   ? ` · ${attentionCount} need${attentionCount === 1 ? "s" : ""} attention`
                                   : "")}
@@ -475,7 +469,7 @@ function App() {
                       </Button>
                     </DropdownMenuTrigger>
 
-                   <DropdownMenuContent align="end" className="w-38">
+                    <DropdownMenuContent align="end" className="w-38">
                       <DropdownMenuItem onClick={handleImport}>
                         <Download className="mr-2 size-4" />
                         <span>Import</span>
@@ -489,7 +483,11 @@ function App() {
                           // while a search is active: it acts on ALL servers, so it must
                           // not silently toggle ones hidden by the filter.
                           disabled={togglingAll || busyId !== null || query.trim() !== ""}
-                          title={query.trim() !== "" ? "Clear the search to enable or disable all servers" : undefined}
+                          title={
+                            query.trim() !== ""
+                              ? "Clear the search to enable or disable all servers"
+                              : undefined
+                          }
                         >
                           <ServerOff className="mr-2 size-4" />
                           <span>
@@ -528,70 +526,67 @@ function App() {
                   </div>
                 }
               >
-              {view === "activity" ? (
-                <ActivityView refreshKey={activityKey} registry={registry} />
-              ) : view === "catalog" ? (
-                <CatalogView registry={registry} onAdded={setRegistry} />
-              ) : view === "playground" ? (
-                <PlaygroundView
-                  registry={registry}
-                  onRegistryChange={setRegistry}
-                />
-              ) : view === "teams" ? (
-                <TeamsView registry={registry} onRegistryChange={setRegistry} />
-              ) : view === "settings" ? (
-                <SettingsView registry={registry} onRegistryChange={setRegistry} />
-              ) : selectedClient ? (
-                <ClientDetail
-                  client={selectedClient}
-                  registry={registry}
-                  onChanged={load}
-                  onRegistryChange={setRegistry}
-                />
-              ) : loading && registry === null ? (
-                <div className="flex flex-col gap-2">
-                  {Array.from({ length: 6 }).map((_, i) => (
-                    <Skeleton key={i} className="h-11 w-full rounded-lg" />
-                  ))}
-                </div>
-              ) : error ? (
-                <ErrorState message={error} />
-              ) : servers.length === 0 ? (
-                <EmptyState
-                  importable={importable}
-                  onImport={handleImport}
-                  onBrowseCatalog={() => selectView("catalog")}
-                />
-              ) : visible.length === 0 ? (
-                <div className="py-16 text-center text-sm text-muted-foreground">
-                  No servers match "{query}".
-                </div>
-              ) : (
-                <div className="flex flex-col gap-5">
-                  <ServerGroup
-                    title="Needs attention"
-                    dot="bg-warning"
-                    count={grouped.attention.length}
-                  >
-                    {grouped.attention.map(serverRow)}
-                  </ServerGroup>
-                  <ServerGroup
-                    title="Active"
-                    dot="bg-success"
-                    count={grouped.active.length}
-                  >
-                    {grouped.active.map(serverRow)}
-                  </ServerGroup>
-                  <ServerGroup
-                    title="Disabled"
-                    dot="bg-muted-foreground/40"
-                    count={grouped.disabled.length}
-                    defaultCollapsed
-                  >
-                    {grouped.disabled.map(serverRow)}
-                  </ServerGroup>
-                </div>
-              )}
+                {view === "activity" ? (
+                  <ActivityView refreshKey={activityKey} registry={registry} />
+                ) : view === "catalog" ? (
+                  <CatalogView registry={registry} onAdded={setRegistry} />
+                ) : view === "playground" ? (
+                  <PlaygroundView registry={registry} onRegistryChange={setRegistry} />
+                ) : view === "teams" ? (
+                  <TeamsView registry={registry} onRegistryChange={setRegistry} />
+                ) : view === "settings" ? (
+                  <SettingsView registry={registry} onRegistryChange={setRegistry} />
+                ) : selectedClient ? (
+                  <ClientDetail
+                    client={selectedClient}
+                    registry={registry}
+                    onChanged={load}
+                    onRegistryChange={setRegistry}
+                  />
+                ) : loading && registry === null ? (
+                  <div className="flex flex-col gap-2">
+                    {Array.from({ length: 6 }).map((_, i) => (
+                      <Skeleton key={i} className="h-11 w-full rounded-lg" />
+                    ))}
+                  </div>
+                ) : error ? (
+                  <ErrorState message={error} />
+                ) : servers.length === 0 ? (
+                  <EmptyState
+                    importable={importable}
+                    onImport={handleImport}
+                    onBrowseCatalog={() => selectView("catalog")}
+                  />
+                ) : visible.length === 0 ? (
+                  <div className="py-16 text-center text-sm text-muted-foreground">
+                    No servers match "{query}".
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-5">
+                    <ServerGroup
+                      title="Needs attention"
+                      dot="bg-warning"
+                      count={grouped.attention.length}
+                    >
+                      {grouped.attention.map(serverRow)}
+                    </ServerGroup>
+                    <ServerGroup
+                      title="Active"
+                      dot="bg-success"
+                      count={grouped.active.length}
+                    >
+                      {grouped.active.map(serverRow)}
+                    </ServerGroup>
+                    <ServerGroup
+                      title="Disabled"
+                      dot="bg-muted-foreground/40"
+                      count={grouped.disabled.length}
+                      defaultCollapsed
+                    >
+                      {grouped.disabled.map(serverRow)}
+                    </ServerGroup>
+                  </div>
+                )}
               </Suspense>
             </div>
           </ScrollArea>
@@ -599,21 +594,21 @@ function App() {
       </div>
       {showOnboarding && registry && (
         <Suspense fallback={null}>
-        <Onboarding
-          key={onboardingStep}
-          initialStep={onboardingStep}
-          clients={clients}
-          registry={registry}
-          onRegistryChange={setRegistry}
-          onClientsRefresh={load}
-          onBrowseCatalog={() => {
-            setShowOnboarding(false);
-            setResumeAtConnect(true);
-            selectView("catalog");
-          }}
-          onProbe={reprobe}
-          onFinish={finishOnboarding}
-        />
+          <Onboarding
+            key={onboardingStep}
+            initialStep={onboardingStep}
+            clients={clients}
+            registry={registry}
+            onRegistryChange={setRegistry}
+            onClientsRefresh={load}
+            onBrowseCatalog={() => {
+              setShowOnboarding(false);
+              setResumeAtConnect(true);
+              selectView("catalog");
+            }}
+            onProbe={reprobe}
+            onFinish={finishOnboarding}
+          />
         </Suspense>
       )}
       <PendingApprovals />
@@ -724,19 +719,14 @@ function ErrorState({ message }: { message: string }) {
           {import.meta.env.DEV ? (
             <>
               Make sure you're running the desktop app with{" "}
-              <code className="font-mono">npm run tauri dev</code>, not the
-              browser-only dev server.
+              <code className="font-mono">npm run tauri dev</code>, not the browser-only
+              dev server.
             </>
           ) : (
-            <>
-              Toolport's backend didn't start. Try quitting and reopening the
-              app.
-            </>
+            <>Toolport's backend didn't start. Try quitting and reopening the app.</>
           )}
         </p>
-        <p className="mt-2 font-mono text-xs text-muted-foreground/70">
-          {message}
-        </p>
+        <p className="mt-2 font-mono text-xs text-muted-foreground/70">{message}</p>
       </div>
     </div>
   );
