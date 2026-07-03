@@ -83,6 +83,15 @@ warning, it's usually the standard Tauri pattern of loading data from the Rust
 backend in a `useEffect` — review it for unnecessary re-renders, but it won't
 block the build.
 
+### Git hooks (pre-commit)
+
+When you run `npm install`, Husky installs a pre-commit hook that automatically
+formats staged files with Prettier and auto-fixes lint errors with ESLint. This
+catches formatting and lint issues before they reach CI.
+
+If you need to bypass hooks for a specific commit (e.g., a work-in-progress
+snapshot), use `git commit --no-verify` — but CI will still enforce all checks.
+
 ### Debugging
 
 **Gateway verbose logging:** the gateway writes an always-on log (connection
