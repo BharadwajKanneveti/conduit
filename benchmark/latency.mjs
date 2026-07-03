@@ -25,7 +25,10 @@ const GATEWAY = exe("conduit-gateway");
 const MOCK = exe("mock-mcp-server");
 const N = Math.max(20, Number(process.argv[2] || 200));
 
-for (const [label, p] of [["gateway", GATEWAY], ["mock server", MOCK]]) {
+for (const [label, p] of [
+  ["gateway", GATEWAY],
+  ["mock server", MOCK],
+]) {
   if (!existsSync(p)) {
     console.error(
       `Missing ${label} at ${p}\nBuild it first:\n  cargo build --manifest-path src-tauri/Cargo.toml --bins`,
@@ -71,7 +74,9 @@ function client(proc) {
       new Promise((res) => {
         const myId = ++id;
         pending.set(myId, res);
-        proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: myId, method, params }) + "\n");
+        proc.stdin.write(
+          JSON.stringify({ jsonrpc: "2.0", id: myId, method, params }) + "\n",
+        );
       }),
     notify: (method, params) =>
       proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n"),
@@ -103,7 +108,14 @@ async function main() {
     JSON.stringify({
       version: 1,
       servers: [
-        { id: "mock", name: "Mock", transport: "stdio", command: MOCK, args: [], env: [] },
+        {
+          id: "mock",
+          name: "Mock",
+          transport: "stdio",
+          command: MOCK,
+          args: [],
+          env: [],
+        },
       ],
       profiles: [{ id: "bench", name: "Bench", enabledServerIds: ["mock"] }],
       activeProfileId: "bench",
@@ -128,7 +140,12 @@ async function main() {
 
   // 2) Through the gateway.
   const gw = spawn(GATEWAY, [], {
-    env: { ...process.env, CONDUIT_REGISTRY: regPath, CONDUIT_PROFILE: "bench", CONDUIT_DISCOVERY: "lazy" },
+    env: {
+      ...process.env,
+      CONDUIT_REGISTRY: regPath,
+      CONDUIT_PROFILE: "bench",
+      CONDUIT_DISCOVERY: "lazy",
+    },
     stdio: ["pipe", "pipe", "ignore"],
   });
   const g = client(gw);
@@ -139,11 +156,19 @@ async function main() {
   for (let k = 0; k < 15; k++) await g.call("tools/list", {}); // warm up
   const list = await loop(() => g.call("tools/list", {}), N);
   const search = await loop(
-    () => g.call("tools/call", { name: "toolport_search_tools", arguments: { query: "a", limit: 25 } }),
+    () =>
+      g.call("tools/call", {
+        name: "toolport_search_tools",
+        arguments: { query: "a", limit: 25 },
+      }),
     N,
   );
   const gwCall = await loop(
-    () => g.call("tools/call", { name: "toolport_call_tool", arguments: { name: `mock__${bare}`, arguments: {} } }),
+    () =>
+      g.call("tools/call", {
+        name: "toolport_call_tool",
+        arguments: { name: `mock__${bare}`, arguments: {} },
+      }),
     N,
   );
 
@@ -156,7 +181,9 @@ async function main() {
   const row = (label, x) =>
     `  ${label.padEnd(28)}${x.median.toFixed(2).padStart(6)} ms   (p95 ${x.p95.toFixed(2)})`;
   console.log(`\nToolport gateway latency  (mock downstream, ${N} iterations, median)\n`);
-  console.log(`  ${"handshake (one-time)".padEnd(28)}${handshake.toFixed(2).padStart(6)} ms`);
+  console.log(
+    `  ${"handshake (one-time)".padEnd(28)}${handshake.toFixed(2).padStart(6)} ms`,
+  );
   console.log(row("tools/list (lazy, 3 tools)", list));
   console.log(row("toolport_search_tools", search));
   console.log(row("toolport_call_tool -> mock", gwCall));
@@ -168,7 +195,9 @@ async function main() {
   console.log(
     `     Real servers take tens to hundreds of ms each, so that overhead is noise,`,
   );
-  console.log(`     and it buys ~90% fewer tokens. See BENCHMARK.md for the token numbers.\n`);
+  console.log(
+    `     and it buys ~90% fewer tokens. See BENCHMARK.md for the token numbers.\n`,
+  );
 }
 
 main().catch((e) => {

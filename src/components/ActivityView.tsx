@@ -195,9 +195,9 @@ function SecurityResting() {
     <div className="mb-4 flex items-center gap-2 rounded-lg border border-border/60 bg-muted/30 px-4 py-2.5 text-xs text-muted-foreground">
       <ShieldCheck className="size-4 shrink-0 text-owned" />
       <span>
-        <span className="font-medium text-foreground">Protection active.</span>{" "}
-        Toolport watches every tool for tampering (rug pulls), poisoned definitions,
-        and injected output (agentjacking). No issues right now.
+        <span className="font-medium text-foreground">Protection active.</span> Toolport
+        watches every tool for tampering (rug pulls), poisoned definitions, and injected
+        output (agentjacking). No issues right now.
       </span>
     </div>
   );
@@ -224,9 +224,7 @@ function SecurityNotices({
         className="flex w-full items-center gap-2 text-left"
       >
         <ShieldAlert className="size-4 shrink-0 text-warning" />
-        <h3 className="text-sm font-medium text-warning">
-          Tool security notices
-        </h3>
+        <h3 className="text-sm font-medium text-warning">Tool security notices</h3>
         <span className="rounded-full bg-warning/15 px-1.5 py-0.5 text-xs font-medium text-warning">
           {events.length}
         </span>
@@ -240,19 +238,17 @@ function SecurityNotices({
         <>
           <p className="mt-2 mb-3 max-w-2xl text-xs text-muted-foreground">
             A tool changed after you approved it, a tool's definition contains
-            instruction-like content, or a tool returned data that looks like
-            injected instructions. Usually benign, but it's how rug pulls, tool
-            poisoning, and agentjacking work, so Toolport flags it (and labels
-            suspicious tool output as data). Dismiss the ones you've reviewed.
+            instruction-like content, or a tool returned data that looks like injected
+            instructions. Usually benign, but it's how rug pulls, tool poisoning, and
+            agentjacking work, so Toolport flags it (and labels suspicious tool output as
+            data). Dismiss the ones you've reviewed.
           </p>
           <ul className="space-y-1.5 text-xs">
             {events.slice(0, 10).map((e) => {
               const badge = eventBadge(e);
               return (
                 <li key={renderKey(e)} className="flex items-center gap-2">
-                  <span
-                    className={`rounded px-1.5 py-0.5 font-medium ${badge.cls}`}
-                  >
+                  <span className={`rounded px-1.5 py-0.5 font-medium ${badge.cls}`}>
                     {badge.label}
                   </span>
                   <code className="font-mono text-foreground">{e.tool}</code>
@@ -400,9 +396,7 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
       <div className="mt-2 flex flex-wrap items-end gap-x-6 gap-y-1">
         <span className="text-3xl font-semibold tabular-nums text-success">
           ≈ {fmtTokens(savings.tokensSaved)}{" "}
-          <span className="text-base font-normal text-muted-foreground">
-            tokens
-          </span>
+          <span className="text-base font-normal text-muted-foreground">tokens</span>
         </span>
         <span className="text-xl font-semibold tabular-nums text-muted-foreground">
           ≈ {fmtDollars(dollars)}
@@ -440,8 +434,8 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
         </button>
       </div>
       <p className="mt-2.5 text-xs text-muted-foreground">
-        {details.join(" · ")}. Estimated, counted once per tool-list load. Clients
-        with built-in tool search (Claude, VS Code) benefit less.
+        {details.join(" · ")}. Estimated, counted once per tool-list load. Clients with
+        built-in tool search (Claude, VS Code) benefit less.
       </p>
     </div>
   );
@@ -533,9 +527,7 @@ function CallRow({ e }: { e: AuditEntry }) {
           hasDetail ? "cursor-pointer hover:bg-muted/30" : ""
         }`}
         onClick={() => hasDetail && setOpen((o) => !o)}
-        {...(hasDetail
-          ? { role: "button", "aria-expanded": open, tabIndex: 0 }
-          : {})}
+        {...(hasDetail ? { role: "button", "aria-expanded": open, tabIndex: 0 } : {})}
       >
         {hasDetail ? (
           <ChevronRight
@@ -590,18 +582,12 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
     <div className="mb-6 flex flex-col gap-3">
       <div className="grid grid-cols-3 gap-3">
         <div className="rounded-lg border p-3">
-          <div className="text-2xl font-semibold tabular-nums">
-            {stats.total}
-          </div>
+          <div className="text-2xl font-semibold tabular-nums">{stats.total}</div>
           <div className="text-xs text-muted-foreground">calls logged</div>
         </div>
         <div className="rounded-lg border p-3">
-          <div className="text-2xl font-semibold tabular-nums">
-            {stats.errors}
-          </div>
-          <div className="text-xs text-muted-foreground">
-            errors ({errPct}%)
-          </div>
+          <div className="text-2xl font-semibold tabular-nums">{stats.errors}</div>
+          <div className="text-xs text-muted-foreground">errors ({errPct}%)</div>
         </div>
         <div className="rounded-lg border p-3">
           <div className="text-2xl font-semibold tabular-nums">
@@ -754,7 +740,9 @@ function DiscoveryRow({ t }: { t: SearchTrace }) {
                 <span
                   key={n}
                   className={`rounded px-1.5 py-0.5 font-mono text-[11px] ${
-                    n === t.top ? "bg-owned/15 text-owned" : "bg-muted text-muted-foreground"
+                    n === t.top
+                      ? "bg-owned/15 text-owned"
+                      : "bg-muted text-muted-foreground"
                   }`}
                 >
                   {n}
@@ -766,10 +754,14 @@ function DiscoveryRow({ t }: { t: SearchTrace }) {
           )}
           <div className="text-muted-foreground">
             Put{" "}
-            <span className="font-medium text-foreground">≈{fmtTokens(t.returnedTokens)}</span>{" "}
+            <span className="font-medium text-foreground">
+              ≈{fmtTokens(t.returnedTokens)}
+            </span>{" "}
             tokens of tool schemas into context, vs{" "}
-            <span className="font-medium text-foreground">≈{fmtTokens(t.flatTokens)}</span> to load
-            the whole catalog
+            <span className="font-medium text-foreground">
+              ≈{fmtTokens(t.flatTokens)}
+            </span>{" "}
+            to load the whole catalog
             {t.flatTokens > 0 ? <> ({pct}% less this turn).</> : "."}
           </div>
         </div>
@@ -934,9 +926,9 @@ function ToolIdentities({ refreshKey }: { refreshKey: number }) {
         <>
           <p className="mt-2 mb-3 max-w-2xl text-xs text-muted-foreground">
             What each model-visible tool name actually maps to: its source server and
-            profiles, the pinned definition fingerprint drift detection checks against, and
-            when it was first seen or last changed. Prefixing helps the model pick a tool;
-            this helps you verify what crossed the boundary.
+            profiles, the pinned definition fingerprint drift detection checks against,
+            and when it was first seen or last changed. Prefixing helps the model pick a
+            tool; this helps you verify what crossed the boundary.
           </p>
           <div className="flex flex-col gap-1">
             {rows.map((t) => (
@@ -987,10 +979,10 @@ function LiveInspector({ refreshKey }: { refreshKey: number }) {
       {open && (
         <>
           <p className="mt-2 mb-3 max-w-2xl text-xs text-muted-foreground">
-            Ephemeral, local, opt-in. While live inspection is on, Toolport keeps the
-            last 50 tool calls' arguments and results here so you can inspect them.
-            This buffer is separate from the audit log, never leaves your machine, and
-            clears when you turn inspection off or restart the gateway.
+            Ephemeral, local, opt-in. While live inspection is on, Toolport keeps the last
+            50 tool calls' arguments and results here so you can inspect them. This buffer
+            is separate from the audit log, never leaves your machine, and clears when you
+            turn inspection off or restart the gateway.
           </p>
           {entries.length === 0 ? (
             <p className="py-6 text-center text-sm text-muted-foreground">
@@ -1057,7 +1049,9 @@ export function ActivityView({
     };
   }, [refreshKey]);
 
-  const liveSecurity = dedupeSecurity(security).filter((e) => !dismissed.has(securityKey(e)));
+  const liveSecurity = dedupeSecurity(security).filter(
+    (e) => !dismissed.has(securityKey(e)),
+  );
   // Split loud/actionable signal from benign churn so vendor revisions don't bury a real
   // poison or privilege-escalation flag (the failure this whole surface exists to avoid).
   const highSecurity = liveSecurity.filter((e) => eventSeverity(e) === "high");
@@ -1088,9 +1082,7 @@ export function ActivityView({
       <DiscoveryTraces refreshKey={refreshKey} />
       <ToolIdentities refreshKey={refreshKey} />
       {registry?.liveInspect ? <LiveInspector refreshKey={refreshKey} /> : null}
-      {savings && savings.tokensSaved > 0 ? (
-        <SavingsBanner savings={savings} />
-      ) : null}
+      {savings && savings.tokensSaved > 0 ? <SavingsBanner savings={savings} /> : null}
     </>
   );
 
@@ -1100,8 +1092,7 @@ export function ActivityView({
   );
 
   const visible = (entries ?? []).filter(
-    (e) =>
-      (!serverFilter || e.server === serverFilter) && (!errorsOnly || !e.ok),
+    (e) => (!serverFilter || e.server === serverFilter) && (!errorsOnly || !e.ok),
   );
 
   if (entries === null) {
@@ -1124,9 +1115,8 @@ export function ActivityView({
           <div>
             <p className="font-medium">Couldn't load activity</p>
             <p className="max-w-md text-sm text-muted-foreground">
-              Toolport couldn't reach the gateway or read the audit log. This is
-              not an empty log, if the gateway isn't running, start it and
-              refresh.
+              Toolport couldn't reach the gateway or read the audit log. This is not an
+              empty log, if the gateway isn't running, start it and refresh.
             </p>
           </div>
         </div>
@@ -1143,8 +1133,8 @@ export function ActivityView({
           <div>
             <p className="font-medium">No tool calls yet</p>
             <p className="max-w-md text-sm text-muted-foreground">
-              Once a client runs a tool through Toolport, every call is recorded
-              here, with per-server latency and error rates.
+              Once a client runs a tool through Toolport, every call is recorded here,
+              with per-server latency and error rates.
             </p>
           </div>
         </div>

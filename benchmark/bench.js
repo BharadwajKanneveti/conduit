@@ -44,7 +44,11 @@ const TOOL_RESULT_CAP = 8000; // trim huge tool outputs so one result can't skew
 const TASKS = [
   { name: "stripe-products", prompt: "List my Stripe products (just the names)." },
   { name: "neon-projects", prompt: "List my Neon projects (just the names)." },
-  { name: "vercel-projects", prompt: "List my Vercel projects. If a team id is required, find it first, then use it." },
+  {
+    name: "vercel-projects",
+    prompt:
+      "List my Vercel projects. If a team id is required, find it first, then use it.",
+  },
 ];
 
 function defaultGateway() {
@@ -73,16 +77,25 @@ class Gateway {
     this.id = 0;
     this.rl.on("line", (line) => {
       let msg;
-      try { msg = JSON.parse(line); } catch { return; }
+      try {
+        msg = JSON.parse(line);
+      } catch {
+        return;
+      }
       const cb = msg.id != null && this.pending.get(msg.id);
-      if (cb) { this.pending.delete(msg.id); cb(msg); }
+      if (cb) {
+        this.pending.delete(msg.id);
+        cb(msg);
+      }
     });
   }
   rpc(method, params) {
     const id = ++this.id;
     return new Promise((resolve) => {
       this.pending.set(id, resolve);
-      this.proc.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n");
+      this.proc.stdin.write(
+        JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n",
+      );
     });
   }
   async init() {
@@ -102,14 +115,19 @@ class Gateway {
     const r = await this.rpc("tools/call", { name, arguments: args || {} });
     return r.result ?? r.error ?? {};
   }
-  stop() { try { this.proc.kill(); } catch {} }
+  stop() {
+    try {
+      this.proc.kill();
+    } catch {}
+  }
 }
 
 // OpenAI function-calling (and strict runtimes like LM Studio) require `parameters`
 // to be an object schema WITH a `properties` field, even for zero-arg tools. MCP
 // tools legitimately ship a bare {"type":"object"}, so normalize before sending.
 function normalizeParams(schema) {
-  const s = schema && typeof schema === "object" && !Array.isArray(schema) ? { ...schema } : {};
+  const s =
+    schema && typeof schema === "object" && !Array.isArray(schema) ? { ...schema } : {};
   if (!s.type) s.type = "object";
   if (s.type === "object" && (s.properties == null || typeof s.properties !== "object")) {
     s.properties = {};
@@ -146,7 +164,13 @@ async function chat(messages, tools) {
   const res = await fetch(LLM_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model: MODEL, messages, tools, tool_choice: "auto", temperature: 0 }),
+    body: JSON.stringify({
+      model: MODEL,
+      messages,
+      tools,
+      tool_choice: "auto",
+      temperature: 0,
+    }),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => "");
@@ -157,10 +181,18 @@ async function chat(messages, tools) {
 
 async function runTask(gw, oaiTools, prompt) {
   const messages = [
-    { role: "system", content: "You are a helpful assistant. Use the available tools to complete the task, then give a short final answer." },
+    {
+      role: "system",
+      content:
+        "You are a helpful assistant. Use the available tools to complete the task, then give a short final answer.",
+    },
     { role: "user", content: prompt },
   ];
-  let tokens = 0, calls = 0, steps = 0, done = false, error = null;
+  let tokens = 0,
+    calls = 0,
+    steps = 0,
+    done = false,
+    error = null;
   try {
     for (; steps < MAX_STEPS; steps++) {
       const res = await chat(messages, oaiTools);
@@ -169,11 +201,16 @@ async function runTask(gw, oaiTools, prompt) {
       if (!m) break;
       messages.push(m);
       const toolCalls = m.tool_calls || [];
-      if (toolCalls.length === 0) { done = true; break; } // produced a final answer
+      if (toolCalls.length === 0) {
+        done = true;
+        break;
+      } // produced a final answer
       for (const c of toolCalls) {
         calls++;
         let args = {};
-        try { args = JSON.parse(c.function.arguments || "{}"); } catch {}
+        try {
+          args = JSON.parse(c.function.arguments || "{}");
+        } catch {}
         const result = await gw.call(c.function.name, args);
         messages.push({
           role: "tool",
@@ -185,7 +222,8 @@ async function runTask(gw, oaiTools, prompt) {
   } catch (e) {
     error = e.message; // e.g. flat mode overflowing the model's context window
   }
-  const answer = messages.filter((m) => m.role === "assistant" && m.content).pop()?.content || "";
+  const answer =
+    messages.filter((m) => m.role === "assistant" && m.content).pop()?.content || "";
   return { tokens, calls, steps, done, error, answer: answer.slice(0, 200) };
 }
 
@@ -199,9 +237,10 @@ async function benchMode(discovery) {
   const mcpTools = await gw.tools();
   const oaiTools = toOpenAITools(mcpTools);
   const overhead = await measureToolOverhead(oaiTools);
-  const ov = overhead.tokens != null
-    ? `${overhead.tokens} tok/request${overhead.overflow ? " (OVERFLOWS context)" : ""}`
-    : "unknown";
+  const ov =
+    overhead.tokens != null
+      ? `${overhead.tokens} tok/request${overhead.overflow ? " (OVERFLOWS context)" : ""}`
+      : "unknown";
   console.log(`\n[${discovery}] ${mcpTools.length} tools, tool-def overhead: ${ov}`);
   const rows = [];
   for (const task of TASKS) {
@@ -211,10 +250,18 @@ async function benchMode(discovery) {
     const median = toks[Math.floor((toks.length - 1) / 2)];
     const done = trials.filter((t) => t.done).length;
     const err = trials.find((t) => t.error)?.error;
-    rows.push({ task: task.name, tokens: median, lo: toks[0], hi: toks[toks.length - 1], done });
+    rows.push({
+      task: task.name,
+      tokens: median,
+      lo: toks[0],
+      hi: toks[toks.length - 1],
+      done,
+    });
     const range = RUNS > 1 ? ` (${toks[0]}-${toks[toks.length - 1]})` : "";
     const status = err ? `ERROR (${String(err).slice(0, 60)})` : `${done}/${RUNS} done`;
-    console.log(`  ${task.name.padEnd(16)} median ${String(median).padStart(6)} tok${range}  ${status}`);
+    console.log(
+      `  ${task.name.padEnd(16)} median ${String(median).padStart(6)} tok${range}  ${status}`,
+    );
   }
   gw.stop();
   return { toolCount: mcpTools.length, overhead, rows };
@@ -223,7 +270,7 @@ async function benchMode(discovery) {
 function totals(modeRows) {
   return modeRows.reduce(
     (a, r) => ({ tokens: a.tokens + (r.tokens || 0), done: a.done + (r.done || 0) }),
-    { tokens: 0, done: 0 }
+    { tokens: 0, done: 0 },
   );
 }
 
@@ -249,27 +296,44 @@ function totals(modeRows) {
   const flat = await benchMode("full");
   const lazy = await benchMode("lazy");
 
-  const tf = totals(flat.rows), tl = totals(lazy.rows);
-  const fmtOv = (o) => o.tokens != null
-    ? `${o.tokens}${o.overflow ? " (overflows context)" : ""}`
-    : "unknown";
-  const ovPct = flat.overhead.tokens && lazy.overhead.tokens
-    ? Math.round((1 - lazy.overhead.tokens / flat.overhead.tokens) * 100)
-    : null;
+  const tf = totals(flat.rows),
+    tl = totals(lazy.rows);
+  const fmtOv = (o) =>
+    o.tokens != null
+      ? `${o.tokens}${o.overflow ? " (overflows context)" : ""}`
+      : "unknown";
+  const ovPct =
+    flat.overhead.tokens && lazy.overhead.tokens
+      ? Math.round((1 - lazy.overhead.tokens / flat.overhead.tokens) * 100)
+      : null;
 
   console.log("\n=== summary ===");
   console.log(`tools exposed:        flat ${flat.toolCount}   lazy ${lazy.toolCount}`);
-  console.log(`tool-def overhead:    flat ${fmtOv(flat.overhead)}   lazy ${fmtOv(lazy.overhead)} tok/request` +
-    (ovPct != null ? `   (${ovPct}% less, EVERY request)` : ""));
+  console.log(
+    `tool-def overhead:    flat ${fmtOv(flat.overhead)}   lazy ${fmtOv(lazy.overhead)} tok/request` +
+      (ovPct != null ? `   (${ovPct}% less, EVERY request)` : ""),
+  );
   const denom = TASKS.length * RUNS;
-  console.log(`tasks completed:      flat ${tf.done}/${denom}   lazy ${tl.done}/${denom}   (${RUNS} run(s)/task)`);
+  console.log(
+    `tasks completed:      flat ${tf.done}/${denom}   lazy ${tl.done}/${denom}   (${RUNS} run(s)/task)`,
+  );
   if (tf.done > 0) {
     const pct = tf.tokens ? Math.round((1 - tl.tokens / tf.tokens) * 100) : 0;
-    console.log(`median tokens (sum):  flat ${tf.tokens}   lazy ${tl.tokens}   (${pct >= 0 ? "-" : "+"}${Math.abs(pct)}%)`);
+    console.log(
+      `median tokens (sum):  flat ${tf.tokens}   lazy ${tl.tokens}   (${pct >= 0 ? "-" : "+"}${Math.abs(pct)}%)`,
+    );
   } else {
-    console.log(`lazy median tokens:   ${tl.tokens} summed across tasks (flat couldn't run, its tool list overflowed the model)`);
+    console.log(
+      `lazy median tokens:   ${tl.tokens} summed across tasks (flat couldn't run, its tool list overflowed the model)`,
+    );
   }
-  console.log("\nThe headline metric is tool-def overhead: the tokens EVERY request pays just to");
-  console.log("list tools. Flat pays it on every call; lazy advertises 3 meta-tools. Set RUNS=5");
-  console.log("for medians; eyeball the answers for correctness; treat the direction as signal.");
+  console.log(
+    "\nThe headline metric is tool-def overhead: the tokens EVERY request pays just to",
+  );
+  console.log(
+    "list tools. Flat pays it on every call; lazy advertises 3 meta-tools. Set RUNS=5",
+  );
+  console.log(
+    "for medians; eyeball the answers for correctness; treat the direction as signal.",
+  );
 })();

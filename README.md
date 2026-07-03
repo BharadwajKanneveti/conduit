@@ -40,10 +40,10 @@ catalog (see [BENCHMARK.md](BENCHMARK.md)). That holds whether you run one AI to
 or five, on cloud models (where tokens are your bill) or local ones (where tool defs
 eat your context window).
 
-| | | |
-|:---:|:---:|:---:|
-| ![Lazy discovery surfaces only the tools a task needs](docs/feature-lazy.png) | ![One gateway, every AI client](docs/feature-clients.png) | ![Flags rug-pulls and poisoned tools before a client can call them](docs/feature-security.png) |
-| **Fewer tokens** - lazy discovery keeps context flat no matter how many servers you connect | **One config, every client** - set up a server once, every AI tool shares it | **Supply-chain security** - rug-pull and tool-poisoning detection on the path |
+|                                                                                             |                                                                              |                                                                                                |
+| :-----------------------------------------------------------------------------------------: | :--------------------------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
+|        ![Lazy discovery surfaces only the tools a task needs](docs/feature-lazy.png)        |          ![One gateway, every AI client](docs/feature-clients.png)           | ![Flags rug-pulls and poisoned tools before a client can call them](docs/feature-security.png) |
+| **Fewer tokens** - lazy discovery keeps context flat no matter how many servers you connect | **One config, every client** - set up a server once, every AI tool shares it |         **Supply-chain security** - rug-pull and tool-poisoning detection on the path          |
 
 <!-- TODO(toolport): add product screenshots + a demo video, re-captured from the rebranded (Toolport) build, after the release is cut. -->
 
@@ -93,7 +93,7 @@ fixes both.
   quietly adds one (a "rug pull"), or if a description or schema carries injection-like
   content ("tool poisoning"). Detection only, on by default, entirely local
   ([details](docs/specs/mcp-integrity.md)).
-- **Content defense (anti-agentjacking).** When a tool *returns* untrusted content (a
+- **Content defense (anti-agentjacking).** When a tool _returns_ untrusted content (a
   Sentry error, a web page, an issue body) with injection-like instructions, Toolport
   flags it and marks it as external data, not instructions, the separation that blunts
   indirect prompt injection. Never blocks, on by default
@@ -146,28 +146,28 @@ Toolport auto-detects these **20 AI clients**, installs the gateway into each wi
 click, and can import a client's existing servers. It writes the config file shown
 below for you, so you never have to edit these by hand.
 
-| Client | Config file | Format |
-| --- | --- | --- |
-| Claude Desktop | `<config>/Claude/claude_desktop_config.json` | JSON (`mcpServers`) |
-| Claude Code | `~/.claude.json` | JSON (`mcpServers`) |
-| Cursor | `~/.cursor/mcp.json` | JSON (`mcpServers`) |
-| VS Code | `<config>/Code/User/mcp.json` | JSON (`servers`) |
-| Windsurf | `~/.codeium/windsurf/mcp_config.json` | JSON (`mcpServers`) |
-| Codex | `~/.codex/config.toml` | TOML (`mcp_servers`) |
-| Continue | `~/.continue/config.yaml` | YAML (`mcpServers`) |
-| Antigravity | `~/.gemini/config/mcp_config.json` | JSON (`mcpServers`) |
-| Gemini CLI | `~/.gemini/settings.json` | JSON (`mcpServers`) |
-| Cline | `<config>/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` | JSON (`mcpServers`) |
-| Roo Code | `<config>/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json` | JSON (`mcpServers`) |
-| Warp | `~/.warp/.mcp.json` | JSON (`mcpServers`) |
-| Amazon Q | `~/.aws/amazonq/mcp.json` | JSON (`mcpServers`) |
-| Kiro | `~/.kiro/settings/mcp.json` | JSON (`mcpServers`) |
-| Zed | `~/.config/zed/settings.json` | JSON (`context_servers`) |
-| LM Studio | `~/.lmstudio/mcp.json` | JSON (`mcpServers`) |
-| Jan | `<data>/Jan/data/mcp_config.json` | JSON (`mcpServers`) |
-| BoltAI | `~/.boltai/mcp.json` | JSON (`mcpServers`) |
-| Goose | `~/.config/goose/config.yaml` | YAML (`extensions`) |
-| Hermes | `~/.hermes/config.yaml` | YAML (`mcp_servers`) |
+| Client         | Config file                                                                                | Format                   |
+| -------------- | ------------------------------------------------------------------------------------------ | ------------------------ |
+| Claude Desktop | `<config>/Claude/claude_desktop_config.json`                                               | JSON (`mcpServers`)      |
+| Claude Code    | `~/.claude.json`                                                                           | JSON (`mcpServers`)      |
+| Cursor         | `~/.cursor/mcp.json`                                                                       | JSON (`mcpServers`)      |
+| VS Code        | `<config>/Code/User/mcp.json`                                                              | JSON (`servers`)         |
+| Windsurf       | `~/.codeium/windsurf/mcp_config.json`                                                      | JSON (`mcpServers`)      |
+| Codex          | `~/.codex/config.toml`                                                                     | TOML (`mcp_servers`)     |
+| Continue       | `~/.continue/config.yaml`                                                                  | YAML (`mcpServers`)      |
+| Antigravity    | `~/.gemini/config/mcp_config.json`                                                         | JSON (`mcpServers`)      |
+| Gemini CLI     | `~/.gemini/settings.json`                                                                  | JSON (`mcpServers`)      |
+| Cline          | `<config>/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json` | JSON (`mcpServers`)      |
+| Roo Code       | `<config>/Code/User/globalStorage/rooveterinaryinc.roo-cline/settings/mcp_settings.json`   | JSON (`mcpServers`)      |
+| Warp           | `~/.warp/.mcp.json`                                                                        | JSON (`mcpServers`)      |
+| Amazon Q       | `~/.aws/amazonq/mcp.json`                                                                  | JSON (`mcpServers`)      |
+| Kiro           | `~/.kiro/settings/mcp.json`                                                                | JSON (`mcpServers`)      |
+| Zed            | `~/.config/zed/settings.json`                                                              | JSON (`context_servers`) |
+| LM Studio      | `~/.lmstudio/mcp.json`                                                                     | JSON (`mcpServers`)      |
+| Jan            | `<data>/Jan/data/mcp_config.json`                                                          | JSON (`mcpServers`)      |
+| BoltAI         | `~/.boltai/mcp.json`                                                                       | JSON (`mcpServers`)      |
+| Goose          | `~/.config/goose/config.yaml`                                                              | YAML (`extensions`)      |
+| Hermes         | `~/.hermes/config.yaml`                                                                    | YAML (`mcp_servers`)     |
 
 `<config>` is your OS application-config dir (`%APPDATA%` on Windows, `~/Library/Application Support` on macOS, `~/.config` on Linux); `<data>` is the data dir (`~/.local/share` on Linux, the same as `<config>` elsewhere). Zed and Goose paths vary slightly by OS; Toolport resolves the right one automatically.
 
@@ -338,7 +338,7 @@ latency/error stats, resources + prompts proxying, and a tool playground. See
 
 - **Linux only, glib `VariantStrIter` soundness ([RUSTSEC-2024-0429](https://rustsec.org/advisories/RUSTSEC-2024-0429)).**
   Tauri's Linux webview stack pulls in `glib` 0.18 transitively (`wry → webkit2gtk →
-  gtk 0.18 → glib 0.18`). The fix only exists in `glib` 0.20+, and the gtk-0.18
+gtk 0.18 → glib 0.18`). The fix only exists in `glib` 0.20+, and the gtk-0.18
   binding line, which is what Tauri 2 uses on Linux, hard-pins `glib = "^0.18"`, so
   the patched release cannot be selected without moving the whole webview stack. The
   bug is a soundness/null-deref crash (not remote code execution), is confined to the

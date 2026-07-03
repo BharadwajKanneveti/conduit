@@ -24,10 +24,10 @@ On macOS/Linux, see the platform notes in the [README troubleshooting](README.md
 
 ### What hot-reloads vs what needs a rebuild
 
-| You changed | What happens |
-|-------------|-------------|
-| React/TS frontend (`src/`) | Vite hot-reloads instantly — no restart needed |
-| Rust backend (`src-tauri/src/`) | `npm run tauri dev` recompiles and restarts the app automatically |
+| You changed                                             | What happens                                                                                                                                |
+| ------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| React/TS frontend (`src/`)                              | Vite hot-reloads instantly — no restart needed                                                                                              |
+| Rust backend (`src-tauri/src/`)                         | `npm run tauri dev` recompiles and restarts the app automatically                                                                           |
 | Gateway binary (`src-tauri/src/bin/conduit-gateway.rs`) | **Not rebuilt by `tauri dev`.** Run `npm run build:gateway` after changes, then restart any connected clients so they re-spawn the gateway. |
 
 The gateway is a separate binary that AI clients spawn as a subprocess. Packaged
@@ -45,6 +45,9 @@ If a client reports the gateway "was not found," you forgot this step.
 # Backend (Rust)
 cargo test --manifest-path src-tauri/Cargo.toml
 
+# Frontend unit tests (Vitest)
+npm run test
+
 # Frontend type-check + build
 npx tsc --noEmit && npm run build
 ```
@@ -52,7 +55,42 @@ npx tsc --noEmit && npm run build
 The Rust suite includes unit tests in each module (`clients`, `catalog`,
 `registry`, `router`, `oauth`, etc.) and an integration test
 (`tests/list_changed.rs`) that exercises the gateway's live tool-change
-notification path.
+notification path. Frontend tests use [Vitest](https://vitest.dev) and live
+alongside the code as `*.test.ts` files inside `src/`.
+
+### Formatting
+
+Prettier enforces consistent formatting across the frontend and docs. The CI
+checks this on every PR, but you can fix issues locally before pushing:
+
+```bash
+npm run format        # format all files in place
+npm run format:check  # check only (fails without writing — same as CI)
+```
+
+### Linting
+
+ESLint catches code-quality issues and React anti-patterns. The CI runs it on
+every PR:
+
+```bash
+npm run lint        # check
+npm run lint:fix    # auto-fix what it can
+```
+
+Warnings are non-blocking. If you see a `react-hooks/set-state-in-effect`
+warning, it's usually the standard Tauri pattern of loading data from the Rust
+backend in a `useEffect` — review it for unnecessary re-renders, but it won't
+block the build.
+
+### Git hooks (pre-commit)
+
+When you run `npm install`, Husky installs a pre-commit hook that automatically
+formats staged files with Prettier and auto-fixes lint errors with ESLint. This
+catches formatting and lint issues before they reach CI.
+
+If you need to bypass hooks for a specific commit (e.g., a work-in-progress
+snapshot), use `git commit --no-verify` — but CI will still enforce all checks.
 
 ### Debugging
 
@@ -104,7 +142,7 @@ For end-user troubleshooting (OAuth, AppImage, VS Code), see the
 ## Before you open a PR
 
 Run the [tests described above](#running-tests). Please match the surrounding
-style: the code favors small, well-commented functions that explain the *why*.
+style: the code favors small, well-commented functions that explain the _why_.
 Keep comments at the density of the file you're editing.
 
 ## Good places to start
@@ -182,15 +220,15 @@ is in `src-tauri/src/clients.rs`.
 
 Check the client's config file and match it to a `Format` variant:
 
-| Format | Config shape | Existing clients |
-|--------|-------------|-----------------|
-| `JsonMcpServers` | `{"mcpServers": {...}}` | Claude Desktop, Cursor, Windsurf |
-| `JsonServers` | `{"servers": {...}}` | VS Code |
-| `JsonContextServers` | `{"context_servers": {...}}` (JSONC) | Zed |
-| `TomlMcpServers` | `[mcp_servers.name]` | Codex |
-| `YamlExtensions` | `extensions:` map (Goose shape: `cmd`/`envs`) | Goose |
-| `YamlMcpServers` | `mcp_servers:` map (Hermes shape: `command`/`env`) | Hermes |
-| `YamlMcpServersList` | `mcpServers:` list | Continue |
+| Format               | Config shape                                       | Existing clients                 |
+| -------------------- | -------------------------------------------------- | -------------------------------- |
+| `JsonMcpServers`     | `{"mcpServers": {...}}`                            | Claude Desktop, Cursor, Windsurf |
+| `JsonServers`        | `{"servers": {...}}`                               | VS Code                          |
+| `JsonContextServers` | `{"context_servers": {...}}` (JSONC)               | Zed                              |
+| `TomlMcpServers`     | `[mcp_servers.name]`                               | Codex                            |
+| `YamlExtensions`     | `extensions:` map (Goose shape: `cmd`/`envs`)      | Goose                            |
+| `YamlMcpServers`     | `mcp_servers:` map (Hermes shape: `command`/`env`) | Hermes                           |
+| `YamlMcpServersList` | `mcpServers:` list                                 | Continue                         |
 
 If the client uses a genuinely new format, add a variant to `enum Format` and a
 parse function (follow the pattern of `parse_json` or `parse_toml`).
@@ -233,6 +271,7 @@ Follow the existing conventions — at minimum:
 
 - A registration test confirming the client appears in `defs()` with the right
   format:
+
   ```rust
   #[test]
   fn my_client_is_registered() {

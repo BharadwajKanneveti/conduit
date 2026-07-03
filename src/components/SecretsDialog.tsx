@@ -367,16 +367,16 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                       </Button>
                       {!oauthBusy && /mac/i.test(navigator.userAgent) && (
                         <p className="text-[11px] text-muted-foreground">
-                          On macOS, set Chrome or Brave as your default browser
-                          first. Safari can block the local sign-in redirect.
+                          On macOS, set Chrome or Brave as your default browser first.
+                          Safari can block the local sign-in redirect.
                         </p>
                       )}
                       {oauthBusy && (
                         <p className="text-[11px] text-muted-foreground">
-                          Finish signing in and approve access in your browser. If
-                          the page is blank, your default browser (e.g. Safari) may
-                          block the local redirect, use Chrome or Brave, or paste an
-                          access token above instead.
+                          Finish signing in and approve access in your browser. If the
+                          page is blank, your default browser (e.g. Safari) may block the
+                          local redirect, use Chrome or Brave, or paste an access token
+                          above instead.
                         </p>
                       )}
                     </>
@@ -384,7 +384,8 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
 
                   {authInfo?.kind === "token" && (
                     <p className="text-[11px] text-muted-foreground">
-                      This server needs a pasted token. OAuth sign-in isn't available here.
+                      This server needs a pasted token. OAuth sign-in isn't available
+                      here.
                     </p>
                   )}
                 </>

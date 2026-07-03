@@ -1,12 +1,5 @@
 import { useState } from "react";
-import {
-  ChevronDown,
-  Copy,
-  KeyRound,
-  LogIn,
-  Pencil,
-  Trash2,
-} from "lucide-react";
+import { ChevronDown, Copy, KeyRound, LogIn, Pencil, Trash2 } from "lucide-react";
 import type { ProbeResult, Registry, ServerEntry } from "@/lib/types";
 import { Switch } from "@/components/ui/switch";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -95,9 +88,7 @@ export function RegistryServerRow({
           : "Disabled";
 
   // Next free "Name (N)" for the duplicate-for-another-account action.
-  const existingNames = new Set(
-    registry?.servers.map((s) => s.name.toLowerCase()) ?? [],
-  );
+  const existingNames = new Set(registry?.servers.map((s) => s.name.toLowerCase()) ?? []);
   const baseName = server.name.replace(/\s\(\d+\)$/, "");
   let duplicateName = `${baseName} (2)`;
   let index = 2;
@@ -134,9 +125,7 @@ export function RegistryServerRow({
           role="status"
         />
 
-        <span className="min-w-0 truncate text-sm font-medium">
-          {server.name}
-        </span>
+        <span className="min-w-0 truncate text-sm font-medium">{server.name}</span>
 
         {server.source && (
           <span className="hidden max-w-40 shrink-0 truncate rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground md:inline">
@@ -161,11 +150,7 @@ export function RegistryServerRow({
               }
             />
           ) : (
-            <StatusLabel
-              status={status}
-              label={label}
-              error={health?.error ?? null}
-            />
+            <StatusLabel status={status} label={label} error={health?.error ?? null} />
           )}
 
           <TransportPill transport={server.transport} />
@@ -178,16 +163,12 @@ export function RegistryServerRow({
             }}
             aria-expanded={expanded}
             aria-label={
-              expanded
-                ? `Hide ${server.name} details`
-                : `Show ${server.name} details`
+              expanded ? `Hide ${server.name} details` : `Show ${server.name} details`
             }
             className="rounded p-0.5 text-muted-foreground/50 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
           >
             <ChevronDown
-              className={`size-4 transition-transform ${
-                expanded ? "rotate-180" : ""
-              }`}
+              className={`size-4 transition-transform ${expanded ? "rotate-180" : ""}`}
               aria-hidden="true"
             />
           </button>
@@ -276,10 +257,7 @@ function StatusLabel({
   error: string | null;
 }) {
   const text = (
-    <span
-      aria-hidden="true"
-      className="text-xs whitespace-nowrap text-muted-foreground"
-    >
+    <span aria-hidden="true" className="text-xs whitespace-nowrap text-muted-foreground">
       {label}
     </span>
   );

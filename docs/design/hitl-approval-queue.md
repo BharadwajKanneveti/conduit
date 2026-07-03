@@ -4,10 +4,10 @@ Status: P1 IMPLEMENTED in PR #82 (2026-07-02, rev 2 architecture). Remaining bef
 
 ## Goal
 
-Let a human approve or deny sensitive tool calls *out-of-band* before they execute,
+Let a human approve or deny sensitive tool calls _out-of-band_ before they execute,
 holding the call until a decision (or a fail-closed timeout). Distinct from the existing
-**agent-facing** `toolport_confirm`, where the *model* re-confirms its own destructive
-call. HITL puts a *person* in the loop through the Toolport app. This is a genuine
+**agent-facing** `toolport_confirm`, where the _model_ re-confirms its own destructive
+call. HITL puts a _person_ in the loop through the Toolport app. This is a genuine
 security differentiator (the "approval queue" gap vs. Lunar MCPX / IBM ContextForge), so
 it is worth building to a high bar rather than the minimal one.
 
@@ -44,6 +44,7 @@ readable only by processes that can already read `~/.conduit/`, the same trust b
 secrets).
 
 Flow for a gated call:
+
 1. Gateway (`process_request`) reads the endpoint+token, **connects to the app**, and sends
    `{ client, server, tool, args, provenance, ts }` authenticated by the token.
 2. The app shows it in a **Pending Approvals** queue (ActivityView) plus a prominent OS
@@ -54,7 +55,7 @@ Flow for a gated call:
 
 **Why this is the best-in-class choice, it wins on every axis the two alternatives lose:**
 
-- **Coverage:** every gateway process dials *out* to the one app broker, so stdio clients
+- **Coverage:** every gateway process dials _out_ to the one app broker, so stdio clients
   are covered, not just the app's own `--http` gateway.
 - **No args on disk:** arguments travel over the socket and stay in memory. The disk only
   ever holds the endpoint descriptor (no payloads). This is the decisive privacy win.
@@ -79,7 +80,7 @@ Flow for a gated call:
 1. **Blocking, not async.** Hold the agent's call until a decision; the agent just sees a
    slower tool and gets the real result or a denial. Async (return-pending-then-replay)
    leaks approval mechanics into the agent and creates a "looks failed" window. A parked
-   call blocking that client's *other* calls is acceptable and arguably desirable (don't let
+   call blocking that client's _other_ calls is acceptable and arguably desirable (don't let
    the agent race ahead of a pending sensitive action); other clients are separate processes
    and unaffected.
 2. **Scope: layered, security-first default.** v1 gates (a) `destructiveHint` tools AND

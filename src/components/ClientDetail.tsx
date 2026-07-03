@@ -1,5 +1,15 @@
 import { useEffect, useState } from "react";
-import { ArrowRight, Check, Download, Link2, Plug, PlugZap, Puzzle, Shuffle, TriangleAlert } from "lucide-react";
+import {
+  ArrowRight,
+  Check,
+  Download,
+  Link2,
+  Plug,
+  PlugZap,
+  Puzzle,
+  Shuffle,
+  TriangleAlert,
+} from "lucide-react";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import { addServer, installGateway, migrateClient, uninstallGateway } from "@/lib/api";
@@ -36,12 +46,7 @@ interface Props {
   onRegistryChange: (registry: Registry) => void;
 }
 
-export function ClientDetail({
-  client,
-  registry,
-  onChanged,
-  onRegistryChange,
-}: Props) {
+export function ClientDetail({ client, registry, onChanged, onRegistryChange }: Props) {
   const [busy, setBusy] = useState(false);
   // "" = expose all enabled servers (follow active profile); else scope to one.
   const [profile, setProfile] = useState("");
@@ -90,9 +95,7 @@ export function ClientDetail({
   }
   // Servers configured directly in the client (not the gateway) that migrate
   // would move into Toolport and strip from the client's config.
-  const movable = client.servers.filter(
-    (s) => s.name.toLowerCase() !== "conduit",
-  );
+  const movable = client.servers.filter((s) => s.name.toLowerCase() !== "conduit");
 
   async function migrate() {
     setBusy(true);
@@ -240,14 +243,17 @@ export function ClientDetail({
           )}
           {!present && !installed && (
             <p className="mt-1 text-xs text-warning">
-              {client.name} doesn't appear to be installed here. Install it first,
-              then connect.
+              {client.name} doesn't appear to be installed here. Install it first, then
+              connect.
             </p>
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {profiles.length > 1 && (
-            <Select value={profile || "__all__"} onValueChange={(v) => setProfile(v === "__all__" ? "" : v)}>
+            <Select
+              value={profile || "__all__"}
+              onValueChange={(v) => setProfile(v === "__all__" ? "" : v)}
+            >
               <SelectTrigger size="sm" className="w-52">
                 <SelectValue />
               </SelectTrigger>
@@ -296,8 +302,8 @@ export function ClientDetail({
       </div>
 
       <p className="text-sm text-muted-foreground">
-        Connect points {client.name} at Toolport so it uses your managed servers.
-        Import copies this client's own servers into Toolport so it can manage them.
+        Connect points {client.name} at Toolport so it uses your managed servers. Import
+        copies this client's own servers into Toolport so it can manage them.
       </p>
 
       {client.usesConnectors && (
@@ -308,9 +314,9 @@ export function ClientDetail({
               <p className="font-medium">{client.name} manages servers as connectors</p>
               <p className="mt-1 text-muted-foreground">
                 Those live in {client.name}'s Customize → Connectors and sync to your
-                account, outside the local config files Toolport reads. Connecting Toolport
-                adds a local gateway entry so your Toolport-managed servers appear in{" "}
-                {client.name} too.
+                account, outside the local config files Toolport reads. Connecting
+                Toolport adds a local gateway entry so your Toolport-managed servers
+                appear in {client.name} too.
               </p>
             </div>
           </CardContent>
@@ -351,29 +357,29 @@ export function ClientDetail({
           </div>
         </div>
         <p className="mb-1 text-xs text-muted-foreground">
-          The servers {client.name} already has, from its config and any plugins
-          (tagged below).
+          The servers {client.name} already has, from its config and any plugins (tagged
+          below).
         </p>
         <ul className="mb-3 space-y-0.5 text-xs text-muted-foreground">
           <li>
-            <span className="font-medium text-foreground">Import</span> copies a
-            server into Toolport; {client.name} keeps its own copy.
+            <span className="font-medium text-foreground">Import</span> copies a server
+            into Toolport; {client.name} keeps its own copy.
           </li>
           <li>
-            <span className="font-medium text-foreground">Move config in</span>{" "}
-            copies it, then removes it from {client.name}'s config so the gateway is
-            the only source (plugin servers stay, only {client.name} can remove
-            those). This is the cutover that actually saves context.
+            <span className="font-medium text-foreground">Move config in</span> copies it,
+            then removes it from {client.name}'s config so the gateway is the only source
+            (plugin servers stay, only {client.name} can remove those). This is the
+            cutover that actually saves context.
           </li>
         </ul>
         {installed && toImport.length > 0 && movable.length > 0 && (
           <p className="mb-3 -mt-1 inline-flex items-start gap-1.5 rounded-md bg-warning/10 px-2 py-1 text-xs text-warning">
             <TriangleAlert className="mt-0.5 size-3.5 shrink-0" />
             <span>
-              {client.name} is already connected to Toolport. Import on its own
-              leaves a copy here too, so these tools load twice, once directly and
-              once through the gateway. Use <span className="font-medium">Move
-              config in</span> to avoid that.
+              {client.name} is already connected to Toolport. Import on its own leaves a
+              copy here too, so these tools load twice, once directly and once through the
+              gateway. Use <span className="font-medium">Move config in</span> to avoid
+              that.
             </span>
           </p>
         )}
@@ -422,13 +428,16 @@ export function ClientDetail({
                 {movable.length} server{movable.length === 1 ? "" : "s"}
               </span>{" "}
               from {client.name} into Toolport, then rewrites {client.name}'s config so it
-              uses <span className="font-medium text-foreground">only the Toolport gateway</span>.
-              The original config is backed up first.
+              uses{" "}
+              <span className="font-medium text-foreground">
+                only the Toolport gateway
+              </span>
+              . The original config is backed up first.
             </p>
             <p className="rounded-md bg-warning/10 p-2 text-xs text-warning">
-              Secret values (API keys, tokens) aren't carried over, they stay only
-              in the backed-up config. After migrating, re-enter them under each
-              server's secrets so the gateway can connect.
+              Secret values (API keys, tokens) aren't carried over, they stay only in the
+              backed-up config. After migrating, re-enter them under each server's secrets
+              so the gateway can connect.
             </p>
             <div className="rounded-md bg-muted/40 p-2 font-mono text-xs text-muted-foreground">
               {movable.map((s) => s.name).join(", ")}
@@ -436,15 +445,16 @@ export function ClientDetail({
             {client.pluginServers.length > 0 && (
               <p className="text-xs text-muted-foreground">
                 Note: {client.pluginServers.length} server
-                {client.pluginServers.length === 1 ? "" : "s"} managed by{" "}
-                {client.name}'s plugins or extensions can't be moved, only{" "}
-                {client.name} controls those. They stay where they are (you can
-                still import a copy above).
+                {client.pluginServers.length === 1 ? "" : "s"} managed by {client.name}'s
+                plugins or extensions can't be moved, only {client.name} controls those.
+                They stay where they are (you can still import a copy above).
               </p>
             )}
             {profiles.length > 1 && (
               <div className="flex items-center justify-between gap-2">
-                <span className="text-xs text-muted-foreground">Scope this client to</span>
+                <span className="text-xs text-muted-foreground">
+                  Scope this client to
+                </span>
                 <Select
                   value={profile || "__all__"}
                   onValueChange={(v) => setProfile(v === "__all__" ? "" : v)}
@@ -465,7 +475,11 @@ export function ClientDetail({
             )}
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setMigrateOpen(false)} disabled={busy}>
+            <Button
+              variant="outline"
+              onClick={() => setMigrateOpen(false)}
+              disabled={busy}
+            >
               Cancel
             </Button>
             <Button onClick={migrate} disabled={busy}>
@@ -493,10 +507,7 @@ function ServerMiniCard({
   onImport: () => void;
 }) {
   return (
-    <Card
-      aria-disabled={imported}
-      className={`gap-0 ${imported ? "opacity-70" : ""}`}
-    >
+    <Card aria-disabled={imported} className={`gap-0 ${imported ? "opacity-70" : ""}`}>
       <CardContent className="flex flex-col gap-2 p-3">
         <div className="flex items-center justify-between gap-2">
           <div className="flex min-w-0 items-center gap-1.5">

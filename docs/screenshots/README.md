@@ -2,10 +2,10 @@
 
 Drop PNGs here with these exact names; the main README references them.
 
-| File | Capture |
-|---|---|
-| `servers.png` | The "All servers" view, with a few servers and their status dots. |
-| `activity.png` | The Activity view showing the per-server latency / error-rate panel. |
+| File             | Capture                                                                                                            |
+| ---------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `servers.png`    | The "All servers" view, with a few servers and their status dots.                                                  |
+| `activity.png`   | The Activity view showing the per-server latency / error-rate panel.                                               |
 | `playground.png` | The Playground: the lazy-discovery + destructive-tool switches and a tool's argument form (ideally with a result). |
 
 How to capture on Windows: `Win` + `Shift` + `S`, drag over the app window,

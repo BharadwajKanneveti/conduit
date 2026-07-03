@@ -1,5 +1,19 @@
 import { useEffect, useState } from "react";
-import { Activity, Bot, Check, Copy, Globe, Layers, Power, ShieldAlert, ShieldCheck, ShieldX, Trash2, UserCheck, X } from "lucide-react";
+import {
+  Activity,
+  Bot,
+  Check,
+  Copy,
+  Globe,
+  Layers,
+  Power,
+  ShieldAlert,
+  ShieldCheck,
+  ShieldX,
+  Trash2,
+  UserCheck,
+  X,
+} from "lucide-react";
 import {
   disable as disableAutostart,
   enable as enableAutostart,
@@ -117,7 +131,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   }, []);
 
   useEffect(() => {
-    const load = () => listQuarantined().then(setQuarantined).catch(() => {});
+    const load = () =>
+      listQuarantined()
+        .then(setQuarantined)
+        .catch(() => {});
     load();
     // Quarantine happens asynchronously in the gateway, so poll to keep the list fresh.
     const id = setInterval(load, 15000);
@@ -136,7 +153,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   // Tools the user allowed to skip human approval. Polled because "always allow" is chosen
   // from the approval overlay (a different component), so this keeps the list in sync.
   useEffect(() => {
-    const load = () => listAllowedTools().then(setAllowedTools).catch(() => {});
+    const load = () =>
+      listAllowedTools()
+        .then(setAllowedTools)
+        .catch(() => {});
     load();
     const id = setInterval(load, 10000);
     return () => clearInterval(id);
@@ -172,17 +192,16 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     );
   };
 
-  const apply =
-    (fn: (v: boolean) => Promise<Registry>) => async (v: boolean) => {
-      setBusy(true);
-      try {
-        onRegistryChange(await fn(v));
-      } catch (e) {
-        toastError(`Couldn't update the setting: ${e}`);
-      } finally {
-        setBusy(false);
-      }
-    };
+  const apply = (fn: (v: boolean) => Promise<Registry>) => async (v: boolean) => {
+    setBusy(true);
+    try {
+      onRegistryChange(await fn(v));
+    } catch (e) {
+      toastError(`Couldn't update the setting: ${e}`);
+    } finally {
+      setBusy(false);
+    }
+  };
 
   // Live inspection needs a step the plain `apply` helper doesn't: when turned OFF,
   // clear the ephemeral capture ring so nothing lingers on disk.
@@ -379,7 +398,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           {bridge?.running && bridge.url && (
             <>
               <div className="flex items-center gap-2 rounded border bg-muted/40 px-2 py-1.5">
-                <span className="shrink-0 text-[11px] font-medium text-muted-foreground">URL</span>
+                <span className="shrink-0 text-[11px] font-medium text-muted-foreground">
+                  URL
+                </span>
                 <code className="min-w-0 flex-1 truncate text-xs">{bridge.url}</code>
                 <button
                   type="button"
@@ -415,9 +436,10 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                 </div>
               )}
               <p className="text-xs text-muted-foreground">
-                In Open WebUI: Settings &rarr; Tools &rarr; add the URL as an OpenAPI server and paste
-                the token as its API key (Bearer auth), then set Function Calling to Native (per chat).
-                The token stops other local apps from calling your tools.
+                In Open WebUI: Settings &rarr; Tools &rarr; add the URL as an OpenAPI
+                server and paste the token as its API key (Bearer auth), then set Function
+                Calling to Native (per chat). The token stops other local apps from
+                calling your tools.
               </p>
 
               <div className="mt-1 flex flex-col gap-2 rounded border bg-muted/20 p-2.5">
@@ -434,7 +456,9 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                   <ul className="flex flex-col gap-1">
                     {httpClients.map((c) => (
                       <li key={c.id} className="flex items-center gap-2 text-xs">
-                        <span className="truncate font-medium">{c.label || "(unnamed)"}</span>
+                        <span className="truncate font-medium">
+                          {c.label || "(unnamed)"}
+                        </span>
                         <span className="shrink-0 rounded bg-muted px-1.5 py-0.5 text-[11px] text-muted-foreground">
                           {c.profile || "all servers"}
                         </span>

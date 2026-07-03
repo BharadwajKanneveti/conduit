@@ -25,7 +25,7 @@ from the [Releases](https://github.com/tsouth89/toolport/releases) page.
 - **Local-first.** Toolport runs entirely on your machine. The desktop app is a
   manager; the gateway is a local process each AI client spawns over stdio. There
   is **no Toolport server, account, or telemetry**, nothing phones home. The only
-  network traffic is between the gateway and the upstream MCP servers *you*
+  network traffic is between the gateway and the upstream MCP servers _you_
   configure.
 - **Secrets in the OS keychain.** API keys and OAuth tokens are stored in the
   platform keychain (macOS Keychain, Windows Credential Manager, Linux Secret

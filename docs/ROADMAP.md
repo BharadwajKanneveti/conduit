@@ -57,11 +57,13 @@ fix is reload-under-lock at every app mutation or a gateway→app cache-refresh 
 low real exposure since the gateway only writes when `allow_agent_control` is on).
 
 **In flight**
+
 - ~~Teams **org screening policy** (Phase 1): tighten-only `forceContentDefense` /
   `forceQuarantineOnDrift`.~~ **Shipped**, and extended with `forceHumanApproval`
   (org-mandated HITL). Plan in `docs/drafts/parry-teams-plan.md`.
 
 **Tier 1 - security + cheap parity (do first)**
+
 - [x] **Stdio spawn hardening.** Refuse code-smuggling / container-escape args
       (interpreter inline-eval + module-preload, docker `--privileged` / host-mount /
       `--cap-add` / host-namespace) before spawning a stdio server, so a
@@ -69,13 +71,14 @@ low real exposure since the gateway only writes when `allow_agent_control` is on
       launcher into arbitrary code execution. `screen_spawn_command` in
       `downstream.rs`, on every spawn path. (S)
 - [~] **Identity attribution in the audit line.** The client label is now threaded
-      through dispatch and stamped into `audit.rs`/`inspect.rs` records (#95). Remaining:
-      a per-caller filter in the Activity view. (S)
+  through dispatch and stamped into `audit.rs`/`inspect.rs` records (#95). Remaining:
+  a per-caller filter in the Activity view. (S)
 - [x] **Tool overrides (rename / re-describe) SHIPPED (#88, #89):** a user can rename or
       replace a tool's description as clients see it (neutralizing a poisoned description
       in place). Param-pin/override defaults is the remaining piece.
 
 **Tier 2 - parity on real gaps**
+
 - [ ] Tool Groups (cross-server reusable collections) + allow/block ACL with an
       explicit `default-allow`/`default-block` posture per client, generalizing
       profiles. (M)
@@ -85,6 +88,7 @@ low real exposure since the gateway only writes when `allow_agent_control` is on
       ships) so remote/network clients connect natively. (M)
 
 **Strategic**
+
 - [x] **Human-in-the-loop approval queue. SHIPPED** (v1.1.0 + follow-ups): the gateway
       holds a gated call and the app prompts to approve/deny, fail-closed on timeout;
       plus tray/menu-bar run, OS notification, approve-for-session/always-allow, exact
@@ -102,6 +106,7 @@ HTTP/security surface). Ordered by impact within each track. (S/M/L = effort.)
 The 2026-07-01 block above supersedes the ordering; these remain the detailed backlog.
 
 ### Security (most shipped in v0.7.0; residuals)
+
 - [x] HTTP bridge **bearer token** (required, OPTIONS preflight exempt), fail-closed
       on non-loopback bind, 4 MB body cap, sanitized reflected headers, `catch_unwind`
       per request. Closed the credential-CSRF (a browser tab can reach `localhost`).
@@ -113,6 +118,7 @@ The 2026-07-01 block above supersedes the ordering; these remain the detailed ba
       longer blocks other callers. (A per-request read timeout for slowloris is still open.)
 
 ### New-user UX (first 10 minutes; scaffolding is strong, these are the sharp edges)
+
 - [ ] **Backend failures render as innocent empty states.** Gateway down ->
       Activity shows "No tool calls yet", not "can't reach backend, retry".
       Distinguish error from empty (CatalogView already does). Top UX fix. (M)
@@ -126,6 +132,7 @@ The 2026-07-01 block above supersedes the ordering; these remain the detailed ba
       `vendorFromKey` fallback for unknown keys. (S each)
 
 ### Robustness / tech debt
+
 - [ ] **Tool-cache versioning.** The gateway serves the on-disk cache verbatim with
       no version tag, so catalog-logic changes don't take effect until a server
       toggles or the cache is deleted. Wrap in `{version, tools}`, discard on
@@ -137,6 +144,7 @@ The 2026-07-01 block above supersedes the ordering; these remain the detailed ba
       `semantic.rs` (blend math, embed cache). (M)
 
 ### Strategic / differentiators (what makes it amazing)
+
 - [ ] **OAuth client registration + per-client server scoping.** A client
       authenticates to Toolport, shows up in the app, you assign which servers it
       sees. Profiles already do half. This is Sigiz's explicit ask AND the proper
@@ -158,6 +166,7 @@ The 2026-07-01 block above supersedes the ordering; these remain the detailed ba
       publish pending) as the funnel + a demo of lazy discovery + result-shaping.
 
 **Community-requested (2026-07-03, r/LocalLLaMA launch thread):**
+
 - [x] **Lazy-discovery search trace / observability.** Shipped (#114) as the Activity
       **Discovery** panel: every `toolport_search_tools` call records the query, the
       matched tool names, which won (top), and the ground-truth per-turn token overhead
@@ -215,16 +224,16 @@ flips every weakness:
   machine. All servers moved to connectors.
 - Connectors + OAuth tokens live in `%APPDATA%\Claude\config.json` as
   **DPAPI-encrypted** blobs (Chromium safeStorage, `v10` prefix). Not readable.
-- Connector *names* (Clerk, GitHub, Pax8, revenuecat, Supabase, Vercel, Stripe,
+- Connector _names_ (Clerk, GitHub, Pax8, revenuecat, Supabase, Vercel, Stripe,
   expo) DO appear in plaintext in the Chromium LevelDB/IndexedDB stores for the
   `claude.ai` origin.
 - BUT those stores are **locked while Claude is running**, the schema is
   undocumented Chromium IndexedDB, and the real source of truth is the user's
   Anthropic account (server-side sync), not a local file.
 
-**Verdict:** local read-only *inventory* of connector names is possible but
+**Verdict:** local read-only _inventory_ of connector names is possible but
 fragile and operationally awkward (locked DBs, undocumented schema, account-side
-truth). It is NOT a foundation to build *management* on. This confirms the
+truth). It is NOT a foundation to build _management_ on. This confirms the
 gateway architecture: Toolport cannot manage Claude's connectors directly, so it
 becomes one connector that fans out to everything it manages. A best-effort,
 read-only "connectors detected (view-only)" panel is worth showing for the
@@ -243,6 +252,7 @@ mutate their live client setup unattended).
 ## Build order
 
 Phase 0 - Foundation
+
 - [x] Tauri + React + Rust scaffold, 0 vulns
 - [x] Client adapter readers (import/discovery): detect clients, parse JSON/TOML
 - [x] Toolport registry: own source-of-truth store (servers, profiles, enabled)
@@ -252,6 +262,7 @@ Phase 0 - Foundation
 - [x] OS keychain module for secrets
 
 Phase 1 - The gateway
+
 - [x] MCP stdio server (initialize, tools/list, tools/call)
 - [x] Downstream MCP client: spawn/connect real servers, multiplex tools (namespaced)
 - [x] Live reconfig + `tools/list_changed` on toggle (registry file watcher)
@@ -262,6 +273,7 @@ Phase 1 - The gateway
 - [x] Tool-name sanitizing (clients drop hyphenated names) + cache-poisoning guard
 
 Phase 1.5 - Remote auth
+
 - [x] Token auth: vault a bearer token per http server, injected by gateway
 - [x] OAuth 2.1 flow: discovery + DCR + PKCE + loopback + exchange
 - [x] OAuth token refresh on 401/expiry
@@ -269,6 +281,7 @@ Phase 1.5 - Remote auth
       vendor hints, live propagation to connected clients
 
 Phase 2 - Client integration
+
 - [x] "Install Toolport into client X" (surgical, backs up, preserves others)
 - [x] Uninstall (surgical remove)
 - [x] Client detail reframed as connect + import sources
@@ -281,6 +294,7 @@ Phase 2 - Client integration
       the packaged `-<triple>` name). Shipping in signed releases.
 
 Phase 3 - Scaling & UX
+
 - [x] Lazy discovery: `CONDUIT_DISCOVERY=lazy` exposes 3 meta-tools (search/call)
 - [x] Per-agent scoping: `CONDUIT_PROFILE` + per-client profile picker, per-profile cache
 - [x] Catalog: curated popular set + live official MCP Registry search, type-ahead
@@ -289,6 +303,7 @@ Phase 3 - Scaling & UX
 ## Next (tiered)
 
 Tier 2 - feature completeness (in progress)
+
 - [x] Per-tool enable/disable + destructive-tool deny-list (UI toggles; gateway
       hides+blocks; global destructiveHint switch)
 - [x] Tool playground: invoke any tool from the app and see the result
@@ -306,7 +321,7 @@ Tier 2 - feature completeness (in progress)
       into the lexical ranker so paraphrased needs surface the right tool. Pluggable
       `/v1/embeddings` endpoint, disk-cached, lexical fallback. Recall measured by
       `benchmark/retrieval.mjs`. See `docs/specs/semantic-search.md`.
-- [x] Content defense (agentjacking): scan untrusted tool *results* for injection and
+- [x] Content defense (agentjacking): scan untrusted tool _results_ for injection and
       wrap flagged content with a "data, not instructions" provenance marker before the
       agent sees it. Detection + labeling, never blocks, on by default. See
       `docs/specs/content-defense.md`.
@@ -314,6 +329,7 @@ Tier 2 - feature completeness (in progress)
       taxonomy; opt-in lossy result shaping / dangerous-call gating (content-defense Tier 2).
 
 Tier 3 - launch prep
+
 - [x] Bundle the gateway sidecar; signed/notarized macOS installers (Win/Linux
       unsigned with documented bypass); cargo-audit in CI.
 - [x] Verify macOS / Linux (signed mac dmgs arm64 + Intel, Linux deb/AppImage;
@@ -327,13 +343,14 @@ Tier 3 - launch prep
 - [x] Launch: Product Hunt, MCP registries (Glama/mcp.so/awesome-mcp listed)
 
 Tier 4 - teams / enterprise (paid)
+
 - [ ] Hosted/remote gateway, shared/synced config, RBAC/SSO
 - [ ] Policy engine (allow/deny tools, approval gates), audit export
 - [ ] Secret-vault integrations (1Password, Vault, cloud secret managers)
 
 ## Security invariants (do not regress)
 
-- Backend never sends secret *values* to the UI; env var names only.
+- Backend never sends secret _values_ to the UI; env var names only.
 - Secrets live in the OS keychain, never in Toolport's registry file or any
   client config.
 - Snapshot every client config before modifying it; modifications are reversible.

@@ -48,6 +48,7 @@ APP=/path/to/Toolport.app ./scripts/macos-sign-local.sh
 ```
 
 The script:
+
 - moves the gateway into `Toolport.app/Contents/Helpers/ConduitGateway.app`,
 - embeds the gateway provisioning profile there,
 - leaves a symlink at the old bare path for backward compat,

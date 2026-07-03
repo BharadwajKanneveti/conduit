@@ -11,12 +11,12 @@ self-signed certificate does not help end users.
 
 ## Options
 
-| Option | Cost | Notes |
-|---|---|---|
-| **Azure Trusted Signing** | ~$10/month | Cheapest real option. Cloud-based, no cert file to manage. Requires an Azure account and identity verification; orgs need 3+ years of history (individuals are eligible). Chains to a Microsoft-operated trusted root and shows your validated publisher name. It is **standard, not EV**, signing, so SmartScreen reputation still accrues with downloads and an early install may still warn. |
-| **OV certificate** (Sectigo, DigiCert, etc.) | ~$100 to $400/year | Standard cert. SmartScreen reputation builds over time/downloads, so early downloads may still warn briefly. Usually requires a hardware token (or cloud HSM) now. |
-| **EV certificate** | ~$300 to $600/year | Instant SmartScreen reputation, no warning from day one. Hardware token required. |
-| **Ship unsigned (interim)** | free | Fine for an early beta. Users click "More info → Run anyway". Document the bypass in release notes. |
+| Option                                       | Cost               | Notes                                                                                                                                                                                                                                                                                                                                                                                           |
+| -------------------------------------------- | ------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Azure Trusted Signing**                    | ~$10/month         | Cheapest real option. Cloud-based, no cert file to manage. Requires an Azure account and identity verification; orgs need 3+ years of history (individuals are eligible). Chains to a Microsoft-operated trusted root and shows your validated publisher name. It is **standard, not EV**, signing, so SmartScreen reputation still accrues with downloads and an early install may still warn. |
+| **OV certificate** (Sectigo, DigiCert, etc.) | ~$100 to $400/year | Standard cert. SmartScreen reputation builds over time/downloads, so early downloads may still warn briefly. Usually requires a hardware token (or cloud HSM) now.                                                                                                                                                                                                                              |
+| **EV certificate**                           | ~$300 to $600/year | Instant SmartScreen reputation, no warning from day one. Hardware token required.                                                                                                                                                                                                                                                                                                               |
+| **Ship unsigned (interim)**                  | free               | Fine for an early beta. Users click "More info → Run anyway". Document the bypass in release notes.                                                                                                                                                                                                                                                                                             |
 
 For a pre-launch beta with no budget, shipping unsigned and documenting the
 bypass is the pragmatic choice. Reputation also accrues as more people run it.
@@ -61,6 +61,7 @@ the bundled gateway sidecar, and the NSIS installer during the build (before the
 updater `.sig` is computed, so auto-update keeps working).
 
 **One-time Azure setup:**
+
 1. Create an **Artifact Signing (Trusted Signing) account** + complete **Individual**
    identity validation, then create a **Public Trust certificate profile**. Note the
    account name, the certificate profile name, and the account's endpoint URI (e.g.
@@ -68,24 +69,24 @@ updater `.sig` is computed, so auto-update keeps working).
 2. Create a **service principal** for CI (Entra ID → App registrations → new
    registration → add a client secret).
 3. On the signing **account → Access control (IAM)**, assign that app the
-   **"Trusted Signing Certificate Profile Signer"** role (this is the *signer* role,
-   distinct from the *Identity Verifier* role you assign to yourself).
+   **"Trusted Signing Certificate Profile Signer"** role (this is the _signer_ role,
+   distinct from the _Identity Verifier_ role you assign to yourself).
 
 **GitHub secrets to add** (Settings → Secrets and variables → Actions → Secrets):
 
-| Secret | Value |
-|---|---|
-| `AZURE_TENANT_ID` | the app registration's Directory (tenant) ID |
-| `AZURE_CLIENT_ID` | the app registration's Application (client) ID |
-| `AZURE_CLIENT_SECRET` | the client secret value |
+| Secret                | Value                                          |
+| --------------------- | ---------------------------------------------- |
+| `AZURE_TENANT_ID`     | the app registration's Directory (tenant) ID   |
+| `AZURE_CLIENT_ID`     | the app registration's Application (client) ID |
+| `AZURE_CLIENT_SECRET` | the client secret value                        |
 
 **GitHub variables to add** (same page → Variables tab):
 
-| Variable | Value |
-|---|---|
-| `AZURE_SIGNING_PROFILE` | your certificate profile name (**required**) |
+| Variable                 | Value                                                     |
+| ------------------------ | --------------------------------------------------------- |
+| `AZURE_SIGNING_PROFILE`  | your certificate profile name (**required**)              |
 | `AZURE_SIGNING_ENDPOINT` | optional, defaults to `https://eus.codesigning.azure.net` |
-| `AZURE_SIGNING_ACCOUNT` | optional, defaults to `southforgesigning` |
+| `AZURE_SIGNING_ACCOUNT`  | optional, defaults to `southforgesigning`                 |
 
 With those set, the next `v*` tag produces a **signed** Windows installer. SmartScreen
 reputation still accrues with downloads, but the "unknown publisher" warning is gone
@@ -123,14 +124,14 @@ Developer ID cert (not an iOS distribution cert).
 The release workflow already passes these env vars to the macOS build; set them as
 repository secrets (Settings → Secrets and variables → Actions):
 
-| Secret | Value |
-|---|---|
-| `APPLE_CERTIFICATE` | base64 of the `.p12`: `base64 -i cert.p12 \| pbcopy` |
-| `APPLE_CERTIFICATE_PASSWORD` | the password you set when exporting the `.p12` |
-| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: Your Name (TEAMID)` (exact string from Keychain Access) |
-| `APPLE_ID` | your Apple ID email |
-| `APPLE_PASSWORD` | the app-specific password from step 3 |
-| `APPLE_TEAM_ID` | the 10-char Team ID |
+| Secret                       | Value                                                                              |
+| ---------------------------- | ---------------------------------------------------------------------------------- |
+| `APPLE_CERTIFICATE`          | base64 of the `.p12`: `base64 -i cert.p12 \| pbcopy`                               |
+| `APPLE_CERTIFICATE_PASSWORD` | the password you set when exporting the `.p12`                                     |
+| `APPLE_SIGNING_IDENTITY`     | `Developer ID Application: Your Name (TEAMID)` (exact string from Keychain Access) |
+| `APPLE_ID`                   | your Apple ID email                                                                |
+| `APPLE_PASSWORD`             | the app-specific password from step 3                                              |
+| `APPLE_TEAM_ID`              | the 10-char Team ID                                                                |
 
 With those set, a tagged build produces a **signed, notarized** `.dmg`, no
 Gatekeeper warning. Without them, the macOS build is simply unsigned (and users

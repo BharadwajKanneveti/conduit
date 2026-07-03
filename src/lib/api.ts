@@ -103,10 +103,7 @@ export interface AddedHttpClient {
 
 /** Register an HTTP-bridge client scoped to a profile (empty = all servers).
  * Returns the one-time plaintext token to paste into the client. */
-export function addHttpClient(
-  label: string,
-  profile?: string,
-): Promise<AddedHttpClient> {
+export function addHttpClient(label: string, profile?: string): Promise<AddedHttpClient> {
   return invoke<AddedHttpClient>("add_http_client", { label, profile });
 }
 
@@ -496,10 +493,7 @@ export function previewImport(json: string): Promise<ImportItem[]> {
 }
 
 /** Enable or disable every server in a profile at once. */
-export function setAllEnabled(
-  profileId: string,
-  enabled: boolean,
-): Promise<Registry> {
+export function setAllEnabled(profileId: string, enabled: boolean): Promise<Registry> {
   return invoke<Registry>("set_all_enabled", { profileId, enabled });
 }
 
