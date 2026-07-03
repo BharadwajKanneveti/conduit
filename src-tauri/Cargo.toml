@@ -1,6 +1,6 @@
 [package]
 name = "conduit"
-version = "1.1.0"
+version = "1.2.0"
 description = "Local MCP gateway: manage all your MCP servers in one place, set up once and shared by every AI client, with ~90% fewer tokens per request"
 authors = ["South Forge AI"]
 edition = "2021"
@@ -19,7 +19,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon"] }
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"

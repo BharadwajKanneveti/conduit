@@ -1845,10 +1845,29 @@ fn http_bridge_status(state: State<HttpBridgeState>) -> Result<HttpBridgeStatus,
     Ok(HttpBridgeStatus::new(bridge.port, bridge.token.clone()))
 }
 
+/// macOS only: show the Dock icon when a window is visible, and drop it (Accessory
+/// activation policy) when the app is only in the menu bar, so Toolport is never in
+/// both the Dock and the menu bar at once. No-op on Windows/Linux, which have no
+/// such concept and keep their normal taskbar/tray behavior.
+#[cfg(target_os = "macos")]
+fn set_dock_icon_visible(app: &AppHandle, visible: bool) {
+    let policy = if visible {
+        tauri::ActivationPolicy::Regular
+    } else {
+        tauri::ActivationPolicy::Accessory
+    };
+    let _ = app.set_activation_policy(policy);
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_dock_icon_visible(_app: &AppHandle, _visible: bool) {}
+
 /// Bring the main window back to the foreground (from the tray, a re-launch, or an
 /// approval). Un-hides, un-minimizes, and focuses so it works from every hidden state.
 fn show_main_window(app: &AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
+        // A visible window means the app should own a Dock icon again (macOS).
+        set_dock_icon_visible(app, true);
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
@@ -1928,6 +1947,17 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
                 show_main_window(tray.app_handle());
             }
         });
+    // macOS: use a monochrome glyph rendered as a template image, so the menu bar
+    // tints it to match every other status item (white on the dark bar) instead of
+    // showing the full-color app icon. Every other platform keeps the colored icon.
+    #[cfg(target_os = "macos")]
+    {
+        let glyph = tauri::image::Image::from_bytes(include_bytes!(
+            "../icons/tray-mac-template.png"
+        ))?;
+        builder = builder.icon(glyph).icon_as_template(true);
+    }
+    #[cfg(not(target_os = "macos"))]
     if let Some(icon) = app.default_window_icon().cloned() {
         builder = builder.icon(icon);
     }
@@ -2096,6 +2126,8 @@ pub fn run() {
                 if window.label() == "main" {
                     api.prevent_close();
                     let _ = window.hide();
+                    // Hidden to the tray => menu-bar only, so drop the Dock icon (macOS).
+                    set_dock_icon_visible(window.app_handle(), false);
                     maybe_show_tray_hint(window.app_handle());
                 }
             }
@@ -2108,7 +2140,11 @@ pub fn run() {
             // window is created hidden (visible:false) so a normal launch never flashes.
             build_tray(handle)?;
             let start_hidden = std::env::args().any(|a| a == "--hidden");
-            if !start_hidden {
+            if start_hidden {
+                // Auto-start at login goes straight to the tray: menu-bar only, no
+                // Dock icon until the user opens the window.
+                set_dock_icon_visible(handle, false);
+            } else {
                 show_main_window(handle);
             }
 

@@ -6,6 +6,8 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-07-03
+
 ### Security
 - **Closed several bypasses in the stdio spawn guard** (the supply-chain check that
   refuses code-smuggling launch args on a spawned server). Two rounds of adversarial
@@ -112,6 +114,11 @@ Entries before the rename below shipped under the project's former name, Conduit
   scope dropdown was also widened so "All enabled servers" is no longer clipped.
 
 ### Fixed
+- **macOS: monochrome menu-bar glyph, and no more Dock-and-menu-bar at once.** The
+  tray now uses a template image (the Toolport porthole mark), so macOS tints it to
+  match every other menu-bar item instead of showing the full-color app icon. And the
+  Dock icon appears only while a window is open: closing to the tray (or auto-starting
+  hidden at login) drops to the menu bar alone, and reopening restores the Dock icon.
 - **Approval prompt is keyboard- and screen-reader-accessible.** When a held call
   appears, focus moves into the prompt, Escape denies the oldest pending call, and
   the count is announced. Also removed a brief flicker where a just-decided row
