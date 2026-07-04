@@ -24,7 +24,7 @@ the rest) points at Toolport and shares them, so you stop configuring the same
 servers separately in each app.
 
 <p align="center">
-  <img src="docs/app.png" alt="The Toolport desktop app: 14 MCP servers connected in one place with per-server tool counts, and every AI client wired in with one click" width="900" />
+  <img src="docs/app.png" alt="The Toolport desktop app: your MCP servers managed in one place with per-server tool counts, and every AI client wired in with one click" width="900" />
 </p>
 
 It also fixes what those servers cost your agent. Every MCP server you connect
