@@ -233,7 +233,7 @@ export function CatalogView({ registry, onAdded }: Props) {
             ? `${shown.length} result${shown.length === 1 ? "" : "s"} (popular picks first, then the MCP Registry)`
             : "Popular servers"}
         </span>
-        {results !== null && (
+        {results !== null && shown.length > 0 && (
           <button className="hover:text-foreground" onClick={() => setQuery("")}>
             Clear search
           </button>
@@ -301,6 +301,16 @@ export function CatalogView({ registry, onAdded }: Props) {
                   ? "Try a provider name, app name, or shorter query. You can also clear the search to browse popular servers."
                   : "Use search to query the MCP Registry, or try again later if the browse list stays empty."}
               </p>
+              {results !== null && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="mt-2"
+                  onClick={() => setQuery("")}
+                >
+                  Clear search
+                </Button>
+              )}
             </div>
           )
         )
