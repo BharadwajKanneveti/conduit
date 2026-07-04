@@ -178,6 +178,30 @@ function dedupeSecurity(events: SecurityEvent[]): SecurityEvent[] {
   return kept;
 }
 
+/** Collapse the loud notices to one row per finding identity (securityKey), keeping the
+ * newest occurrence and a count of how many times it has fired. `dedupeSecurity` only
+ * merges a short window (to fold a per-client burst); this merges across ALL time, so a
+ * finding that recurs hours apart - e.g. the same poison flag re-emitted after each
+ * baseline reset - reads as one "×N, last seen …" row instead of a confusing stack of
+ * identical notices. Dismissing the row clears the whole group (dismissal is by identity). */
+function collapseByIdentity(
+  events: SecurityEvent[],
+): { e: SecurityEvent; count: number }[] {
+  const groups = new Map<string, { e: SecurityEvent; count: number }>();
+  for (const e of events) {
+    const key = securityKey(e);
+    const g = groups.get(key);
+    if (!g) {
+      groups.set(key, { e, count: 1 });
+    } else {
+      g.count += 1;
+      // Keep the newest occurrence so the timestamp and any evidence excerpt are current.
+      if (e.ts > g.e.ts) g.e = e;
+    }
+  }
+  return [...groups.values()].sort((a, b) => b.e.ts - a.e.ts);
+}
+
 function loadDismissed(): Set<string> {
   try {
     const raw = localStorage.getItem(SECURITY_DISMISSED_KEY);
@@ -216,6 +240,8 @@ function SecurityNotices({
   onDismiss: (e: SecurityEvent) => void;
 }) {
   const [open, setOpen] = useState(true);
+  // One row per finding, newest first, with a recurrence count. See collapseByIdentity.
+  const collapsed = collapseByIdentity(events);
   return (
     <div className="mb-4 rounded-lg border border-warning/40 bg-warning/5 p-4">
       <button
@@ -226,7 +252,7 @@ function SecurityNotices({
         <ShieldAlert className="size-4 shrink-0 text-warning" />
         <h3 className="text-sm font-medium text-warning">Tool security notices</h3>
         <span className="rounded-full bg-warning/15 px-1.5 py-0.5 text-xs font-medium text-warning">
-          {events.length}
+          {collapsed.length}
         </span>
         <ChevronRight
           className={`ml-auto size-4 text-warning/70 transition-transform ${
@@ -244,10 +270,10 @@ function SecurityNotices({
             data). Dismiss the ones you've reviewed.
           </p>
           <ul className="space-y-1.5 text-xs">
-            {events.slice(0, 10).map((e) => {
+            {collapsed.slice(0, 10).map(({ e, count }) => {
               const badge = eventBadge(e);
               return (
-                <li key={renderKey(e)} className="flex flex-col gap-1">
+                <li key={securityKey(e)} className="flex flex-col gap-1">
                   <div className="flex items-center gap-2">
                     <span className={`rounded px-1.5 py-0.5 font-medium ${badge.cls}`}>
                       {badge.label}
@@ -258,7 +284,16 @@ function SecurityNotices({
                         ({e.signatures.join(", ")})
                       </span>
                     )}
+                    {count > 1 && (
+                      <span
+                        className="rounded-full bg-warning/15 px-1.5 py-0.5 font-medium text-warning"
+                        title={`Fired ${count} times`}
+                      >
+                        ×{count}
+                      </span>
+                    )}
                     <span className="ml-auto text-muted-foreground">
+                      {count > 1 ? "last " : ""}
                       {new Date(e.ts).toLocaleString(undefined, {
                         month: "short",
                         day: "numeric",
@@ -593,6 +628,10 @@ function CallRow({ e }: { e: AuditEntry }) {
 }
 
 function StatsPanel({ stats }: { stats: AuditStats }) {
+  // The three summary cards are the glanceable health check and stay visible; the full
+  // per-server table (can be 20+ rows) collapses by default so it stops being a wall
+  // below the security lane. It's one tap when you actually want the breakdown.
+  const [tableOpen, setTableOpen] = useState(false);
   if (stats.total === 0) return null;
   const errPct = (stats.errorRate * 100).toFixed(stats.errorRate < 0.1 ? 1 : 0);
   return (
@@ -602,8 +641,14 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
           <div className="text-2xl font-semibold tabular-nums">{stats.total}</div>
           <div className="text-xs text-muted-foreground">calls logged</div>
         </div>
-        <div className="rounded-lg border p-3">
-          <div className="text-2xl font-semibold tabular-nums">{stats.errors}</div>
+        <div
+          className={`rounded-lg border p-3 ${stats.errors > 0 ? "border-destructive/40 bg-destructive/[0.04]" : ""}`}
+        >
+          <div
+            className={`text-2xl font-semibold tabular-nums ${stats.errors > 0 ? "text-destructive" : ""}`}
+          >
+            {stats.errors}
+          </div>
           <div className="text-xs text-muted-foreground">errors ({errPct}%)</div>
         </div>
         <div className="rounded-lg border p-3">
@@ -613,27 +658,46 @@ function StatsPanel({ stats }: { stats: AuditStats }) {
           <div className="text-xs text-muted-foreground">active servers</div>
         </div>
       </div>
-      <div className="overflow-hidden rounded-lg border">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b bg-muted/40 text-left text-xs text-muted-foreground">
-              <th className="px-3 py-2 font-medium">Server</th>
-              <th className="px-3 py-2 text-right font-medium">Calls</th>
-              <th className="px-3 py-2 text-right font-medium">Errors</th>
-              <th className="px-3 py-2 text-right font-medium">Avg</th>
-              <th className="px-3 py-2 text-right font-medium">p95</th>
-            </tr>
-          </thead>
-          <tbody>
-            {stats.servers.map((s) => (
-              <ServerRow key={s.server} s={s} />
-            ))}
-          </tbody>
-        </table>
-      </div>
-      <p className="text-xs text-muted-foreground/70">
-        Click a server to see its per-tool breakdown.
-      </p>
+
+      <button
+        onClick={() => setTableOpen((v) => !v)}
+        aria-expanded={tableOpen}
+        className="flex w-fit items-center gap-2 text-sm font-medium text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <ChevronRight
+          className={`size-4 transition-transform ${tableOpen ? "rotate-90" : ""}`}
+        />
+        Per-server breakdown
+        <span className="text-xs font-normal text-muted-foreground/70">
+          {stats.servers.length} {stats.servers.length === 1 ? "server" : "servers"}
+        </span>
+      </button>
+
+      {tableOpen && (
+        <>
+          <div className="overflow-hidden rounded-lg border">
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b bg-muted/40 text-left text-xs text-muted-foreground">
+                  <th className="px-3 py-2 font-medium">Server</th>
+                  <th className="px-3 py-2 text-right font-medium">Calls</th>
+                  <th className="px-3 py-2 text-right font-medium">Errors</th>
+                  <th className="px-3 py-2 text-right font-medium">Avg</th>
+                  <th className="px-3 py-2 text-right font-medium">p95</th>
+                </tr>
+              </thead>
+              <tbody>
+                {stats.servers.map((s) => (
+                  <ServerRow key={s.server} s={s} />
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p className="text-xs text-muted-foreground/70">
+            Click a server to see its per-tool breakdown.
+          </p>
+        </>
+      )}
     </div>
   );
 }
@@ -826,7 +890,9 @@ function DiscoveryRow({ t }: { t: SearchTrace }) {
  * local, bounded. */
 function DiscoveryTraces({ refreshKey }: { refreshKey: number }) {
   const [entries, setEntries] = useState<SearchTrace[]>([]);
-  const [open, setOpen] = useState(true);
+  // Collapsed by default: this is glanceable telemetry, not an alert, and the list can run
+  // to 100 rows. Leading with it open was a big part of the Activity tab feeling busy.
+  const [open, setOpen] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -1085,7 +1151,10 @@ export function ActivityView({
   const [stats, setStats] = useState<AuditStats | null>(null);
   const [savings, setSavings] = useState<SavingsSummary | null>(null);
   const [serverFilter, setServerFilter] = useState<string>("");
-  const [errorsOnly, setErrorsOnly] = useState(true);
+  // Show ALL recent calls by default, not a pre-filtered errors-only view. Defaulting the
+  // filter on made a healthy log read as "everything is failing"; the StatsPanel already
+  // surfaces the true error rate, and the toggle is right there for triage.
+  const [errorsOnly, setErrorsOnly] = useState(false);
   const [security, setSecurity] = useState<SecurityEvent[]>([]);
   const [dismissed, setDismissed] = useState<Set<string>>(loadDismissed);
   const [logOpen, setLogOpen] = useState(false);
@@ -1173,6 +1242,7 @@ export function ActivityView({
 
   const banner = (
     <>
+      {/* Loud lane: the only thing here that may need a decision. */}
       {highSecurity.length > 0 ? (
         <SecurityNotices events={highSecurity} onDismiss={dismissSecurity} />
       ) : (
@@ -1185,10 +1255,13 @@ export function ActivityView({
           onDismissAll={() => dismissAllSecurity(infoSecurity)}
         />
       ) : null}
+      {/* Calm lane: lead with the value stat people actually want to see, then keep the
+          reference panels (discovery / identities / inspector) collapsed below it so they
+          don't stack into a wall on first load. */}
+      {savings && savings.tokensSaved > 0 ? <SavingsBanner savings={savings} /> : null}
       <DiscoveryTraces refreshKey={refreshKey} />
       <ToolIdentities refreshKey={refreshKey} />
       {registry?.liveInspect ? <LiveInspector refreshKey={refreshKey} /> : null}
-      {savings && savings.tokensSaved > 0 ? <SavingsBanner savings={savings} /> : null}
     </>
   );
 
