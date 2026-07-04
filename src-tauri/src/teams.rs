@@ -105,6 +105,45 @@ pub fn pull_config(
     }
 }
 
+/// Result of the `/me` membership heartbeat.
+pub enum MembershipCheck {
+    /// Still a member; carries the current (possibly changed) role.
+    Active { role: String },
+    /// The server explicitly rejected the token (401/403): the member was removed or
+    /// their token revoked. Distinct from a transport error so a mere network blip
+    /// never tears down the local team.
+    Removed,
+    /// The server has no `/me` route (an older self-host build). Fall back to the plain
+    /// config-pull behavior so a new client still works against an old server.
+    Unsupported,
+}
+
+/// Ask the team server who the caller is now. Returns `Removed` only on an explicit
+/// 401/403 (the authoritative "you're no longer a member" signal); any transport
+/// error is surfaced as `Err` so a flaky network doesn't masquerade as removal.
+pub fn fetch_me(server_url: &str, team_id: &str, token: &str) -> Result<MembershipCheck, String> {
+    let url = format!("{}/teams/{}/me", base(server_url), team_id);
+    match agent()
+        .get(&url)
+        .set("authorization", &format!("Bearer {token}"))
+        .call()
+    {
+        Ok(resp) => {
+            let v: Value = resp.into_json().map_err(|e| e.to_string())?;
+            // Fail noisily on a malformed 200 rather than defaulting to "member": a
+            // silent default would demote an admin's persisted role on a buggy response.
+            let role = v["role"]
+                .as_str()
+                .ok_or("membership response had no role")?
+                .to_string();
+            Ok(MembershipCheck::Active { role })
+        }
+        Err(ureq::Error::Status(401 | 403, _)) => Ok(MembershipCheck::Removed),
+        Err(ureq::Error::Status(404, _)) => Ok(MembershipCheck::Unsupported),
+        Err(e) => Err(stringify(e)),
+    }
+}
+
 /// Admin push of the team config. Returns the new version.
 pub fn push_config(server_url: &str, team_id: &str, token: &str, config: &Value) -> Result<i64, String> {
     let url = format!("{}/teams/{}/config", base(server_url), team_id);
@@ -169,21 +208,82 @@ fn finish_connect(server_url: &str, member_name: Option<&str>, joined: Joined) -
 }
 
 /// Pull the latest team config and merge it. `Ok(None)` if nothing changed.
-pub fn sync_now() -> Result<Option<(i64, MergeOutcome)>, String> {
-    let mut reg = crate::registry::load()?;
-    let conn = reg.team.clone().ok_or("not connected to a team")?;
+/// The result of a sync.
+pub enum SyncResult {
+    /// The member was removed from the team; the local team servers, connection, and
+    /// token have already been cleared (via `disconnect`).
+    Removed,
+    /// Still a member. `role` is the current role (refreshed even on a config 304),
+    /// `role_changed` flags a promotion/demotion, and `applied` is `Some` only when the
+    /// shared config actually changed this sync.
+    Ok {
+        role: String,
+        role_changed: bool,
+        applied: Option<(i64, MergeOutcome)>,
+    },
+}
+
+pub fn sync_now() -> Result<SyncResult, String> {
+    // Snapshot only what the network calls need; do NOT hold this copy to save later.
+    let conn = {
+        let reg = crate::registry::load()?;
+        reg.team.clone().ok_or("not connected to a team")?
+    };
     let token = load_token().ok_or("team token is missing from the keychain")?;
-    match pull_config(&conn.server_url, &conn.team_id, &token, conn.last_version)? {
-        None => Ok(None),
+
+    // Membership heartbeat first. This catches two things a config pull can't: removal
+    // (a config pull would just error on the now-invalid token, indistinguishable from a
+    // network failure) and a role change (a role change doesn't bump the config version,
+    // so the pull returns 304 and the client would keep showing stale admin controls).
+    let role = match fetch_me(&conn.server_url, &conn.team_id, &token)? {
+        MembershipCheck::Removed => {
+            // Authoritatively removed: tear down the local team so we stop running its
+            // servers and stop showing it. `disconnect` reloads + saves the registry.
+            disconnect()?;
+            return Ok(SyncResult::Removed);
+        }
+        MembershipCheck::Active { role } => role,
+        // Old server without /me: keep the last-known role and fall through to the pull.
+        MembershipCheck::Unsupported => conn.role.clone(),
+    };
+    let role_changed = role != conn.role;
+
+    let pulled = pull_config(&conn.server_url, &conn.team_id, &token, conn.last_version)?;
+
+    // Re-load a FRESH registry now, AFTER the (possibly multi-second) network round
+    // trips, and apply the deltas to it. Loading at the top and saving here would clobber
+    // any change another command made to the registry while we were on the network.
+    let mut reg = crate::registry::load()?;
+    match reg.team.as_ref() {
+        // The user disconnected or switched teams mid-sync: don't apply stale results.
+        None => return Ok(SyncResult::Ok { role, role_changed, applied: None }),
+        Some(t) if t.team_id != conn.team_id => {
+            return Ok(SyncResult::Ok { role, role_changed, applied: None })
+        }
+        _ => {}
+    }
+
+    let applied = match pulled {
+        None => None,
         Some((version, cfg)) => {
             let outcome = apply_team_config(&mut reg, &conn.team_id, &cfg);
             if let Some(t) = reg.team.as_mut() {
                 t.last_version = version;
             }
-            crate::registry::save(&reg)?;
-            Ok(Some((version, outcome)))
+            Some((version, outcome))
         }
+    };
+    // Persist the refreshed role alongside any applied config, so admin-only UI tracks
+    // the member's real, current role on every sync.
+    if let Some(t) = reg.team.as_mut() {
+        t.role = role.clone();
     }
+    crate::registry::save(&reg)?;
+    Ok(SyncResult::Ok {
+        role,
+        role_changed,
+        applied,
+    })
 }
 
 /// Leave the team: remove its merged servers, clear the connection and the token.

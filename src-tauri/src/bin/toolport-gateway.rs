@@ -33,7 +33,7 @@ use conduit_lib::inspect;
 use conduit_lib::integrity;
 use conduit_lib::registry::{self, Registry, ServerEntry};
 use conduit_lib::remote;
-use conduit_lib::router::{is_destructive, sanitize_segment, Router, ToolPolicy};
+use conduit_lib::router::{is_destructive, sanitize_segment, Reconnect, Router, ToolPolicy};
 use conduit_lib::approval;
 use conduit_lib::savings;
 use conduit_lib::searchtrace;
@@ -2234,12 +2234,17 @@ fn build_router(
         },
     };
 
-    // Connect concurrently so total time is the slowest server, not the sum.
+    // Connect concurrently so total time is the slowest server, not the sum. Each
+    // thread hands back the server spec + dirty flag alongside the connection so we can
+    // build a reconnect factory (used to re-spawn it if it dies mid-session).
     let handles: Vec<_> = servers
         .into_iter()
         .map(|server| {
             let dirty = Arc::clone(dirty);
-            std::thread::spawn(move || connect_one(&server, &dirty))
+            std::thread::spawn(move || {
+                let ds = connect_one(&server, &dirty);
+                (server, dirty, ds)
+            })
         })
         .collect();
 
@@ -2248,8 +2253,12 @@ fn build_router(
     // since they're applied as each server's tools are added.
     router.set_overrides(reg.tool_overrides.clone());
     for handle in handles {
-        if let Ok(Some(ds)) = handle.join() {
-            router.add(ds);
+        if let Ok((server, dirty, Some(ds))) = handle.join() {
+            // The same `connect_one` used for the initial spawn is the reconnect
+            // factory, so a re-spawn re-injects keychain secrets and re-handshakes
+            // exactly like a fresh connect.
+            let reconnect: Reconnect = Box::new(move || connect_one(&server, &dirty));
+            router.add_with_reconnect(ds, Some(reconnect));
         }
     }
     router
@@ -2483,16 +2492,26 @@ fn tool_cache_path(profile: Option<&str>) -> Option<PathBuf> {
 
 /// The namespaced tool catalog from the last successful build, so tools/list can
 /// answer instantly without waiting on downstream connections.
+/// Bump when the shape/derivation of cached tools changes (new sanitizing, projection,
+/// schema handling), so a stale on-disk cache from an older build is discarded and
+/// rebuilt rather than served verbatim until the next server toggle.
+const TOOL_CACHE_VERSION: u64 = 1;
+
 fn load_tool_cache(profile: Option<&str>) -> Vec<Value> {
     tool_cache_path(profile)
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        // Only honor a cache written by this catalog version; a bare-array (pre-version)
+        // or older-version file has no matching tag and is dropped, forcing a rebuild.
+        .filter(|v| v.get("version").and_then(Value::as_u64) == Some(TOOL_CACHE_VERSION))
+        .and_then(|v| v.get("tools").and_then(Value::as_array).cloned())
         .unwrap_or_default()
 }
 
 fn save_tool_cache(tools: &[Value], profile: Option<&str>) {
     if let Some(path) = tool_cache_path(profile) {
-        if let Ok(s) = serde_json::to_string(tools) {
+        let wrapped = json!({ "version": TOOL_CACHE_VERSION, "tools": tools });
+        if let Ok(s) = serde_json::to_string(&wrapped) {
             // Atomic + unique temp: several gateways share this cache file, so a
             // torn or interleaved write would leave an inconsistent catalog.
             let _ = registry::atomic_write(&path, &s);

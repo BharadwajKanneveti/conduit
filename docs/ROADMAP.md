@@ -133,10 +133,9 @@ The 2026-07-01 block above supersedes the ordering; these remain the detailed ba
 
 ### Robustness / tech debt
 
-- [ ] **Tool-cache versioning.** The gateway serves the on-disk cache verbatim with
-      no version tag, so catalog-logic changes don't take effect until a server
-      toggles or the cache is deleted. Wrap in `{version, tools}`, discard on
-      mismatch. (S)
+- [x] **Tool-cache versioning SHIPPED (2026-07-04 robustness sprint):** the cache is
+      wrapped as `{version, tools}` (`TOOL_CACHE_VERSION`) and discarded on mismatch, so
+      a stale cache from an older build is rebuilt rather than served verbatim.
 - [x] **Router lock held across the downstream call SHIPPED (#95, #99):** the live
       router is a `Mutex<Arc<Router>>`; dispatch clones the Arc and releases the lock
       before the (possibly 120s-held) downstream call, and the HTTP loop is multithreaded.
@@ -186,6 +185,76 @@ The 2026-07-01 block above supersedes the ordering; these remain the detailed ba
       ("a lot of users here use pi for local agent coding"). Registered pi as a
       `JsonMcpServers` client writing its Pi-owned global config at `~/.pi/agent/mcp.json`
       (home-anchored), mirroring the Cursor/BoltAI writers. Bound for the next release.
+- [ ] **Two-layer / hybrid tool search (the "Zillow isn't near 'house'" miss).** Suggested
+      by MajMin5 (r/LocalLLaMA), who independently built the same lazy loader and validated
+      the pattern. Pure semantic (embedding) search misses tools whose name/description
+      doesn't embed near the query even though the association is common knowledge (search
+      "home information" → embeddings skip a `zillow` tool). His fix was a slow LLM fallback
+      (ask a small model "which of these tools fit <task>?"). Our cheaper version: (a) a
+      genuine **hybrid ranker** (lexical/BM25 blended with the existing semantic score, not
+      semantic-alone), and (b) **broaden the candidate set when top scores are low-confidence**
+      so the (already capable) calling model can reason over descriptions instead of us
+      hiding them. Optionally a `search_tools_deep` meta-tool that returns more candidates +
+      full descriptions. No mandatory local model — the client model IS the reasoning layer.
+      Ties into the open "per-candidate lexical+semantic scores" search-trace follow-up. (M)
+- [ ] **Per-client discovery mode + raw/direct passthrough.** Also from MajMin5: clients that
+      already do their own tool-gating/deferral (Claude Desktop, LibreChat, and Claude Code's
+      tool-search) pay a wasteful double hop when forced through our meta-tools (load meta-tools
+      → search → load tool → call) versus just seeing the tools directly and using their native
+      logic. Today `lazy_discovery` is a single **global** bool in the registry (registry.rs);
+      make it **per-client** (and consider auto-defaulting self-managing clients to the direct
+      catalog, weak/local models to lazy). This is the client-agnostic story finished: one
+      place to configure servers, right discovery surface per client. (His stdio→HTTP + mobile
+      asks we already cover — the gateway speaks HTTP/OpenAPI natively.) (M)
+
+## Robustness sprint (2026-07-04, "nothing fails silently")
+
+A 3-surface completeness/edge-case audit (app UX, gateway runtime, Teams). **SHIPPED
+on branch `robustness-sprint`:** downstream **re-spawn on the breaker's half-open probe**
+(a crashed stdio child no longer stays dead until a full registry rebuild; self-heal
+only fired when EVERY server was down); **Playground call timeout + Cancel + elapsed**
+(the one true hang with no escape); **ConfirmDialog on the two credential-deleting
+actions**; **Catalog live-search error-vs-empty** with retry; **embeddings HTTP timeout**
+(a hung endpoint falls back to lexical, no stalled search); **bounded stdio read_line**
+(a newline-less multi-GB line can't grow unbounded); **shaped-result marker honesty**
+(no more "Nothing was lost" over-promise; says held-temporarily + re-run on expiry);
+**tool-cache `{version, tools}` versioning** (stale cache from an old build is discarded);
+and the whole **Teams removed-member/role/auto-sync** fix (new server `GET /me` heartbeat,
+removed members actually disconnect locally, role refreshes every sync, app-level 5-min
+background sync so policy reaches every member; deployed server-side).
+
+**Still open from the audit (not yet built):**
+
+- [ ] **Slowloris read timeout on the HTTP bridge** (tracked) — needs a socket read
+      deadline `tiny_http` doesn't expose; deferred rather than shipped as a fragile
+      threaded-read hack. Low risk (loopback bind + bearer + 4MB + inflight caps).
+- [ ] **Persist OAuth token expiry.** `authenticate_oauth` parses `expires_in` then drops
+      it (`oauth.rs`), so no "re-auth soon" UX is possible. Store issue/expiry ts; then a
+      subtle near/past-expiry hint on the server row (probe stays source of truth). (M)
+- [ ] **Post-connect success signal for first-timers** ("Toolport is now serving N servers
+      to <client>; open it and ask for tools"), and make onboarding's Done step surface
+      probe failures instead of swallowing them to `health=[]`. (M)
+- [ ] **Playground empty/auth states**: explicit "server advertises no tools" copy; detect
+      an auth-required connect failure and link to the server's Secrets dialog; label the
+      raw-JSON fallback when a schema is too complex to form-render. (S-M)
+- [ ] **Settings status panels** distinguish stale-from-poll-failure vs empty (HTTP-bridge
+      status, quarantine 15s / allowed 10s polls swallow errors). Same class as the
+      tracked Activity empty-vs-error item, different screens. (S)
+- [ ] **Client-import preview**: `handleImport` bulk-adds every importable server with only
+      a count toast; reuse the share-link `preview_import`/`ImportItem` review flow. (S-M)
+- [ ] **Recall escape hatch** for lazy discovery: a `list_server_tools`/`search_tools_deep`
+      meta-tool returning more candidates + full descriptions when a search misses, and a
+      "no match" lead that names the empty-query-with-server escape. (M, extends hybrid search)
+- [ ] **Integrity-file cross-process lock.** `tool-pins.json` / `tool-quarantine.json` are
+      atomic-write but unlocked; two gateways detecting drift at once can clobber each
+      other's quarantine set (a lost entry un-blocks a tool). Reload-under-lock or centralize
+      writes in the app. Security-adjacent sibling of the deferred registry cache-coherence. (M)
+- [ ] **Deterministic tool-collision suffixes.** `exposed_name` `_2/_3` depends on add
+      order; a removed-then-readded server can take a different slot and silently rename a
+      tool the client cached, failing in-flight calls with "no route". Derive from
+      `(server_id, tool_name)` content instead of position. (M)
+- [ ] Small: "Clear filter" buttons on zero-match states (Activity recent-calls, Playground
+      tool filter, catalog search); light credential/raw-arg client-side validation. (S)
 
 ## The core decision: Toolport is a gateway, not a file editor
 
