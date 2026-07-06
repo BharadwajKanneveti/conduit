@@ -234,8 +234,8 @@ namespaced per server, so the two never collide even in the same profile.
 
 Prebuilt installers are published on the
 [Releases](https://github.com/tsouth89/toolport/releases) page. Toolport runs on
-**Windows and macOS** (both builds are code-signed; macOS is also notarized), with
-**Linux** in beta. On Linux, prefer the **`.deb`** (it links your system's WebKitGTK and is
+**Windows, macOS, and Linux** (Windows and macOS builds are code-signed; macOS is
+also notarized). On Linux, prefer the **`.deb`** (it links your system's WebKitGTK and is
 the most reliable package); the **AppImage** is a portable, no-root fallback but
 can clash with very new or virtualized graphics stacks (see Troubleshooting). To
 run from source, see Development below.
