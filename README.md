@@ -9,6 +9,7 @@ every AI client, with far fewer tokens.
 [![Latest release](https://img.shields.io/github/v/release/tsouth89/toolport?label=release)](https://github.com/tsouth89/toolport/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Discord](https://img.shields.io/badge/Discord-join%20the%20community-5865F2?logo=discord&logoColor=white)](https://discord.gg/Xsn27MxdBA)
+[![Glama quality](https://glama.ai/mcp/servers/tsouth89/toolport/badges/score.svg)](https://glama.ai/mcp/servers/tsouth89/toolport)
 
 </div>
 
