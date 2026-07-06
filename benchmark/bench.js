@@ -4,7 +4,7 @@
 // stays flat") by running the SAME agent tasks against your local LLM twice:
 //
 //   - flat: the gateway exposes every downstream tool directly (CONDUIT_DISCOVERY=full)
-//   - lazy: the gateway exposes 3 meta-tools and the agent searches (CONDUIT_DISCOVERY=lazy)
+//   - lazy: the gateway exposes its meta-tools and the agent searches (CONDUIT_DISCOVERY=lazy)
 //
 // It reports total tokens, tool calls, and completion per task, so the trade-off
 // is honest: lazy makes MORE tool calls (search round-trips) but should use FAR
@@ -331,7 +331,7 @@ function totals(modeRows) {
     "\nThe headline metric is tool-def overhead: the tokens EVERY request pays just to",
   );
   console.log(
-    "list tools. Flat pays it on every call; lazy advertises 3 meta-tools. Set RUNS=5",
+    "list tools. Flat pays it on every call; lazy advertises its meta-tools. Set RUNS=5",
   );
   console.log(
     "for medians; eyeball the answers for correctness; treat the direction as signal.",

@@ -31,11 +31,11 @@ It also fixes what those servers cost your agent. Every MCP server you connect
 dumps all of its tools into context on every single request, and it adds up fast:
 just 3 servers (62 tools) cost ~24,000 tokens of definitions before you've asked
 anything. Toolport advertises a handful of compact meta-tools the agent searches
-on demand instead, so it pays a few hundred tokens.
+on demand instead, so it pays ~900 tokens (96% less, measured).
 
 **Measured on a frontier model: up to 91% fewer total tokens at the same task
-success** (graded for correct answers, not just completion), plus 97% less
-tool-definition overhead on every request, rising to 99.6% on a real 415-tool
+success** (graded for correct answers, not just completion), plus 96% less
+tool-definition overhead on every request, rising to 99.5% on a real 415-tool
 catalog (see [BENCHMARK.md](BENCHMARK.md)). That holds whether you run one AI tool
 or five, on cloud models (where tokens are your bill) or local ones (where tool defs
 eat your context window).
@@ -62,8 +62,8 @@ fixes both.
   calls on demand, so context stays flat no matter how many servers you connect.
   (A couple more appear only when you turn the matching feature on: `toolport_confirm`
   with approvals, enable/disable with agent control.) Benchmarked, graded for correct answers: up to 91% fewer
-  total tokens at the same task success, 97% less tool-definition overhead per request,
-  99.6% at a real 415-tool catalog ([BENCHMARK.md](BENCHMARK.md)). Ask `toolport_status`
+  total tokens at the same task success, 96% less tool-definition overhead per request,
+  99.5% at a real 415-tool catalog ([BENCHMARK.md](BENCHMARK.md)). Ask `toolport_status`
   for what it has saved you so far.
 - **Search by intent, not just keywords.** `toolport_search_tools` ranks by relevance
   across every server, and no tool is ever hidden, any server's full set is one call

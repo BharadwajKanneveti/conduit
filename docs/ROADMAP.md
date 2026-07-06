@@ -3,7 +3,7 @@
 Toolport is a local MCP gateway for AI coding tools (Claude Desktop, Cursor,
 VS Code, Windsurf, Codex CLI). Every server you connect dumps its whole tool list
 into the agent's context on every request; Toolport routes them through one gateway
-that exposes 3 meta-tools the agent searches on demand, so context stays flat:
+that exposes 4 meta-tools the agent searches on demand, so context stays flat:
 measured ~90% fewer tokens at the same task success. This document is the working
 spec, capturing the architecture decision and the build order.
 
@@ -274,7 +274,7 @@ once (as a local stdio server and/or a custom connector URL). Toolport holds the
 real registry of servers and routes to them. This unlocks the headline win and
 flips every weakness:
 
-- **~90% fewer tokens.** In lazy-discovery mode the gateway advertises 3 meta-tools
+- **~90% fewer tokens.** In lazy-discovery mode the gateway advertises 4 meta-tools
   instead of every server's full tool list, so the agent's context stays flat no
   matter how many servers you connect. Measured: 97% less tool overhead per request
   (see [BENCHMARK.md](../BENCHMARK.md)).
@@ -367,7 +367,7 @@ Phase 2 - Client integration
 
 Phase 3 - Scaling & UX
 
-- [x] Lazy discovery: `CONDUIT_DISCOVERY=lazy` exposes 3 meta-tools (search/call)
+- [x] Lazy discovery: `CONDUIT_DISCOVERY=lazy` exposes 4 meta-tools (search/call)
 - [x] Per-agent scoping: `CONDUIT_PROFILE` + per-client profile picker, per-profile cache
 - [x] Catalog: curated popular set + live official MCP Registry search, type-ahead
 - [x] Catalog as a left-nav destination; status grouping; non-blocking UI commands
@@ -435,7 +435,7 @@ of services whose official MCP is read-only / partial / missing (e.g. Stripe's o
 is read-only; a full one can create prices, payment links, everything).
 
 **Why only Toolport does this well:** a complete-API server is 100s-of-tools huge and would
-blow up any agent's context — which is why nobody ships one. Lazy discovery (3 meta-tools +
+blow up any agent's context — which is why nobody ships one. Lazy discovery (4 meta-tools +
 search-on-demand, flat context) is the one thing that makes it usable. This reframes lazy
 discovery from "saves tokens" to "unlocks otherwise-impossible servers." Plus Toolport's
 governance (HITL + destructive-tool gating) is what makes handing an agent a full billing

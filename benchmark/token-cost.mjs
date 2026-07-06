@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Measures the per-request token cost of a real MCP tool catalog: the tool
 // definitions an agent loads into context on every request without lazy
-// discovery, broken down by server, plus the savings from Toolport's 3-meta-tool
+// discovery, broken down by server, plus the savings from Toolport's
 // lazy mode and what it means in context window, dollars, and scaling.
 //
 // Usage:
@@ -40,7 +40,7 @@ function resolveCachePath(arg) {
 }
 
 const path = resolveCachePath(process.argv[2]);
-const LAZY_FLOOR = Number(process.argv[3] || 660); // 3 meta-tools, measured
+const LAZY_FLOOR = Number(process.argv[3] || 886); // the 4 default meta-tools, measured
 const tools = JSON.parse(readFileSync(path, "utf8"));
 const est = (obj) => Math.ceil(JSON.stringify(obj).length / 4);
 const fmt = (n) => Math.round(n).toLocaleString("en-US");
@@ -83,9 +83,7 @@ for (const r of rows) {
 }
 console.log("");
 console.log(`Without Toolport:  ${fmt(total)} tokens / request`);
-console.log(
-  `With Toolport:     ${fmt(LAZY_FLOOR)} tokens / request (3 meta-tools, flat)`,
-);
+console.log(`With Toolport:     ${fmt(LAZY_FLOOR)} tokens / request (meta-tools, flat)`);
 console.log(`Reduction:        ${reduction}%`);
 
 // --- 2. Per-tool distribution ---
@@ -118,7 +116,7 @@ for (const [name, w] of WINDOWS) {
 
 // --- 4. Scaling: reduction grows with tool count ---
 // Uses the measured mean tokens/tool from THIS catalog, so the curve is grounded
-// in real schemas. Lazy's floor is fixed at 3 meta-tools no matter the size.
+// in real schemas. Lazy's floor is fixed at the meta-tools no matter the size.
 console.log("");
 console.log(
   `Scaling (def-overhead reduction vs tool count, at ${fmt(meanPerTool)} tok/tool measured here):`,

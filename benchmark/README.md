@@ -1,6 +1,6 @@
 # Toolport token benchmark
 
-Quantifies Toolport's core claim, that lazy discovery (3 meta-tools the agent
+Quantifies Toolport's core claim, that lazy discovery (a handful of meta-tools the agent
 searches) keeps context flat where flat tool exposure (every server's tools loaded
 into every request) does not, by running the **same agent tasks** against your
 local LLM under both modes and measuring tokens, tool calls, and completion.

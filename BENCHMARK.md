@@ -14,8 +14,9 @@ Reproduce it yourself: [`benchmark/`](benchmark/).
   - **flat**, every downstream tool exposed directly (`CONDUIT_DISCOVERY=full`), the normal MCP setup.
   - **lazy**, Toolport advertises 3 meta-tools (`toolport_status`, `toolport_search_tools`,
     `toolport_call_tool`) and the agent searches/calls on demand (`CONDUIT_DISCOVERY=lazy`).
-    (The current default adds a fourth, `toolport_fetch_result`, ~330 tokens more of
-    always-on overhead. It doesn't change the reduction story below.)
+    (The current default advertises a fourth, `toolport_fetch_result`; the default
+    set measures 886 tokens of always-on overhead today. It doesn't change the
+    reduction story below.)
 - **Model:** GPT-5.5 (frontier, via the Vercel AI Gateway), so model capability is not the
   variable, both modes can actually complete every task.
 - **Tasks (5 runs each):** list Stripe products; list Neon projects; list Vercel projects
@@ -57,11 +58,14 @@ at a real Toolport catalog (no model needed, it just measures the tool definitio
 and the gap widens fast. On a live 14-server setup of **415 tools**, the definitions
 an agent loads on **every request** measure:
 
-|                                    | Per request        |
-| ---------------------------------- | ------------------ |
-| Without Toolport (all 415 tools)   | **164,880 tokens** |
-| With Toolport (3 meta-tools, flat) | **660 tokens**     |
-| Reduction                          | **99.6%**          |
+|                                  | Per request        |
+| -------------------------------- | ------------------ |
+| Without Toolport (all 415 tools) | **164,880 tokens** |
+| With Toolport (meta-tools, flat) | **886 tokens**     |
+| Reduction                        | **99.5%**          |
+
+(660 tokens / 99.6% as originally measured on the 3-meta-tool set; the current
+default set of 4 measures 886.)
 
 The cost is dominated by a few large servers:
 
