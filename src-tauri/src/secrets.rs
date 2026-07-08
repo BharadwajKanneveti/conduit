@@ -776,11 +776,45 @@ pub fn get_secret(server_id: &str, key: &str) -> Option<String> {
 /// from an actual keychain failure (`Err`, e.g. the keychain is locked or denied
 /// access to this app). Callers that need to explain *why* a secret is missing
 /// use this so a read failure isn't silently treated as "never saved".
+///
+/// Resolution order for headless / container deploys:
+/// 1. Process env `CONDUIT_SECRET_<KEY>` (preferred; avoids colliding with
+///    unrelated host env vars that share a common name like `TOKEN`)
+/// 2. Process env `<KEY>` when `CONDUIT_ALLOW_BARE_SECRET_ENV=1` (opt-in)
+/// 3. Encrypted `secrets.enc` when `CONDUIT_SECRET_KEY` is set
+/// 4. OS keychain / platform backend
 pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
+    if let Some(v) = env_secret_override(key) {
+        return Ok(Some(v));
+    }
     if file::active() {
         return file::get_secret_result(server_id, key);
     }
     platform::get_secret_result(server_id, key)
+}
+
+/// Look up a secret from the process environment for container / env-file deploys.
+/// Prefers `CONDUIT_SECRET_<KEY>`; falls back to the bare key name only when
+/// `CONDUIT_ALLOW_BARE_SECRET_ENV` is set. Empty values are treated as unset.
+fn env_secret_override(key: &str) -> Option<String> {
+    let prefixed = format!("CONDUIT_SECRET_{key}");
+    env_var_nonblank(&prefixed).or_else(|| {
+        if bare_secret_env_enabled() {
+            env_var_nonblank(key)
+        } else {
+            None
+        }
+    })
+}
+
+fn bare_secret_env_enabled() -> bool {
+    std::env::var("CONDUIT_ALLOW_BARE_SECRET_ENV")
+        .ok()
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+}
+
+fn env_var_nonblank(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
 pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
@@ -1028,6 +1062,53 @@ mod tests {
         match prev {
             Some(v) => std::env::set_var("CONDUIT_SECRET_KEY", v),
             None => std::env::remove_var("CONDUIT_SECRET_KEY"),
+        }
+    }
+
+    /// Process-env secrets win over the vault so a container can inject keys via
+    /// an env file without writing `secrets.enc`. Prefixed form beats bare key;
+    /// bare keys require CONDUIT_ALLOW_BARE_SECRET_ENV.
+    #[test]
+    fn env_secret_override_prefers_prefixed_then_bare() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let key = "TOOLPORT_ENV_SECRET_TEST";
+        let prefixed = format!("CONDUIT_SECRET_{key}");
+        let prev_bare = std::env::var(key).ok();
+        let prev_pref = std::env::var(&prefixed).ok();
+        let prev_allow = std::env::var("CONDUIT_ALLOW_BARE_SECRET_ENV").ok();
+        std::env::remove_var(key);
+        std::env::remove_var(&prefixed);
+        std::env::remove_var("CONDUIT_ALLOW_BARE_SECRET_ENV");
+
+        assert_eq!(env_secret_override(key), None);
+
+        std::env::set_var(key, "from-bare");
+        assert_eq!(env_secret_override(key), None, "bare key blocked without opt-in");
+
+        std::env::set_var("CONDUIT_ALLOW_BARE_SECRET_ENV", "1");
+        assert_eq!(env_secret_override(key).as_deref(), Some("from-bare"));
+
+        std::env::set_var(&prefixed, "from-prefixed");
+        assert_eq!(env_secret_override(key).as_deref(), Some("from-prefixed"));
+
+        // Preserve intentional whitespace; blank-only values don't count.
+        std::env::set_var(&prefixed, "  spaced  ");
+        assert_eq!(env_secret_override(key).as_deref(), Some("  spaced  "));
+        std::env::set_var(&prefixed, "   ");
+        std::env::set_var(key, "");
+        assert_eq!(env_secret_override(key), None);
+
+        match prev_bare {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
+        match prev_pref {
+            Some(v) => std::env::set_var(&prefixed, v),
+            None => std::env::remove_var(&prefixed),
+        }
+        match prev_allow {
+            Some(v) => std::env::set_var("CONDUIT_ALLOW_BARE_SECRET_ENV", v),
+            None => std::env::remove_var("CONDUIT_ALLOW_BARE_SECRET_ENV"),
         }
     }
 
