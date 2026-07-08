@@ -3041,8 +3041,7 @@ bad = "not-a-table"
 
     #[test]
     fn zed_context_servers_jsonc_round_trip() {
-        let path = 
-        std::env::temp_dir().join(format!("conduit-zed-{}.json", std::process::id()));
+        let path = std::env::temp_dir().join(format!("conduit-zed-{}.json", std::process::id()));
         // JSONC: line comment, trailing comma, an unrelated user setting.
         std::fs::write(
             &path,
@@ -3091,8 +3090,7 @@ bad = "not-a-table"
 
         // A whole-app-state client with a genuinely-broken config errors (leaving the
         // file intact) instead of replacing it with just the gateway entry.
-        let path = 
-            std::env::temp_dir().join(format!("conduit-claude-{}.json", std::process::id()));
+        let path = std::env::temp_dir().join(format!("conduit-claude-{}.json", std::process::id()));
         let garbage = "{ \"projects\": {}, \"oauthAccount\": broken not json";
         std::fs::write(&path, garbage).unwrap();
         assert!(edit_json_gateway(&path, "mcpServers", true, None, true).is_err());
@@ -3105,8 +3103,7 @@ bad = "not-a-table"
         // Codex's config.toml holds the user's whole config; a parse failure must
         // ERROR and leave the file byte-for-byte intact, never rewrite it down to
         // just our [mcp_servers.Toolport] entry.
-        let path = 
-            std::env::temp_dir().join(format!("conduit-bad-{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!("conduit-bad-{}.toml", std::process::id()));
         let garbage = "model = \"o3\"\n[[[ this is not valid toml";
         std::fs::write(&path, garbage).unwrap();
         assert!(edit_toml_gateway(&path, true, None).is_err());
@@ -3117,8 +3114,7 @@ bad = "not-a-table"
     #[test]
     fn toml_edit_preserves_other_settings() {
         // A parseable config.toml keeps every unrelated key when we add our entry.
-        let path = 
-            std::env::temp_dir().join(format!("conduit-ok-{}.toml", std::process::id()));
+        let path = std::env::temp_dir().join(format!("conduit-ok-{}.toml", std::process::id()));
         std::fs::write(
             &path,
             "model = \"o3\"\napproval_policy = \"on-request\"\n\n[profiles.work]\nmodel = \"gpt-5\"\n",
@@ -3148,7 +3144,7 @@ bad = "not-a-table"
 
     #[test]
     fn new_json_clients_are_registered() {
-        // Warp, Amazon Q, Kiro, and LM Studio, Jan, and AnythingLLM all use the standard mcpServers JSON
+        // Warp, Amazon Q, Kiro, LM Studio, Jan, and AnythingLLM all use the standard mcpServers JSON
         // shape, so a ClientDef + path is all they need. Lock in their registration,
         // format, and that their config paths resolve on this OS.
         for id in [
