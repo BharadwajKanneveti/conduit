@@ -8,6 +8,21 @@ default-run = "conduit"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[features]
+default = ["desktop"]
+desktop = [
+    "dep:tauri",
+    "dep:tauri-build",
+    "dep:tauri-plugin-opener",
+    "dep:tauri-plugin-updater",
+    "dep:tauri-plugin-process",
+    "dep:tauri-plugin-dialog",
+    "dep:tauri-plugin-notification",
+    "dep:tauri-plugin-autostart",
+    "dep:tauri-plugin-deep-link",
+    "dep:tauri-plugin-single-instance",
+]
+
 [lib]
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
@@ -16,16 +31,16 @@ name = "conduit_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [] }
+tauri-build = { version = "2", features = [], optional = true }
 
 [dependencies]
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
-tauri-plugin-opener = "2"
-tauri-plugin-updater = "2"
-tauri-plugin-process = "2"
-tauri-plugin-dialog = "2"
-tauri-plugin-notification = "2"
-tauri-plugin-autostart = "2"
+tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
+tauri-plugin-opener = { version = "2", optional = true }
+tauri-plugin-updater = { version = "2", optional = true }
+tauri-plugin-process = { version = "2", optional = true }
+tauri-plugin-dialog = { version = "2", optional = true }
+tauri-plugin-notification = { version = "2", optional = true }
+tauri-plugin-autostart = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 json5 = "0.4"
@@ -42,8 +57,8 @@ urlencoding = "2"
 # Minimal synchronous HTTP server for the gateway's native HTTP/OpenAPI mode
 # (first-class Open WebUI and any OpenAPI tool client, no external bridge).
 tiny_http = "0.12"
-tauri-plugin-deep-link = "2"
-tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
+tauri-plugin-deep-link = { version = "2", optional = true }
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"], optional = true }
 
 # OS keychain, with the native backend per platform.
 [target.'cfg(target_os = "windows")'.dependencies]
