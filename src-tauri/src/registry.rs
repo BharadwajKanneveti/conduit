@@ -1169,10 +1169,8 @@ pub(crate) fn arg_looks_secret(arg: &str) -> bool {
     // A connection URI with embedded userinfo: scheme://user:pass@host/...
     if let Some((_, rest)) = arg.split_once("://") {
         let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-        if let Some((userinfo, _host)) = authority.rsplit_once('@') {
-            if userinfo.contains(':') {
-                return true;
-            }
+        if authority.contains('@') {
+            return true;
         }
     }
     false
