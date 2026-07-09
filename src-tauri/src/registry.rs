@@ -1152,6 +1152,51 @@ pub fn load_resolved() -> Result<Registry, String> {
     }
 }
 
+/// True when a command argument looks like it carries a secret: an inline
+/// credential param (password=, token=, ...) or a connection URI with embedded
+/// userinfo (scheme://user:pass@host). Used to redact args before sharing, since
+/// some servers (e.g. Postgres) take a connection string with a password in args.
+/// Biased toward over-redacting: for a share, a false positive is harmless.
+pub(crate) fn arg_looks_secret(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    const NEEDLES: [&str; 8] = [
+        "password=", "pwd=", "token=", "apikey=", "api_key=", "secret=", "accountkey=",
+        "access_key",
+    ];
+    if NEEDLES.iter().any(|n| lower.contains(n)) {
+        return true;
+    }
+    // A connection URI with embedded userinfo: scheme://user:pass@host/...
+    if let Some((_, rest)) = arg.split_once("://") {
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+        if let Some((userinfo, _host)) = authority.rsplit_once('@') {
+            if userinfo.contains(':') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Redact credentials embedded in a URL's authority: `scheme://user:pass@host/x`
+/// (or `scheme://token@host/x`) becomes `scheme://<redacted>@host/x`. A URL is a
+/// legitimate place for a secret (HTTP basic, token-as-username), so it must be
+/// stripped anywhere a setup leaves the machine - env/arg redaction alone misses the
+/// `url` field. Returns the input unchanged when there is no userinfo. Best-effort
+/// string surgery (no URL-crate dependency): only the span between `://` and the
+/// first `/?#` is touched, and ANY `@` there is treated as a userinfo separator.
+pub(crate) fn redact_url_userinfo(url: &str) -> String {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    let auth_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(auth_end);
+    match authority.rsplit_once('@') {
+        Some((_userinfo, host)) => format!("{scheme}://<redacted>@{host}{tail}"),
+        None => url.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

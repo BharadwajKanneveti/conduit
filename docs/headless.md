@@ -1,5 +1,10 @@
 # Headless / container gateway
 
+**Gateway-only compile:** CI and headless builds use
+`cargo build --no-default-features --bin toolport-gateway` to skip the Tauri
+desktop shell and WebKit dependencies. The default feature set (`desktop`) is
+for the full app.
+
 Run `toolport-gateway` without the desktop app — for Docker hosts, sandboxed
 coding agents, and Open WebUI. The desktop app stays the local-first product
 (client config writers, HITL approvals, OAuth UX). This path is the same binary
@@ -83,7 +88,7 @@ docker build -f Dockerfile.source -t toolport-gateway .
 Or use the runtime Dockerfile after building the binary on the host:
 
 ```bash
-cargo build --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml
+cargo build --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features
 cp src-tauri/target/release/toolport-gateway toolport-gateway-bin
 docker build -t toolport-gateway .
 ```

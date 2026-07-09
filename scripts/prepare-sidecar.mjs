@@ -42,10 +42,13 @@ function buildGateway(triple) {
   console.log(
     `[sidecar] building toolport-gateway (${profile}) ${triple ? "for " + triple : "(host)"}`,
   );
-  execSync(`cargo build ${debug ? "" : "--release "}${targetArg}--bin toolport-gateway`, {
-    cwd: "src-tauri",
-    stdio: "inherit",
-  });
+  execSync(
+    `cargo build ${debug ? "" : "--release "}${targetArg}--bin toolport-gateway --no-default-features`,
+    {
+      cwd: "src-tauri",
+      stdio: "inherit",
+    },
+  );
   const src = gatewayPathFor(triple);
   if (!existsSync(src)) throw new Error(`built gateway not found at ${src}`);
   return src;
@@ -55,9 +58,8 @@ function buildGateway(triple) {
 const stagedTriple = requested || hostTriple();
 const dest = join(destDir, `toolport-gateway-${stagedTriple}${ext}`);
 
-// Break the chicken-and-egg: the gateway's own build (via the shared build.rs ->
-// tauri_build) validates this externalBin path exists at compile time. Seed a
-// placeholder so that check passes; we overwrite it with the real binary below.
+// Seed a placeholder so Tauri's externalBin check passes at bundle time; we
+// overwrite it with the real binary below.
 if (!existsSync(dest)) {
   writeFileSync(dest, "");
 }
