@@ -8,79 +8,68 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [1.7.0] - 2026-07-09
 
-**Security and reliability batch.** A scoped client whose profile is missing now fails
-closed instead of widening to the active profile's servers. Adds per-server working
-directories and live per-client profile scoping; the server grid refreshes incrementally
-so one cold install no longer stalls it; error rows lead with a readable headline; and
-registry recovery is hardened with a rolling backup journal and unknown-field preservation.
+This release leads with a security fix and clears a batch of rough edges around running
+servers and living in the app day to day.
 
 ### Security
 
-- **Scoped client fails closed on an unknown profile** — `resolve_profile_id` previously
-  fell back to the active profile when a scope reference matched no profile, so a scoped
-  client whose profile was deleted or renamed silently widened to the active profile's
-  servers (scope fail-open). A named reference that matches nothing now resolves to an
-  empty server set; an empty/whitespace reference still follows the active profile
-  (unscoped, unchanged). (#261, #258)
+**Scoped clients now fail closed on a missing profile.** If a client was pinned to a
+profile that later got deleted or renamed, it used to fall back to your active profile and
+quietly expose that set of servers instead. It now resolves to nothing rather than the
+wrong thing. Clients that aren't scoped still follow the active profile, unchanged. (#261)
 
 ### Added
 
-- **Per-server working directory (cwd)** — an optional working directory on each stdio
-  server. A leading `~` expands to home and `${VAR}` expands from the environment. Pins a
-  server that operates on a project (filesystem/grep tools) to that project instead of
-  inheriting Toolport's cwd; unset inherits the gateway's cwd (unchanged). The dynamic
-  `${ROOT}`-from-MCP-roots variant is a scoped follow-up. (#262, #239)
-- **Live per-client profile scoping** — the gateway re-resolves each client's profile on
-  every reload via `CONDUIT_CLIENT_ID` (now written for every install), so re-scoping
-  applies without restarting the client (scoped→scoped, scoped→unscoped, unscoped→scoped).
-  Adds diagnostics: the registry watcher logs each profile transition with server and tool
-  counts, and `toolport_status` flags enabled servers that expose 0 tools (the classic
-  connected-but-unauthenticated case), guarded so it stays quiet during startup. (#247)
-- **Copy button on server-row errors** — the expanded server-row error has a Copy button
-  that puts the full raw output on the clipboard. (#264, #254)
-- **Dev data directory** — debug/`tauri dev` builds use `Conduit-dev` instead of the
-  production `Conduit` folder (`CONDUIT_DATA_DIR` overrides). (#232)
-- **Registry recovery notice** — when `registry.json` is restored from `.bak`, the app
-  shows a one-time toast with the recovery time (and quarantine path when applicable).
-  (#231)
+**Per-server working directory.** Any stdio server can now run in a working directory you
+choose, so a filesystem or grep server operates on the project you point it at instead of
+wherever Toolport happens to sit. Paths support `~` and `${VAR}`; leave it blank to keep
+the old behavior. (#262)
+
+**Re-scope a client without restarting it.** Change which profile a client uses and it
+takes effect on the next reload, with no client restart. The app also flags servers that
+are connected but exposing zero tools, which is almost always a sign the server still
+needs to authenticate. (#247)
+
+**Copy button on server errors.** Copy a server's full error output to the clipboard in
+one click. (#264)
+
+**Dev builds keep their own data.** Development builds now store data under `Conduit-dev`,
+so debugging can't touch your real setup. (#232)
+
+**Recovery notice.** When the registry is restored from a backup, a one-time message tells
+you it happened and when. (#231)
 
 ### Fixed
 
-- **Server grid refreshes incrementally** — each server is now probed on its own thread
-  and resolves its grid row the moment it finishes, so a cold `npx`/`uvx` install no longer
-  leaves the whole grid "checking" for 30-60s. A 90s per-probe timeout backstops a hung
-  server. (#263, #252)
-- **Readable error headlines** — a failed probe/spawn now leads with a one-line headline
-  instead of burying it under a Node stack trace and a multi-KB OAuth authorize URL; the
-  full output stays below, bounded/scrollable/monospace with long URLs shortened. A giant
-  authorize URL on its own no longer reads as an auth error. (#253, #229)
-- **Package-runner servers named after their package** — pasting a bare object like
-  `{command: npx, args: [-y, @scope/mcp-automem]}` now names the server `automem` instead
-  of `npx`, so `npx`-launched servers no longer collide on one id and expose tools as
-  `npx__*`. Honors an explicit `--package`/`-p` and stops at `--`; uses a cross-platform
-  command stem. (ids are immutable — remove and re-paste an already-saved `npx` server to
-  fix its id.) (#255, #256, #251)
-- **Unknown per-server fields preserved on re-save** — `ServerEntry` now carries a
-  flattened unknown-fields map, so an older binary that loads and re-saves a newer build's
-  registry no longer strips per-server fields it doesn't recognize (mirrors the top-level
-  protection from #224). (#249, #234)
-- **Rolling backup journal** — every save writes a timestamped generation
-  (`registry.json.bak.<ts>`, pruned to the newest 5) alongside the single `.bak`, and
-  recovery walks newest-first, so restoration isn't stuck on one possibly-stale backup.
-  (#250, #233)
-- **Activity keyboard a11y + transport label** — Enter/Space activation for the Activity
-  rows that were `role=button` without a handler, and an `aria-label` on the Add-Server
-  transport select for an accessible name. (#264, #260)
-- **OAuth callback port collision across clients** — concurrent gateway processes now
-  serialize browser OAuth for the same remote server with a short-lived filesystem
-  lock, so only one callback listener/browser flow runs and waiters reuse the
-  vaulted auth state when it completes. (#228)
-- **Gateway stale secrets** — `secrets_generation` in the registry bumps on vault
-  changes so running gateways reload credentials without a manual restart. (#226)
+**One slow server no longer freezes the whole grid.** Each server is checked on its own
+now, so a cold `npx` or `uvx` download stops leaving every other server stuck on
+"checking" for up to a minute. (#263)
+
+**Errors lead with the useful line.** A failed server used to bury the real problem under a
+stack trace and a giant login URL. It now shows a one-line summary first, with the full
+output kept below if you want it. A long OAuth URL on its own no longer looks like an auth
+error. (#253)
+
+**Servers pasted as `npx` get a real name.** Pasting a package-runner config now names the
+server after the package it runs (for example `automem`) instead of `npx`, so several
+`npx` servers stop colliding and hiding each other's tools. A server already saved as
+`npx` needs a quick remove and re-paste to pick up the correct name. (#255)
+
+**Registry recovery is harder to break.** Toolport now keeps a short rolling journal of
+recent backups instead of a single one, so recovery isn't stuck when the latest backup is
+stale. Settings written by a newer build also survive being re-saved by an older one.
+(#249, #250)
+
+**Better keyboard access.** Activity rows respond to Enter and Space, and the add-server
+transport picker has a proper label for screen readers. (#264)
+
+Also includes the OAuth callback and credential-reload fixes carried over from the 1.6.x
+line. (#226, #228)
 
 ### Documentation
 
-- **Roadmap, README, and benchmark** refreshed to the current state. (#248)
+**Refreshed the roadmap, README, and benchmark** to match where the project actually is.
+(#248)
 
 ## [1.6.2] - 2026-07-09
 
