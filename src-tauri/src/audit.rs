@@ -24,6 +24,21 @@ pub fn audit_path() -> Option<PathBuf> {
     Some(crate::registry::conduit_dir()?.join("audit.jsonl"))
 }
 
+/// Delete the audit log (called when the user clears retained activity). Returns
+/// `Err` only on a real removal failure; a missing file (nothing to clear) is
+/// success, so the caller can honestly confirm the log is gone rather than report a
+/// false "cleared". Local and irreversible; the next call re-creates the file.
+pub fn try_clear() -> std::io::Result<()> {
+    let Some(path) = audit_path() else {
+        return Ok(());
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn epoch_millis() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
