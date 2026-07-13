@@ -165,6 +165,10 @@ fn fetch_result_tool_def() -> Value {
                 "cursor": { "type": "string", "description": "The cursor from the marker." },
                 "offset": { "type": "integer", "minimum": 0, "description": "Character offset to read from (shown in the marker)." }
             },
+            "projection": {
+                "type": "string",
+                "description": "Optional dot-separated path into structuredContent (for example: data.items.0.name)."
+            },
             "required": ["cursor", "offset"],
             "additionalProperties": false
         }
@@ -1947,9 +1951,12 @@ fn handle_request_with_cancel(
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
                 let len = arguments.get("len").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let projection = arguments
+                    .get("projection")
+                    .and_then(|v| v.as_str());
                 // Pass the calling client so a client can only fetch results it stashed
                 // (the stash is process-global in HTTP mode).
-                return Some(success(id, shaping::fetch_result(cursor, offset, len, client)));
+                return Some(success(id, shaping::fetch_result(cursor, offset, len, client, projection)));
             }
 
             // toolport_confirm: replay a previously-intercepted destructive call.
@@ -2450,6 +2457,8 @@ fn handle_request_with_cancel(
                         .map(|&b| b as usize)
                         .unwrap_or_else(shaping::budget);
                     shaping::shape_result(&mut result, budget, client);
+                    let text = result["content"][0]["text"].as_str().unwrap();
+
                     // Recover from a downstream failure: point the model at
                     // sibling list/get tools that can supply a missing/invalid
                     // identifier. Appended after shaping so it's never truncated.
@@ -5702,6 +5711,44 @@ mod tests {
             Ok(())
         }
     }
+    struct PagingRoute {
+    body: String,
+    }
+
+    impl conduit_lib::downstream::Transport for PagingRoute {
+        fn request(
+            &mut self,
+            method: &str,
+            _params: Value,
+        ) -> Result<Value, conduit_lib::downstream::TransportError> {
+             match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-06-18"
+                })),
+                "tools/list" => Ok(json!({
+                    "tools": [{
+                        "name": "big",
+                        "description": "",
+                    }]
+                })),
+                "tools/call" => Ok(json!({
+                    "content": [{
+                        "type": "text",
+                        "text" : self.body.clone()
+                    }],
+                    "isError": false
+                })),
+                other => Err(conduit_lib::downstream::TransportError::Fatal(
+                    format!("unexpected {other}")
+                )),
+             }
+        }
+
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<(), conduit_lib::downstream::TransportError> {
+            Ok(())
+        }
+    }
+
 
     /// A router with one server `id` exposing one tool `tool` (so `id__tool` routes).
     fn routed_router(id: &str, tool: &str) -> Router {
@@ -5712,6 +5759,19 @@ mod tests {
             }),
         )
         .unwrap();
+        let mut r = Router::new();
+        r.add(ds);
+        r
+    }
+
+
+    fn paging_router(body: String) -> Router {
+        let ds = DownstreamServer::connect(
+            "s".to_string(),
+            Box::new(PagingRoute {body}),
+        )
+        .unwrap();
+       
         let mut r = Router::new();
         r.add(ds);
         r
@@ -7977,4 +8037,105 @@ mod tests {
             "confirmed call must not be re-intercepted (would loop). Got: {text2}"
         );
     }
-}
+            
+        #[test]
+        fn oversized_tool_call_can_be_fetched() {
+            let body = format!("{}THE_END", "A".repeat(50_000));
+
+            let reg = Registry::default();
+            let router = paging_router(body.clone());
+
+            // First call: invoke the downstream tool.
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "s__big",
+                    "arguments": {}
+                }
+            });
+
+            let resp = handle_request(
+                &req,
+                &reg,
+                &router,
+                &[],
+                true,
+                None,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                None,
+                None,
+            )
+            .unwrap();
+
+            let text = resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap();
+
+
+            // Oversized results should be shaped into a preview.
+            assert!(text.len() < body.len());
+            assert!(text.contains("Toolport shaped"));
+            assert!(text.contains("\"cursor\""));
+
+            // Extract cursor.
+            let cursor = text
+                .split("\"cursor\":\"")
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap();
+
+            // Extract offset.
+            let offset: usize = text
+                .split("\"offset\":")
+                .nth(1)
+                .unwrap()
+                .split(|c| c == ',' || c == '}')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap();
+
+
+            // Fetch the remainder through the public tool API.
+            let fetch_req = json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "toolport_fetch_result",
+                    "arguments": {
+                        "cursor": cursor,
+                        "offset": offset,
+                        "len": body.len() - offset,
+                    }
+                }
+            });
+
+            let fetch_resp = handle_request(
+                &fetch_req,
+                &reg,
+                &router,
+                &[],
+                true,
+                None,
+                &SearchGuard::default(),
+                &ConfirmGuard::new(),
+                None,
+                None,
+            )
+            .unwrap();
+
+
+            let fetched = fetch_resp["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap();
+
+            assert!(fetched.starts_with(&body[offset..]));
+            assert!(fetched.contains("[Toolport: end of result"));
+        }
+    }
