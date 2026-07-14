@@ -163,12 +163,11 @@ fn fetch_result_tool_def() -> Value {
             "type": "object",
             "properties": {
                 "cursor": { "type": "string", "description": "The cursor from the marker." },
-                "offset": { "type": "integer", "minimum": 0, "description": "Character offset to read from (shown in the marker)." }
+                "offset": { "type": "integer", "minimum": 0, "description": "Character offset to read from (shown in the marker)." },
+                "projection": { "type": "string", "description": "Optional dot-separated path into structuredContent (for example: data.items.0.name)."
+             },
             },
-            "projection": {
-                "type": "string",
-                "description": "Optional dot-separated path into structuredContent (for example: data.items.0.name)."
-            },
+          
             "required": ["cursor", "offset"],
             "additionalProperties": false
         }
@@ -2457,7 +2456,6 @@ fn handle_request_with_cancel(
                         .map(|&b| b as usize)
                         .unwrap_or_else(shaping::budget);
                     shaping::shape_result(&mut result, budget, client);
-                    let text = result["content"][0]["text"].as_str().unwrap();
 
                     // Recover from a downstream failure: point the model at
                     // sibling list/get tools that can supply a missing/invalid
@@ -5736,6 +5734,12 @@ mod tests {
                         "type": "text",
                         "text" : self.body.clone()
                     }],
+                    "structuredContent": {
+                        "user": {
+                            "name": "Alice",
+                            "age": 30
+                        }
+                    },
                     "isError": false
                 })),
                 other => Err(conduit_lib::downstream::TransportError::Fatal(
@@ -8138,4 +8142,82 @@ mod tests {
             assert!(fetched.starts_with(&body[offset..]));
             assert!(fetched.contains("[Toolport: end of result"));
         }
+
+        #[test]
+    fn fetch_result_projection_dispatch_returns_requested_field() {
+        let body = "A".repeat(50_000);
+
+        let reg = Registry::default();
+        let router = paging_router(body);
+
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "s__big",
+                "arguments": {}
+            }
+        });
+
+        let resp = handle_request(
+            &req,
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        let text = resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+
+        let cursor = text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+
+        let fetch_req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "toolport_fetch_result",
+                "arguments": {
+                    "cursor": cursor,
+                    "projection": "user.age"
+                }
+            }
+        });
+
+        let fetch_resp = handle_request(
+            &fetch_req,
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(!fetch_resp["result"]["isError"].as_bool().unwrap());
+
+        assert_eq!(
+            fetch_resp["result"]["content"][0]["text"].as_str().unwrap(),
+            "30"
+        );
+    }
     }

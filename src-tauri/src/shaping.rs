@@ -90,6 +90,10 @@ fn extract_body(result: &Value) -> String {
     out
 }
 
+fn value_size(value: &Value) -> usize { 
+    serde_json::to_string(value) .map(|s| s.len()) .unwrap_or(0) 
+}
+
 fn text_result(text: String, is_error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
 }
@@ -161,10 +165,10 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
     // projection captures under half the bytes), shaping would drop data and its
     // "nothing was lost" claim would be false. Pass those through untouched.
     let body = extract_body(result);
-    let structured = result.get("structuredContent").cloned();
     if !is_text_representable(result) || body.len() < size / 2 {
         return false;
     }
+    let structured = result.get("structuredContent").cloned();
 
     let total = body.chars().count();
     // Reserve room for the marker, then show as much of the body head as fits the
@@ -178,20 +182,40 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
         .unwrap_or(false);
 
     let cursor = next_cursor();
+    let new_entry_size = body.len()
+        + structured
+            .as_ref()
+            .map(value_size)
+            .unwrap_or(0);
+
     {
         let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
         sweep(&mut map);
+
         // Bound memory: evict oldest until the entry count and total bytes leave
-        // room for this body (or the cache empties, keeping one over-cap body).
+        // room for this cached result (or the cache empties, keeping one over-cap
+        // result).
         while !map.is_empty()
             && (map.len() >= MAX_CACHE_ENTRIES
-                || map.values().map(|c| c.body.len()).sum::<usize>() + body.len() > MAX_CACHE_BYTES)
+                || map
+                    .values()
+                    .map(|c| {
+                        c.body.len()
+                            + c.structured
+                                .as_ref()
+                                .map(value_size)
+                                .unwrap_or(0)
+                    })
+                    .sum::<usize>()
+                    + new_entry_size
+                    > MAX_CACHE_BYTES)
         {
             let Some(oldest) = map.iter().min_by_key(|(_, c)| c.at).map(|(k, _)| k.clone()) else {
                 break;
             };
             map.remove(&oldest);
         }
+
         map.insert(
             cursor.clone(),
             Cached {
@@ -202,7 +226,6 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
             },
         );
     }
-
     let marker = format!(
         "\n\n[Toolport shaped this result: it was ~{} KB, larger than the {} KB context \
          budget. Showing the first {} of {} characters. The rest is held temporarily, call \
