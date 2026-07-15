@@ -1935,6 +1935,9 @@ fn set_auth_token(
     server_id: String,
     token: String,
 ) -> Result<(), String> {
+    // A manually pasted bearer replaces any prior OAuth session. Keeping stale
+    // refresh metadata could otherwise overwrite the user's token later.
+    remote::clear_oauth_state(&server_id)?;
     secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &token)?;
     bump_secrets_generation(state.inner());
     Ok(())
@@ -1942,6 +1945,9 @@ fn set_auth_token(
 
 #[tauri::command]
 fn clear_auth_token(state: State<RegistryState>, server_id: String) -> Result<(), String> {
+    // Remove refresh metadata first so a second-write failure cannot leave state
+    // that silently recreates the bearer token the user asked to delete.
+    remote::clear_oauth_state(&server_id)?;
     secrets::delete_secret(&server_id, secrets::HTTP_AUTH_KEY)?;
     bump_secrets_generation(state.inner());
     Ok(())
@@ -1985,6 +1991,8 @@ async fn authenticate_oauth(
         &res.client_id,
         res.refresh_token,
         Some(resource),
+        res.issued_at,
+        res.expires_at,
     )?;
     bump_secrets_generation(state.inner());
     Ok(())
