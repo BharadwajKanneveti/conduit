@@ -45,6 +45,11 @@ pub fn budget() -> usize {
 
 struct Cached {
     body: String,
+    structured: Option<Value>,
+    /// The entry's total serialized size (`body` + structured JSON), computed once at
+    /// insert. The eviction loop sums this across entries on every oversized call, so
+    /// caching it avoids re-serializing every structured payload on each iteration.
+    size: usize,
     at: Instant,
     /// The client the result belongs to (a registered HTTP client's label), or None
     /// for the single-tenant stdio process. Only this client may fetch it back.
@@ -89,8 +94,29 @@ fn extract_body(result: &Value) -> String {
     out
 }
 
+fn value_size(value: &Value) -> usize { 
+    serde_json::to_string(value) .map(|s| s.len()) .unwrap_or(0) 
+}
+
 fn text_result(text: String, is_error: bool) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
+}
+
+fn project<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut current = value;
+
+    for segment in path.split('.') {
+        if let Some(object) = current.as_object() {
+            current = object.get(segment)?;
+        } else if let Some(array) = current.as_array() {
+            let index = segment.parse::<usize>().ok()?;
+            current = array.get(index)?;
+        } else {
+            return None;
+        }
+    }
+
+    Some(current)
 }
 
 /// The longest char-boundary prefix of `s` whose UTF-8 length is at most
@@ -146,6 +172,7 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
     if !is_text_representable(result) || body.len() < size / 2 {
         return false;
     }
+    let structured = result.get("structuredContent").cloned();
 
     let total = body.chars().count();
     // Reserve room for the marker, then show as much of the body head as fits the
@@ -159,30 +186,37 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
         .unwrap_or(false);
 
     let cursor = next_cursor();
+    let new_entry_size = body.len() + structured.as_ref().map(value_size).unwrap_or(0);
+
     {
         let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
         sweep(&mut map);
+
         // Bound memory: evict oldest until the entry count and total bytes leave
-        // room for this body (or the cache empties, keeping one over-cap body).
+        // room for this cached result (or the cache empties, keeping one over-cap
+        // result). Each entry's `size` is precomputed, so this sum is O(n) adds, not
+        // O(n) JSON re-serializations, on every iteration.
         while !map.is_empty()
             && (map.len() >= MAX_CACHE_ENTRIES
-                || map.values().map(|c| c.body.len()).sum::<usize>() + body.len() > MAX_CACHE_BYTES)
+                || map.values().map(|c| c.size).sum::<usize>() + new_entry_size > MAX_CACHE_BYTES)
         {
             let Some(oldest) = map.iter().min_by_key(|(_, c)| c.at).map(|(k, _)| k.clone()) else {
                 break;
             };
             map.remove(&oldest);
         }
+
         map.insert(
             cursor.clone(),
             Cached {
                 body,
+                structured,
+                size: new_entry_size,
                 at: Instant::now(),
                 owner: owner.map(str::to_string),
             },
         );
     }
-
     let marker = format!(
         "\n\n[Toolport shaped this result: it was ~{} KB, larger than the {} KB context \
          budget. Showing the first {} of {} characters. The rest is held temporarily, call \
@@ -201,7 +235,7 @@ pub fn shape_result(result: &mut Value, budget: usize, owner: Option<&str>) -> b
 
 /// Return the next slice of a cached shaped result, by cursor + character offset.
 /// `len` of 0 means "use the current budget".
-pub fn fetch_result(cursor: &str, offset: usize, len: usize, requester: Option<&str>) -> Value {
+pub fn fetch_result(cursor: &str, offset: usize, len: usize, requester: Option<&str>, projection: Option<&str>,) -> Value {
     let mut map = cache().lock().unwrap_or_else(|e| e.into_inner());
     sweep(&mut map);
     // Scope: a cached result is readable only by the client that stashed it. A mismatch
@@ -222,6 +256,32 @@ pub fn fetch_result(cursor: &str, offset: usize, len: usize, requester: Option<&
             );
         }
     };
+    if let Some(path) = projection {
+    let structured = match &c.structured {
+        Some(value) => value,
+        None => {
+            return text_result(
+                "[Toolport: this cached result has no structuredContent.]".to_string(),
+                true,
+            );
+        }
+    };
+
+    let value = match project(structured, path) {
+        Some(value) => value,
+        None => {
+            return text_result(
+                format!("[Toolport: projection \"{path}\" not found.]"),
+                true,
+            );
+        }
+    };
+
+    return text_result(
+        serde_json::to_string(value).unwrap_or_default(),
+        false,
+    );
+}
     let total = c.body.chars().count();
     if offset >= total {
         return text_result(
@@ -311,14 +371,14 @@ mod tests {
             .and_then(|s| s.split('"').next())
             .unwrap()
             .to_string();
-        let more = fetch_result(&cursor, 1500, 500, None);
+        let more = fetch_result(&cursor, 1500, 500, None, None);
         let mt = more["content"][0]["text"].as_str().unwrap();
         assert!(mt.contains("of 10000"));
     }
 
     #[test]
     fn fetch_unknown_cursor_is_an_error() {
-        let v = fetch_result("nope", 0, 100, None);
+        let v = fetch_result("nope", 0, 100, None, None);
         assert_eq!(v["isError"].as_bool(), Some(true));
     }
 
@@ -344,16 +404,16 @@ mod tests {
         // cursors exist. The stash is process-global, so in HTTP mode this is the only
         // thing stopping one client from reading another's result by guessing r{n}.
         assert_eq!(
-            fetch_result(&cursor, 0, 100, Some("mallory"))["isError"].as_bool(),
+            fetch_result(&cursor, 0, 100, Some("mallory"),None)["isError"].as_bool(),
             Some(true)
         );
         assert_eq!(
-            fetch_result(&cursor, 0, 100, None)["isError"].as_bool(),
+            fetch_result(&cursor, 0, 100, None, None)["isError"].as_bool(),
             Some(true)
         );
         // The owner still reads it.
         assert_ne!(
-            fetch_result(&cursor, 0, 100, Some("alice"))["isError"].as_bool(),
+            fetch_result(&cursor, 0, 100, Some("alice"), None)["isError"].as_bool(),
             Some(true)
         );
     }
@@ -365,7 +425,7 @@ mod tests {
         let cursor = cursor_of(&r);
         // offset + len must saturate, not overflow into a start > end byte slice
         // (which panics, and on the stdio transport takes down the whole gateway).
-        let v = fetch_result(&cursor, 5, usize::MAX, None);
+        let v = fetch_result(&cursor, 5, usize::MAX, None, None);
         assert_ne!(v["isError"].as_bool(), Some(true));
         assert!(v["content"][0]["text"]
             .as_str()
@@ -408,7 +468,7 @@ mod tests {
             .unwrap()
             .to_string();
         // Read 100 chars starting at char 1000 (byte 3000): all euros, none split.
-        let page = fetch_result(&cursor, 1000, 100, None);
+        let page = fetch_result(&cursor, 1000, 100, None, None);
         let pt = page["content"][0]["text"].as_str().unwrap();
         let body = pt.split("\n\n[Toolport:").next().unwrap();
         assert_eq!(body.chars().filter(|&c| c == '€').count(), 100);
@@ -426,7 +486,7 @@ mod tests {
             .and_then(|s| s.split('"').next())
             .unwrap()
             .to_string();
-        let past = fetch_result(&cursor, 999_999, 100, None);
+        let past = fetch_result(&cursor, 999_999, 100, None, None);
         let pt = past["content"][0]["text"].as_str().unwrap();
         assert!(pt.contains("past the end"));
         assert_eq!(past["isError"].as_bool(), Some(false));
@@ -469,5 +529,58 @@ mod tests {
             "cache grew to {} entries",
             map.len()
         );
+    }
+
+    #[test]
+    fn fetch_result_projection_returns_nested_field() {
+        let mut r = json!({
+            "content": [{
+                "type": "text",
+                "text": "x".repeat(4096)
+            }],
+            "structuredContent": {
+                "data": {
+                    "users": [
+                        {
+                            "profile": {
+                                "name": "Alice",
+                                "age": 30
+                            }
+                        },
+                        {
+                            "profile": {
+                                "name": "Bob",
+                                "age": 40
+                            }
+                        }
+                    ]
+                }
+            },
+            "isError": false
+        });
+
+        // Force shaping so the result is cached.
+        assert!(shape_result(&mut r, 2048, None));
+
+        let text = r["content"][0]["text"].as_str().unwrap();
+        let cursor = text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .unwrap()
+            .to_string();
+
+        let projected = fetch_result(
+            &cursor,
+            0,
+            0,
+            None,
+            Some("data.users.1.profile.age"),
+        );
+
+        assert!(!projected["isError"].as_bool().unwrap());
+
+        let text = projected["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, "40");
     }
 }
