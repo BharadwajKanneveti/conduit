@@ -335,6 +335,98 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
     Some(path)
 }
 
+/// Resolve where a client reads its GLOBAL agent-rules file (Team Instructions, spec "W2").
+/// This is DISTINCT from the client's MCP-config path — e.g. Claude Code's config is
+/// `~/.claude.json` but its rules live under `~/.claude/rules/`. `None` means the client has
+/// no global-rules location we write: either its globals are UI/cloud-stored (Cursor, Warp),
+/// or it's covered transitively by another client's file (Antigravity reads Gemini's
+/// `GEMINI.md`; VS Code Copilot reads Claude Code's `~/.claude` rules). Unlike the config
+/// resolver these paths are all home-anchored (or literal `~/.config`), so one cross-platform
+/// resolver covers Linux too — no XDG/data-dir or MSIX handling needed. See the spec's adapter
+/// table for citations.
+fn resolve_rules_target(
+    client_id: &str,
+    home: &std::path::Path,
+    platform: Platform,
+) -> Option<crate::instructions::Target> {
+    use crate::instructions::{Strategy, Target};
+    let config = roaming_config_dir(home, platform);
+    let owned = |path: PathBuf| Target {
+        path,
+        strategy: Strategy::OwnedFile,
+        char_cap: None,
+        blocked_if_present: None,
+    };
+    let block = |path: PathBuf| Target {
+        path,
+        strategy: Strategy::SentinelBlock,
+        char_cap: None,
+        blocked_if_present: None,
+    };
+    let target = match client_id {
+        // Strategy A — Toolport owns a whole file in the client's rules DIRECTORY.
+        // Claude Code's `~/.claude/rules/` is also read by VS Code Copilot (Claude-compat
+        // paths), so both map here; path-dedup writes it once when both are installed and a
+        // standalone VS Code install is still covered.
+        "claude-code" | "vscode" => owned(
+            home.join(".claude")
+                .join("rules")
+                .join("toolport-team-rules.md"),
+        ),
+        "kiro" => owned(
+            home.join(".kiro")
+                .join("steering")
+                .join("toolport-team-rules.md"),
+        ),
+        "roo-code" => owned(home.join(".roo").join("rules").join("toolport-team-rules.md")),
+        "cline" => owned(
+            home.join("Documents")
+                .join("Cline")
+                .join("Rules")
+                .join("toolport-team-rules.md"),
+        ),
+        // Strategy B — Toolport owns only the sentinel span in a shared global file.
+        "codex" => Target {
+            path: home.join(".codex").join("AGENTS.md"),
+            strategy: Strategy::SentinelBlock,
+            char_cap: None,
+            // AGENTS.override.md, if present, makes Codex ignore AGENTS.md entirely.
+            blocked_if_present: Some(home.join(".codex").join("AGENTS.override.md")),
+        },
+        // Gemini CLI and Antigravity share `~/.gemini/GEMINI.md`; both resolve to it so a
+        // standalone install of EITHER is covered, and `apply_instructions`' path-dedup writes
+        // it once when both are present.
+        "gemini-cli" | "antigravity" => block(home.join(".gemini").join("GEMINI.md")),
+        "windsurf" => Target {
+            path: home
+                .join(".codeium")
+                .join("windsurf")
+                .join("memories")
+                .join("global_rules.md"),
+            strategy: Strategy::SentinelBlock,
+            char_cap: Some(6000), // Windsurf hard-caps the global rules file.
+            blocked_if_present: None,
+        },
+        "goose" => block(home.join(".config").join("goose").join(".goosehints")),
+        "pi" => block(home.join(".pi").join("agent").join("AGENTS.md")),
+        "zed" => match platform {
+            Platform::Windows => block(config.join("Zed").join("AGENTS.md")),
+            Platform::MacOs | Platform::Linux => {
+                block(home.join(".config").join("zed").join("AGENTS.md"))
+            }
+        },
+        _ => return None,
+    };
+    Some(target)
+}
+
+/// The rules-file target for a client on the current machine, or `None` if unsupported /
+/// transitively covered. Mirrors [`client_config_path`].
+pub fn client_rules_target(client_id: &str) -> Option<crate::instructions::Target> {
+    let home = home()?;
+    resolve_rules_target(client_id, &home, Platform::current())
+}
+
 fn claude_desktop_path() -> Option<PathBuf> {
     // Claude Desktop is MSIX-packaged, so its Roaming config can live at the real
     // %APPDATA% and/or inside the package's virtualized LocalCache. Prefer the
@@ -3727,6 +3819,91 @@ command = "npx"
             Platform::MacOs => PathBuf::from("/Users/alice"),
             Platform::Linux => PathBuf::from("/home/alice"),
         }
+    }
+
+    #[test]
+    fn rules_target_claude_code_is_owned_file_all_platforms() {
+        use crate::instructions::Strategy;
+        for p in [Platform::Windows, Platform::MacOs, Platform::Linux] {
+            let t = resolve_rules_target("claude-code", &mock_home(p), p).expect("supported");
+            assert_eq!(t.strategy, Strategy::OwnedFile);
+            assert!(
+                t.path.ends_with(PathBuf::from("rules").join("toolport-team-rules.md")),
+                "unexpected claude-code rules path on {p:?}: {:?}",
+                t.path
+            );
+            assert!(t.path.to_string_lossy().contains(".claude"));
+        }
+    }
+
+    #[test]
+    fn rules_target_codex_is_sentinel_and_flags_override() {
+        use crate::instructions::Strategy;
+        let home = mock_home(Platform::MacOs);
+        let t = resolve_rules_target("codex", &home, Platform::MacOs).expect("supported");
+        assert_eq!(t.strategy, Strategy::SentinelBlock);
+        assert!(t.path.ends_with(PathBuf::from(".codex").join("AGENTS.md")));
+        assert_eq!(
+            t.blocked_if_present,
+            Some(home.join(".codex").join("AGENTS.override.md")),
+            "Codex AGENTS.override.md must shadow AGENTS.md"
+        );
+    }
+
+    #[test]
+    fn rules_target_windsurf_carries_hard_cap() {
+        let t = resolve_rules_target("windsurf", &mock_home(Platform::Linux), Platform::Linux)
+            .expect("supported");
+        assert_eq!(t.char_cap, Some(6000));
+    }
+
+    #[test]
+    fn rules_target_zed_is_platform_specific() {
+        let win = resolve_rules_target("zed", &mock_home(Platform::Windows), Platform::Windows)
+            .expect("supported");
+        assert!(win.path.to_string_lossy().contains("Zed"));
+        let mac = resolve_rules_target("zed", &mock_home(Platform::MacOs), Platform::MacOs)
+            .expect("supported");
+        assert!(mac.path.ends_with(PathBuf::from(".config").join("zed").join("AGENTS.md")));
+    }
+
+    #[test]
+    fn rules_target_unsupported_clients_return_none() {
+        // Cursor/Warp store globals in UI/cloud; Continue is deferred; chat/identity apps have
+        // no global rules file we manage.
+        for id in [
+            "cursor",
+            "warp",
+            "continue",
+            "claude-desktop",
+            "lm-studio",
+            "jan",
+            "hermes",
+        ] {
+            assert!(
+                resolve_rules_target(id, &mock_home(Platform::MacOs), Platform::MacOs).is_none(),
+                "{id} should have no managed rules target"
+            );
+        }
+    }
+
+    #[test]
+    fn rules_target_transitive_clients_share_the_covering_file() {
+        // A standalone Antigravity / VS Code install must still be covered: each resolves to the
+        // same file as the client whose format it reads, and `apply_instructions` de-dupes the
+        // shared path so it's written once when both are installed.
+        let home = mock_home(Platform::MacOs);
+        let p = Platform::MacOs;
+        assert_eq!(
+            resolve_rules_target("antigravity", &home, p),
+            resolve_rules_target("gemini-cli", &home, p),
+            "Antigravity shares Gemini's GEMINI.md"
+        );
+        assert_eq!(
+            resolve_rules_target("vscode", &home, p),
+            resolve_rules_target("claude-code", &home, p),
+            "VS Code Copilot shares Claude Code's rules file"
+        );
     }
 
     /// Serializes tests that read or mutate the process-global XDG env vars. Rust
