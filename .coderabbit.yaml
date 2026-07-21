@@ -20,12 +20,17 @@ reviews:
     auto_incremental_review: false
     # Don't spend review quota on PRs that carry no production logic. Matching is
     # case-insensitive substring against the PR title, and the repo uses
-    # conventional-commit prefixes, so "docs:", "chore:", "style:" and friends are
-    # caught. Deliberately NOT skipped: "ci"/"build"/"deps", where a workflow or
-    # dependency change can be security-relevant and is worth a look.
+    # conventional-commit prefixes, so "docs:", "style:" and friends are caught.
+    #
+    # Deliberately NOT skipped:
+    #   ci / build / deps - a workflow or dependency change can be
+    #     security-relevant and is worth a look.
+    #   chore - was skipped initially and removed after PR #391 ("chore: add jsx
+    #     a11y linting") went unreviewed and shipped a TS compile error. "chore:"
+    #     is the prefix most likely to sit on a PR that actually changes lint
+    #     config, tooling, or source, so it's the wrong thing to skip.
     ignore_title_keywords:
       - docs
-      - chore
       - style
       - typo
       - release
