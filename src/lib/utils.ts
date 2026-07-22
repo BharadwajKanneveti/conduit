@@ -33,3 +33,18 @@ export function fmtPercent(
   if (options.floorNonZero && percent === 0) return "<0.1%";
   return `${percent.toFixed(percent > 0 && percent < 10 ? 1 : 0)}%`;
 }
+
+export function fmtTs(timestamp: number, format?: "time" | "date"): string {
+  if (format === "time") {
+    return new Date(timestamp).toLocaleTimeString();
+  } else if (format === "date") {
+    return new Date(timestamp).toLocaleDateString();
+  } else {
+    return new Date(timestamp).toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+}
