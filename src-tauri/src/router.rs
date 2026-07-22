@@ -372,8 +372,10 @@ impl Router {
 
     /// Index one server's advertised tools/resources/prompts into the exposed
     /// aggregation (names, routes, policy). Shared by `add` (a new server) and
-    /// `rebuild_aggregation` (after a refresh); the call order is the exposed-name
-    /// order, so `_2` collision suffixes stay stable.
+    /// `rebuild_aggregation` (after a refresh). Within a server, `_2` collision
+    /// suffixes are allocated by raw name rather than list position, so neither
+    /// the call order nor a downstream reordering its own catalog can move them
+    /// (see [`allocate_exposed_names`](Self::allocate_exposed_names)).
     fn index_server(
         &mut self,
         server_id: &str,
@@ -381,13 +383,17 @@ impl Router {
         resources: &[Value],
         prompts: &[Value],
     ) {
-        for tool in tools {
+        // Allocate the exposed name regardless of policy so toggling one tool
+        // never renames its siblings (their `_2` suffixes stay put), and in an
+        // order that doesn't depend on how the server happened to list them.
+        let tool_names = self.allocate_exposed_names(server_id, tools);
+        for (idx, tool) in tools.iter().enumerate() {
             let Some(orig) = tool.get("name").and_then(|n| n.as_str()) else {
                 continue;
             };
-            // Allocate the exposed name regardless of policy so toggling one tool
-            // never renames its siblings (their `_2` suffixes stay put).
-            let exposed = self.exposed_name(server_id, orig);
+            let exposed = tool_names[idx]
+                .clone()
+                .expect("a tool with a name always gets an allocated exposed name");
             if let Some(reason) = self.policy.blocked_reason(&exposed, server_id, orig, tool) {
                 self.blocked.insert(exposed, reason.to_string());
                 continue;
@@ -436,12 +442,16 @@ impl Router {
             }
         }
 
-        // Prompts: namespace names like tools so two servers can't collide.
-        for prompt in prompts {
+        // Prompts: namespace names like tools so two servers can't collide, and
+        // allocate them in the same order-independent way.
+        let prompt_names = self.allocate_exposed_names(server_id, prompts);
+        for (idx, prompt) in prompts.iter().enumerate() {
             let Some(orig) = prompt.get("name").and_then(|n| n.as_str()) else {
                 continue;
             };
-            let exposed = self.exposed_name(server_id, orig);
+            let exposed = prompt_names[idx]
+                .clone()
+                .expect("a prompt with a name always gets an allocated exposed name");
             let mut p = prompt.clone();
             p["name"] = json!(exposed);
             self.prompts.push(p);
@@ -472,6 +482,38 @@ impl Router {
 
     pub fn server_count(&self) -> usize {
         self.servers.len()
+    }
+
+    /// Allocate exposed names for one server's `items` (tools or prompts),
+    /// returned positionally so the caller keeps the server's own catalog order.
+    ///
+    /// Names are handed out in order of the item's RAW name rather than the order
+    /// the server listed them in. Two names that sanitize to the same string
+    /// (`get-user` and `get_user`) collide, and the loser takes a `_2` suffix;
+    /// allocating in list order meant a downstream that reordered its
+    /// `tools/list` across a refresh swapped that suffix between two real tools.
+    /// The client's cached name then pointed at the *other* tool, so calls kept
+    /// working and silently went somewhere new. Sorting on the raw name makes the
+    /// assignment a property of the tools themselves, so list order can't move it.
+    ///
+    /// Cross-server collisions can't arise here: server ids are slugified to
+    /// `[a-z0-9-]` and `sanitize_segment` only maps `-` to `_`, which is injective
+    /// over that alphabet. So the contested namespace is always within one server.
+    fn allocate_exposed_names(&mut self, server_id: &str, items: &[Value]) -> Vec<Option<String>> {
+        fn raw_name(item: &Value) -> Option<&str> {
+            item.get("name").and_then(|n| n.as_str())
+        }
+        let mut order: Vec<usize> = (0..items.len()).collect();
+        // Ties (a server listing the same raw name twice) fall back to list
+        // position, which keeps the sort total and the result reproducible.
+        order.sort_by(|&a, &b| raw_name(&items[a]).cmp(&raw_name(&items[b])).then(a.cmp(&b)));
+        let mut out = vec![None; items.len()];
+        for i in order {
+            if let Some(orig) = raw_name(&items[i]) {
+                out[i] = Some(self.exposed_name(server_id, orig));
+            }
+        }
+        out
     }
 
     /// Allocate a unique exposed name for `server_id`'s `tool`, sanitizing both
@@ -553,6 +595,13 @@ impl Router {
     pub fn requarantine(&mut self, quarantined: BTreeSet<String>) {
         self.policy.quarantined = quarantined;
         self.rebuild_aggregation();
+    }
+
+    /// The quarantine set this router is currently enforcing. Lets a caller diff the
+    /// live set against the persisted one and skip `requarantine` (and the client
+    /// `list_changed` that follows it) when nothing actually changed.
+    pub fn quarantined(&self) -> &BTreeSet<String> {
+        &self.policy.quarantined
     }
 
     /// Re-derive the exposed tool/resource/prompt aggregation from the current
@@ -1284,6 +1333,65 @@ mod tests {
     }
 
     #[test]
+    fn requarantine_restores_a_re_approved_tool_without_a_rebuild() {
+        // Regression for SOU-292: re-approving a quarantined tool left it blocked in the
+        // running gateway. The refresh path could ADD to the quarantine set but never
+        // REMOVE from it, and because `route_call` reads the materialized `blocked` map,
+        // a client that already held its catalog stayed broken even though the app showed
+        // nothing quarantined. Shrinking the set must restore the tool in place, with no
+        // rebuild and no downstream re-query.
+        let mut policy = ToolPolicy::default();
+        policy.quarantined = ["github__echo".to_string()].into_iter().collect();
+        let mut router = Router::with_policy(policy);
+        router.add(mock_server("github"));
+
+        // Quarantined: hidden from the catalog AND blocked on a direct call.
+        let names: Vec<String> = router
+            .aggregated_tools()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        assert_eq!(names, vec!["github__add"]);
+        let err = router.route_call("github__echo", json!({})).unwrap_err();
+        assert!(err.contains("quarantined"), "unexpected: {err}");
+
+        // Re-approval: the persisted set no longer holds the tool.
+        router.requarantine(BTreeSet::new());
+
+        // It must be routable again immediately, not "on the next rebuild".
+        assert!(
+            router.route_call("github__echo", json!({})).is_ok(),
+            "a re-approved tool must route again without a rebuild"
+        );
+        let names: Vec<String> = router
+            .aggregated_tools()
+            .iter()
+            .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(String::from))
+            .collect();
+        assert!(
+            names.contains(&"github__echo".to_string()),
+            "and be re-exposed"
+        );
+    }
+
+    #[test]
+    fn quarantined_accessor_reflects_the_live_set() {
+        // The watcher diffs this against the persisted set to decide whether to re-filter,
+        // so it has to track `requarantine` exactly. If it went stale the reconciler would
+        // either spin (re-filtering every tick) or never fire at all.
+        let mut router = Router::new();
+        router.add(mock_server("github"));
+        assert!(router.quarantined().is_empty());
+
+        let set: BTreeSet<String> = ["github__echo".to_string()].into_iter().collect();
+        router.requarantine(set.clone());
+        assert_eq!(router.quarantined(), &set);
+
+        router.requarantine(BTreeSet::new());
+        assert!(router.quarantined().is_empty());
+    }
+
+    #[test]
     fn aggregates_and_routes_resources() {
         let mut router = Router::new();
         router.add(mock_server("github"));
@@ -1467,6 +1575,69 @@ mod tests {
         assert_eq!(before, vec!["s__a_b", "s__a_b_2"]);
         router.refresh_tools();
         assert_eq!(names(&router), before, "refresh shuffled the collision suffixes");
+    }
+
+    #[test]
+    fn reordered_tool_list_keeps_each_tool_its_own_exposed_name() {
+        // The dangerous variant of the test above: the server doesn't just get
+        // re-queried, it comes back listing the SAME two colliding tools in the
+        // opposite order. Allocating suffixes by list position swapped `_2`
+        // between them, so the client's cached `s__a_b` silently started routing
+        // to `a_b` instead of `a-b` — calls kept succeeding and went to the wrong
+        // tool. The exposed name must be a property of the tool, not its position.
+        struct ReorderMock {
+            calls: AtomicU32,
+        }
+        impl Transport for ReorderMock {
+            fn request(&mut self, method: &str, _params: Value) -> Result<Value, TransportError> {
+                match method {
+                    "initialize" => Ok(json!({ "protocolVersion": "2025-06-18" })),
+                    "tools/list" => {
+                        let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+                        // Same two tools, flipped on the second listing.
+                        Ok(if first {
+                            json!({ "tools": [
+                                { "name": "a-b", "description": "one" },
+                                { "name": "a_b", "description": "two" }
+                            ] })
+                        } else {
+                            json!({ "tools": [
+                                { "name": "a_b", "description": "two" },
+                                { "name": "a-b", "description": "one" }
+                            ] })
+                        })
+                    }
+                    other => Err(TransportError::Fatal(format!("unexpected {other}"))),
+                }
+            }
+            fn notify(&mut self, _m: &str, _p: Value) -> Result<(), TransportError> {
+                Ok(())
+            }
+        }
+
+        let mut router = Router::new();
+        router.add(
+            DownstreamServer::connect(
+                "s".to_string(),
+                Box::new(ReorderMock {
+                    calls: AtomicU32::new(0),
+                }),
+            )
+            .unwrap(),
+        );
+        // Assert the ROUTE, not just the name set: both names exist either way,
+        // so only the mapping reveals the swap.
+        assert_eq!(router.route_of("s__a_b"), Some(("s", "a-b")));
+        assert_eq!(router.route_of("s__a_b_2"), Some(("s", "a_b")));
+
+        router.refresh_tools();
+
+        assert_eq!(
+            router.route_of("s__a_b"),
+            Some(("s", "a-b")),
+            "a reordered tools/list re-pointed a cached exposed name at a different tool"
+        );
+        assert_eq!(router.route_of("s__a_b_2"), Some(("s", "a_b")));
     }
 
     /// Shared retry-capable mock used to exercise the Router helper.

@@ -18,7 +18,7 @@
 //!   model searches and calls on demand, keeping context flat.
 //! - Records every tool call to a local audit log.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::io::{BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -3648,6 +3648,117 @@ fn requarantine_if_needed(
     }
 }
 
+/// The quarantine set the router SHOULD be enforcing right now, mirroring how the
+/// initial build gates on the feature flag: when quarantine-on-drift is off, nothing is
+/// blocked even though the persisted set survives on disk for when it's turned back on.
+fn effective_quarantine(
+    registry: &Arc<Mutex<Registry>>,
+    profile: Option<&str>,
+) -> Option<BTreeSet<String>> {
+    let on = {
+        let r = registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        r.quarantine_on_drift_effective()
+    };
+    if !on {
+        return Some(BTreeSet::new());
+    }
+    match integrity::quarantined_checked(profile) {
+        Ok(set) => {
+            // Recovered: let a future failure warn again.
+            QUARANTINE_READ_FAILED.store(false, Ordering::SeqCst);
+            Some(set)
+        }
+        // Fail CLOSED. An unreadable store is indistinguishable from an empty one, so
+        // treating it as empty would silently un-block every quarantined tool. Returning
+        // None keeps the router enforcing whatever it already has until the store is
+        // readable again.
+        Err(e) => {
+            // Warn once per failure streak: this runs on a 1s watcher tick, so logging
+            // unconditionally would bury the gateway log.
+            if !QUARANTINE_READ_FAILED.swap(true, Ordering::SeqCst) {
+                glog(&format!(
+                    "SECURITY: {e}; keeping the current quarantine set rather than \
+                     un-blocking. Re-approve tools once the store is readable."
+                ));
+                eprintln!("toolport: {e}; keeping the current quarantine set");
+            }
+            None
+        }
+    }
+}
+
+/// Whether the last quarantine-store read failed, so the 1s watcher tick warns on the
+/// transition into failure rather than on every tick.
+static QUARANTINE_READ_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Reconcile the router's live quarantine set against what's persisted, and re-filter if
+/// they diverged. Returns whether anything changed.
+///
+/// Why this exists (SOU-292): `requarantine_if_needed` only refreshes when a NEW drift is
+/// quarantined, so the refresh path could ADD to the set but never REMOVE from it.
+/// Re-approving a tool rewrites `quarantine.json`, a file the registry watcher never
+/// looks at, so the router kept blocking a tool the user had already released — and
+/// since `route_call` reads the materialized `blocked` map, a client that already had
+/// its catalog stayed broken even though the app showed nothing quarantined. Running
+/// this from the watcher fixes the call path too, not just `tools/list`.
+///
+/// Diffing the SET rather than the file's mtime matters: this gateway writes
+/// `quarantine.json` itself in `apply_quarantine`, so keying off mtime would make it
+/// react to its own writes and emit a spurious `list_changed` every time it quarantined
+/// something. It also self-corrects for any writer — the desktop app's release, a second
+/// gateway, or a hand edit.
+fn reconcile_quarantine(
+    registry: &Arc<Mutex<Registry>>,
+    router: &Arc<Mutex<Arc<Router>>>,
+    stdout: &Arc<Mutex<std::io::Stdout>>,
+    profile: Option<&str>,
+) -> bool {
+    match effective_quarantine(registry, profile) {
+        Some(want) => reconcile_to(router, stdout, want),
+        // Store unreadable: keep enforcing the current set rather than weakening it.
+        None => false,
+    }
+}
+
+/// Apply a target quarantine set to the live router, re-filtering (and telling the client)
+/// only if it actually differs. Split out from the disk read so the decision logic is
+/// testable without touching `conduit_dir()`, which memoizes per process and so can't be
+/// redirected from a test once anything else has resolved it.
+fn reconcile_to(
+    router: &Arc<Mutex<Arc<Router>>>,
+    stdout: &Arc<Mutex<std::io::Stdout>>,
+    want: BTreeSet<String>,
+) -> bool {
+    let changed = {
+        let mut guard = router
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.quarantined() == &want {
+            false
+        } else {
+            // make_mut clones only if an in-flight request still holds the old Arc, so a
+            // request mid-flight keeps serving its snapshot until it finishes.
+            let r = Arc::make_mut(&mut guard);
+            r.requarantine(want);
+            true
+        }
+    };
+    // Notify outside the router lock so a slow client write can't stall a request.
+    if changed {
+        // To the gateway log, not just stderr: MCP clients swallow a gateway's stderr, so a
+        // user reporting "re-approve didn't work" would send diagnostics with no trace of
+        // whether the reconcile ever ran. The failure path already logs here; this keeps the
+        // success path visible too.
+        glog("quarantine set changed on disk; re-filtering exposed tools");
+        eprintln!("toolport: quarantine set changed on disk; re-filtering exposed tools");
+        notify_tools_changed(stdout);
+    }
+    changed
+}
+
 fn persist_and_emit(
     tools: &[Value],
     cached_tools: &Arc<Mutex<Vec<Value>>>,
@@ -3857,6 +3968,17 @@ fn watch_registry(
     );
     loop {
         std::thread::sleep(Duration::from_millis(1000));
+        // Re-approving a tool rewrites quarantine.json, which is NOT the registry file
+        // this loop watches, so it has to be reconciled on its own. Deliberately ahead of
+        // the early-continue below: a release changes neither the registry mtime nor the
+        // downstream flag, so gating it on either would skip it entirely (SOU-292).
+        {
+            let p = profile
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            reconcile_quarantine(&registry, &router, &stdout, p.as_deref());
+        }
         // A live downstream server that changed its own tool set (sent
         // tools/list_changed) sets this. Swap before acting so a notification
         // arriving mid-refresh is caught on the next tick rather than lost.
@@ -7075,6 +7197,9 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Test-only: the blend-ranking test builds these directly. Kept here rather than at
+    // module scope so a non-test build doesn't warn about an unused import.
+    use conduit_lib::semantic::SemanticConfig;
 
     #[test]
     fn router_relevant_ignores_team_metadata_but_tracks_real_changes() {
@@ -9533,6 +9658,394 @@ mod tests {
         assert_eq!(outcome.broadened, 3);
         assert_eq!(outcome.matches.len(), 4);
         assert_eq!(outcome.matches[0]["name"], "homes__lookup");
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The router wrapped the way the gateway holds it, plus a stdout sink.
+    fn reconcile_harness() -> (Arc<Mutex<Arc<Router>>>, Arc<Mutex<std::io::Stdout>>) {
+        (
+            Arc::new(Mutex::new(Arc::new(Router::new()))),
+            Arc::new(Mutex::new(std::io::stdout())),
+        )
+    }
+
+    fn set_of(names: &[&str]) -> BTreeSet<String> {
+        names.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn reconcile_to_clears_a_re_approved_tool() {
+        // Regression for SOU-292. Re-approving a tool rewrote quarantine.json, but nothing
+        // told the running gateway: the refresh path only fired when a NEW drift was
+        // quarantined, so it could ADD to the set and never REMOVE from it. The registry
+        // watcher doesn't look at that file either, so the router kept the stale entry and
+        // `route_call` (which reads the materialized `blocked` map) failed with
+        // "quarantined ... re-approve to restore" while the app showed nothing quarantined.
+        let (router, stdout) = reconcile_harness();
+
+        // A drift quarantines a tool.
+        assert!(reconcile_to(&router, &stdout, set_of(&["srv__wipe"])));
+        assert_eq!(router.lock().unwrap().quarantined(), &set_of(&["srv__wipe"]));
+
+        // The same set again is a no-op, so the gateway's own quarantine writes can't
+        // churn the catalog or spam the client with list_changed.
+        assert!(!reconcile_to(&router, &stdout, set_of(&["srv__wipe"])));
+
+        // The user re-approves and the set SHRINKS. This is the assertion that fails
+        // without the fix.
+        assert!(
+            reconcile_to(&router, &stdout, BTreeSet::new()),
+            "a release must be reconciled into the live router"
+        );
+        assert!(
+            router.lock().unwrap().quarantined().is_empty(),
+            "the router must stop blocking a re-approved tool"
+        );
+
+        // Idempotent: the next watcher tick does nothing.
+        assert!(!reconcile_to(&router, &stdout, BTreeSet::new()));
+    }
+
+    #[test]
+    fn reconcile_to_detects_a_partial_release() {
+        // Releasing one of several must still re-filter. A cheaper "is it empty vs
+        // non-empty" check would miss this and leave the released tool blocked.
+        let (router, stdout) = reconcile_harness();
+        assert!(reconcile_to(&router, &stdout, set_of(&["a__x", "b__y"])));
+
+        assert!(reconcile_to(&router, &stdout, set_of(&["a__x"])));
+        assert_eq!(router.lock().unwrap().quarantined(), &set_of(&["a__x"]));
+        assert!(!reconcile_to(&router, &stdout, set_of(&["a__x"])));
+    }
+
+    #[test]
+    fn effective_quarantine_is_empty_while_the_feature_is_off() {
+        // Mirrors how the initial router build gates: the persisted set stays on disk so
+        // it can be restored when the feature is switched back on, but while
+        // quarantine-on-drift is OFF nothing may be enforced. The off branch returns
+        // without reading a profile file, so this stays independent of conduit_dir().
+        let mut reg = Registry::default();
+        reg.quarantine_on_drift = false;
+        assert!(
+            !reg.quarantine_on_drift_effective(),
+            "fixture must have the feature off"
+        );
+        let registry = Arc::new(Mutex::new(reg));
+        assert_eq!(
+            effective_quarantine(&registry, Some("unused-profile")),
+            Some(BTreeSet::new()),
+            "feature off is a known-empty set, not an unknown one"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_quarantine_store_keeps_the_current_set_instead_of_un_blocking() {
+        // `load_quarantine` reports a corrupt store as an EMPTY set (and moves the file
+        // aside). At startup that is the only answer available, but reconciling a LIVE set
+        // against it is a fail-OPEN: empty is indistinguishable from "the user re-approved
+        // everything", so a corrupt file would silently un-block every quarantined tool,
+        // and the rename would make the next tick read a legitimately-empty store and keep
+        // it that way. Reconciling must fail CLOSED.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("toolport-corrupt-q-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let profile = Some("corrupt-q");
+        let current = vec![json!({ "name": "srv__wipe", "description": "x", "inputSchema": {} })];
+        let events = vec![json!({
+            "server": "srv", "tool": "srv__wipe", "change": "poison", "severity": "high"
+        })];
+        assert!(conduit_lib::integrity::apply_quarantine(
+            profile, &current, &events
+        ));
+
+        let mut reg = Registry::default();
+        reg.quarantine_on_drift = true;
+        let registry = Arc::new(Mutex::new(reg));
+        let router = Arc::new(Mutex::new(Arc::new(Router::new())));
+        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+
+        assert!(reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(router.lock().unwrap().quarantined().contains("srv__wipe"));
+
+        // Corrupt the store underneath the running gateway.
+        let path = dir.join("quarantine-corrupt-q.json");
+        assert!(path.exists(), "fixture wrote where expected: {path:?}");
+        std::fs::write(&path, "{ not json at all").unwrap();
+
+        assert_eq!(
+            effective_quarantine(&registry, profile),
+            None,
+            "an unreadable store must be reported as unknown, not as empty"
+        );
+        assert!(
+            !reconcile_quarantine(&registry, &router, &stdout, profile),
+            "a corrupt store must not trigger a re-filter"
+        );
+        assert!(
+            router.lock().unwrap().quarantined().contains("srv__wipe"),
+            "the tool must STAY blocked while the store is unreadable"
+        );
+
+        // And it must recover once the store is readable again.
+        std::fs::write(&path, "{}").unwrap();
+        assert!(reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(router.lock().unwrap().quarantined().is_empty());
+
+        drop(_data_dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn reconcile_quarantine_reads_the_persisted_set_and_clears_a_release() {
+        // Covers `reconcile_quarantine` itself, the function the watcher actually calls.
+        // The other tests exercise `reconcile_to`, its pure half, which leaves the
+        // composition with `effective_quarantine` (and that function's ON branch, the one
+        // that touches disk) unverified. Given SOU-292 was a correct function nothing
+        // invoked, the composition is worth asserting directly.
+        //
+        // Only writable because SOU-301 landed DataDirOverride: `set_var` cannot redirect
+        // conduit_dir() once anything has resolved it, so this would otherwise read and
+        // write the developer's real data dir and be order-dependent.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("toolport-sou292-e2e-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let profile = Some("sou292-e2e");
+        let current = vec![json!({ "name": "srv__wipe", "description": "x", "inputSchema": {} })];
+        let events = vec![json!({
+            "server": "srv", "tool": "srv__wipe", "change": "poison", "severity": "high"
+        })];
+        assert!(
+            conduit_lib::integrity::apply_quarantine(profile, &current, &events),
+            "fixture should have quarantined the tool"
+        );
+
+        let mut reg = Registry::default();
+        reg.quarantine_on_drift = true;
+        let registry = Arc::new(Mutex::new(reg));
+        let router = Arc::new(Mutex::new(Arc::new(Router::new())));
+        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+
+        // Picks the persisted set up off disk (effective_quarantine's ON branch).
+        assert!(reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(router.lock().unwrap().quarantined().contains("srv__wipe"));
+
+        // Steady state: no churn while nothing changes.
+        assert!(!reconcile_quarantine(&registry, &router, &stdout, profile));
+
+        // The user re-approves. This is the SOU-292 regression, end to end.
+        assert!(conduit_lib::integrity::release(profile, "srv__wipe"));
+        assert!(reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(
+            router.lock().unwrap().quarantined().is_empty(),
+            "a released tool must stop being enforced"
+        );
+
+        drop(_data_dir);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn data_dir_override_redirects_and_reverts() {
+        // The revert half matters as much as the redirect: the override is
+        // process-global, so one that outlived its test would silently point the app
+        // (and every other test) at a scratch directory.
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let before = conduit_lib::registry::conduit_dir();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-ddo-{}", std::process::id()));
+        {
+            let _guard = conduit_lib::registry::DataDirOverride::set(&scratch);
+            assert_eq!(
+                conduit_lib::registry::conduit_dir().as_deref(),
+                Some(scratch.as_path()),
+                "conduit_dir must follow the override even though it memoizes"
+            );
+        }
+        assert_eq!(
+            conduit_lib::registry::conduit_dir(),
+            before,
+            "the override must revert when the guard drops"
+        );
+    }
+
+    #[test]
+    fn end_to_end_lexical_semantic_blend() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let cat = vec![
+            json!({
+                "name": "email__send_email",
+                "description": "Send a welcome email to a new signup",
+                "inputSchema": {}
+            }),
+            json!({
+                "name": "stripe__create_payment",
+                "description": "Charge a customer's credit card",
+                "inputSchema": {}
+            }),
+            json!({
+                "name": "github__create_pull_request",
+                "description": "Open a pull request for a branch",
+                "inputSchema": {}
+            })
+            
+        ];
+
+        let listener = tiny_http::Server::http("127.0.0.1:0").unwrap();
+        let port = listener.server_addr().to_ip().unwrap().port();
+        let endpoint = format!("http://127.0.0.1:{port}/v1/embeddings");
+        let server = std::thread::spawn(move || {
+            // request 1: embed_query
+            let request = listener.recv().unwrap();
+            let query_body1 = r#"
+            {
+            "data": [
+                {
+                "embedding": [1.0, 0.0]
+                }
+            ]
+            }
+            "#;
+
+            let content_type = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"application/json"[..],
+            )
+            .unwrap();
+
+            request
+                .respond(
+                    tiny_http::Response::from_string(query_body1)
+                        .with_header(content_type),
+                )
+                .unwrap();
+            // request 2: embed_tools
+            let request = listener.recv().unwrap();
+            let tools_body1 = r#"
+            {
+            "data": [
+                {
+                "embedding": [1.0, 0.0]
+                },
+                {
+                "embedding": [0.0, 1.0]
+                },
+                {
+                "embedding": [0.5, 0.5]
+                }
+            ]
+            }
+            "#;
+
+            let content_type = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"application/json"[..],
+            )
+            .unwrap();
+
+            request
+                .respond(
+                    tiny_http::Response::from_string(tools_body1)
+                        .with_header(content_type),
+                )
+                .unwrap();
+            // request 3: embed_query
+            let request = listener.recv().unwrap();
+            let query_body2 = r#"
+            {
+            "data": [
+                {
+                "embedding": [0.0, 1.0]
+                }
+            ]
+            }
+            "#;
+
+            let content_type = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"application/json"[..],
+            )
+            .unwrap();
+
+            request
+                .respond(
+                    tiny_http::Response::from_string(query_body2)
+                        .with_header(content_type),
+                )
+                .unwrap();
+            // request 4: embed_tools
+            let request = listener.recv().unwrap();
+            let tools_body2 = r#"
+            {
+            "data": [
+                {
+                "embedding": [1.0, 0.0]
+                },
+                {
+                "embedding": [-1.0, 0.0]
+                },
+                {
+                "embedding": [0.0, 1.0]
+                }
+            ]
+            }
+            "#;
+            let content_type = tiny_http::Header::from_bytes(
+                &b"Content-Type"[..],
+                &b"application/json"[..],
+            )
+            .unwrap();
+
+            request
+                .respond(
+                    tiny_http::Response::from_string(tools_body2)
+                        .with_header(content_type),
+                )
+                .unwrap();
+        });
+        let cfg1 = SemanticConfig {
+            enabled: true,
+            endpoint: endpoint.clone(),
+            model: "test-model".to_string(),
+            blend: 0.5,
+        };
+        let cfg2 = SemanticConfig {
+            enabled: true,
+            endpoint: endpoint.clone(),
+            model: "test-model-2".to_string(),
+            blend: 0.6,
+        };
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "conduit-semantic-test-{}",
+            std::process::id()
+        ));
+
+        std::fs::create_dir_all(&path).unwrap();
+        // Must be the override, NOT `set_var("CONDUIT_DATA_DIR", ..)`: conduit_dir()
+        // memoizes, so the env var is silently ignored unless this test happens to be the
+        // first in the process to resolve the dir. That made this test order-dependent
+        // (green alone, red in the full suite) and pointed its embeddings cache at the
+        // developer's real data dir, where a warm cache stops embed_tools from firing and
+        // the mock server's later responses are never consumed. See SOU-301.
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&path);
+
+        let outcome1 = search_catalog_with(&cat, "send a welcome email", None, 25, Some(&cfg1));
+        assert_eq!(outcome1.matches[0]["name"], "email__send_email");
+
+        let outcome2 = search_catalog_with(&cat, "send a welcome email", None, 25, Some(&cfg2));
+        assert_eq!(outcome2.matches[0]["name"], "github__create_pull_request");
+
+        server.join().unwrap();
+        drop(_data_dir);
+        std::fs::remove_dir_all(&path).ok();
     }
 
     #[test]
