@@ -973,6 +973,14 @@ pub struct SnippetEnvVar {
     pub value: Option<String>,
 }
 
+fn json_value_to_arg(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
 /// Like `json_server`, but also captures env-var values from the JSON def.
 /// Used for pasted snippets where the user is voluntarily providing values.
 /// Non-string values (numbers, booleans) are stringified so e.g.
@@ -993,7 +1001,7 @@ fn json_server_with_values(name: &str, def: &serde_json::Value) -> ParsedSnippet
         .and_then(|a| a.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|x| x.as_str().map(String::from))
+                .filter_map(json_value_to_arg)
                 .collect()
         })
         .unwrap_or_default();
@@ -1357,6 +1365,16 @@ fn parse_json_snippet(
     Err("JSON parsed but no server definition found (expected mcpServers, servers, context_servers, or a bare server object)".to_string())
 }
 
+fn toml_value_to_arg(v: &toml::Value) -> Option<String> {
+    match v {
+        toml::Value::String(s) => Some(s.clone()),
+        toml::Value::Integer(i) => Some(i.to_string()),
+        toml::Value::Float(f) => Some(f.to_string()),
+        toml::Value::Boolean(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
 /// Parse a TOML snippet with `[mcp_servers.<name>]` tables.
 fn parse_toml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String> {
     let value: toml::Value = toml::from_str(content).map_err(|e| e.to_string())?;
@@ -1379,7 +1397,7 @@ fn parse_toml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                 .and_then(|a| a.as_array())
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
+                        .filter_map(toml_value_to_arg)
                         .collect()
                 })
                 .unwrap_or_default();
@@ -1436,6 +1454,15 @@ fn yaml_value_to_string(v: &serde_yaml::Value) -> Option<String> {
     }
 }
 
+fn yaml_value_to_arg(v: &serde_yaml::Value) -> Option<String> {
+    match v {
+        serde_yaml::Value::String(s) => Some(s.clone()),
+        serde_yaml::Value::Number(n) => Some(n.to_string()),
+        serde_yaml::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
 /// Parse a YAML snippet (Hermes `mcp_servers:`, Goose `extensions:`, or Continue `mcpServers:`).
 fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String> {
     let value: serde_yaml::Value = serde_yaml::from_str(content).map_err(|e| e.to_string())?;
@@ -1458,7 +1485,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     .and_then(|v| v.as_sequence())
                     .map(|seq| {
                         seq.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
+                            .filter_map(yaml_value_to_arg)
                             .collect()
                     })
                     .unwrap_or_default();
@@ -1508,7 +1535,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     .and_then(|v| v.as_sequence())
                     .map(|seq| {
                         seq.iter()
-                            .filter_map(|x| x.as_str().map(String::from))
+                            .filter_map(yaml_value_to_arg)
                             .collect()
                     })
                     .unwrap_or_default();
@@ -1563,7 +1590,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                     .and_then(|v| v.as_sequence())
                     .map(|seq| {
                         seq.iter()
-                            .filter_map(|item| item.as_str().map(String::from))
+                            .filter_map(yaml_value_to_arg)
                             .collect()
                     })
                     .unwrap_or_default();
@@ -1824,7 +1851,7 @@ fn parse_toml(content: &str) -> Result<Vec<McpServer>, String> {
                 .and_then(|a| a.as_array())
                 .map(|arr| {
                     arr.iter()
-                        .filter_map(|x| x.as_str().map(String::from))
+                        .filter_map(toml_value_to_arg)
                         .collect()
                 })
                 .unwrap_or_default(),
@@ -2367,7 +2394,7 @@ fn parse_yaml_extensions(content: &str) -> Result<Vec<McpServer>, String> {
             .and_then(|v| v.as_sequence())
             .map(|seq| {
                 seq.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
+                    .filter_map(yaml_value_to_arg)
                     .collect()
             })
             .unwrap_or_default();
@@ -2543,7 +2570,7 @@ fn parse_continue_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> 
             .and_then(|v| v.as_sequence())
             .map(|seq| {
                 seq.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
+                    .filter_map(yaml_value_to_arg)
                     .collect()
             })
             .unwrap_or_default();
@@ -2712,7 +2739,7 @@ fn parse_hermes_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> {
             .and_then(|v| v.as_sequence())
             .map(|seq| {
                 seq.iter()
-                    .filter_map(|x| x.as_str().map(String::from))
+                    .filter_map(yaml_value_to_arg)
                     .collect()
             })
             .unwrap_or_default();
@@ -4985,6 +5012,85 @@ DEBUG = true
         assert_eq!(vals.get("PORT"), Some(&"3000"));
         assert_eq!(vals.get("DEBUG"), Some(&"true"));
     }
+
+    #[test]
+    fn parse_non_string_json_arg_values() {
+        let json = r#"{"mcpServers":{"srv":{"command":"npx","args":["server.js",8080,true]}}}"#;
+        let servers = parse_snippet(json).unwrap();
+        assert_eq!(servers[0].args.len(), 3);
+        assert_eq!(servers[0].args, vec!["server.js", "8080", "true"]
+        );
+    }
+
+    #[test]
+    fn parse_non_string_toml_arg_values() {
+        let toml = r#"
+        [mcp_servers.srv]
+        command = "npx"
+        args = ["server.js",8080,true]
+        "#;
+        let servers = parse_snippet(toml).unwrap();
+        assert_eq!(servers[0].args.len(), 3);
+        assert_eq!(servers[0].args, vec!["server.js", "8080", "true"])
+    }
+
+    #[test]
+    fn parse_non_string_goose_yaml_arg_values() { 
+        let yaml = r#"
+        extensions:
+        srv:
+            enabled: true
+            type: stdio
+            cmd: npx
+            args:
+            - "server.js"
+            - 8080
+            - true
+        "#;
+        let servers = parse_snippet(yaml).unwrap();
+        assert_eq!(servers[0].args.len(), 3);
+        assert_eq!(servers[0].args, vec!["server.js", "8080", "true"]
+        );
+     }
+
+   #[test]
+fn parse_non_string_continue_yaml_arg_values() {
+    let yaml = r#"
+mcpServers:
+  - name: fetch
+    command: uvx
+    args:
+      - mcp-server-fetch
+      - 8080
+      - true
+"#;
+
+    let servers = parse_snippet(yaml).unwrap();
+    assert_eq!(servers.len(), 1);
+    assert_eq!(servers[0].args.len(), 3);
+    assert_eq!(
+        servers[0].args,
+        vec!["mcp-server-fetch", "8080", "true"]
+    );
+}
+
+    #[test]
+    fn parse_non_string_hermes_yaml_arg_values() { 
+        let yaml = r#"
+        mcp_servers:
+         my-server:
+            command: npx
+            args:
+              - "-y"
+              - 8080
+              - true
+        "#;
+        let servers = parse_snippet(yaml).unwrap();
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].args.len(), 3);
+        assert_eq!(servers[0].args, vec!["-y", "8080", "true"]);
+     }
+
 
     #[test]
     fn parse_claude_cli_with_braces_in_string() {
