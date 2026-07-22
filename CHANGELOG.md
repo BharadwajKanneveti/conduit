@@ -8,65 +8,77 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [1.9.4] - 2026-07-22
 
-Re-approving a blocked tool now actually unblocks it, and you can find it without hunting.
+Toolport blocks a tool when its definition changes in a risky way. This release fixes the
+part where un-blocking it didn't work, and makes the whole thing visible instead of buried.
 
-### Fixed
+### Quarantine: blocked tools you can actually see and unblock
 
-**Re-approving a quarantined tool didn't unblock it.** After a tool was blocked for a
-high-risk change, re-approving it cleared the list in the app but the running gateway kept
-refusing the call with "re-approve to restore" - telling you to do the thing you had just
-done, with no way out from inside the app. Restarting Toolport or toggling a server off and
-on was the only escape. The gateway now reconciles what's blocked against what you've
-approved, so a re-approved tool works on the very next call. (#395)
+**Re-approving a blocked tool now unblocks it.** Re-approving cleared the list in the app,
+but the gateway kept refusing the call with "re-approve to restore" - telling you to do the
+thing you had just done, with no way out from inside the app. Restarting Toolport or toggling
+a server off and on was the only escape. The gateway now reconciles what's blocked against
+what you've approved, so a re-approved tool works on the very next call. (#395)
 
-**A damaged quarantine file no longer un-blocks tools.** If the file recording which tools
-are blocked couldn't be read, it was treated as "nothing is blocked", quietly dropping the
-protection. It now keeps enforcing what it already knows and says so. (#399)
+**Blocked tools surface anywhere in the app.** A card now appears with the reason the tool
+was blocked and a re-approve button right there, plus a count on Settings so it stays easy to
+find. Previously the first sign of trouble was an agent call failing, and the remedy was
+buried in Settings. (#401)
 
-**No more black command windows flashing on launch.** A few of Toolport's internal
-housekeeping steps were briefly opening console windows on Windows at startup. They did no
-harm, but they looked alarming. (#405)
+**A damaged quarantine file no longer un-blocks tools.** If the file recording what's blocked
+couldn't be read, it was treated as "nothing is blocked", quietly dropping the protection. It
+now keeps enforcing what it already knows, and says so. (#399)
 
-**Updating now actually replaces the gateway your AI clients are using.** Toolport runs a
-small gateway process for each connected client, and that's where most fixes live - including
-the re-approve fix above. After an update those clients could keep running the _old_ gateway
-until you restarted them, so you'd install a fix, watch the problem persist, and reasonably
-conclude the update hadn't worked. Toolport now retires out-of-date gateways when it starts,
-and each client picks up the new one on its next request. (#404)
+### Updating
 
-**Downstream servers run in their own process group on macOS and Linux**, so a server
-starting up can't disturb the display of a terminal-based AI client. Thanks to
-@bradhallett. (#364)
+**Updating now replaces the gateway your AI clients are using.** Toolport runs a small
+gateway process for each connected client, and that's where most fixes live - including the
+re-approve fix above. Those clients could keep running the _old_ gateway until you restarted
+them, so you'd install a fix, watch the problem persist, and reasonably conclude the update
+hadn't worked. Toolport now retires out-of-date gateways when it starts, and each client picks
+up the new one on its next request. (#404)
 
-**Pasting a Continue `config.yaml` block now works.** "Paste from client config" rejected
+**No more black command windows flashing on launch.** A few internal housekeeping steps were
+briefly opening console windows on Windows at startup. Harmless, but alarming. (#405)
+
+### Clients
+
+**Two new clients: Witsy and Oh My Pi.** Toolport now detects 24 clients. (#366, #365)
+
+**Pasting a Continue `config.yaml` block works.** "Paste from client config" rejected
 Continue's format with "Could not detect format", even though Toolport already reads and
 writes that exact file for the Continue client. Environment variable values in the pasted
-block are preserved. Thanks to @manishchalla. (#403)
+block are preserved. (#403)
 
-**Activity no longer shows a red "0%"** for a server that does have errors. Small error
-rates now read as "0.2%" or "<0.1%" instead of rounding away to zero. Thanks to
-@pollychen-lab. (#388)
+**Downstream servers run in their own process group on macOS and Linux**, so a server
+starting up can't disturb the display of a terminal-based AI client. (#364)
+
+### Polish
+
+**Activity no longer shows a red "0%"** for a server that does have errors. Small error rates
+read as "0.2%" or "<0.1%" instead of rounding away to nothing. (#388)
 
 **The new-profile name box clears when you cancel**, so reopening it no longer offers to
-create a profile you had already abandoned. Thanks to @pollychen-lab. (#386)
-
-### Added
-
-**Blocked tools now surface anywhere in the app.** When Toolport blocks a tool after a
-high-risk change, a card appears with the reason it was blocked and a re-approve action in
-place, plus a count on Settings so it stays findable. Previously the first sign was an agent
-call failing, and the fix was buried in Settings. (#401)
-
-**Two new clients: Witsy and Oh My Pi.** Both contributed - thanks to @amitvijapur and
-@bradhallett. Toolport now detects 24 clients. (#366, #365)
+create a profile you had already abandoned. (#386)
 
 ### Security
 
-Cleared seven advisories from the dependency tree: two high-severity in `brace-expansion`
-and `js-yaml`, then one high and four moderate reaching us through `fast-uri` and `hono`.
-The second batch arrived because `shadcn`, a code-generation CLI, was listed as a production
-dependency; moving it removed the whole subtree from the shipped app rather than patching
+Cleared seven advisories from the dependency tree: two high-severity in `brace-expansion` and
+`js-yaml`, then one high and four moderate reaching us through `fast-uri` and `hono`. The
+second batch arrived because `shadcn`, a code-generation CLI, was listed as a production
+dependency - moving it removed that whole subtree from the shipped app rather than patching
 versions one at a time. (#367, #396, #402)
+
+### Thanks
+
+This release includes work from:
+
+- [@bradhallett](https://github.com/bradhallett) - Oh My Pi client support (#365), process-group isolation on Unix (#364)
+- [@amitvijapur](https://github.com/amitvijapur) - Witsy client support (#366)
+- [@pollychen-lab](https://github.com/pollychen-lab) - Activity error-rate formatting (#388), new-profile field reset (#386)
+- [@manishchalla](https://github.com/manishchalla) - Continue snippet parsing (#403)
+- [@gxrey59-dev](https://github.com/gxrey59-dev) - contributor guide corrections (#385)
+- [@dubeyharshit0605](https://github.com/dubeyharshit0605) - ConfirmDialog test coverage (#393)
+- [@BharadwajKanneveti](https://github.com/BharadwajKanneveti) - discovery-ranker blend test (#394)
 
 ## [1.9.3] - 2026-07-18
 
