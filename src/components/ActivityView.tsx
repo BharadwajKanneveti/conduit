@@ -432,13 +432,7 @@ function SavingsBanner({ savings }: { savings: SavingsSummary }) {
   const [modelLabel, setModelLabel] = useState("Claude Sonnet");
   const price = SAVINGS_MODEL_PRICE.get(modelLabel) ?? 3;
   const dollars = (savings.tokensSaved / 1_000_000) * price;
-  const since =
-    savings.sinceTs > 0
-      ? new Date(savings.sinceTs).toLocaleDateString(undefined, {
-          month: "short",
-          day: "numeric",
-        })
-      : null;
+  const since = savings.sinceTs > 0 ? fmtTs(savings.sinceTs, "monthDay") : null;
   const details = [
     `across ${savings.listLoads.toLocaleString()} tool-list load${savings.listLoads === 1 ? "" : "s"}`,
     savings.peakCatalog > 4

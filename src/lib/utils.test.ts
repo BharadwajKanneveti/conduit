@@ -79,4 +79,13 @@ describe("fmtTs", () => {
   it("formats date-only timestamps", () => {
     expect(fmtTs(timestamp, "date")).toBe(new Date(timestamp).toLocaleDateString());
   });
+
+  it("formats month-and-day timestamps without a year", () => {
+    expect(fmtTs(timestamp, "monthDay")).toBe(
+      new Date(timestamp).toLocaleDateString(undefined, {
+        month: "short",
+        day: "numeric",
+      }),
+    );
+  });
 });

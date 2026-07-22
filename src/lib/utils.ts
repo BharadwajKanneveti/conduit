@@ -34,11 +34,22 @@ export function fmtPercent(
   return `${percent.toFixed(percent > 0 && percent < 10 ? 1 : 0)}%`;
 }
 
-export function fmtTs(timestamp: number, format?: "time" | "date"): string {
+/**
+ * Format an epoch-ms timestamp for display. The default is the short
+ * date-and-time shape used by most Activity rows; `"time"` and `"date"` are the
+ * locale defaults for a single component, and `"monthDay"` is the compact
+ * month-and-day used where the year would be noise (the savings banner).
+ */
+export function fmtTs(timestamp: number, format?: "time" | "date" | "monthDay"): string {
   if (format === "time") {
     return new Date(timestamp).toLocaleTimeString();
   } else if (format === "date") {
     return new Date(timestamp).toLocaleDateString();
+  } else if (format === "monthDay") {
+    return new Date(timestamp).toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+    });
   } else {
     return new Date(timestamp).toLocaleString(undefined, {
       month: "short",
