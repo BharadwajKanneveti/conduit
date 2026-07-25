@@ -17,7 +17,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Results whose serialized size exceeds this get shaped. Generous on purpose, so
-/// only genuinely large results are touched. Override with `CONDUIT_RESULT_BUDGET`
+/// only genuinely large results are touched. Override with `TOOLPORT_RESULT_BUDGET`
+/// (legacy: `CONDUIT_RESULT_BUDGET`)
 /// (bytes); set it to 0 to disable shaping entirely.
 pub const DEFAULT_BUDGET_BYTES: usize = 48 * 1024;
 
@@ -41,7 +42,7 @@ pub fn resolve_budget(value: Option<&str>) -> (usize, Option<String>) {
             Err(_) => (
                 DEFAULT_BUDGET_BYTES,
                 Some(format!(
-                    "toolport: invalid CONDUIT_RESULT_BUDGET value '{v}', falling back to default budget"
+                    "toolport: invalid TOOLPORT_RESULT_BUDGET/CONDUIT_RESULT_BUDGET value '{v}', falling back to default budget"
                 )),
             ),
         },
@@ -52,7 +53,7 @@ pub fn resolve_budget(value: Option<&str>) -> (usize, Option<String>) {
 /// Resolve the byte budget from the env override, falling back to the default.
 /// 0 disables shaping (every result is treated as under budget).
 pub fn budget() -> (usize, Option<String>) {
-    let value = std::env::var("CONDUIT_RESULT_BUDGET").ok();
+    let value = crate::brand::env_var("TOOLPORT_RESULT_BUDGET", "CONDUIT_RESULT_BUDGET");
 
     resolve_budget(value.as_deref())
 }
@@ -408,7 +409,7 @@ mod tests {
         assert_eq!(
             warning.as_deref(),
             Some(
-                "toolport: invalid CONDUIT_RESULT_BUDGET value 'invalid', falling back to default budget"
+                "toolport: invalid TOOLPORT_RESULT_BUDGET/CONDUIT_RESULT_BUDGET value 'invalid', falling back to default budget"
             )
         );
     }

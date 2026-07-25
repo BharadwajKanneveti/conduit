@@ -679,7 +679,7 @@ mod file {
     /// data-protection keychain — the "keys never on disk" property we sell — and
     /// reading that master item across an app update is itself a prompt source.
     fn key_material() -> Option<[u8; 32]> {
-        let secret = std::env::var("CONDUIT_SECRET_KEY").ok()?;
+        let secret = crate::brand::env_var("TOOLPORT_SECRET_KEY", "CONDUIT_SECRET_KEY")?;
         if secret.is_empty() {
             return None;
         }
@@ -797,20 +797,21 @@ pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, S
 /// Prefers `CONDUIT_SECRET_<KEY>`; falls back to the bare key name only when
 /// `CONDUIT_ALLOW_BARE_SECRET_ENV` is set. Empty values are treated as unset.
 fn env_secret_override(key: &str) -> Option<String> {
-    let prefixed = format!("CONDUIT_SECRET_{key}");
-    env_var_nonblank(&prefixed).or_else(|| {
-        if bare_secret_env_enabled() {
-            env_var_nonblank(key)
-        } else {
-            None
-        }
-    })
+    let toolport_prefixed = format!("TOOLPORT_SECRET_{key}");
+    let conduit_prefixed = format!("CONDUIT_SECRET_{key}");
+    env_var_nonblank(&toolport_prefixed)
+        .or_else(|| env_var_nonblank(&conduit_prefixed))
+        .or_else(|| {
+            if bare_secret_env_enabled() {
+                env_var_nonblank(key)
+            } else {
+                None
+            }
+        })
 }
 
 fn bare_secret_env_enabled() -> bool {
-    std::env::var("CONDUIT_ALLOW_BARE_SECRET_ENV")
-        .ok()
-        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+    crate::brand::env_flag("TOOLPORT_ALLOW_BARE_SECRET_ENV", "CONDUIT_ALLOW_BARE_SECRET_ENV")
 }
 
 fn env_var_nonblank(name: &str) -> Option<String> {

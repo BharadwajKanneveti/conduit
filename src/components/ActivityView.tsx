@@ -132,7 +132,8 @@ function eventBadge(e: SecurityEvent): { label: string; cls: string } {
   return { label: "new tool", cls: "bg-owned/15 text-owned" };
 }
 
-const SECURITY_DISMISSED_KEY = "conduit.security.dismissed";
+const SECURITY_DISMISSED_KEY = "toolport.security.dismissed";
+const SECURITY_DISMISSED_KEY_LEGACY = "conduit.security.dismissed";
 
 /** High-signal, interrupting events vs benign, quiet-history churn. The backend now
  * tags a `severity`; for events written before that (no field) we classify by type:
@@ -219,7 +220,9 @@ function collapseByIdentity(
 
 function loadDismissed(): Set<string> {
   try {
-    const raw = localStorage.getItem(SECURITY_DISMISSED_KEY);
+    const raw =
+      localStorage.getItem(SECURITY_DISMISSED_KEY) ??
+      localStorage.getItem(SECURITY_DISMISSED_KEY_LEGACY);
     return new Set(raw ? (JSON.parse(raw) as string[]) : []);
   } catch {
     return new Set();
@@ -241,6 +244,7 @@ function addDismissed(prev: Set<string>, keys: string[]): Set<string> {
     arr.length > MAX_DISMISSED ? new Set(arr.slice(arr.length - MAX_DISMISSED)) : merged;
   try {
     localStorage.setItem(SECURITY_DISMISSED_KEY, JSON.stringify([...next]));
+    localStorage.removeItem(SECURITY_DISMISSED_KEY_LEGACY);
   } catch {
     // ignore storage failures; the dismissal just won't persist
   }

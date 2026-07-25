@@ -11,10 +11,10 @@ Reproduce it yourself: [`benchmark/`](benchmark/).
 ## Method
 
 - **Two modes**, same tasks, same model:
-  - **flat**, every downstream tool exposed directly (`CONDUIT_DISCOVERY=full`), the normal MCP setup.
+  - **flat**, every downstream tool exposed directly (`TOOLPORT_DISCOVERY=full`), the normal MCP setup.
   - **lazy**, Toolport advertises 4 meta-tools (`toolport_status`, `toolport_search_tools`,
     `toolport_call_tool`, `toolport_fetch_result`) and the agent searches/calls on demand
-    (`CONDUIT_DISCOVERY=lazy`). (The headline reduction below was originally measured on the
+    (`TOOLPORT_DISCOVERY=lazy`). (The headline reduction below was originally measured on the
     earlier 3-meta-tool set; the current 4-tool default measures 886 tokens of always-on
     overhead, which doesn't change the reduction story.)
 - **Model:** GPT-5.5 (frontier, via the Vercel AI Gateway), so model capability is not the

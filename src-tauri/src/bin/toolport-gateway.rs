@@ -406,7 +406,7 @@ fn parse_mode(s: &str) -> Option<DiscoveryMode> {
 /// Resolve this client's discovery mode from a loaded registry + env. See
 /// [`resolve_mode_from`] for the precedence.
 fn discovery_mode_for(reg: &Registry, client_id: Option<&str>) -> DiscoveryMode {
-    let env = std::env::var("CONDUIT_DISCOVERY").ok();
+    let env = conduit_lib::brand::env_var("TOOLPORT_DISCOVERY", "CONDUIT_DISCOVERY");
     let client_mode = client_id.and_then(|id| reg.client_discovery_mode(id));
     let (mode, warning) = resolve_mode_from(
         env.as_deref(),
@@ -422,16 +422,18 @@ fn discovery_mode_for(reg: &Registry, client_id: Option<&str>) -> DiscoveryMode 
 }
 
 /// Resolve from disk for the gateway bootstrap (before the watcher takes over the live
-/// updates), keyed by this client's `CONDUIT_CLIENT_ID`.
+/// updates), keyed by this client's `TOOLPORT_CLIENT_ID` (legacy: `CONDUIT_CLIENT_ID`).
 fn resolve_discovery_mode() -> DiscoveryMode {
-    let client_id = std::env::var("CONDUIT_CLIENT_ID")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let client_id = conduit_lib::brand::env_var(
+        conduit_lib::brand::CLIENT_ID,
+        conduit_lib::brand::CLIENT_ID_LEGACY,
+    );
     match registry::load_resolved().ok() {
         Some(reg) => discovery_mode_for(&reg, client_id.as_deref()),
         None => {
                 let (mode, warning) = resolve_mode_from(
-                    std::env::var("CONDUIT_DISCOVERY").ok().as_deref(),
+                    conduit_lib::brand::env_var("TOOLPORT_DISCOVERY", "CONDUIT_DISCOVERY")
+                        .as_deref(),
                     None,
                     None,
                     true,
@@ -463,7 +465,7 @@ fn resolve_mode_from(
             _ => (
                     DiscoveryMode::Full,
                     Some(format!(
-                        "toolport: unrecognized CONDUIT_DISCOVERY value '{v}', falling back to full discovery",
+                        "toolport: unrecognized TOOLPORT_DISCOVERY/CONDUIT_DISCOVERY value '{v}', falling back to full discovery",
                     )),
                 ),
         };
@@ -496,15 +498,11 @@ fn grouped_discovery() -> bool {
 /// default: code mode runs an agent-supplied JS script that can call many tools in one
 /// round-trip, a powerful capability worth an explicit opt-in even under Toolport's local
 /// trust model. Enabled by the registry's `code_mode` toggle (the Settings switch, synced
-/// into [`CODE_MODE`]); `CONDUIT_CODE_MODE=1` (or `true`) still force-enables regardless, for
-/// power users and tests. When off, `run_script` is neither advertised nor dispatched.
+/// into [`CODE_MODE`]); `TOOLPORT_CODE_MODE=1` (or legacy `CONDUIT_CODE_MODE`) still
+/// force-enables regardless, for power users and tests. When off, `run_script` is
+/// neither advertised nor dispatched.
 fn code_mode_enabled() -> bool {
-    let env_forced = std::env::var("CONDUIT_CODE_MODE")
-        .map(|v| {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true")
-        })
-        .unwrap_or(false);
+    let env_forced = conduit_lib::brand::env_flag("TOOLPORT_CODE_MODE", "CONDUIT_CODE_MODE");
     env_forced || CODE_MODE.load(Ordering::Relaxed)
 }
 
@@ -3351,7 +3349,7 @@ fn handle_request_with_cancel(
                     return Some(success(
                         id,
                         json!({
-                            "content": [{ "type": "text", "text": "Toolport: code mode is disabled. Set CONDUIT_CODE_MODE=1 to enable toolport_run_script." }],
+                            "content": [{ "type": "text", "text": "Toolport: code mode is disabled. Enable it in Settings, or set TOOLPORT_CODE_MODE=1 (legacy: CONDUIT_CODE_MODE=1) to enable toolport_run_script." }],
                             "isError": true
                         }),
                     ));
@@ -3681,7 +3679,7 @@ fn connect_one(
                          (set env {}, {}, secrets.enc, or the OS keychain)",
                         server.id,
                         e.key,
-                        format_args!("CONDUIT_SECRET_{}", e.key),
+                        format_args!("TOOLPORT_SECRET_{}", e.key),
                         e.key
                     ),
                     Err(err) => eprintln!(
@@ -3978,10 +3976,11 @@ fn glog(msg: &str) {
     trim_log_if_large(&path);
 }
 
-/// Per-request trace, gated behind `CONDUIT_DEBUG` so the always-on log stays
-/// focused on connection lifecycle and doesn't fill with one line per call.
+/// Per-request trace, gated behind `TOOLPORT_DEBUG` / `CONDUIT_DEBUG` so the
+/// always-on log stays focused on connection lifecycle and doesn't fill with one
+/// line per call.
 fn gtrace(msg: &str) {
-    if std::env::var_os("CONDUIT_DEBUG").is_some() {
+    if conduit_lib::brand::env_var_os("TOOLPORT_DEBUG", "CONDUIT_DEBUG").is_some() {
         glog(msg);
     }
 }
@@ -5450,7 +5449,7 @@ fn resolve_http_port(
     (
         None,
         Some(format!(
-            "toolport: unrecognized CONDUIT_HTTP value '{v}', HTTP bridge disabled"
+            "toolport: unrecognized TOOLPORT_HTTP/CONDUIT_HTTP value '{v}', HTTP bridge disabled"
         )),
     )
 }
@@ -5471,8 +5470,8 @@ fn http_port() -> (Option<u16>, Option<String>) {
                 .any(|a| a == "--http")
                 .then_some(8765)
         });
-    let http = std::env::var("CONDUIT_HTTP").ok();
-    let http_port = std::env::var("CONDUIT_HTTP_PORT").ok();
+    let http = conduit_lib::brand::env_var("TOOLPORT_HTTP", "CONDUIT_HTTP");
+    let http_port = conduit_lib::brand::env_var("TOOLPORT_HTTP_PORT", "CONDUIT_HTTP_PORT");
     resolve_http_port(
         cli_port,
         http.as_deref(),
@@ -6039,9 +6038,9 @@ fn handle_http(
         ),
         ("GET", "/") | ("GET", "/docs") => {
             let metrics_line = if conduit_lib::metrics::metrics_enabled() {
-                "Metrics: GET /metrics (Prometheus text; set CONDUIT_METRICS=1).\n"
+                "Metrics: GET /metrics (Prometheus text; set TOOLPORT_METRICS=1).\n"
             } else {
-                "Metrics: off (set CONDUIT_METRICS=1 to enable GET /metrics).\n"
+                "Metrics: off (set TOOLPORT_METRICS=1 to enable GET /metrics).\n"
             };
             HttpOut::new(
                 200,
@@ -6051,7 +6050,7 @@ fn handle_http(
                      OpenAPI: GET /openapi.json, POST /{{tool_name}} with a JSON body.\n\
                      MCP streamable-HTTP: POST /mcp with JSON-RPC; GET /mcp for server→client SSE.\n\
                      {metrics_line}\
-                     Auth: Authorization: Bearer <CONDUIT_HTTP_TOKEN>."
+                     Auth: Authorization: Bearer <TOOLPORT_HTTP_TOKEN>."
                 ),
             )
         }
@@ -6059,7 +6058,7 @@ fn handle_http(
             if !conduit_lib::metrics::metrics_enabled() {
                 return HttpOut::json_err(
                     404,
-                    "metrics disabled; set CONDUIT_METRICS=1 on the gateway to enable",
+                    "metrics disabled; set TOOLPORT_METRICS=1 on the gateway to enable",
                 );
             }
             HttpOut::new(
@@ -6668,15 +6667,13 @@ fn http_allows_insecure_open(
 }
 
 fn serve_http(state: GatewayState, port: u16) {
-    let host = std::env::var("CONDUIT_HTTP_HOST")
-        .ok()
+    let host = conduit_lib::brand::env_var("TOOLPORT_HTTP_HOST", "CONDUIT_HTTP_HOST")
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "127.0.0.1".to_string());
     // A bearer token, when set, is required on every request. The desktop app
     // always sets one (auto-generated) and shows it for the user to paste into
     // their client; manual `--http` users can set it themselves.
-    let token = std::env::var("CONDUIT_HTTP_TOKEN")
-        .ok()
+    let token = conduit_lib::brand::env_var("TOOLPORT_HTTP_TOKEN", "CONDUIT_HTTP_TOKEN")
         .map(|t| t.trim().to_string())
         .filter(|t| !t.is_empty());
 
@@ -6696,13 +6693,13 @@ fn serve_http(state: GatewayState, port: u16) {
         if loopback {
             eprintln!(
                 "toolport-gateway: refusing to bind {host}:{port} without HTTP authentication. \
-                 Set CONDUIT_HTTP_TOKEN, configure a registered HTTP client, or explicitly pass \
+                 Set TOOLPORT_HTTP_TOKEN (legacy: CONDUIT_HTTP_TOKEN), configure a registered HTTP client, or explicitly pass \
                  {INSECURE_LOOPBACK_FLAG} to accept unauthenticated local access."
             );
         } else {
             eprintln!(
                 "toolport-gateway: refusing to bind {host}:{port} without HTTP authentication. \
-                 Set CONDUIT_HTTP_TOKEN or configure a registered HTTP client. \
+                 Set TOOLPORT_HTTP_TOKEN (legacy: CONDUIT_HTTP_TOKEN) or configure a registered HTTP client. \
                  {INSECURE_LOOPBACK_FLAG} is valid only for loopback binds."
             );
         }
@@ -7198,18 +7195,20 @@ fn main() {
     // Per-client scoping: this gateway exposes only the named profile's servers.
     // This is only the bootstrap value - once the registry loads below, the live
     // value (kept in sync with registry.client_scopes on every watcher tick) wins.
-    let env_profile = std::env::var("CONDUIT_PROFILE")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    let env_profile = conduit_lib::brand::env_var(
+        conduit_lib::brand::PROFILE,
+        conduit_lib::brand::PROFILE_LEGACY,
+    );
     // Identifies this client for a live profile lookup in registry.client_scopes,
     // so any re-scope (scoped->scoped, scoped->unscoped, unscoped->scoped)
     // propagates without restarting the client. Every install now writes this,
     // scoped or not; only a client installed before this env var existed lacks it
-    // (until its next reinstall) and falls back to CONDUIT_PROFILE - see
-    // docs/drafts/profile-switch-live-reload-plan.md.
-    let client_id = std::env::var("CONDUIT_CLIENT_ID")
-        .ok()
-        .filter(|s| !s.trim().is_empty());
+    // (until its next reinstall) and falls back to TOOLPORT_PROFILE/CONDUIT_PROFILE
+    // - see docs/drafts/profile-switch-live-reload-plan.md.
+    let client_id = conduit_lib::brand::env_var(
+        conduit_lib::brand::CLIENT_ID,
+        conduit_lib::brand::CLIENT_ID_LEGACY,
+    );
     // HTTP/OpenAPI bridge mode: one process serves every registered client, so the
     // router connects the union of their profiles. Resolve the port once up front.
     let (http_port_opt, warning) = http_port();
@@ -7220,9 +7219,9 @@ fn main() {
     let http_mode = http_port_opt.is_some();
     glog("=== gateway start ===");
     glog(&format!(
-        "cwd={:?} CONDUIT_REGISTRY={:?} registry_path={:?} dir_resolution={:?} lazy={lazy} profile={env_profile:?} client_id={client_id:?}",
+        "cwd={:?} TOOLPORT_REGISTRY={:?} registry_path={:?} dir_resolution={:?} lazy={lazy} profile={env_profile:?} client_id={client_id:?}",
         std::env::current_dir().ok(),
-        std::env::var("CONDUIT_REGISTRY").ok(),
+        conduit_lib::brand::env_var("TOOLPORT_REGISTRY", "CONDUIT_REGISTRY"),
         registry::resolved_path(),
         registry::conduit_dir_resolution(),
     ));
@@ -11295,7 +11294,7 @@ mod tests {
         assert_eq!(
             warning.as_deref(),
             Some(
-                "toolport: unrecognized CONDUIT_DISCOVERY value 'typo', falling back to full discovery"
+                "toolport: unrecognized TOOLPORT_DISCOVERY/CONDUIT_DISCOVERY value 'typo', falling back to full discovery"
             )
         );
         // Empty env is also treated as an unrecognized value.
@@ -11304,7 +11303,7 @@ mod tests {
         assert_eq!(
             warning.as_deref(),
             Some(
-                "toolport: unrecognized CONDUIT_DISCOVERY value '', falling back to full discovery"
+                "toolport: unrecognized TOOLPORT_DISCOVERY/CONDUIT_DISCOVERY value '', falling back to full discovery"
             )
         );
 
@@ -11346,7 +11345,7 @@ mod tests {
         assert_eq!(
             warning.as_deref(),
             Some(
-                "toolport: unrecognized CONDUIT_HTTP value 'invalid', HTTP bridge disabled"
+                "toolport: unrecognized TOOLPORT_HTTP/CONDUIT_HTTP value 'invalid', HTTP bridge disabled"
             )
         );
     }

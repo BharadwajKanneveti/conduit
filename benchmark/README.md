@@ -23,8 +23,8 @@ node benchmark/token-cost.mjs            # auto-reads the active profile's cache
 node benchmark/token-cost.mjs <path>     # or point at a specific tool-cache JSON
 ```
 
-With no argument it resolves Toolport's data dir for you (Windows `%APPDATA%\Conduit`,
-macOS `~/Library/Application Support/Conduit`, Linux `~/.config/Conduit`). A
+With no argument it resolves Toolport's data dir for you (Windows `%APPDATA%\Toolport`,
+macOS `~/Library/Application Support/Toolport`, Linux `~/.config/Toolport`). A
 profile-scoped client writes `tool-cache-<profile>.json`; the unscoped default is
 `tool-cache.json`, which is what the auto-path uses.
 

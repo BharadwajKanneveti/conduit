@@ -584,7 +584,7 @@ export function shareStack(setupJson: string): Promise<string> {
   return invoke<string>("share_stack", { setupJson });
 }
 
-/** Fetch a shared setup's JSON by id (resolving a conduit://import?s=<id> link). */
+/** Fetch a shared setup's JSON by id (resolving a toolport://import?s=<id> link). */
 export function fetchSharedSetup(id: string): Promise<string> {
   return invoke<string>("fetch_shared_setup", { id });
 }

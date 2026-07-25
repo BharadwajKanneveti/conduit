@@ -2281,14 +2281,17 @@ async fn share_stack(setup_json: String) -> Result<String, String> {
     .map_err(|e| e.to_string())?
 }
 
-/// Holds a share id captured from a conduit:// deep link that arrived before the
-/// UI was ready (cold start). The frontend claims it on mount.
+/// Holds a share id captured from a toolport:// (or legacy conduit://) deep link
+/// that arrived before the UI was ready (cold start). The frontend claims it on mount.
 type PendingShare = Mutex<Option<String>>;
 
-/// Parse a conduit://import?s=<id> deep link into its share id. Tolerates an
-/// optional trailing slash after the host; the id must look like a share id.
+/// Parse a `toolport://import?s=<id>` (or legacy `conduit://…`) deep link into its
+/// share id. Tolerates an optional trailing slash after the host; the id must look
+/// like a share id.
 fn parse_share_url(url: &str) -> Option<String> {
-    let after = url.strip_prefix("conduit://")?;
+    let after = url
+        .strip_prefix("toolport://")
+        .or_else(|| url.strip_prefix("conduit://"))?;
     let after = after.strip_prefix("import")?;
     let query = after.trim_start_matches('/').strip_prefix('?')?;
     query.split('&').find_map(|pair| {
@@ -2618,6 +2621,9 @@ fn start_http_bridge(
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("--http")
         .arg(port.to_string())
+        // Prefer TOOLPORT_*; also set CONDUIT_* so a mixed-version gateway binary
+        // still authenticates during an upgrade window.
+        .env("TOOLPORT_HTTP_TOKEN", &token)
         .env("CONDUIT_HTTP_TOKEN", &token)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -3033,12 +3039,24 @@ pub fn run() {
             let handle = app.handle().clone();
             std::thread::spawn(move || watch_registry_for_app(handle));
 
-            // One-time, idempotent migration: after the conduit-gateway ->
-            // toolport-gateway rename, re-point any existing client whose config
-            // still names the old binary (Windows/Linux have no compat symlink, so
-            // that path no longer exists). Surgical + backed up; a no-op once every
-            // client is on the current path.
+            // One-time, idempotent migrations on launch:
+            //   1. Rename the data-dir leaf Conduit → Toolport when safe (legacy
+            //      installs keep working on the old leaf until this succeeds).
+            //   2. Publish the versioned gateway binary into that dir.
+            //   3. Re-point client configs that still use the conduit entry name,
+            //      CONDUIT_* env keys, conduit-gateway binary, or the old data-dir
+            //      path. Surgical + backed up; a no-op once every client is current.
             std::thread::spawn(|| {
+                // Prefer a quiet data-dir rename before publishing/repointing so the
+                // new bin path is under Toolport and client configs get that path.
+                // Gateways holding files open may block the rename; we then keep the
+                // legacy leaf and still repoint names/env keys.
+                if let Some(migrated) = registry::migrate_legacy_data_dir() {
+                    eprintln!(
+                        "toolport: migrated data directory to {}",
+                        migrated.display()
+                    );
+                }
                 if let Some(published) = crate::gateway_publish::publish_bundled_gateway() {
                     eprintln!(
                         "toolport: published client gateway at {}",
@@ -3082,9 +3100,10 @@ pub fn run() {
             let broker = approval_broker::start(app.handle().clone());
             app.manage(broker);
 
-            // conduit://import?s=<id> deep links open the shared-stack import.
-            // The installer registers the scheme; we also register at runtime so
-            // it works unpackaged (dev). Three delivery paths are covered:
+            // toolport://import?s=<id> (and legacy conduit://) deep links open the
+            // shared-stack import. The installer registers the schemes; we also
+            // register at runtime so they work unpackaged (dev). Three delivery
+            // paths are covered:
             //   - cold start (app launched by the link): the URL is in this
             //     process's launch args, read via get_current();
             //   - already running (second launch): the single-instance plugin
@@ -3095,7 +3114,10 @@ pub fn run() {
             {
                 use tauri_plugin_deep_link::DeepLinkExt;
                 #[cfg(any(target_os = "windows", target_os = "linux"))]
-                let _ = app.deep_link().register("conduit");
+                {
+                    let _ = app.deep_link().register("toolport");
+                    let _ = app.deep_link().register("conduit");
+                }
 
                 // Cold start: the URL(s) the app was launched with.
                 if let Ok(Some(urls)) = app.deep_link().get_current() {
@@ -3726,17 +3748,22 @@ mod tests {
     #[test]
     fn parse_share_url_extracts_id() {
         assert_eq!(
+            parse_share_url("toolport://import?s=071g6i3h5f5g6h2i"),
+            Some("071g6i3h5f5g6h2i".to_string())
+        );
+        // Legacy scheme still accepted so existing share links keep working.
+        assert_eq!(
             parse_share_url("conduit://import?s=071g6i3h5f5g6h2i"),
             Some("071g6i3h5f5g6h2i".to_string())
         );
         // Tolerate a trailing slash after the host, and pick s out of many params.
         assert_eq!(
-            parse_share_url("conduit://import/?ref=x&s=abc123"),
+            parse_share_url("toolport://import/?ref=x&s=abc123"),
             Some("abc123".to_string())
         );
         // Reject the wrong action, missing id, and non-alphanumeric ids.
         assert_eq!(parse_share_url("conduit://other?s=abc"), None);
-        assert_eq!(parse_share_url("conduit://import?x=1"), None);
+        assert_eq!(parse_share_url("toolport://import?x=1"), None);
         assert_eq!(parse_share_url("conduit://import?s=../etc"), None);
         assert_eq!(parse_share_url("https://example.com?s=abc"), None);
     }

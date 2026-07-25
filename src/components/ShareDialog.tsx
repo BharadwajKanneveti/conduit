@@ -216,7 +216,7 @@ export function ShareDialog({ trigger, onImported }: Props) {
     }
   }
 
-  // Open the import review when a conduit://import?s=<id> deep link arrives (the
+  // Open the import review when a toolport://import?s=<id> deep link arrives (the
   // share page's "Open in Toolport" button), including one captured before mount.
   useEffect(() => {
     let cancelled = false;

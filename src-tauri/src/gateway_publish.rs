@@ -1,10 +1,10 @@
 //! Versioned gateway publishing for Windows packaged installs.
 //!
-//! Client MCP configs point at `%APPDATA%\Roaming\Conduit\bin\toolport-gateway-{version}.exe`
-//! instead of the install-dir copy NSIS must overwrite on update. Publishing copies the
-//! bundled gateway to a new versioned filename (never fighting a lock on the old file),
-//! records the path in `gateway-manifest.json`, and lets `repoint_stale_gateways` migrate
-//! client configs.
+//! Client MCP configs point at `%APPDATA%\Roaming\Toolport\bin\toolport-gateway-{version}.exe`
+//! (legacy leaf `Conduit` is still accepted until launch migrates it) instead of the
+//! install-dir copy NSIS must overwrite on update. Publishing copies the bundled gateway
+//! to a new versioned filename (never fighting a lock on the old file), records the path
+//! in `gateway-manifest.json`, and lets `repoint_stale_gateways` migrate client configs.
 
 use std::path::{Path, PathBuf};
 
@@ -86,7 +86,7 @@ fn file_size(path: &Path) -> Option<u64> {
     std::fs::metadata(path).ok().map(|m| m.len())
 }
 
-/// Copy the install-dir gateway into `Conduit/bin` when needed and write the manifest.
+/// Copy the install-dir gateway into `Toolport/bin` when needed and write the manifest.
 pub fn publish_bundled_gateway() -> Option<PathBuf> {
     if !should_publish_client_gateway() {
         return None;

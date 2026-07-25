@@ -31,18 +31,18 @@ manager around it. What network surface exists depends on the mode you run:
   input/output). In this mode the gateway binds **no listening network port** at
   all. The only socket it ever opens is a transient `127.0.0.1` loopback listener
   during an OAuth callback, which closes as soon as that flow completes.
-- **Local HTTP / OpenAPI bridge (`CONDUIT_HTTP`).** For clients that speak HTTP
+- **Local HTTP / OpenAPI bridge (`TOOLPORT_HTTP`, legacy `CONDUIT_HTTP`).** For clients that speak HTTP
   or OpenAPI instead of stdio, the gateway can bind a listener. It defaults to
-  `127.0.0.1:8765` (loopback only), configurable with `CONDUIT_HTTP_HOST` and the
+  `127.0.0.1:8765` (loopback only), configurable with `TOOLPORT_HTTP_HOST` and the
   port. When the desktop app starts this bridge it auto-generates a bearer token
-  (`CONDUIT_HTTP_TOKEN`); a request without a valid token gets `401`, and any
+  (`TOOLPORT_HTTP_TOKEN`; legacy `CONDUIT_HTTP_TOKEN` still accepted); a request without a valid token gets `401`, and any
   cross-site browser request is rejected with `403` regardless of token. A gateway
   you launch by hand on loopback **without** a token binds anyway and is reachable
   by any local process, so set a token if other local users or processes are not
   trusted.
 - **Headless / Docker.** The published image runs the HTTP bridge and sets
-  `CONDUIT_HTTP_HOST=0.0.0.0` so it is reachable off-host. Binding to a
-  non-loopback address **requires** `CONDUIT_HTTP_TOKEN`: without one the gateway
+  `TOOLPORT_HTTP_HOST=0.0.0.0` so it is reachable off-host. Binding to a
+  non-loopback address **requires** `TOOLPORT_HTTP_TOKEN` (legacy `CONDUIT_HTTP_TOKEN`): without one the gateway
   refuses to start. Put it behind your own TLS/ingress; the gateway serves plain
   HTTP and expects the operator to terminate TLS.
 - **Sharing and Teams (opt-in, hosted).** These make explicit, user-initiated
@@ -153,8 +153,8 @@ agent, and the governance controls above can gate a call, but a tool you approve
 still executes upstream.
 
 When you run Toolport outside the desktop app, some safety defaults become your
-responsibility: set `CONDUIT_HTTP_TOKEN` (required for any non-loopback bind),
-choose a high-entropy `CONDUIT_SECRET_KEY` for the encrypted file backend, and put
+responsibility: set `TOOLPORT_HTTP_TOKEN` (legacy `CONDUIT_HTTP_TOKEN`; required for any non-loopback bind),
+choose a high-entropy `TOOLPORT_SECRET_KEY` (legacy `CONDUIT_SECRET_KEY`) for the encrypted file backend, and put
 the HTTP bridge behind your own TLS.
 
 ## Known issues

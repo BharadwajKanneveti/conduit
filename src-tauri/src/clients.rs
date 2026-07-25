@@ -107,10 +107,10 @@ struct ClientDef {
 
 /// The name Toolport uses for its own entry when installed into a client config.
 /// This is the user-visible label the entry shows up as inside every client (e.g.
-/// Claude Desktop lists it as this). It is cosmetic/identity only — the frozen
-/// wire identifiers the gateway depends on (`CONDUIT_*` env vars, keychain
-/// access-group, data dir, bundle id) are deliberately NOT tied to this and must
-/// stay `conduit` forever. See [`LEGACY_GATEWAY_ENTRY_NAME`] for the migration path.
+/// Claude Desktop lists it as this). Wire identifiers now prefer `TOOLPORT_*`
+/// (with `CONDUIT_*` still accepted). Bundle id and keychain access-group stay
+/// on the pre-rename identity so OS installs/updates keep working. See
+/// [`LEGACY_GATEWAY_ENTRY_NAME`] for the entry-name migration path.
 pub const GATEWAY_ENTRY_NAME: &str = "toolport";
 
 /// The name Toolport wrote before the SOU-318 rename. Existing installs still have
@@ -3166,20 +3166,20 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
     // Only per-client profile scoping needs an env var.
     let mut env: Vec<crate::registry::EnvVar> = Vec::new();
     // Always identify the client. The gateway re-resolves this client's live
-    // profile from registry.client_scopes[CONDUIT_CLIENT_ID] on every reload, so
+    // profile from registry.client_scopes[TOOLPORT_CLIENT_ID] on every reload, so
     // every re-scope applies without restarting the client - scoped->scoped,
     // scoped->unscoped, AND unscoped->scoped (an unscoped install still carries
     // its id, and its empty-string scope marker just resolves to "follow the
     // active profile" until it's given a named one). A client installed before
-    // this env var existed simply has no CONDUIT_CLIENT_ID until its next
-    // reinstall and falls back to CONDUIT_PROFILE meanwhile. See
-    // docs/drafts/profile-switch-live-reload-plan.md.
-    env.push(env_var("CONDUIT_CLIENT_ID", client_id));
-    // CONDUIT_PROFILE is only the *initial* value for a scoped install; once the
+    // this env var existed simply has no client-id env until its next
+    // reinstall and falls back to TOOLPORT_PROFILE / CONDUIT_PROFILE meanwhile.
+    // See docs/drafts/profile-switch-live-reload-plan.md.
+    env.push(env_var(crate::brand::CLIENT_ID, client_id));
+    // PROFILE is only the *initial* value for a scoped install; once the
     // registry loads, the live client_scopes entry wins. Unscoped installs omit
     // it (and record an empty-string scope marker via set_client_unscoped).
     if let Some(p) = profile.map(str::trim).filter(|p| !p.is_empty()) {
-        env.push(env_var("CONDUIT_PROFILE", p));
+        env.push(env_var(crate::brand::PROFILE, p));
     }
     Ok(ServerEntry {
         id: GATEWAY_ENTRY_NAME.to_string(),
@@ -3189,7 +3189,7 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
         args: Vec::new(),
         env,
         url: None,
-        source: Some("conduit".to_string()),
+        source: Some("toolport".to_string()),
         disabled_tools: Vec::new(),
         cwd: None,
         unknown_fields: serde_json::Map::new(),
@@ -3364,7 +3364,7 @@ fn install_or_remove(
 }
 
 /// Add Toolport's gateway entry to a client's config (preserves existing servers).
-/// `profile` scopes the client to one profile via `CONDUIT_PROFILE` (None = all).
+/// `profile` scopes the client to one profile via `TOOLPORT_PROFILE` (None = all).
 pub fn install_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
     install_or_remove(client_id, true, profile)
 }
@@ -3395,32 +3395,66 @@ fn gateway_command_is_stale(stored: &str, current: &str) -> bool {
     if stored.to_lowercase().contains("conduit-gateway") || !Path::new(stored).exists() {
         return true;
     }
-    // Published bin dir: repoint when the app version bumped the gateway path.
+    // Published bin dir: repoint when the app version bumped the gateway path,
+    // or when the data-dir leaf moved Conduit → Toolport.
     let current_norm = current.replace('/', "\\").to_ascii_lowercase();
-    if current_norm.contains("\\conduit\\bin\\toolport-gateway-") {
+    let stored_norm = stored.replace('/', "\\").to_ascii_lowercase();
+    if current_norm.contains("\\toolport\\bin\\toolport-gateway-")
+        || current_norm.contains("\\conduit\\bin\\toolport-gateway-")
+    {
+        return true;
+    }
+    // Legacy data-dir path still in the client config after leaf migration.
+    if stored_norm.contains("\\conduit\\bin\\") && current_norm.contains("\\toolport\\bin\\") {
         return true;
     }
     false
 }
 
 /// Whether [`repoint_stale_gateways`] should rewrite a client's existing gateway
-/// entry: either its command is stale (see [`gateway_command_is_stale`]) or it still
-/// carries the pre-rename `conduit` name and needs migrating to [`GATEWAY_ENTRY_NAME`]
-/// even though its command is already current.
-fn gateway_entry_needs_rewrite(entry_name: &str, stored_command: &str, current: &str) -> bool {
-    gateway_command_is_stale(stored_command, current)
+/// entry: either its command is stale (see [`gateway_command_is_stale`]), it still
+/// carries the pre-rename `conduit` name, or its env block still uses only the
+/// pre-rename `CONDUIT_*` keys (no `TOOLPORT_*` yet).
+fn gateway_entry_needs_rewrite(
+    entry_name: &str,
+    stored_command: &str,
+    current: &str,
+    config_text: Option<&str>,
+) -> bool {
+    if gateway_command_is_stale(stored_command, current)
         || entry_name.eq_ignore_ascii_case(LEGACY_GATEWAY_ENTRY_NAME)
+    {
+        return true;
+    }
+    // Migrate CONDUIT_CLIENT_ID / CONDUIT_PROFILE → TOOLPORT_* on launch when the
+    // entry name and path are already current (SOU-318 only renamed the key).
+    if let Some(text) = config_text {
+        let has_legacy = text.contains(crate::brand::CLIENT_ID_LEGACY)
+            || text.contains(crate::brand::PROFILE_LEGACY);
+        let has_new =
+            text.contains(crate::brand::CLIENT_ID) || text.contains(crate::brand::PROFILE);
+        if has_legacy && !has_new {
+            return true;
+        }
+    }
+    false
 }
 
-/// Best-effort read of the gateway entry's `CONDUIT_PROFILE` from raw client-config
-/// text, format-tolerantly (JSON `"CONDUIT_PROFILE": "x"`, TOML `= "x"`, YAML `: x`).
+/// Best-effort read of the gateway entry's profile env from raw client-config
+/// text, format-tolerantly (JSON `"TOOLPORT_PROFILE": "x"`, TOML `= "x"`, YAML
+/// `: x`). Prefers `TOOLPORT_PROFILE`, then legacy `CONDUIT_PROFILE`.
 /// The parsed `McpServer` drops env VALUES (they can be secret), so a re-point reads
 /// the profile here to preserve per-client scoping. None if absent/unparseable, in
 /// which case the re-point falls back to the unscoped default, which widens access
 /// rather than breaking it.
 fn profile_from_config_text(content: &str) -> Option<String> {
-    let idx = content.find("CONDUIT_PROFILE")?;
-    let mut rest = content[idx + "CONDUIT_PROFILE".len()..].trim_start();
+    profile_key_from_config_text(content, crate::brand::PROFILE)
+        .or_else(|| profile_key_from_config_text(content, crate::brand::PROFILE_LEGACY))
+}
+
+fn profile_key_from_config_text(content: &str, key: &str) -> Option<String> {
+    let idx = content.find(key)?;
+    let mut rest = content[idx + key.len()..].trim_start();
     rest = rest.strip_prefix('"').unwrap_or(rest).trim_start(); // JSON key's closing quote
     rest = rest.trim_start_matches([':', '=']).trim_start(); // the key/value separator
     if let Some(after) = rest.strip_prefix('"') {
@@ -3483,10 +3517,17 @@ pub fn repoint_stale_gateways() -> Vec<String> {
             .find(|s| gateway_identity_matches(&s.name, &s.name, s.command.as_deref()));
         let stored = entry.and_then(|s| s.command.as_deref()).unwrap_or("");
         let entry_name = entry.map(|s| s.name.as_str()).unwrap_or("");
-        if !gateway_entry_needs_rewrite(entry_name, stored, &current) {
+        // Raw config text for profile preservation + legacy CONDUIT_* env detection.
+        let config_text = find_def(&client.id)
+            .and_then(|def| (def.path)())
+            .and_then(|path| read_config_file(&path).ok());
+        if !gateway_entry_needs_rewrite(entry_name, stored, &current, config_text.as_deref()) {
             continue;
         }
-        let profile = read_gateway_profile(&client.id);
+        let profile = config_text
+            .as_deref()
+            .and_then(profile_from_config_text)
+            .or_else(|| read_gateway_profile(&client.id));
         if install_gateway(&client.id, profile.as_deref()).is_ok() {
             repointed.push(client.id.clone());
         }
@@ -3520,14 +3561,19 @@ mod tests {
 
     #[test]
     fn profile_extracted_across_config_formats() {
-        // JSON
+        // New keys
+        assert_eq!(
+            profile_from_config_text(r#"{"env":{"TOOLPORT_PROFILE":"work"}}"#).as_deref(),
+            Some("work")
+        );
+        // Legacy keys still parse (existing installs until re-point).
         assert_eq!(
             profile_from_config_text(r#"{"env":{"CONDUIT_PROFILE":"work"}}"#).as_deref(),
             Some("work")
         );
         // TOML
         assert_eq!(
-            profile_from_config_text("CONDUIT_PROFILE = \"billing\"").as_deref(),
+            profile_from_config_text("TOOLPORT_PROFILE = \"billing\"").as_deref(),
             Some("billing")
         );
         // YAML, quoted and bareword
@@ -3536,8 +3582,16 @@ mod tests {
             Some("dev")
         );
         assert_eq!(
-            profile_from_config_text("env:\n  CONDUIT_PROFILE: staging\n").as_deref(),
+            profile_from_config_text("env:\n  TOOLPORT_PROFILE: staging\n").as_deref(),
             Some("staging")
+        );
+        // Prefer new over legacy when both appear.
+        assert_eq!(
+            profile_from_config_text(
+                r#"{"env":{"TOOLPORT_PROFILE":"new","CONDUIT_PROFILE":"old"}}"#
+            )
+            .as_deref(),
+            Some("new")
         );
         // Absent
         assert_eq!(profile_from_config_text(r#"{"env":{"OTHER":"x"}}"#), None);
@@ -3922,7 +3976,10 @@ bad = "not-a-table"
         assert!(servers.contains_key("existing"));
         // Discovery mode comes from the registry, not the client config; only the
         // profile scope is written as an env var.
-        assert_eq!(servers[GATEWAY_ENTRY_NAME]["env"]["CONDUIT_PROFILE"], "Billing");
+        assert_eq!(
+            servers[GATEWAY_ENTRY_NAME]["env"][crate::brand::PROFILE],
+            "Billing"
+        );
         assert!(servers[GATEWAY_ENTRY_NAME]["env"]
             .get("CONDUIT_DISCOVERY")
             .is_none());
@@ -3957,9 +4014,29 @@ bad = "not-a-table"
         assert!(gateway_entry_needs_rewrite(
             LEGACY_GATEWAY_ENTRY_NAME,
             current,
-            current
+            current,
+            None
         ));
-        assert!(!gateway_entry_needs_rewrite(GATEWAY_ENTRY_NAME, current, current));
+        assert!(!gateway_entry_needs_rewrite(
+            GATEWAY_ENTRY_NAME,
+            current,
+            current,
+            None
+        ));
+        // Current name + path, but still only CONDUIT_* env keys → rewrite.
+        assert!(gateway_entry_needs_rewrite(
+            GATEWAY_ENTRY_NAME,
+            current,
+            current,
+            Some(r#"{"env":{"CONDUIT_CLIENT_ID":"claude-code"}}"#)
+        ));
+        // Already on TOOLPORT_* → leave alone.
+        assert!(!gateway_entry_needs_rewrite(
+            GATEWAY_ENTRY_NAME,
+            current,
+            current,
+            Some(r#"{"env":{"TOOLPORT_CLIENT_ID":"claude-code"}}"#)
+        ));
 
         // Installing over a config whose only gateway entry is the legacy name renames
         // it in place: the entry is retained-out by identity and re-inserted under the
@@ -3980,9 +4057,13 @@ bad = "not-a-table"
         assert!(!servers.contains_key(LEGACY_GATEWAY_ENTRY_NAME));
         assert!(servers.contains_key("existing"));
         assert_eq!(
-            servers[GATEWAY_ENTRY_NAME]["env"]["CONDUIT_PROFILE"],
+            servers[GATEWAY_ENTRY_NAME]["env"][crate::brand::PROFILE],
             "Billing"
         );
+        // Legacy env keys are not re-written on migrate; new installs use TOOLPORT_*.
+        assert!(servers[GATEWAY_ENTRY_NAME]["env"]
+            .get(crate::brand::PROFILE_LEGACY)
+            .is_none());
         std::fs::remove_file(&path).ok();
     }
 
@@ -4011,7 +4092,7 @@ bad = "not-a-table"
         assert!(json_servers.contains_key(GATEWAY_ENTRY_NAME));
         assert!(json_servers.contains_key("existing"));
         assert_eq!(
-            json_servers[GATEWAY_ENTRY_NAME]["env"]["CONDUIT_CLIENT_ID"],
+            json_servers[GATEWAY_ENTRY_NAME]["env"][crate::brand::CLIENT_ID],
             "claude-code"
         );
         edit_json_gateway(&json_path, "mcpServers", false, None, false, "claude-code").unwrap();
@@ -4120,7 +4201,7 @@ command = "npx"
 
     #[test]
     fn scoped_install_writes_client_id_for_live_profile_resolution() {
-        // A scoped install must carry CONDUIT_CLIENT_ID alongside CONDUIT_PROFILE,
+        // A scoped install must carry TOOLPORT_CLIENT_ID alongside TOOLPORT_PROFILE,
         // so the running gateway can re-resolve this client's profile live from
         // registry.client_scopes instead of trusting a frozen env var forever.
         let entry = gateway_entry(Some("Billing"), "cursor").unwrap();
@@ -4129,20 +4210,29 @@ command = "npx"
             .iter()
             .map(|e| (e.key.clone(), e.value.clone()))
             .collect();
-        assert_eq!(env.get("CONDUIT_PROFILE").unwrap().as_deref(), Some("Billing"));
-        assert_eq!(env.get("CONDUIT_CLIENT_ID").unwrap().as_deref(), Some("cursor"));
+        assert_eq!(
+            env.get(crate::brand::PROFILE).unwrap().as_deref(),
+            Some("Billing")
+        );
+        assert_eq!(
+            env.get(crate::brand::CLIENT_ID).unwrap().as_deref(),
+            Some("cursor")
+        );
 
-        // Unscoped installs still carry CONDUIT_CLIENT_ID (so the client can be
+        // Unscoped installs still carry TOOLPORT_CLIENT_ID (so the client can be
         // re-scoped to a named profile live later, without a restart) but omit
-        // CONDUIT_PROFILE - the gateway resolves the active profile live for them.
+        // TOOLPORT_PROFILE - the gateway resolves the active profile live for them.
         let unscoped = gateway_entry(None, "cursor").unwrap();
         let uenv: std::collections::HashMap<_, _> = unscoped
             .env
             .iter()
             .map(|e| (e.key.clone(), e.value.clone()))
             .collect();
-        assert_eq!(uenv.get("CONDUIT_CLIENT_ID").unwrap().as_deref(), Some("cursor"));
-        assert!(uenv.get("CONDUIT_PROFILE").is_none());
+        assert_eq!(
+            uenv.get(crate::brand::CLIENT_ID).unwrap().as_deref(),
+            Some("cursor")
+        );
+        assert!(uenv.get(crate::brand::PROFILE).is_none());
     }
 
     // Informational (no assert): prints what the Cursor plugin scanner finds on
@@ -4447,11 +4537,11 @@ command = "npx"
             .unwrap()
             .contains("toolport-gateway"));
         assert_eq!(
-            mcp[GATEWAY_ENTRY_NAME]["environment"]["CONDUIT_CLIENT_ID"],
+            mcp[GATEWAY_ENTRY_NAME]["environment"][crate::brand::CLIENT_ID],
             "opencode"
         );
         assert_eq!(
-            mcp[GATEWAY_ENTRY_NAME]["environment"]["CONDUIT_PROFILE"],
+            mcp[GATEWAY_ENTRY_NAME]["environment"][crate::brand::PROFILE],
             "Work"
         );
 

@@ -160,7 +160,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   }
 
   /** Re-apply a scope to an already-connected client (overwrites its gateway
-   * entry's CONDUIT_PROFILE in place, no disconnect needed). */
+   * entry's TOOLPORT_PROFILE in place, no disconnect needed). */
   async function applyScope() {
     setBusy(true);
     try {

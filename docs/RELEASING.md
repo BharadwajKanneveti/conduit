@@ -7,9 +7,10 @@ Releases are built by CI on a version tag (`.github/workflows/release.yml`).
    - `src-tauri/Cargo.toml` (`version`)
    - `package.json` (`version`)
    - `package-lock.json` (root `version` fields)
-   - `src-tauri/Cargo.lock` (the `conduit` package `version` entry)
+   - `src-tauri/Cargo.lock` (the Cargo package is still named `conduit` for history;
+     update that package's `version` entry)
    - `CHANGELOG.md` — move `[Unreleased]` entries into a dated section
-   - `server.json` only when publishing a matching standalone `@tsouth89/conduit-gateway` package
+   - `server.json` only when publishing a matching standalone gateway package
 2. Draft user-facing notes in `docs/release-notes/vX.Y.Z.md` (paste into the GitHub
    release body when publishing the draft CI creates).
 3. Commit the bump (e.g. `chore(release): 1.6.0`).
