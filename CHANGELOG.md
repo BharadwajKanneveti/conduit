@@ -53,7 +53,8 @@ mapping and apply receipts so admins can see policy land on the desktop.
 **Opt-in Prometheus `/metrics`** on the gateway HTTP surface (`TOOLPORT_METRICS=1`).
 (#464)
 
-**Grok Build** client detection and install. (#433)
+**Grok Build** (xAI terminal coding agent used with Toolport Studio) as a
+first-class client: detect, one-click connect, `~/.grok/config.toml`. (#433)
 
 **Quarantine cards show annotation detail** and notify when new entries appear.
 (#439)
