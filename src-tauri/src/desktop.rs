@@ -2621,7 +2621,10 @@ fn start_http_bridge(
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("--http")
         .arg(port.to_string())
+        // Prefer TOOLPORT_*; also set CONDUIT_* so a mixed-version gateway binary
+        // still authenticates during an upgrade window.
         .env("TOOLPORT_HTTP_TOKEN", &token)
+        .env("CONDUIT_HTTP_TOKEN", &token)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

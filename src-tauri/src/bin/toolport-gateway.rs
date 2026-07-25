@@ -465,7 +465,7 @@ fn resolve_mode_from(
             _ => (
                     DiscoveryMode::Full,
                     Some(format!(
-                        "toolport: unrecognized CONDUIT_DISCOVERY value '{v}', falling back to full discovery",
+                        "toolport: unrecognized TOOLPORT_DISCOVERY/CONDUIT_DISCOVERY value '{v}', falling back to full discovery",
                     )),
                 ),
         };
@@ -3349,7 +3349,7 @@ fn handle_request_with_cancel(
                     return Some(success(
                         id,
                         json!({
-                            "content": [{ "type": "text", "text": "Toolport: code mode is disabled. Set CONDUIT_CODE_MODE=1 to enable toolport_run_script." }],
+                            "content": [{ "type": "text", "text": "Toolport: code mode is disabled. Enable it in Settings, or set TOOLPORT_CODE_MODE=1 (legacy: CONDUIT_CODE_MODE=1) to enable toolport_run_script." }],
                             "isError": true
                         }),
                     ));
@@ -3679,7 +3679,7 @@ fn connect_one(
                          (set env {}, {}, secrets.enc, or the OS keychain)",
                         server.id,
                         e.key,
-                        format_args!("CONDUIT_SECRET_{}", e.key),
+                        format_args!("TOOLPORT_SECRET_{}", e.key),
                         e.key
                     ),
                     Err(err) => eprintln!(
@@ -5449,7 +5449,7 @@ fn resolve_http_port(
     (
         None,
         Some(format!(
-            "toolport: unrecognized CONDUIT_HTTP value '{v}', HTTP bridge disabled"
+            "toolport: unrecognized TOOLPORT_HTTP/CONDUIT_HTTP value '{v}', HTTP bridge disabled"
         )),
     )
 }
@@ -6038,9 +6038,9 @@ fn handle_http(
         ),
         ("GET", "/") | ("GET", "/docs") => {
             let metrics_line = if conduit_lib::metrics::metrics_enabled() {
-                "Metrics: GET /metrics (Prometheus text; set CONDUIT_METRICS=1).\n"
+                "Metrics: GET /metrics (Prometheus text; set TOOLPORT_METRICS=1).\n"
             } else {
-                "Metrics: off (set CONDUIT_METRICS=1 to enable GET /metrics).\n"
+                "Metrics: off (set TOOLPORT_METRICS=1 to enable GET /metrics).\n"
             };
             HttpOut::new(
                 200,
@@ -6050,7 +6050,7 @@ fn handle_http(
                      OpenAPI: GET /openapi.json, POST /{{tool_name}} with a JSON body.\n\
                      MCP streamable-HTTP: POST /mcp with JSON-RPC; GET /mcp for server→client SSE.\n\
                      {metrics_line}\
-                     Auth: Authorization: Bearer <CONDUIT_HTTP_TOKEN>."
+                     Auth: Authorization: Bearer <TOOLPORT_HTTP_TOKEN>."
                 ),
             )
         }
@@ -6058,7 +6058,7 @@ fn handle_http(
             if !conduit_lib::metrics::metrics_enabled() {
                 return HttpOut::json_err(
                     404,
-                    "metrics disabled; set CONDUIT_METRICS=1 on the gateway to enable",
+                    "metrics disabled; set TOOLPORT_METRICS=1 on the gateway to enable",
                 );
             }
             HttpOut::new(
@@ -6693,13 +6693,13 @@ fn serve_http(state: GatewayState, port: u16) {
         if loopback {
             eprintln!(
                 "toolport-gateway: refusing to bind {host}:{port} without HTTP authentication. \
-                 Set CONDUIT_HTTP_TOKEN, configure a registered HTTP client, or explicitly pass \
+                 Set TOOLPORT_HTTP_TOKEN (legacy: CONDUIT_HTTP_TOKEN), configure a registered HTTP client, or explicitly pass \
                  {INSECURE_LOOPBACK_FLAG} to accept unauthenticated local access."
             );
         } else {
             eprintln!(
                 "toolport-gateway: refusing to bind {host}:{port} without HTTP authentication. \
-                 Set CONDUIT_HTTP_TOKEN or configure a registered HTTP client. \
+                 Set TOOLPORT_HTTP_TOKEN (legacy: CONDUIT_HTTP_TOKEN) or configure a registered HTTP client. \
                  {INSECURE_LOOPBACK_FLAG} is valid only for loopback binds."
             );
         }

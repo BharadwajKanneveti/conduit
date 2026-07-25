@@ -20,9 +20,10 @@ npm run tauri dev       # run the desktop app
 ```
 
 **Dev data directory:** debug builds (`tauri dev`, `cargo build` without `--release`)
-use a separate data dir — `%APPDATA%\\Roaming\\Conduit-dev` on Windows,
-`~/.config/Conduit-dev` on Linux/macOS — so development never touches your
-installed release data. Override with `CONDUIT_DATA_DIR` for headless tests.
+use a separate data dir — `%APPDATA%\\Roaming\\Toolport-dev` on Windows,
+`~/.config/Toolport-dev` on Linux/macOS — so development never touches your
+installed release data. Override with `TOOLPORT_DATA_DIR` (legacy: `CONDUIT_DATA_DIR`)
+for headless tests.
 
 On macOS/Linux, see the platform notes in the [README troubleshooting](README.md#troubleshooting).
 
@@ -104,13 +105,13 @@ snapshot), use `git commit --no-verify` — but CI will still enforce all checks
 ### Debugging
 
 **Gateway verbose logging:** the gateway writes an always-on log (connection
-lifecycle events) to a file in Toolport's data directory. Set `CONDUIT_DEBUG=1`
-to also capture per-request traces (tool-call arguments, routing decisions,
-downstream responses). "Copy diagnostics" in the app bundles this log with
-version info and a registry summary for bug reports.
+lifecycle events) to a file in Toolport's data directory. Set `TOOLPORT_DEBUG=1`
+(legacy: `CONDUIT_DEBUG=1`) to also capture per-request traces (tool-call arguments,
+routing decisions, downstream responses). "Copy diagnostics" in the app bundles
+this log with version info and a registry summary for bug reports.
 
 ```bash
-CONDUIT_DEBUG=1 npm run tauri dev
+TOOLPORT_DEBUG=1 npm run tauri dev
 ```
 
 **Registry file:** stored at a stable per-user path (visible via "Open data dir"

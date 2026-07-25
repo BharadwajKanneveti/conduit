@@ -6,6 +6,83 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.9.5] - 2026-07-25
+
+Finishes the Conduit → Toolport rename for what users and configs see, keeps
+legacy `CONDUIT_*` env aliases working, and ships security, Teams policy, quarantine,
+and client polish that landed after 1.9.4.
+
+### Branding and upgrade migration
+
+**Client configs write `toolport`, not `conduit`.** New connects and a launch
+migration rename the MCP entry, move the data directory leaf
+`Conduit` → `Toolport` when safe, and rewrite client env keys to
+`TOOLPORT_CLIENT_ID` / `TOOLPORT_PROFILE` while still accepting the old
+`CONDUIT_*` names. Downstream children no longer inherit `TOOLPORT_*` control-plane
+env (vault key / HTTP token). Deep links accept `toolport://` and still open
+legacy `conduit://` share links. (#445 and follow-ups)
+
+### Security and integrity
+
+**Opt-in block-on-injection, with org force.** Content-defense hits can refuse the
+tool result instead of only flagging it; Teams can force the policy on members.
+(#465)
+
+**Structured tool results are scanned more thoroughly**, including head/tail of
+large `structuredContent`, with redaction on hit. (#455)
+
+**Corrupt quarantine store fails closed** instead of treating the file as empty
+and unblocking tools. (#448)
+
+**Upstream MCP responses are shape-validated** before use. (#452)
+
+### Teams and gateway policy
+
+**Org `allowedTools` maps into local profile `tool_scope`**, with allowlist id
+mapping and apply receipts so admins can see policy land on the desktop.
+(#457, #458, #456)
+
+**Org rate limits enforced in the local gateway.** (#461)
+
+**Optional per-call audit export to the org.** (#460)
+
+**Profile `tool_scope` enforced on the HTTP bridge** as well as stdio. (#459)
+
+### Observability and clients
+
+**Opt-in Prometheus `/metrics`** on the gateway HTTP surface (`TOOLPORT_METRICS=1`).
+(#464)
+
+**Grok Build** client detection and install. (#433)
+
+**Quarantine cards show annotation detail** and notify when new entries appear.
+(#439)
+
+**Client detection errors surface in the UI** instead of failing silently. (#466)
+
+**Restart toast after connecting a client** so users know to reload the AI client.
+(#317 / #442)
+
+**Client scope copy matches behavior** (active profile, not “all servers”). (#447)
+
+### Reliability and polish
+
+**Activity rows keep expansion across the 3s live refresh.** (#450)
+
+**Timestamps go through shared `fmtTs`.** (#451)
+
+**Quarantine.json re-parse skipped when mtime+len unchanged.** (#435)
+
+**Invalid discovery / HTTP / budget env values warn** instead of failing quietly.
+(#453)
+
+**CI runs Rust integration tests**; notarytool submit is time-bounded. (#454, #441)
+
+### Docs
+
+Headless, Open WebUI, Docker compose, README, and env reference prefer
+`TOOLPORT_*` names and document `CONDUIT_*` as still-accepted aliases.
+
 ## [1.9.4] - 2026-07-22
 
 Toolport blocks a tool when its definition changes in a risky way. This release fixes the
