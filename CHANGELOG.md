@@ -56,6 +56,11 @@ mapping and apply receipts so admins can see policy land on the desktop.
 **Grok Build** (xAI terminal coding agent used with Toolport Studio) as a
 first-class client: detect, one-click connect, `~/.grok/config.toml`. (#433)
 
+**Toolport Studio** as a first-class client (`toolport-studio`): detect install
+markers, one-click connect to `~/.toolport-studio/mcp.json`, profile scope, and
+session-aware connect toasts. Studio still auto-discovers the gateway without
+Connect; Connect pins profile and Activity attribution.
+
 **Quarantine cards show annotation detail** and notify when new entries appear.
 (#439)
 

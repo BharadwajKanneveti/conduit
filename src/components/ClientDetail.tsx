@@ -49,7 +49,11 @@ import {
 import { TransportPill } from "@/components/TransportPill";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { ImportReviewDialog } from "@/components/ImportReviewDialog";
-import { clientRestartHint, connectSuccessDescription } from "@/lib/clientConnect";
+import {
+  clientRestartHint,
+  connectSuccessDescription,
+  toolportStudioClientBlurb,
+} from "@/lib/clientConnect";
 
 interface Props {
   client: DetectedClient;
@@ -171,7 +175,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         profile
           ? `${client.name} scoped to "${profile}".`
           : `${client.name} now follows the active profile.`,
-        { description: clientRestartHint(client.name) },
+        { description: clientRestartHint(client.name, client.id) },
       );
       onChanged();
     } catch (e) {
@@ -309,10 +313,14 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         // Restart is the load-bearing line (SOU-317): MCP clients typically do not
         // pick up a new gateway entry until relaunch. Scope/backup are secondary.
         toast.success(`Connected Toolport to ${client.name}`, {
-          description: connectSuccessDescription(client.name, [
-            profile ? `Scoped to the "${profile}" profile.` : null,
-            !profile && outcome.backup ? "Previous config backed up." : null,
-          ]),
+          description: connectSuccessDescription(
+            client.name,
+            [
+              profile ? `Scoped to the "${profile}" profile.` : null,
+              !profile && outcome.backup ? "Previous config backed up." : null,
+            ],
+            client.id,
+          ),
         });
       }
       onChanged();
@@ -345,6 +353,11 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                 ? "installed - no MCP config yet"
                 : "not installed on this machine"}
           </p>
+          {client.id === "toolport-studio" && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              {toolportStudioClientBlurb()}
+            </p>
+          )}
           {installed && (
             <p className="mt-1 text-xs text-muted-foreground">
               Sees{" "}

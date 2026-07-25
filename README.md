@@ -16,9 +16,10 @@ every AI client, with far fewer tokens.
 ![Toolport: every tool from all your servers, collapsed to the handful your agent loads](docs/lazy-discovery.svg)
 
 Toolport is a local MCP (Model Context Protocol) gateway. You set up and
-authenticate each server once, and every AI client (Claude, Cursor, Codex, and
-the rest) points at Toolport and shares them, so you stop configuring the same
-servers separately in each app.
+authenticate each server once, and every AI client (Claude, Cursor, Codex,
+[Toolport Studio](https://github.com/tsouth89/toolport-studio), and the rest)
+points at Toolport and shares them, so you stop configuring the same servers
+separately in each app.
 
 ![Toolport demo: add a server once, connect every AI client, lazy tool discovery, and a destructive call blocked by human approval](docs/demo.gif)
 

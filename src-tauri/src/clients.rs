@@ -302,6 +302,11 @@ fn resolve_client_config_path(
         },
         "hermes" => home.join(".hermes").join("config.yaml"),
         "witsy" => config.join("Witsy").join("settings.json"),
+        // Toolport Studio injects the gateway per provider session with
+        // TOOLPORT_CLIENT_ID=toolport-studio (legacy CONDUIT_CLIENT_ID dual-write
+        // in Studio for older gateways). This file is the Toolport-managed connect
+        // marker + scope target (same identity Studio already uses).
+        "toolport-studio" => home.join(".toolport-studio").join("mcp.json"),
         _ => return None,
     };
     Some(path)
@@ -371,6 +376,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
         "continue" => home.join(".continue").join("config.yaml"),
         "hermes" => home.join(".hermes").join("config.yaml"),
         "witsy" => config.join("Witsy").join("settings.json"),
+        "toolport-studio" => home.join(".toolport-studio").join("mcp.json"),
         _ => return None,
     };
     Some(path)
@@ -547,6 +553,54 @@ fn codex_path() -> Option<PathBuf> {
 /// pickup).
 fn grok_path() -> Option<PathBuf> {
     client_config_path("grok")
+}
+
+/// Toolport Studio (sibling product): per-session MCP injection uses
+/// `TOOLPORT_CLIENT_ID=toolport-studio`. Connect writes `~/.toolport-studio/mcp.json`
+/// so scopes, discovery overrides, and gatewayInstalled state stay consistent
+/// with every other client. Tools still work without Connect (Studio auto-discovers
+/// the gateway); Connect pins profile scope and shows the client as connected.
+fn toolport_studio_path() -> Option<PathBuf> {
+    client_config_path("toolport-studio")
+}
+
+/// Install / state markers for Toolport Studio. The MCP connect file lives under
+/// `~/.toolport-studio`, but a fresh install may only have the app dir or
+/// Electron userData until the first Studio launch creates the home state tree.
+fn toolport_studio_install_marker() -> Option<PathBuf> {
+    let home = home()?;
+    let mut candidates: Vec<PathBuf> = vec![home.join(".toolport-studio")];
+
+    if let Some(roaming) = dirs::config_dir() {
+        candidates.push(roaming.join("toolport-studio"));
+        candidates.push(roaming.join("toolport-studio-dev"));
+    }
+    if let Some(local) = dirs::data_local_dir() {
+        // NSIS default under electron-builder; include the transitional t3code
+        // install folder from the Studio fork until installers fully rename.
+        candidates.push(local.join("Programs").join("toolport-studio"));
+        candidates.push(local.join("Programs").join("t3code"));
+        candidates.push(local.join("toolport-studio"));
+        candidates.push(local.join("toolport-studio-updater"));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        candidates.push(PathBuf::from("/Applications/Toolport Studio.app"));
+        candidates.push(PathBuf::from("/Applications/Toolport Studio (Alpha).app"));
+        candidates.push(PathBuf::from("/Applications/Toolport Studio (Nightly).app"));
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Some(data) = dirs::data_dir() {
+            candidates.push(data.join("applications").join("toolport-studio.desktop"));
+            candidates.push(data.join("toolport-studio"));
+        }
+        candidates.push(home.join(".local").join("share").join("applications").join(
+            "toolport-studio.desktop",
+        ));
+    }
+
+    candidates.into_iter().find(|path| path.exists())
 }
 
 fn claude_code_path() -> Option<PathBuf> {
@@ -815,6 +869,18 @@ fn defs() -> Vec<ClientDef> {
             format: Format::TomlMcpServers,
             uses_connectors: false,
             path: grok_path,
+            plugin_scan: None,
+        },
+        ClientDef {
+            // Sibling product: injects this gateway into provider sessions as
+            // TOOLPORT_CLIENT_ID=toolport-studio. Connect target is
+            // ~/.toolport-studio/mcp.json (Json mcpServers). Distinct from Grok
+            // Build (the CLI under Studio's Grok provider), which uses ~/.grok.
+            id: "toolport-studio",
+            name: "Toolport Studio",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            path: toolport_studio_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -2020,6 +2086,9 @@ fn install_override(id: &str) -> Option<PathBuf> {
         // ~/.kiro/settings may not exist until something is configured; ~/.kiro is
         // created on install.
         "kiro" => Some(home()?.join(".kiro")),
+        // MCP file lives under ~/.toolport-studio, but presence also includes
+        // Electron userData and installer dirs (and the transitional t3code path).
+        "toolport-studio" => toolport_studio_install_marker(),
         _ => None,
     }
 }
@@ -4340,10 +4409,77 @@ command = "npx"
         );
         assert!(install_override("kiro").unwrap().ends_with(".kiro"));
         let _ = install_override("warp"); // env-dependent; just ensure no panic.
-                                          // Well-behaved clients have no override (they use the config-parent heuristic).
+        let _ = install_override("toolport-studio"); // install/state dirs vary by machine.
+                                                     // Well-behaved clients have no override (they use the config-parent heuristic).
         assert!(install_override("cursor").is_none());
         assert!(install_override("codex").is_none());
         assert!(install_override("vscode").is_none());
+    }
+
+    #[test]
+    fn toolport_studio_is_registered_with_session_client_id() {
+        let d = defs()
+            .into_iter()
+            .find(|d| d.id == "toolport-studio")
+            .expect("toolport-studio client");
+        assert_eq!(d.name, "Toolport Studio");
+        assert!(matches!(d.format, Format::JsonMcpServers));
+        assert!(!d.uses_connectors);
+        assert!((d.path)().is_some());
+        // Identity must match Studio's McpProviderSession TOOLPORT_CLIENT_ID.
+        assert_eq!(d.id, "toolport-studio");
+    }
+
+    #[test]
+    fn toolport_studio_config_path_is_under_home_state_dir() {
+        for platform in Platform::ALL {
+            let home = mock_home(platform);
+            let path = resolve_client_config_path("toolport-studio", &home, platform)
+                .expect("toolport-studio path");
+            assert_eq!(
+                path,
+                home.join(".toolport-studio").join("mcp.json"),
+                "toolport-studio on {platform:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn toolport_studio_gateway_round_trip() {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-studio-client-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("mcp.json");
+
+        // Install writes mcpServers.toolport with TOOLPORT_CLIENT_ID=toolport-studio.
+        edit_json_gateway(&path, "mcpServers", true, Some("Work"), false, "toolport-studio")
+            .unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let entry = &root["mcpServers"][GATEWAY_ENTRY_NAME];
+        assert!(entry["command"].as_str().is_some());
+        let env = entry["env"].as_object().expect("env object");
+        assert_eq!(
+            env.get(crate::brand::CLIENT_ID).and_then(|v| v.as_str()),
+            Some("toolport-studio")
+        );
+        assert_eq!(
+            env.get(crate::brand::PROFILE).and_then(|v| v.as_str()),
+            Some("Work")
+        );
+
+        // Uninstall removes the gateway entry and leaves an empty mcpServers map.
+        edit_json_gateway(&path, "mcpServers", false, None, false, "toolport-studio").unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let servers = root["mcpServers"].as_object().unwrap();
+        assert!(!servers.contains_key(GATEWAY_ENTRY_NAME));
+        assert!(!servers.contains_key(LEGACY_GATEWAY_ENTRY_NAME));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -5092,6 +5228,9 @@ command = "npx"
         let cases: &[(&str, fn(&Path, Platform) -> PathBuf)] = &[
             ("cursor", |home, _| home.join(".cursor").join("mcp.json")),
             ("grok", |home, _| home.join(".grok").join("config.toml")),
+            ("toolport-studio", |home, _| {
+                home.join(".toolport-studio").join("mcp.json")
+            }),
             ("opencode", |home, _| {
                 home.join(".config").join("opencode").join("opencode.json")
             }),
