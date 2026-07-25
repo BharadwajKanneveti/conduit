@@ -31,6 +31,7 @@ import {
 } from "@tauri-apps/plugin-autostart";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import { toastError } from "@/lib/toast";
+import { Button } from "@/components/ui/button";
 import {
   addHttpClient,
   clearInspectLog,
@@ -375,9 +376,28 @@ function ProfileToolScope({
   }, [registry.servers]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [toolsByServer, setToolsByServer] = useState<Record<string, string[]>>({});
+  const [errorByServer, setErrorByServer] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const scope = profile.toolScope ?? {};
+
+  async function loadTools(serverId: string) {
+    setLoading(serverId);
+    try {
+      const tools = await listServerTools(serverId);
+      setToolsByServer((m) => ({ ...m, [serverId]: tools.map((t) => t.name) }));
+      setErrorByServer((m) => {
+        const next = { ...m };
+        delete next[serverId];
+        return next;
+      });
+    } catch (e) {
+      toastError(`Couldn't load ${serverName.get(serverId) ?? serverId} tools: ${e}`);
+      setErrorByServer((m) => ({ ...m, [serverId]: true }));
+    } finally {
+      setLoading(null);
+    }
+  }
 
   async function expand(serverId: string) {
     if (expanded === serverId) {
@@ -386,15 +406,7 @@ function ProfileToolScope({
     }
     setExpanded(serverId);
     if (!toolsByServer[serverId]) {
-      setLoading(serverId);
-      try {
-        const tools = await listServerTools(serverId);
-        setToolsByServer((m) => ({ ...m, [serverId]: tools.map((t) => t.name) }));
-      } catch (e) {
-        toastError(`Couldn't load ${serverName.get(serverId) ?? serverId} tools: ${e}`);
-      } finally {
-        setLoading(null);
-      }
+      await loadTools(serverId);
     }
   }
 
@@ -453,6 +465,22 @@ function ProfileToolScope({
               <div className="border-t border-border/40 px-2 py-1.5">
                 {loading === serverId ? (
                   <p className="text-xs text-muted-foreground">Loading tools…</p>
+                ) : errorByServer[serverId] ? (
+                  <div
+                    role="status"
+                    aria-live="polite"
+                    className="flex flex-col gap-2 rounded-md border border-border p-3"
+                  >
+                    <p className="text-xs text-muted-foreground">Couldn't load tools</p>
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      className="w-fit"
+                      onClick={() => loadTools(serverId)}
+                    >
+                      Retry
+                    </Button>
+                  </div>
                 ) : allTools && allTools.length > 0 ? (
                   <div className="flex flex-col gap-1">
                     {allTools.map((tool) => (
@@ -470,7 +498,7 @@ function ProfileToolScope({
                   </div>
                 ) : (
                   <p className="text-xs text-muted-foreground">
-                    No tools, or the server isn&apos;t reachable right now.
+                    This server exposes no tools.
                   </p>
                 )}
               </div>
