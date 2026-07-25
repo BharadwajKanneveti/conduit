@@ -1,0 +1,12 @@
+{
+  "ratel": {
+    "package": "@ratel-ai/ratel-local",
+    "version": "0.5.0"
+  },
+  "defaults": {
+    "catalogSizes": [25, 100, 500],
+    "iterations": 100,
+    "settleMilliseconds": 500,
+    "topK": 5
+  }
+}

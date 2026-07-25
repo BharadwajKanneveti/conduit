@@ -22,6 +22,7 @@
     "test:rust:windows": "powershell -ExecutionPolicy Bypass -File scripts/test-rust-windows.ps1",
     "bench:latency": "node benchmark/latency.mjs",
     "bench:latency:check": "node benchmark/latency.mjs --check",
+    "bench:compare": "node benchmark/compare-local.mjs",
     "audit:prod": "npm audit --omit=dev",
     "prepare": "husky"
   },
