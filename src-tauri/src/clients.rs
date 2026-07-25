@@ -4825,18 +4825,25 @@ command = "npx"
 
     #[test]
     fn continue_yaml_parses_remote_server() {
-        let content = "mcpServers:\n  - name: remote\n    type: streamable-http\n    url: https://example.com/mcp\n";
+        let content = "mcpServers:\n  - name: remote-http\n    type: streamable-http\n    url: https://example.com/mcp\n  - name: remote-sse\n    type: sse\n    url: https://example.com/events\n";
 
         let parsed = parse_continue_yaml_servers(content).unwrap();
 
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].name, "remote");
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "remote-http");
         assert_eq!(parsed[0].transport, "http");
         assert_eq!(
             parsed[0].url.as_deref(),
             Some("https://example.com/mcp")
         );
         assert!(parsed[0].command.is_none());
+        assert_eq!(parsed[1].name, "remote-sse");
+        assert_eq!(parsed[1].transport, "sse");
+        assert_eq!(
+            parsed[1].url.as_deref(),
+            Some("https://example.com/events")
+        );
+        assert!(parsed[1].command.is_none());
     }
 
     #[test]
@@ -4865,12 +4872,13 @@ command = "npx"
             stdio("filesystem"),
             stdio("github"),
             remote("remote", "http"),
+            remote("remote-sse", "sse"),
         ];
         write_continue_yaml_servers(&path, &servers).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed = parse_continue_yaml_servers(&content).unwrap();
-        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed.len(), 4);
         assert_eq!(parsed[0].name, "filesystem");
         assert_eq!(parsed[0].command.as_deref(), Some("npx"));
         assert_eq!(
@@ -4886,6 +4894,13 @@ command = "npx"
             Some("https://remote.example.com/mcp")
         );
         assert!(parsed[2].command.is_none());
+        assert_eq!(parsed[3].name, "remote-sse");
+        assert_eq!(parsed[3].transport, "sse");
+        assert_eq!(
+            parsed[3].url.as_deref(),
+            Some("https://remote-sse.example.com/mcp")
+        );
+        assert!(parsed[3].command.is_none());
 
         let root: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
         assert_eq!(
