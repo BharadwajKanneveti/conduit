@@ -11294,7 +11294,7 @@ mod tests {
         assert_eq!(
             warning.as_deref(),
             Some(
-                "toolport: unrecognized CONDUIT_DISCOVERY value 'typo', falling back to full discovery"
+                "toolport: unrecognized TOOLPORT_DISCOVERY/CONDUIT_DISCOVERY value 'typo', falling back to full discovery"
             )
         );
         // Empty env is also treated as an unrecognized value.
@@ -11303,7 +11303,7 @@ mod tests {
         assert_eq!(
             warning.as_deref(),
             Some(
-                "toolport: unrecognized CONDUIT_DISCOVERY value '', falling back to full discovery"
+                "toolport: unrecognized TOOLPORT_DISCOVERY/CONDUIT_DISCOVERY value '', falling back to full discovery"
             )
         );
 
@@ -11345,7 +11345,7 @@ mod tests {
         assert_eq!(
             warning.as_deref(),
             Some(
-                "toolport: unrecognized CONDUIT_HTTP value 'invalid', HTTP bridge disabled"
+                "toolport: unrecognized TOOLPORT_HTTP/CONDUIT_HTTP value 'invalid', HTTP bridge disabled"
             )
         );
     }
