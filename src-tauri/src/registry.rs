@@ -1146,14 +1146,12 @@ impl Registry {
     }
 }
 
-/// Leaf directory name under the OS config root (`Conduit` release, `Conduit-dev`
-/// for debug/`tauri dev` builds). Override the full path with `CONDUIT_DATA_DIR`.
+/// Leaf directory name under the OS config root (`Toolport` release, `Toolport-dev`
+/// for debug/`tauri dev` builds). Override the full path with `TOOLPORT_DATA_DIR`
+/// (legacy: `CONDUIT_DATA_DIR`). Existing `Conduit` / `Conduit-dev` dirs are migrated
+/// in place by [`crate::brand::resolve_data_dir_under`] when safe.
 pub(crate) fn data_dir_leaf_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "Conduit-dev"
-    } else {
-        "Conduit"
-    }
+    crate::brand::data_dir_leaf_name()
 }
 
 /// How [`conduit_dir`] was resolved, for startup diagnostics. Only Windows has
@@ -1172,31 +1170,32 @@ pub enum DirResolution {
     VirtualizedFallback,
 }
 
-/// Conduit's data dir, anchored so every process agrees regardless of launch
+/// Toolport's data dir, anchored so every process agrees regardless of launch
 /// context.
 ///
-/// On Windows this is `%USERPROFILE%\AppData\Roaming\Conduit`. Spelling the path
-/// out (instead of the APPDATA known folder) is NOT enough to agree across
-/// processes: a gateway spawned by an MSIX-packaged client (e.g. Claude Desktop)
-/// runs inside that app's container, whose filesystem filter redirects opens
-/// under `AppData\Roaming` - by ANY path spelling, home-derived or not - into
-/// the package's `LocalCache` shadow copy, which can be days stale. (Verified
-/// empirically 2026-07-05: a probe file written to `%APPDATA%` from inside the
-/// Claude container landed in the package `LocalCache`. An earlier version of
-/// this comment claimed home-derived paths escape the redirect; that is false.)
+/// On Windows this is `%USERPROFILE%\AppData\Roaming\Toolport` (migrated from the
+/// pre-rename `…\Conduit` leaf when safe). Spelling the path out (instead of the
+/// APPDATA known folder) is NOT enough to agree across processes: a gateway
+/// spawned by an MSIX-packaged client (e.g. Claude Desktop) runs inside that app's
+/// container, whose filesystem filter redirects opens under `AppData\Roaming` -
+/// by ANY path spelling, home-derived or not - into the package's `LocalCache`
+/// shadow copy, which can be days stale. (Verified empirically 2026-07-05: a
+/// probe file written to `%APPDATA%` from inside the Claude container landed in
+/// the package `LocalCache`. An earlier version of this comment claimed
+/// home-derived paths escape the redirect; that is false.)
 /// A shadowed gateway reads a frozen `registry.json` (server/profile edits never
 /// arrive) and a stale `approval-endpoint.json` (HITL approvals fail closed
 /// against a dead broker port).
 ///
 /// The fix: when this process has MSIX package identity - meaning it was spawned
-/// inside a packaged app's container, since Conduit's own binaries never ship as
+/// inside a packaged app's container, since Toolport's own binaries never ship as
 /// MSIX - address the SAME directory through its loopback-UNC twin
 /// (`\\localhost\C$\Users\...`). SMB serves those opens from the real filesystem,
 /// outside the virtualization filter's reach (verified on the same machine). If
 /// the UNC view is unreachable we fall back to the natural path, no worse than
 /// before; see [`DirResolution`] and [`conduit_dir_resolution`].
 ///
-/// Public so every Conduit file (registry, tool cache, audit log, approval
+/// Public so every Toolport file (registry, tool cache, audit log, approval
 /// endpoint, debug logs) derives from the same anchor - otherwise the app and a
 /// client-spawned gateway would read/write different dirs.
 pub fn conduit_dir() -> Option<PathBuf> {
@@ -1234,11 +1233,11 @@ pub(crate) fn data_dir_test_lock() -> std::sync::MutexGuard<'static, ()> {
 
 /// Points [`conduit_dir`] at a scratch directory until the guard drops. **Tests only.**
 ///
-/// Setting `CONDUIT_DATA_DIR` does NOT work from a test: [`resolve_conduit_dir`]
-/// memoizes in a `OnceLock`, so whichever test resolves the dir first wins and every
-/// later `set_var` is silently ignored, leaving the test reading and writing the
-/// developer's REAL data dir. That made suite results order-dependent and leaked
-/// fixture files into `Conduit-dev` (SOU-301).
+/// Setting `TOOLPORT_DATA_DIR` / `CONDUIT_DATA_DIR` does NOT work from a test:
+/// [`resolve_conduit_dir`] memoizes in a `OnceLock`, so whichever test resolves the
+/// dir first wins and every later `set_var` is silently ignored, leaving the test
+/// reading and writing the developer's REAL data dir. That made suite results
+/// order-dependent and leaked fixture files into the debug data dir (SOU-301).
 ///
 /// Deliberately not `#[cfg(test)]`-gated: the gateway binary's tests link this library
 /// compiled WITHOUT `cfg(test)`, so a cfg-gated hook would be invisible in exactly the
@@ -1272,10 +1271,14 @@ impl Drop for DataDirOverride {
     }
 }
 
-/// Resolve the data dir once and cache it: the container check and the UNC
+/// Resolve the data dir and cache it: the container check and the UNC
 /// reachability probe should not run on every path lookup, and a stable answer
 /// keeps every consumer (registry, watcher, tool cache, approval endpoint) on
 /// one directory for the process lifetime.
+///
+/// Cache is an `RwLock` (not `OnceLock`) so a desktop-launch data-dir migration
+/// can [`invalidate_data_dir_cache`] after renaming `Conduit` → `Toolport`;
+/// otherwise a pre-migration resolution would keep pointing at the old path.
 fn resolve_conduit_dir() -> (Option<PathBuf>, DirResolution) {
     // Checked ahead of the memoized value so a test can redirect the dir even after
     // something else in the process has already resolved it.
@@ -1288,45 +1291,81 @@ fn resolve_conduit_dir() -> (Option<PathBuf>, DirResolution) {
             return (Some(p), DirResolution::Direct);
         }
     }
-    static RESOLVED: std::sync::OnceLock<(Option<PathBuf>, DirResolution)> =
-        std::sync::OnceLock::new();
-    RESOLVED
-        .get_or_init(|| {
-            if let Ok(dir) = std::env::var("CONDUIT_DATA_DIR") {
-                if !dir.trim().is_empty() {
-                    return (Some(PathBuf::from(dir)), DirResolution::Direct);
-                }
+    {
+        let cached = DATA_DIR_RESOLVED
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((path, resolution)) = cached.as_ref() {
+            // Re-resolve when the cached path was removed (e.g. legacy leaf renamed).
+            let still_valid = path.as_ref().map(|p| p.exists()).unwrap_or(true);
+            if still_valid {
+                return (path.clone(), *resolution);
             }
-            let leaf = data_dir_leaf_name();
-            #[cfg(windows)]
-            {
-                let Some(home) = dirs::home_dir() else {
-                    return (None, DirResolution::Direct);
-                };
-                let conduit = |base: &Path| {
-                    base.join("AppData").join("Roaming").join(leaf)
-                };
-                if !msix::has_package_identity() {
-                    return (Some(conduit(&home)), DirResolution::Direct);
-                }
-                match msix::unc_twin(&home) {
-                    // The profile dir always exists, so a metadata success proves the
-                    // UNC view actually works before we commit every file to it.
-                    Some(unc_home) if std::fs::metadata(&unc_home).is_ok() => {
-                        (Some(conduit(&unc_home)), DirResolution::Devirtualized)
-                    }
-                    _ => (Some(conduit(&home)), DirResolution::VirtualizedFallback),
-                }
+        }
+    }
+    let fresh = compute_conduit_dir();
+    *DATA_DIR_RESOLVED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(fresh.clone());
+    fresh
+}
+
+static DATA_DIR_RESOLVED: std::sync::RwLock<Option<(Option<PathBuf>, DirResolution)>> =
+    std::sync::RwLock::new(None);
+
+/// Drop the memoized data-dir path so the next lookup re-runs resolution.
+/// Used after a successful Conduit → Toolport leaf rename on desktop launch.
+pub fn invalidate_data_dir_cache() {
+    *DATA_DIR_RESOLVED
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+fn compute_conduit_dir() -> (Option<PathBuf>, DirResolution) {
+    if let Some(dir) = crate::brand::env_var("TOOLPORT_DATA_DIR", "CONDUIT_DATA_DIR") {
+        return (Some(PathBuf::from(dir)), DirResolution::Direct);
+    }
+    #[cfg(windows)]
+    {
+        let Some(home) = dirs::home_dir() else {
+            return (None, DirResolution::Direct);
+        };
+        let under_roaming = |base: &Path| {
+            crate::brand::resolve_data_dir_under(&crate::brand::windows_roaming_base(base))
+        };
+        if !msix::has_package_identity() {
+            return (Some(under_roaming(&home)), DirResolution::Direct);
+        }
+        match msix::unc_twin(&home) {
+            // The profile dir always exists, so a metadata success proves the
+            // UNC view actually works before we commit every file to it.
+            Some(unc_home) if std::fs::metadata(&unc_home).is_ok() => {
+                (Some(under_roaming(&unc_home)), DirResolution::Devirtualized)
             }
-            #[cfg(not(windows))]
-            {
-                (
-                    dirs::config_dir().map(|d| d.join(leaf)),
-                    DirResolution::Direct,
-                )
-            }
-        })
-        .clone()
+            _ => (Some(under_roaming(&home)), DirResolution::VirtualizedFallback),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        (
+            dirs::config_dir().map(|d| crate::brand::resolve_data_dir_under(&d)),
+            DirResolution::Direct,
+        )
+    }
+}
+
+/// Best-effort desktop-launch migration of the legacy data-dir leaf (`Conduit`
+/// / `Conduit-dev`) to `Toolport` / `Toolport-dev`. Invalidates the path cache
+/// on success so subsequent lookups use the new leaf. Returns the new path when
+/// a rename happened.
+pub fn migrate_legacy_data_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let base = dirs::home_dir().map(|h| crate::brand::windows_roaming_base(&h))?;
+    #[cfg(not(windows))]
+    let base = dirs::config_dir()?;
+    let migrated = crate::brand::migrate_legacy_data_dir_under(&base)?;
+    invalidate_data_dir_cache();
+    Some(migrated)
 }
 
 /// MSIX app-container detection and escape hatch (see [`conduit_dir`]).
@@ -1776,16 +1815,17 @@ pub fn update_at<T>(
     Ok((reg, out))
 }
 
-/// The path the registry actually resolves to, honoring `CONDUIT_REGISTRY`.
+/// The path the registry actually resolves to, honoring `TOOLPORT_REGISTRY`
+/// (legacy: `CONDUIT_REGISTRY`).
 pub fn resolved_path() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("CONDUIT_REGISTRY") {
+    if let Some(path) = crate::brand::env_var("TOOLPORT_REGISTRY", "CONDUIT_REGISTRY") {
         return Some(PathBuf::from(path));
     }
     registry_path()
 }
 
-/// Load honoring the `CONDUIT_REGISTRY` env override (used by the gateway and
-/// tests), falling back to the default path.
+/// Load honoring the `TOOLPORT_REGISTRY` / `CONDUIT_REGISTRY` env override (used
+/// by the gateway and tests), falling back to the default path.
 pub fn load_resolved() -> Result<Registry, String> {
     match resolved_path() {
         Some(path) => load_from(&path),
@@ -2422,8 +2462,18 @@ mod tests {
         let _data_dir = data_dir_test_lock();
         assert_eq!(conduit_dir_resolution(), DirResolution::Direct);
         let dir = conduit_dir().expect("home dir resolves");
-        assert!(dir.ends_with(format!("AppData\\Roaming\\{}", data_dir_leaf_name())));
-        assert!(!dir.to_string_lossy().starts_with(r"\\"));
+        let s = dir.to_string_lossy();
+        // Prefer Toolport; existing installs may still resolve under the legacy leaf
+        // until desktop launch migrates it.
+        assert!(
+            s.ends_with(&format!("AppData\\Roaming\\{}", data_dir_leaf_name()))
+                || s.ends_with(&format!(
+                    "AppData\\Roaming\\{}",
+                    crate::brand::legacy_data_dir_leaf_name()
+                )),
+            "unexpected data dir: {s}"
+        );
+        assert!(!s.starts_with(r"\\"));
     }
 
     #[test]
@@ -2821,9 +2871,9 @@ mod tests {
         assert_eq!(
             data_dir_leaf_name(),
             if cfg!(debug_assertions) {
-                "Conduit-dev"
+                "Toolport-dev"
             } else {
-                "Conduit"
+                "Toolport"
             }
         );
     }

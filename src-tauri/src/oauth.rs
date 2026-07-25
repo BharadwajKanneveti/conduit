@@ -51,7 +51,7 @@ fn base64url(data: &[u8]) -> String {
 /// Off unless `CONDUIT_DEBUG` is set, so auth-flow metadata isn't written to disk
 /// for every user. Never log token values here.
 fn debug_log(msg: &str) {
-    if std::env::var_os("CONDUIT_DEBUG").is_none() {
+    if crate::brand::env_var_os("TOOLPORT_DEBUG", "CONDUIT_DEBUG").is_none() {
         return;
     }
     if let Some(path) = crate::registry::conduit_dir().map(|d| d.join("oauth-debug.log")) {

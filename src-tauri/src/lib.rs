@@ -4,6 +4,7 @@ mod approval_broker;
 #[cfg(feature = "desktop")]
 mod desktop;
 pub mod audit;
+pub mod brand;
 pub mod catalog;
 pub mod clients;
 pub mod codemode;

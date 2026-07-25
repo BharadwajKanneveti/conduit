@@ -1,6 +1,6 @@
 //! Opt-in Prometheus `/metrics` for the HTTP gateway (SOU-347).
 //!
-//! Off by default (`CONDUIT_METRICS=1` / `true` / `yes` to enable). Scrapes the
+//! Off by default (`TOOLPORT_METRICS=1` / legacy `CONDUIT_METRICS`). Scrapes the
 //! same local audit + savings + quarantine files the desktop dashboards use.
 //! Labels are bounded to ids only (server / tool / client / ok), never args.
 
@@ -10,13 +10,7 @@ use serde_json::Value;
 
 /// Whether `GET /metrics` is served. Default off.
 pub fn metrics_enabled() -> bool {
-    match std::env::var("CONDUIT_METRICS") {
-        Ok(v) => {
-            let t = v.trim();
-            t == "1" || t.eq_ignore_ascii_case("true") || t.eq_ignore_ascii_case("yes")
-        }
-        Err(_) => false,
-    }
+    crate::brand::env_flag("TOOLPORT_METRICS", "CONDUIT_METRICS")
 }
 
 /// Prometheus text exposition of current local stats.

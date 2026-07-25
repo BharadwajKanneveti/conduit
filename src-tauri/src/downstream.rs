@@ -587,7 +587,7 @@ pub trait Transport: Send {
 }
 
 fn downstream_trace(msg: &str) {
-    if std::env::var_os("CONDUIT_DEBUG").is_none() {
+    if crate::brand::env_var_os("TOOLPORT_DEBUG", "CONDUIT_DEBUG").is_none() {
         return;
     }
     let Some(path) = crate::registry::gateway_log_path() else {
