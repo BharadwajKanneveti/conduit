@@ -46,6 +46,24 @@ MODEL="qwen2.5-7b-instruct" node benchmark/bench.js
 LLM_URL="http://localhost:11434/v1/chat/completions" MODEL="qwen2.5:7b" node benchmark/bench.js
 ```
 
+## Deterministic latency and startup report (`latency.mjs`)
+
+This offline benchmark uses the bundled mock MCP server to isolate Toolport's own
+cost. It measures the gateway handshake, time until the downstream catalog is
+searchable, lazy `tools/list`, search, and routed-call overhead versus calling the
+same server directly.
+
+```bash
+cargo build --manifest-path src-tauri/Cargo.toml --bins
+node benchmark/latency.mjs 200
+node benchmark/latency.mjs 200 --json
+node benchmark/latency.mjs 200 --check
+```
+
+`--json` is intended for storing and comparing results across commits and competing
+local gateways. `--check` enforces the deliberately generous regression ceilings in
+`latency-budget.json`; tighten them only with evidence from multiple machines.
+
 ## What it reports
 
 Per task and as totals, for each mode:
