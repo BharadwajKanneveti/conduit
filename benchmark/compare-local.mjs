@@ -10,6 +10,7 @@
 //   node benchmark/compare-local.mjs --json --out=benchmark/local-compare.json
 
 import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
   existsSync,
   mkdtempSync,
@@ -635,6 +636,19 @@ function gitRevision() {
   return result.status === 0 ? result.stdout.trim() : null;
 }
 
+function gitDirty() {
+  const result = spawnSync("git", ["status", "--porcelain", "--untracked-files=no"], {
+    cwd: ROOT,
+    encoding: "utf8",
+    windowsHide: true,
+  });
+  return result.status === 0 ? result.stdout.trim().length > 0 : null;
+}
+
+function fileSha256(path) {
+  return createHash("sha256").update(readFileSync(path)).digest("hex");
+}
+
 function markdown(result) {
   const lines = [
     "# Local MCP gateway comparison",
@@ -681,7 +695,9 @@ async function main() {
     },
     versions: {
       toolportRevision: gitRevision(),
+      toolportDirty: gitDirty(),
       toolportBinary: TOOLPORT_GATEWAY,
+      toolportBinarySha256: fileSha256(TOOLPORT_GATEWAY),
       toolportBuildProfile: TOOLPORT_GATEWAY === RELEASE_GATEWAY ? "release" : "debug",
       ratelPackage: ratelBin ? `${CONFIG.ratel.package}@${CONFIG.ratel.version}` : null,
     },

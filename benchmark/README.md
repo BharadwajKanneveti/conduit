@@ -94,9 +94,10 @@ npm run bench:compare -- --json --out=benchmark/local-compare.json
 npm run bench:compare -- --products=toolport
 ```
 
-The comparison prefers Toolport's release binary and records the selected path and
-build profile in JSON. A debug binary is accepted for development smoke tests, but
-do not publish performance numbers from a debug-vs-release run.
+The comparison prefers Toolport's release binary and records the selected path,
+SHA-256, build profile, Git revision, and dirty-worktree state in JSON. A debug
+binary is accepted for development smoke tests, but do not publish performance
+numbers from a debug-vs-release run.
 
 The report deliberately separates deterministic gateway mechanics from model-graded
 agent accuracy. Use `bench-sweep.mjs` for end-to-end model tasks; do not present this
