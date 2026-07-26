@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import {
   Activity,
   Bot,
@@ -377,14 +377,23 @@ function ProfileToolScope({
   const [expanded, setExpanded] = useState<string | null>(null);
   const [toolsByServer, setToolsByServer] = useState<Record<string, string[]>>({});
   const [errorByServer, setErrorByServer] = useState<Record<string, boolean>>({});
-  const [loading, setLoading] = useState<string | null>(null);
+  const [loadingByServer, setLoadingByServer] = useState<Record<string, boolean>>({});
+  const requestIdByServer = useRef<Record<string, number>>({});
   const [busy, setBusy] = useState(false);
   const scope = profile.toolScope ?? {};
 
   async function loadTools(serverId: string) {
-    setLoading(serverId);
+    const requestId = (requestIdByServer.current[serverId] ?? 0) + 1;
+    requestIdByServer.current[serverId] = requestId;
+    setLoadingByServer((m) => ({
+      ...m,
+      [serverId]: true,
+    }));
     try {
       const tools = await listServerTools(serverId);
+      if (requestIdByServer.current[serverId] !== requestId) {
+        return;
+      }
       setToolsByServer((m) => ({ ...m, [serverId]: tools.map((t) => t.name) }));
       setErrorByServer((m) => {
         const next = { ...m };
@@ -395,7 +404,12 @@ function ProfileToolScope({
       toastError(`Couldn't load ${serverName.get(serverId) ?? serverId} tools: ${e}`);
       setErrorByServer((m) => ({ ...m, [serverId]: true }));
     } finally {
-      setLoading(null);
+      if (requestIdByServer.current[serverId] === requestId) {
+        setLoadingByServer((m) => ({
+          ...m,
+          [serverId]: false,
+        }));
+      }
     }
   }
 
@@ -463,7 +477,7 @@ function ProfileToolScope({
             </button>
             {open && (
               <div className="border-t border-border/40 px-2 py-1.5">
-                {loading === serverId ? (
+                {loadingByServer[serverId] ? (
                   <p className="text-xs text-muted-foreground">Loading tools…</p>
                 ) : errorByServer[serverId] ? (
                   <div
