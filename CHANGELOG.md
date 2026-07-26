@@ -14,6 +14,26 @@ still hits the same scope and approval gates as `toolport_call_tool`. Code mode 
 security boundary (agent-supplied JS). `TOOLPORT_CODE_MODE=1` still force-enables.
 Existing registries that already store `"codeMode": false` stay off. (SOU-397)
 
+### Fixed
+
+**A hand-edited gateway entry is no longer reverted on every app launch.** The
+launch-time re-point recognized its own entry by _name_, so an entry still called
+`toolport` but pointed at something else — an `mcp-remote` bridge against the HTTP
+endpoint, a container, a wrapper script — was treated as a stale install and rewritten
+back to the default stdio command every time the app started. Re-pointing now requires
+the stored command to actually name a Toolport gateway binary; anything else is treated
+as user-managed and left exactly as written (and the skip is logged). Genuine
+migrations — an older version, the pre-rename `conduit-gateway`, the pre-rename data
+directory, an unversioned install path — are unaffected. (#487)
+
+**A machine-wide `TOOLPORT_HTTP` / `CONDUIT_HTTP` no longer hijacks client-spawned
+gateways.** HTTP mode replaces the stdio transport, so an inherited value left every
+MCP client with a gateway that never answered its pipe, and every gateway after the
+first colliding on the shared port (`WSAEADDRINUSE`) — which some clients treat as
+fatal. The env forms are now ignored, with a warning, when stdin is a pipe. The
+desktop app, the Docker images, and the documented headless setup all pass `--http`
+explicitly and are unaffected; use the flag in scripts and services too. (#487)
+
 ## [1.9.5] - 2026-07-25
 
 Finishes the Conduit → Toolport rename for what users and configs see, keeps

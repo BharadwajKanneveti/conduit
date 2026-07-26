@@ -6671,10 +6671,13 @@ fn handle_stdio_request(
     }
 }
 
+/// `stdio_peer` is true when stdin is a pipe rather than a terminal, i.e. an MCP
+/// client spawned this process and is waiting to speak JSON-RPC on it.
 fn resolve_http_port(
     cli_port: Option<u16>,
     http: Option<&str>,
     http_port: Option<&str>,
+    stdio_peer: bool,
 ) -> (Option<u16>, Option<String>) {
     // CLI flag has highest priority.
     if let Some(port) = cli_port {
@@ -6686,6 +6689,27 @@ fn resolve_http_port(
     let v = v.trim();
     if v.is_empty() {
         return (None, None);
+    }
+    // Ambient env + a client on the other end of stdin: ignore the env (issue #487).
+    // HTTP mode REPLACES the stdio loop rather than running beside it, so honoring a
+    // machine-wide TOOLPORT_HTTP here hands the client a gateway that never answers
+    // its pipe - and every client that starts after the first also collides on the
+    // shared port (WSAEADDRINUSE / os error 10048), which some clients treat as fatal.
+    // The env var is a global, so one stray `setx` breaks every client at once.
+    //
+    // The desktop app starts its bridge with an explicit `--http`, handled above and
+    // unaffected. A human running the gateway by hand has a terminal on stdin and
+    // still gets the env form. Anything else - a service, or a detached run with stdin
+    // redirected from null - now has to say `--http` out loud, which the warning says.
+    if stdio_peer {
+        return (
+            None,
+            Some(format!(
+                "toolport: ignoring TOOLPORT_HTTP/CONDUIT_HTTP='{v}' from the environment - this \
+                 gateway was spawned by a client on stdio, and HTTP mode would replace the stdio \
+                 transport that client is waiting on. Pass --http explicitly to run the HTTP bridge."
+            )),
+        );
     }
     if let Ok(port) = v.parse::<u16>() {
         if port > 0 {
@@ -6713,7 +6737,12 @@ fn resolve_http_port(
 /// Resolve the HTTP port. `--http [port]` on the command line wins; otherwise
 /// `CONDUIT_HTTP=<port>` is the direct env form, and a truthy `CONDUIT_HTTP`
 /// falls back to `CONDUIT_HTTP_PORT` or 8765. Absent everywhere -> stdio mode.
+///
+/// The env forms are ignored (with a warning) when a client spawned us on stdio, so a
+/// machine-wide `TOOLPORT_HTTP` can't silently turn every client's gateway into a
+/// racing HTTP server - see [`resolve_http_port`] and issue #487.
 fn http_port() -> (Option<u16>, Option<String>) {
+    use std::io::IsTerminal;
     // CLI flag: `toolport-gateway --http` (default 8765) or `--http 9000`.
     let args: Vec<String> = std::env::args().collect();
     let cli_port = args
@@ -6729,11 +6758,9 @@ fn http_port() -> (Option<u16>, Option<String>) {
         });
     let http = conduit_lib::brand::env_var("TOOLPORT_HTTP", "CONDUIT_HTTP");
     let http_port = conduit_lib::brand::env_var("TOOLPORT_HTTP_PORT", "CONDUIT_HTTP_PORT");
-    resolve_http_port(
-        cli_port,
-        http.as_deref(),
-        http_port.as_deref(),
-    )
+    // A client that spawns us over stdio gives us a pipe; a human gets a terminal.
+    let stdio_peer = !std::io::stdin().is_terminal();
+    resolve_http_port(cli_port, http.as_deref(), http_port.as_deref(), stdio_peer)
 }
 
 /// The tools the HTTP surface exposes, mirroring `tools/list`: the meta-tools
@@ -13267,17 +13294,29 @@ mod tests {
     #[test]
     fn resolve_http_port_cases() {
         // CLI port wins over everything.
-        assert_eq!(resolve_http_port(Some(9000), Some("8000"), Some("7000")), (Some(9000), None));
+        assert_eq!(
+            resolve_http_port(Some(9000), Some("8000"), Some("7000"), false),
+            (Some(9000), None)
+        );
         // Direct port form: CONDUIT_HTTP=9000.
-        assert_eq!(resolve_http_port(None, Some("9000"), None), (Some(9000), None));
+        assert_eq!(
+            resolve_http_port(None, Some("9000"), None, false),
+            (Some(9000), None)
+        );
         // Truthy CONDUIT_HTTP uses CONDUIT_HTTP_PORT.
-        assert_eq!(resolve_http_port(None, Some("true"), Some("9001")), (Some(9001), None));
+        assert_eq!(
+            resolve_http_port(None, Some("true"), Some("9001"), false),
+            (Some(9001), None)
+        );
         // Truthy CONDUIT_HTTP without a port falls back to default.
-        assert_eq!(resolve_http_port(None, Some("yes"), None), (Some(8765), None));
+        assert_eq!(
+            resolve_http_port(None, Some("yes"), None, false),
+            (Some(8765), None)
+        );
         // No HTTP configuration means stdio mode.
-        assert_eq!(resolve_http_port(None, None, None), (None, None));
+        assert_eq!(resolve_http_port(None, None, None, false), (None, None));
         // Invalid value returns no port and warning.
-        let (port, warning) = resolve_http_port(None, Some("invalid"), None);
+        let (port, warning) = resolve_http_port(None, Some("invalid"), None, false);
         assert_eq!(port, None);
         assert_eq!(
             warning.as_deref(),
@@ -13285,6 +13324,40 @@ mod tests {
                 "toolport: unrecognized TOOLPORT_HTTP/CONDUIT_HTTP value 'invalid', HTTP bridge disabled"
             )
         );
+    }
+
+    #[test]
+    fn ambient_http_env_is_ignored_when_a_client_spawned_us() {
+        // Regression for issue #487. A machine-wide TOOLPORT_HTTP/CONDUIT_HTTP is
+        // inherited by every client, and every gateway those clients spawn. HTTP mode
+        // REPLACES the stdio loop, so honoring it here would leave each client with a
+        // gateway that never answers its pipe, and every gateway after the first
+        // colliding on the shared port (WSAEADDRINUSE) - which some clients treat as
+        // fatal. Ignore the env and serve stdio, loudly.
+        for value in ["1", "true", "on", "yes", "9000", "invalid"] {
+            let (port, warning) = resolve_http_port(None, Some(value), Some("9001"), true);
+            assert_eq!(
+                port, None,
+                "env value {value:?} must not enable HTTP on a stdio spawn"
+            );
+            let warning = warning.expect("ignoring the env must be reported, not silent");
+            assert!(
+                warning.contains("spawned by a client on stdio") && warning.contains("--http"),
+                "warning should name the cause and the fix, got: {warning}"
+            );
+        }
+
+        // The desktop app's own bridge passes --http explicitly and is unaffected,
+        // even though it is itself spawned with piped stdio.
+        assert_eq!(
+            resolve_http_port(Some(8765), Some("1"), None, true),
+            (Some(8765), None)
+        );
+
+        // No HTTP configuration at all stays a silent stdio start - a client spawn is
+        // the normal case and must not warn.
+        assert_eq!(resolve_http_port(None, None, None, true), (None, None));
+        assert_eq!(resolve_http_port(None, Some(""), None, true), (None, None));
     }
 
     #[test]
