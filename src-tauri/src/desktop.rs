@@ -386,11 +386,21 @@ async fn test_server(entry: ServerEntry) -> Result<ProbeResult, String> {
 
 /// Probe every supported MCP client and return its current server configuration.
 #[tauri::command]
-async fn detect_clients() -> Result<Vec<clients::DetectedClient>, String> {
+async fn detect_clients(
+    state: State<'_, RegistryState>,
+) -> Result<Vec<clients::DetectedClient>, String> {
     // Reads several config files and scans plugin dirs - off the UI thread.
-    tauri::async_runtime::spawn_blocking(clients::detect_clients)
+    let mut list = tauri::async_runtime::spawn_blocking(clients::detect_clients)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Ownership record lives on the registry (SOU-406).
+    let managed = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .client_managed_entries
+        .clone();
+    clients::apply_entry_states(&mut list, &managed);
+    Ok(list)
 }
 
 #[tauri::command]
@@ -663,12 +673,38 @@ fn write_to_client(
 
 /// Install the Toolport gateway into a client (one click "connect to Toolport").
 /// `profile` scopes that client to one profile (None = all enabled servers).
+/// When the live entry is user-customized, pass `force: true` after the UI confirms
+/// overwrite (SOU-406); otherwise the install is refused.
 #[tauri::command]
 fn install_gateway(
     state: State<RegistryState>,
     client_id: String,
     profile: Option<String>,
+    force: Option<bool>,
 ) -> Result<clients::WriteOutcome, String> {
+    let force = force.unwrap_or(false);
+    if !force {
+        // Refuse to silently clobber a hand-edited gateway entry (Integrations toggle
+        // / apply-scope). The UI must confirm and retry with force=true.
+        let mut list = clients::detect_clients();
+        let managed = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .client_managed_entries
+            .clone();
+        clients::apply_entry_states(&mut list, &managed);
+        if list
+            .iter()
+            .find(|c| c.id == client_id)
+            .is_some_and(|c| c.entry_state == clients::GatewayEntryState::Customized)
+        {
+            return Err(
+                "This client's Toolport entry has a custom configuration. Confirm to \
+                 reset it to the default gateway, or leave it as-is."
+                    .into(),
+            );
+        }
+    }
     let outcome = clients::install_gateway(&client_id, profile.as_deref())?;
     // Record the scope we just wrote into the client's config, so the UI can show
     // and re-apply this client's effective scope without re-reading the config.
@@ -682,10 +718,14 @@ fn install_gateway(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(str::to_string);
+    let managed = outcome.managed.clone();
     write_registry(state.inner(), |reg| {
         match scope.as_deref() {
             Some(p) => reg.set_client_scope(&client_id, Some(p)),
             None => reg.set_client_unscoped(&client_id),
+        }
+        if let Some(m) = managed {
+            reg.set_client_managed_entry(&client_id, m);
         }
         Ok(())
     })?;
@@ -701,6 +741,7 @@ fn uninstall_gateway(
     let outcome = clients::uninstall_gateway(&client_id)?;
     write_registry(state.inner(), |reg| {
         reg.set_client_scope(&client_id, None);
+        reg.clear_client_managed_entry(&client_id);
         Ok(())
     })?;
     Ok(outcome)
@@ -811,7 +852,7 @@ async fn migrate_client(
 
     // Rewrite the client to only the gateway (backs up first). External to the registry, so
     // it stays outside the lock; the scope record below is a separate locked write.
-    clients::migrate_to_gateway(&client_id, profile.as_deref())?;
+    let migrate_write = clients::migrate_to_gateway(&client_id, profile.as_deref())?;
 
     // Record the scope now that the client config was rewritten to the gateway.
     // "No profile" becomes an explicit-unscoped marker (not a removal) so a live
@@ -821,10 +862,14 @@ async fn migrate_client(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(str::to_string);
+    let managed = migrate_write.managed;
     let (registry, _) = write_registry(state.inner(), |reg| {
         match scope.as_deref() {
             Some(p) => reg.set_client_scope(&client_id, Some(p)),
             None => reg.set_client_unscoped(&client_id),
+        }
+        if let Some(m) = managed {
+            reg.set_client_managed_entry(&client_id, m);
         }
         Ok(())
     })?;
@@ -3064,12 +3109,35 @@ pub fn run() {
                         published.display()
                     );
                 }
-                let repointed = clients::repoint_stale_gateways();
-                if !repointed.is_empty() {
+                // Ownership map from disk (this launch thread has no RegistryState handle).
+                let managed_snapshot = registry::load()
+                    .map(|r| r.client_managed_entries)
+                    .unwrap_or_default();
+                let repoint = clients::repoint_stale_gateways(&managed_snapshot);
+                if !repoint.repointed.is_empty() {
+                    let ids: Vec<&str> = repoint
+                        .repointed
+                        .iter()
+                        .map(|(id, _)| id.as_str())
+                        .collect();
                     eprintln!(
                         "toolport: re-pointed {} client config(s) to the renamed gateway: {}",
-                        repointed.len(),
-                        repointed.join(", ")
+                        repoint.repointed.len(),
+                        ids.join(", ")
+                    );
+                    // Refresh ownership records for everything we rewrote (SOU-406).
+                    let _ = registry::update(|reg| {
+                        for (id, entry) in &repoint.repointed {
+                            reg.set_client_managed_entry(id, entry.clone());
+                        }
+                        Ok(())
+                    });
+                }
+                if !repoint.customized.is_empty() {
+                    eprintln!(
+                        "toolport: left {} client config(s) alone (custom configuration): {}",
+                        repoint.customized.len(),
+                        repoint.customized.join(", ")
                     );
                 }
                 // Stop any gateway running a version other than this one, so each client
@@ -3266,6 +3334,7 @@ mod tests {
             servers: servers.into_iter().map(detected_mcp_server).collect(),
             plugin_servers: plugin_servers.into_iter().map(detected_mcp_server).collect(),
             gateway_installed: false,
+            entry_state: clients::GatewayEntryState::Absent,
             error: None,
         }
     }

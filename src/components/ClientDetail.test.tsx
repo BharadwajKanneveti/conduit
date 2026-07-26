@@ -38,6 +38,7 @@ function client(over: Partial<DetectedClient> = {}): DetectedClient {
     configPath: "C:\\Users\\me\\Claude\\claude_desktop_config.json",
     configExists: true,
     gatewayInstalled: false,
+    entryState: "absent",
     appPresent: true,
     servers: [],
     pluginServers: [],
@@ -77,6 +78,38 @@ describe("ClientDetail detection errors", () => {
       "Couldn't parse config: unexpected token",
     );
     expect(screen.getByRole("button", { name: /connect to toolport/i })).toBeEnabled();
+  });
+});
+
+describe("ClientDetail customized entry (SOU-406)", () => {
+  it("shows custom configuration badge and Reset to default", () => {
+    render(
+      <ClientDetail
+        client={client({
+          gatewayInstalled: true,
+          entryState: "customized",
+          servers: [
+            {
+              name: "toolport",
+              transport: "stdio",
+              command: "npx",
+              args: ["-y", "mcp-remote", "http://localhost:8765/mcp"],
+              envKeys: [],
+              url: null,
+            },
+          ],
+        })}
+        registry={emptyRegistry()}
+        onChanged={() => {}}
+        onRegistryChange={() => {}}
+      />,
+    );
+
+    expect(screen.getAllByText(/custom configuration/i).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: /reset to default/i })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /connect to toolport/i }),
+    ).not.toBeInTheDocument();
   });
 });
 
