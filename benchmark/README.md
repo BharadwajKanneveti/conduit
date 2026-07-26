@@ -46,6 +46,63 @@ MODEL="qwen2.5-7b-instruct" node benchmark/bench.js
 LLM_URL="http://localhost:11434/v1/chat/completions" MODEL="qwen2.5:7b" node benchmark/bench.js
 ```
 
+## Deterministic latency and startup report (`latency.mjs`)
+
+This offline benchmark uses the bundled mock MCP server to isolate Toolport's own
+cost. It measures the gateway handshake, time until the downstream catalog is
+searchable, lazy `tools/list`, search, and routed-call overhead versus calling the
+same server directly.
+
+```bash
+cargo build --release --manifest-path src-tauri/Cargo.toml --bins
+node benchmark/latency.mjs 200
+node benchmark/latency.mjs 200 --json
+node benchmark/latency.mjs 200 --check
+```
+
+`--json` is intended for storing and comparing results across commits and competing
+local gateways. `--check` enforces the deliberately generous regression ceilings in
+`latency-budget.json`; tighten them only with evidence from multiple machines.
+
+## Side-by-side local gateway comparison (`compare-local.mjs`)
+
+This is the competitive harness. It generates one deterministic MCP catalog, launches
+the same dependency-free fixture server behind each gateway, and drives both products
+through their public stdio MCP interfaces. It compares:
+
+- cold start until a known capability is searchable;
+- the count and estimated token cost of always-exposed gateway tools plus MCP
+  initialization instructions;
+- search median/p95, returned-payload size, recall@K, and mean reciprocal rank
+  over shared queries;
+- routed-call median/p95 overhead against calling the fixture directly.
+
+Ratel Local is pinned in `compare-local.config.json` and installed into the operating
+system's temporary directory, not this repository:
+
+```bash
+cargo build --release --manifest-path src-tauri/Cargo.toml --bins
+npm run bench:compare -- --install-ratel
+
+# Subsequent offline/cached runs
+npm run bench:compare
+npm run bench:compare -- --sizes=25,100,500 --iterations=200
+npm run bench:compare -- --settle-ms=1000
+npm run bench:compare -- --json --out=benchmark/local-compare.json
+
+# Toolport-only regression run
+npm run bench:compare -- --products=toolport
+```
+
+The comparison prefers Toolport's release binary and records the selected path,
+SHA-256, build profile, Git revision, and dirty-worktree state in JSON. A debug
+binary is accepted for development smoke tests, but do not publish performance
+numbers from a debug-vs-release run.
+
+The report deliberately separates deterministic gateway mechanics from model-graded
+agent accuracy. Use `bench-sweep.mjs` for end-to-end model tasks; do not present this
+synthetic retrieval fixture as an agent-accuracy benchmark.
+
 ## What it reports
 
 Per task and as totals, for each mode:
