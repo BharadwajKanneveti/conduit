@@ -401,6 +401,10 @@ function ProfileToolScope({
         return next;
       });
     } catch (e) {
+      // Ignore stale failures (a newer load for this server is in flight or done).
+      if (requestIdByServer.current[serverId] !== requestId) {
+        return;
+      }
       toastError(`Couldn't load ${serverName.get(serverId) ?? serverId} tools: ${e}`);
       setErrorByServer((m) => ({ ...m, [serverId]: true }));
     } finally {
