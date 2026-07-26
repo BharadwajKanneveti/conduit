@@ -783,11 +783,10 @@ impl Router {
         let (server_id, tool) = self
             .routes
             .get(exposed_name)
-            .cloned()
             .ok_or_else(|| format!("no route for tool '{exposed_name}'"))?;
-        let slot = self.slot_for(&server_id)?;
+        let slot = self.slot_for(server_id)?;
         self.call_with_retry(&slot, |server| {
-            server.call_with_cancel(&tool, arguments.clone(), cancel.clone())
+            server.call_with_cancel(tool, arguments.clone(), cancel.clone())
         })
     }
 

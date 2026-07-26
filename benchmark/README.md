@@ -74,7 +74,10 @@ through their public stdio MCP interfaces. It compares:
 - the count and estimated token cost of always-exposed gateway tools plus MCP
   initialization instructions;
 - search median/p95, returned-payload size, recall@K, and mean reciprocal rank
-  over shared queries;
+  over shared queries with plausible near-match distractors;
+- schema-ready@K plus the total response tokens and round trips needed to obtain
+  the exact input schema and make a discovered result ready to invoke (so a
+  smaller first response is not rewarded when it forces another lookup);
 - routed-call median/p95 overhead against calling the fixture directly.
 
 Ratel Local is pinned in `compare-local.config.json` and installed into the operating
@@ -87,6 +90,7 @@ npm run bench:compare -- --install-ratel
 # Subsequent offline/cached runs
 npm run bench:compare
 npm run bench:compare -- --sizes=25,100,500 --iterations=200
+npm run bench:compare -- --products=toolport --check
 npm run bench:compare -- --settle-ms=1000
 npm run bench:compare -- --json --out=benchmark/local-compare.json
 
@@ -97,7 +101,11 @@ npm run bench:compare -- --products=toolport
 The comparison prefers Toolport's release binary and records the selected path,
 SHA-256, build profile, Git revision, and dirty-worktree state in JSON. A debug
 binary is accepted for development smoke tests, but do not publish performance
-numbers from a debug-vs-release run.
+numbers from a debug-vs-release run. Each catalog size also gets a disposable
+Toolport data directory, so existing audit logs, traces, caches, and result
+cursors cannot influence the timings. `--check` enforces the cross-machine
+regression ceilings in `compare-local.config.json`; it checks Toolport only,
+even when a competitor is included in the report.
 
 The report deliberately separates deterministic gateway mechanics from model-graded
 agent accuracy. Use `bench-sweep.mjs` for end-to-end model tasks; do not present this

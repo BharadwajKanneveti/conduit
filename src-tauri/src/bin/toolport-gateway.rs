@@ -1319,39 +1319,59 @@ fn search_catalog_indexed(
         // pure lexical (positive scores only, highest first), identical to before.
         let semantic_ranked = semantic_rerank(sem, query, &lex);
         let used_semantic = semantic_ranked.is_some();
-        let ranked: Vec<(f64, &Value)> = semantic_ranked.unwrap_or_else(|| {
+        let mut ranked: Vec<(f64, &Value)> = semantic_ranked.unwrap_or_else(|| {
             let mut s: Vec<(f64, &Value)> =
                 lex.iter().filter(|(sc, _)| *sc > 0.0).cloned().collect();
             s.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             s
         });
+        // An agent follows schemaOmitted recovery by searching the exact exposed
+        // name it was given. Make that contract deterministic: an exact name must
+        // lead even when another tool happens to score higher on shared tokens.
+        // This also guarantees project_budgeted keeps the requested tool's schema.
+        let exact_position = ranked.iter().position(|(_, tool)| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .map(|name| name.eq_ignore_ascii_case(query.trim()))
+                .unwrap_or(false)
+        });
+        if let Some(position) = exact_position.filter(|position| *position > 0) {
+            let exact = ranked.remove(position);
+            ranked.insert(0, exact);
+        }
         let total = ranked.len();
 
-        let low_confidence = match ranked.first() {
-            None => true,
-            Some((top_score, _)) if used_semantic => *top_score < LOW_CONFIDENCE_HYBRID_SCORE,
-            Some((top_score, _)) => {
-                // Normalize the raw lexical score against an ideal result where
-                // every meaningful query token hits a tool name. Missing query
-                // terms still contribute to the denominator, which is exactly the
-                // weak-evidence case that should broaden.
-                let ideal_idf: f64 = q_tokens
-                    .iter()
-                    .map(|qt| {
-                        let matched_idf = std::iter::once(qt.as_str())
-                            .chain(synonym_group(qt).iter().copied())
-                            .filter(|candidate| df.contains_key(*candidate))
-                            .map(idf)
-                            .fold(0.0_f64, f64::max);
-                        if matched_idf > 0.0 {
-                            matched_idf
-                        } else {
-                            idf(qt)
-                        }
-                    })
-                    .sum();
-                let ideal = NAME_W * ideal_idf * (1.0 + NAME_SPECIFICITY_W);
-                ideal <= f64::EPSILON || *top_score / ideal < LOW_CONFIDENCE_LEXICAL_RATIO
+        let low_confidence = if exact_position.is_some() {
+            false
+        } else {
+            match ranked.first() {
+                None => true,
+                Some((top_score, _)) if used_semantic => {
+                    *top_score < LOW_CONFIDENCE_HYBRID_SCORE
+                }
+                Some((top_score, _)) => {
+                    // Normalize the raw lexical score against an ideal result where
+                    // every meaningful query token hits a tool name. Missing query
+                    // terms still contribute to the denominator, which is exactly the
+                    // weak-evidence case that should broaden.
+                    let ideal_idf: f64 = q_tokens
+                        .iter()
+                        .map(|qt| {
+                            let matched_idf = std::iter::once(qt.as_str())
+                                .chain(synonym_group(qt).iter().copied())
+                                .filter(|candidate| df.contains_key(*candidate))
+                                .map(idf)
+                                .fold(0.0_f64, f64::max);
+                            if matched_idf > 0.0 {
+                                matched_idf
+                            } else {
+                                idf(qt)
+                            }
+                        })
+                        .sum();
+                    let ideal = NAME_W * ideal_idf * (1.0 + NAME_SPECIFICITY_W);
+                    ideal <= f64::EPSILON || *top_score / ideal < LOW_CONFIDENCE_LEXICAL_RATIO
+                }
             }
         };
 
@@ -2479,13 +2499,9 @@ fn execute_call(
     // NOT by splitting the exposed name on `__`. A renamed tool (via a tool override)
     // or a server id containing `__` would otherwise mis-derive the server and
     // silently weaken the scope guard and the HITL untrusted-provenance check below.
-    let (server_id, tool_name) = router
-        .route_of(name)
-        .map(|(s, t)| (s.to_string(), t.to_string()))
-        .unwrap_or_else(|| (String::new(), name.to_string()));
-    let srv_owned = sanitize_segment(&server_id);
+    let (server_id, tool) = router.route_of(name).unwrap_or(("", name));
+    let srv_owned = sanitize_segment(server_id);
     let srv = srv_owned.as_str();
-    let tool = tool_name.as_str();
 
     // Scope guard: a registered HTTP client may only call tools on the
     // servers its token is allowed to see (a no-op when unscoped). Search
@@ -2529,7 +2545,7 @@ fn execute_call(
     if let Some(team) = reg.team.as_ref() {
         if !team.rate_limits.is_empty() {
             if let Err(msg) =
-                conduit_lib::rate_limits::check_and_count(&team.rate_limits, &server_id, tool)
+                conduit_lib::rate_limits::check_and_count(&team.rate_limits, server_id, tool)
             {
                 // Count as a failed call with a clear reason so Activity / export show the block.
                 audit::record_timed(srv, tool, false, None, Some("rate_limit"), client);
@@ -3446,14 +3462,17 @@ fn handle_request_with_cancel(
                     // commits instead of re-searching (the v0.3.6 keep-searching nudges
                     // overcorrected and made compliant models thrash).
                     format!(
-                        "Found {total} matching tool(s){scope}. Top match: `{top}` - its full input \
-                         schema is included below, so call it now with toolport_call_tool (name: \
-                         \"{top}\") if it fits. Only search again if none of these match.{pin_note}{more}{schema_note}"
+                        "Found {total} matching tool(s){scope}. Top match: `{top}`. Its complete \
+                         schema is below; if it fits, call it with toolport_call_tool using name \
+                         \"{top}\". Only search again if none match.{pin_note}{more}{schema_note}"
                     )
                 };
                 let text = format!(
                     "{lead}\n\n{}",
-                    serde_json::to_string_pretty(&matches).unwrap_or_default()
+                    // This JSON is model input, not a human-facing log. Compact encoding
+                    // preserves every field and the complete top schema while avoiding
+                    // spending tokens on indentation and line breaks on every search.
+                    serde_json::to_string(&matches).unwrap_or_default()
                 );
                 // Record the trace: the ground-truth cost of what THIS search returned
                 // vs. what advertising the whole (scoped) catalog would cost per turn.
@@ -11192,6 +11211,26 @@ mod tests {
     }
 
     #[test]
+    fn exact_exposed_name_promotes_tool_and_restores_schema() {
+        let cat = vec![
+            json!({
+                "name": "filesystem__search_files",
+                "description": "Search local file names and paths.",
+                "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } } }
+            }),
+            json!({
+                "name": "filesystem__read_file",
+                "description": "Read one local file.",
+                "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } } }
+            }),
+        ];
+        let (hits, _) = search_catalog(&cat, "filesystem__read_file", None, 5);
+        assert_eq!(hits[0]["name"], "filesystem__read_file");
+        assert_eq!(hits[0]["inputSchema"]["properties"]["path"]["type"], "string");
+        assert!(hits[0].get("schemaOmitted").is_none());
+    }
+
+    #[test]
     fn search_diversifies_across_servers_when_unscoped() {
         // One server with many matching tools shouldn't crowd the others out.
         let mut cat = catalog();
@@ -11320,6 +11359,18 @@ mod tests {
         assert!(
             text.to_lowercase().contains("only search again"),
             "should signal not to keep searching"
+        );
+        let (_, payload) = text
+            .split_once("\n\n")
+            .expect("guidance and compact JSON payload");
+        assert!(
+            !payload.contains('\n'),
+            "search JSON should not spend context on pretty-print whitespace"
+        );
+        let tools: Value = serde_json::from_str(payload).expect("valid search result JSON");
+        assert!(
+            tools[0]["inputSchema"].is_object(),
+            "the top match must remain ready to invoke with its complete schema"
         );
     }
 

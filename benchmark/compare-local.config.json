@@ -8,5 +8,16 @@
     "iterations": 100,
     "settleMilliseconds": 500,
     "topK": 5
+  },
+  "toolportBudgets": {
+    "maxCatalogReadyMilliseconds": 1500,
+    "maxAlwaysOnEstimatedTokens": 1050,
+    "maxSearchMedianMilliseconds": 10,
+    "maxSearchP95Milliseconds": 25,
+    "maxSearchMedianEstimatedTokens": 450,
+    "maxSearchP95EstimatedTokens": 550,
+    "minRecallAtK": 1,
+    "minSchemaReadyAtK": 1,
+    "maxCallOverheadP95Milliseconds": 5
   }
 }
