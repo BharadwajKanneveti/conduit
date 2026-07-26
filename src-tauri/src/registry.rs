@@ -343,8 +343,8 @@ pub struct Registry {
     /// round-trip). **On by default** (SOU-397): each in-script call still hits the same
     /// scope / approval gates as `toolport_call_tool`, and Settings is the kill switch.
     /// Code mode is not a security boundary (agent-supplied JS). Shared/HTTP multi-tenant
-    /// operators who do not want the surface can turn it off in Settings or omit it from
-    /// the registry with an explicit `false`. `TOOLPORT_CODE_MODE=1` (legacy
+    /// operators who do not want the surface can turn it off in Settings or set
+    /// `"codeMode": false` in the registry. `TOOLPORT_CODE_MODE=1` (legacy
     /// `CONDUIT_CODE_MODE`) still force-enables regardless of the toggle.
     #[serde(default = "default_true")]
     pub code_mode: bool,

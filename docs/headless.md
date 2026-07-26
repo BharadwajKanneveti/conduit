@@ -319,8 +319,8 @@ headless and Docker configs do not break on upgrade.
   app or a one-time manual URL in the client config — which is what sandboxed
   setups usually want anyway.
 - **Code mode** (`toolport_run_script`) is **on by default** in the registry
-  (Settings kill switch / `"code_mode": false`). It is not a security boundary:
+  (Settings kill switch / `"codeMode": false`). It is not a security boundary:
   agents supply JS that can call many tools in one round-trip; each call still
   hits the same scope and approval gates. Shared multi-tenant gateways that do
-  not want the surface should set `"code_mode": false` in the registry.
+  not want the surface should set `"codeMode": false` in the registry.
 - Open WebUI details: [openwebui.md](./openwebui.md).

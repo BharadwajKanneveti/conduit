@@ -857,7 +857,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           codeMode,
           "text-info",
           "Code mode",
-          "On by default: agents can run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary — turn off to hide toolport_run_script.",
+          "On by default: agents can run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script.",
           apply(setCodeMode),
         )}
       </section>
