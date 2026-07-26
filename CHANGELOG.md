@@ -16,6 +16,13 @@ Existing registries that already store `"codeMode": false` stay off. (SOU-397)
 
 ### Fixed
 
+**Client gateway ownership is now a first-class state (Managed / Customized /
+Absent).** Toolport records what it last wrote into each client's config and surfaces
+hand-edited entries as "custom configuration" in Integrations, with an explicit Reset
+to default (confirm before overwrite). Launch re-point and Connect no longer silently
+clobber a customized entry. Pre-ownership installs still use the command-basename
+heuristic. (SOU-406, follow-up to #487)
+
 **A hand-edited gateway entry is no longer reverted on every app launch.** The
 launch-time re-point recognized its own entry by _name_, so an entry still called
 `toolport` but pointed at something else — an `mcp-remote` bridge against the HTTP

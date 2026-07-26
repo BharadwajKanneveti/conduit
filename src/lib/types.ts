@@ -24,6 +24,9 @@ export interface ParsedSnippetServer {
   env: { key: string; value: string | null }[];
 }
 
+/** Ownership of the gateway entry under our name in a client config (SOU-406). */
+export type GatewayEntryState = "managed" | "customized" | "absent";
+
 export interface DetectedClient {
   id: string;
   name: string;
@@ -37,6 +40,8 @@ export interface DetectedClient {
   /** Servers found outside the config file (e.g. Cursor plugins); read-only. */
   pluginServers: McpServer[];
   gatewayInstalled: boolean;
+  /** First-class ownership: managed by us, hand-customized, or absent (SOU-406). */
+  entryState: GatewayEntryState;
   error: string | null;
 }
 
@@ -451,9 +456,20 @@ export interface Registry {
   /** Which profile each client was connected with, keyed by client id (e.g.
    * "cursor" -> "Billing"). Absent = that client follows the active profile. */
   clientScopes?: Record<string, string>;
+  /** What Toolport last wrote into each client config as its gateway entry
+   * (SOU-406 ownership record). Absent key = pre-ownership install. */
+  clientManagedEntries?: Record<string, ManagedEntry>;
   /** Consumers registered to reach the gateway over the HTTP/OpenAPI bridge,
    * each with its own hashed token and scope (multi-tenant bridge). */
   httpClients?: HttpClient[];
+}
+
+/** Snapshot of the gateway entry Toolport last wrote (SOU-406). */
+export interface ManagedEntry {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+  updatedAt: number;
 }
 
 /** A consumer registered to reach the HTTP/OpenAPI bridge with its own token and

@@ -38,6 +38,7 @@ function client(over: Partial<DetectedClient> = {}): DetectedClient {
     configPath: "C:\\Users\\me\\Claude\\claude_desktop_config.json",
     configExists: true,
     gatewayInstalled: false,
+    entryState: "absent",
     appPresent: true,
     servers: [],
     pluginServers: [],
@@ -77,6 +78,65 @@ describe("ClientDetail detection errors", () => {
       "Couldn't parse config: unexpected token",
     );
     expect(screen.getByRole("button", { name: /connect to toolport/i })).toBeEnabled();
+  });
+});
+
+describe("ClientDetail customized entry (SOU-406)", () => {
+  function customizedClient() {
+    return client({
+      gatewayInstalled: true,
+      entryState: "customized",
+      servers: [
+        {
+          name: "toolport",
+          transport: "stdio",
+          command: "npx",
+          args: ["-y", "mcp-remote", "http://localhost:8765/mcp"],
+          envKeys: [],
+          url: null,
+        },
+      ],
+    });
+  }
+
+  it("shows custom configuration badge and Reset to default", () => {
+    render(
+      <ClientDetail
+        client={customizedClient()}
+        registry={emptyRegistry()}
+        onChanged={() => {}}
+        onRegistryChange={() => {}}
+      />,
+    );
+
+    expect(screen.getAllByText(/custom configuration/i).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: /reset to default/i })).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: /connect to toolport/i }),
+    ).not.toBeInTheDocument();
+    // Managed onboarding copy must not claim scope is reachable for a customized entry.
+    expect(screen.queryByText(/connect .* once and it reaches/i)).not.toBeInTheDocument();
+  });
+
+  it("calls installGateway with force=true after confirming Reset to default", async () => {
+    installGateway.mockResolvedValue({ backup: false });
+    render(
+      <ClientDetail
+        client={customizedClient()}
+        registry={emptyRegistry()}
+        onChanged={() => {}}
+        onRegistryChange={() => {}}
+      />,
+    );
+
+    // Open confirm dialog, then click the dialog's confirm action (last match).
+    await userEvent.click(screen.getByRole("button", { name: /reset to default/i }));
+    const confirms = screen.getAllByRole("button", { name: /reset to default/i });
+    await userEvent.click(confirms[confirms.length - 1]!);
+
+    await waitFor(() =>
+      expect(installGateway).toHaveBeenCalledWith("claude-desktop", undefined, true),
+    );
   });
 });
 

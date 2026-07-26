@@ -8,11 +8,12 @@
 //! Security note: we surface env-variable *names* but never their *values*.
 //! Those values are secrets (API keys, tokens) and must not leak to the UI.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::registry::ServerEntry;
+use crate::registry::{ManagedEntry, ServerEntry};
 
 /// One MCP server, normalized across every client format.
 #[derive(Debug, Clone, Serialize)]
@@ -26,6 +27,19 @@ pub struct McpServer {
     /// Names of env vars only. Values are deliberately omitted (secrets).
     pub env_keys: Vec<String>,
     pub url: Option<String>,
+}
+
+/// Ownership of the gateway entry under our name in a client config (SOU-406).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum GatewayEntryState {
+    /// We wrote it (or pre-record install that still looks like our binary).
+    Managed,
+    /// An identity-matching entry exists but is not what we last wrote (or, with
+    /// no ownership record, its command is not a Toolport gateway binary).
+    Customized,
+    /// No identity-matching gateway entry.
+    Absent,
 }
 
 /// The result of probing a single client on this machine.
@@ -53,6 +67,9 @@ pub struct DetectedClient {
     pub plugin_servers: Vec<McpServer>,
     /// Whether the Toolport gateway is currently installed in this client's config.
     pub gateway_installed: bool,
+    /// First-class ownership of that entry: managed by us, hand-customized, or
+    /// absent (SOU-406). Computed with the registry ownership record when present.
+    pub entry_state: GatewayEntryState,
     /// Set when the config exists but could not be read or parsed.
     pub error: Option<String>,
 }
@@ -2118,6 +2135,13 @@ fn read_client(def: &ClientDef) -> DetectedClient {
                 server.command.as_deref(),
             )
         });
+        // Ownership is filled in later via [`apply_entry_states`] once the registry
+        // record is available. Until then: identity match → Managed (legacy), none → Absent.
+        let entry_state = if gateway_installed {
+            GatewayEntryState::Managed
+        } else {
+            GatewayEntryState::Absent
+        };
         // The config file's parent is the client's own data dir (e.g. `.../Code/User`,
         // `.../Claude`, `~/.codex`); its presence means the app has run here. If the
         // config itself exists the app is obviously present. An empty path means we
@@ -2139,6 +2163,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
             servers,
             plugin_servers: plugin_servers.clone(),
             gateway_installed,
+            entry_state,
             error,
         }
     };
@@ -2204,6 +2229,58 @@ pub fn detect_clients() -> Vec<DetectedClient> {
     defs().iter().map(read_client).collect()
 }
 
+/// Whether a detected gateway slot matches the ownership record we last wrote.
+fn managed_matches_detected(server: &McpServer, rec: &ManagedEntry) -> bool {
+    let cmd = server.command.as_deref().unwrap_or("");
+    if cmd != rec.command {
+        return false;
+    }
+    if server.args != rec.args {
+        return false;
+    }
+    let mut keys = server.env_keys.clone();
+    keys.sort();
+    let rec_keys: Vec<String> = rec.env.keys().cloned().collect();
+    keys == rec_keys
+}
+
+/// Resolve Managed / Customized / Absent for one client (SOU-406).
+pub fn resolve_entry_state(
+    servers: &[McpServer],
+    record: Option<&ManagedEntry>,
+) -> GatewayEntryState {
+    let entry = servers.iter().find(|s| {
+        gateway_identity_matches(&s.name, &s.name, s.command.as_deref())
+    });
+    let Some(entry) = entry else {
+        return GatewayEntryState::Absent;
+    };
+    match record {
+        Some(rec) if managed_matches_detected(entry, rec) => GatewayEntryState::Managed,
+        Some(_) => GatewayEntryState::Customized,
+        // No ownership record (install predates SOU-406): fall back to the
+        // SOU-405 command-basename heuristic so genuine installs stay Managed
+        // and hand-edited npx/docker/etc. entries surface as Customized.
+        None if command_is_gateway_binary(entry.command.as_deref().unwrap_or("")) => {
+            GatewayEntryState::Managed
+        }
+        None => GatewayEntryState::Customized,
+    }
+}
+
+/// Fill [`DetectedClient::entry_state`] from the registry ownership map.
+pub fn apply_entry_states(
+    clients: &mut [DetectedClient],
+    managed: &HashMap<String, ManagedEntry>,
+) {
+    for client in clients.iter_mut() {
+        client.entry_state =
+            resolve_entry_state(&client.servers, managed.get(&client.id));
+        // Keep gateway_installed aligned with identity presence (not ownership).
+        client.gateway_installed = client.entry_state != GatewayEntryState::Absent;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Write path
 //
@@ -2219,6 +2296,20 @@ pub fn detect_clients() -> Vec<DetectedClient> {
 pub struct WriteOutcome {
     pub path: String,
     pub backup: Option<String>,
+    /// Snapshot of the gateway entry just installed (for the ownership record).
+    /// Absent on uninstall or when the write did not install a gateway entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed: Option<ManagedEntry>,
+}
+
+/// Result of launch-time re-point (SOU-405/406).
+#[derive(Debug, Default)]
+pub struct RepointOutcome {
+    /// Client ids whose gateway entry was rewritten to the current binary, with
+    /// the ownership snapshot that was written.
+    pub repointed: Vec<(String, ManagedEntry)>,
+    /// Client ids left alone because their entry is user-customized.
+    pub customized: Vec<String>,
 }
 
 fn find_def(client_id: &str) -> Option<ClientDef> {
@@ -3135,9 +3226,17 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
         Format::YamlMcpServers => write_hermes_yaml_servers(&path, servers)?,
         Format::YamlMcpServersList => write_continue_yaml_servers(&path, servers)?,
     }
+    // migrate_to_gateway writes a single gateway entry; capture ownership when so.
+    let managed = servers
+        .iter()
+        .find(|s| is_gateway_server(s))
+        .filter(|_| servers.len() == 1)
+        .map(ManagedEntry::from_gateway_entry);
+
     Ok(WriteOutcome {
         path: path.display().to_string(),
         backup: backup.map(|b| b.display().to_string()),
+        managed,
     })
 }
 
@@ -3440,6 +3539,15 @@ fn install_or_remove(
     let path = (def.path)().ok_or("Could not resolve a config path on this OS")?;
     let backup = backup_file(client_id, &path)?;
     let lenient = config_is_whole_app_state(client_id);
+    // Build the snapshot before writing so the ownership record matches the bytes
+    // we put on disk (SOU-406).
+    let managed = if install {
+        Some(ManagedEntry::from_gateway_entry(&gateway_entry(
+            profile, client_id,
+        )?))
+    } else {
+        None
+    };
     match def.format {
         Format::JsonMcpServers => {
             edit_json_gateway(&path, "mcpServers", install, profile, lenient, client_id)?
@@ -3466,6 +3574,7 @@ fn install_or_remove(
     Ok(WriteOutcome {
         path: path.display().to_string(),
         backup: backup.map(|b| b.display().to_string()),
+        managed,
     })
 }
 
@@ -3652,22 +3761,21 @@ fn read_gateway_profile(client_id: &str) -> Option<String> {
 /// independent of the entry name). Guarded so it never writes a path that doesn't
 /// exist. Returns the ids of clients it rewrote.
 ///
-/// Only entries whose command is one of our own gateway binaries are ever rewritten
-/// (see [`command_is_gateway_binary`]). An entry under our name pointing at anything
-/// else - an HTTP bridge, a container, a wrapper script - is the user's, and is left
-/// exactly as they wrote it (issue #487).
-pub fn repoint_stale_gateways() -> Vec<String> {
+/// Only entries we still own are ever rewritten. Ownership is the registry record
+/// when present, else the SOU-405 command-basename heuristic (issue #487 / SOU-406).
+/// A Customized entry is left byte-identical and reported in [`RepointOutcome::customized`].
+pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> RepointOutcome {
+    let mut outcome = RepointOutcome::default();
     let Some(current) = resolve_gateway_path().map(|p| p.to_string_lossy().into_owned()) else {
-        return Vec::new();
+        return outcome;
     };
     // Never re-point onto a binary that isn't there (resolve_gateway_path returns a
     // best-guess path even when nothing is found, for clearer error messages).
     if !Path::new(&current).exists() {
-        return Vec::new();
+        return outcome;
     }
-    let mut repointed = Vec::new();
     for client in detect_clients() {
-        if !client.gateway_installed || !client.config_exists || client.error.is_some() {
+        if !client.config_exists || client.error.is_some() {
             continue;
         }
         // Find our entry by identity (recognizes the legacy `conduit` name too), so
@@ -3676,37 +3784,41 @@ pub fn repoint_stale_gateways() -> Vec<String> {
             .servers
             .iter()
             .find(|s| gateway_identity_matches(&s.name, &s.name, s.command.as_deref()));
-        let stored = entry.and_then(|s| s.command.as_deref()).unwrap_or("");
-        let entry_name = entry.map(|s| s.name.as_str()).unwrap_or("");
+        let Some(entry) = entry else {
+            continue;
+        };
+        let stored = entry.command.as_deref().unwrap_or("");
+        let entry_name = entry.name.as_str();
+        let state = resolve_entry_state(&client.servers, managed.get(&client.id));
+        if state == GatewayEntryState::Customized {
+            eprintln!(
+                "toolport: leaving {}'s '{}' entry alone - custom configuration (not managed \
+                 by Toolport); command={}",
+                client.id,
+                entry_name,
+                if stored.is_empty() { "none" } else { stored },
+            );
+            outcome.customized.push(client.id.clone());
+            continue;
+        }
         // Raw config text for profile preservation + legacy CONDUIT_* env detection.
         let config_text = find_def(&client.id)
             .and_then(|def| (def.path)())
             .and_then(|path| read_config_file(&path).ok());
         if !gateway_entry_needs_rewrite(entry_name, stored, &current, config_text.as_deref()) {
-            // Say so when we're standing down because the entry is the user's, rather
-            // than because it was already current. Both are no-ops here, but they mean
-            // very different things, and a silent skip is what made issue #487's
-            // opposite (a silent rewrite) so hard to diagnose.
-            if entry.is_some() && !command_is_gateway_binary(stored) {
-                eprintln!(
-                    "toolport: leaving {}'s '{}' entry alone - its command ({}) is not a Toolport \
-                     gateway binary, so the entry is treated as user-managed",
-                    client.id,
-                    entry_name,
-                    if stored.is_empty() { "none" } else { stored },
-                );
-            }
             continue;
         }
         let profile = config_text
             .as_deref()
             .and_then(profile_from_config_text)
             .or_else(|| read_gateway_profile(&client.id));
-        if install_gateway(&client.id, profile.as_deref()).is_ok() {
-            repointed.push(client.id.clone());
+        if let Ok(write) = install_gateway(&client.id, profile.as_deref()) {
+            if let Some(m) = write.managed {
+                outcome.repointed.push((client.id.clone(), m));
+            }
         }
     }
-    repointed
+    outcome
 }
 
 #[cfg(test)]
@@ -4168,6 +4280,77 @@ bad = "not-a-table"
         assert!(!servers2.contains_key(GATEWAY_ENTRY_NAME));
         assert!(servers2.contains_key("existing"));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn entry_state_from_record_and_heuristic() {
+        // SOU-406: ownership record when present; SOU-405 basename heuristic when not.
+        let managed_cmd = r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.5.exe";
+        let rec = ManagedEntry {
+            command: managed_cmd.to_string(),
+            args: vec![],
+            env: [
+                (crate::brand::CLIENT_ID.to_string(), "claude-desktop".into()),
+            ]
+            .into_iter()
+            .collect(),
+            updated_at: 1,
+        };
+        let matching = McpServer {
+            name: GATEWAY_ENTRY_NAME.into(),
+            transport: "stdio".into(),
+            command: Some(managed_cmd.into()),
+            args: vec![],
+            env_keys: vec![crate::brand::CLIENT_ID.to_string()],
+            url: None,
+        };
+        assert_eq!(
+            resolve_entry_state(&[matching.clone()], Some(&rec)),
+            GatewayEntryState::Managed
+        );
+
+        let mut args_changed = matching.clone();
+        args_changed.args = vec!["--extra".into()];
+        assert_eq!(
+            resolve_entry_state(&[args_changed], Some(&rec)),
+            GatewayEntryState::Customized
+        );
+
+        let mut cmd_changed = matching.clone();
+        cmd_changed.command = Some("npx".into());
+        assert_eq!(
+            resolve_entry_state(&[cmd_changed.clone()], Some(&rec)),
+            GatewayEntryState::Customized
+        );
+        // No record + npx → Customized (heuristic).
+        assert_eq!(
+            resolve_entry_state(&[cmd_changed], None),
+            GatewayEntryState::Customized
+        );
+        // No record + our binary → Managed (back-compat).
+        assert_eq!(
+            resolve_entry_state(&[matching], None),
+            GatewayEntryState::Managed
+        );
+        // No identity entry → Absent.
+        assert_eq!(
+            resolve_entry_state(&[], None),
+            GatewayEntryState::Absent
+        );
+        assert_eq!(
+            resolve_entry_state(
+                &[McpServer {
+                    name: "other".into(),
+                    transport: "stdio".into(),
+                    command: Some("node".into()),
+                    args: vec![],
+                    env_keys: vec![],
+                    url: None,
+                }],
+                Some(&rec)
+            ),
+            GatewayEntryState::Absent
+        );
     }
 
     #[test]

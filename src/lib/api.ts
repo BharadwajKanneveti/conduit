@@ -467,14 +467,17 @@ export function detectClients(): Promise<DetectedClient[]> {
 }
 
 /** Install the Toolport gateway into a client's config, optionally scoped to a
- * profile (by name). Omit profile to expose all enabled servers. */
+ * profile (by name). Omit profile to expose all enabled servers.
+ * Pass `force: true` after the user confirms overwriting a custom entry (SOU-406). */
 export function installGateway(
   clientId: string,
   profile?: string,
+  force?: boolean,
 ): Promise<WriteOutcome> {
   return invoke<WriteOutcome>("install_gateway", {
     clientId,
     profile: profile ?? null,
+    force: force ?? false,
   });
 }
 
@@ -484,14 +487,17 @@ export function uninstallGateway(clientId: string): Promise<WriteOutcome> {
 }
 
 /** Import a client's servers into Toolport, then leave the client with only the
- * Toolport gateway (optionally scoped to a profile). Backs up the config first. */
+ * Toolport gateway (optionally scoped to a profile). Backs up the config first.
+ * Pass `force: true` after the user confirms overwriting a custom entry (SOU-406). */
 export function migrateClient(
   clientId: string,
   profile?: string,
+  force?: boolean,
 ): Promise<MigrateResult> {
   return invoke<MigrateResult>("migrate_client", {
     clientId,
     profile: profile ?? null,
+    force: force ?? false,
   });
 }
 
