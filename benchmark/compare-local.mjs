@@ -782,6 +782,10 @@ function toolportBudgetViolations(result) {
   if (!budget) return [];
   const violations = [];
   const maximum = (label, actual, limit, catalogSize) => {
+    if (typeof actual !== "number" || typeof limit !== "number") {
+      violations.push(`${catalogSize} tools: ${label} has no numeric metric or budget`);
+      return;
+    }
     if (actual > limit) {
       violations.push(
         `${catalogSize} tools: ${label} ${actual.toFixed(2)} exceeded ${limit}`,
@@ -789,6 +793,10 @@ function toolportBudgetViolations(result) {
     }
   };
   const minimum = (label, actual, limit, catalogSize) => {
+    if (typeof actual !== "number" || typeof limit !== "number") {
+      violations.push(`${catalogSize} tools: ${label} has no numeric metric or budget`);
+      return;
+    }
     if (actual < limit) {
       violations.push(
         `${catalogSize} tools: ${label} ${actual.toFixed(3)} fell below ${limit}`,
