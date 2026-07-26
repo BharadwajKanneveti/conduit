@@ -3488,9 +3488,43 @@ pub fn migrate_to_gateway(client_id: &str, profile: Option<&str>) -> Result<Writ
     write_servers(client_id, &[gateway_entry(profile, client_id)?])
 }
 
+/// Whether a stored client-config command is recognizably one of *our* gateway
+/// binaries. This is the provenance test that separates an entry Toolport wrote
+/// from one the user has taken over.
+///
+/// [`gateway_identity_matches`] deliberately matches on the entry NAME alone, so a
+/// hand-edited entry still called `toolport` is found (we must not leave a duplicate
+/// behind, and the UI must still show it as our slot). But "we recognize this slot"
+/// is not "we own this command". A user who repoints the entry at an HTTP bridge
+/// (`npx -y mcp-remote http://localhost:8765/mcp ...`), a container, or their own
+/// wrapper script has taken it over, and rewriting it destroys a deliberate
+/// customization on every launch (issue #487).
+///
+/// Matched on the command's BASENAME rather than a substring of the whole path, so a
+/// wrapper that merely *lives* in a directory containing `toolport-gateway` is not
+/// mistaken for the binary itself. Version suffixes (`toolport-gateway-1.9.5.exe`)
+/// and the pre-rename name (`conduit-gateway`) both count as ours.
+fn command_is_gateway_binary(stored: &str) -> bool {
+    let basename = stored
+        .trim()
+        .trim_matches('"')
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let stem = basename.strip_suffix(".exe").unwrap_or(&basename);
+    stem.starts_with("toolport-gateway") || stem.starts_with("conduit-gateway")
+}
+
 /// Whether a client's stored gateway command should be re-pointed: it names the
 /// pre-rename binary (`conduit-gateway`), or its path no longer exists on disk, and
 /// it isn't already the current path.
+///
+/// Presumes the command is already known to be ours; the caller
+/// ([`gateway_entry_needs_rewrite`]) establishes that with
+/// [`command_is_gateway_binary`] first. These heuristics cannot make that call
+/// themselves - they read "not our current path" as "our binary moved", which is only
+/// true once provenance is settled.
 fn gateway_command_is_stale(stored: &str, current: &str) -> bool {
     if stored.is_empty() || stored == current {
         return false;
@@ -3527,6 +3561,22 @@ fn gateway_entry_needs_rewrite(
     current: &str,
     config_text: Option<&str>,
 ) -> bool {
+    // Provenance gate (issue #487), deliberately FIRST. Every rewrite below is a
+    // migration of an entry we wrote - a moved binary, the pre-rename entry name, the
+    // pre-rename env keys. None of them apply to an entry whose command isn't one of
+    // our gateway binaries: that entry belongs to the user, and rewriting it silently
+    // reverts a deliberate customization on every app launch.
+    //
+    // The heuristics below cannot make this call on their own. A bare `npx` fails
+    // `gateway_command_is_stale`'s `Path::exists` test, and on a normal install its
+    // published-bin branch treats anything not byte-identical to the current path as
+    // stale - so without this gate every custom command is "stale" by construction.
+    //
+    // An entry with no command at all (a user-written http/sse entry under our name)
+    // is likewise not ours, and falls out here on the empty basename.
+    if !command_is_gateway_binary(stored_command) {
+        return false;
+    }
     if gateway_command_is_stale(stored_command, current)
         || entry_name.eq_ignore_ascii_case(LEGACY_GATEWAY_ENTRY_NAME)
     {
@@ -3601,6 +3651,11 @@ fn read_gateway_profile(client_id: &str) -> Option<String> {
 /// up first), and profile-preserving (the profile is read from raw config text,
 /// independent of the entry name). Guarded so it never writes a path that doesn't
 /// exist. Returns the ids of clients it rewrote.
+///
+/// Only entries whose command is one of our own gateway binaries are ever rewritten
+/// (see [`command_is_gateway_binary`]). An entry under our name pointing at anything
+/// else - an HTTP bridge, a container, a wrapper script - is the user's, and is left
+/// exactly as they wrote it (issue #487).
 pub fn repoint_stale_gateways() -> Vec<String> {
     let Some(current) = resolve_gateway_path().map(|p| p.to_string_lossy().into_owned()) else {
         return Vec::new();
@@ -3628,6 +3683,19 @@ pub fn repoint_stale_gateways() -> Vec<String> {
             .and_then(|def| (def.path)())
             .and_then(|path| read_config_file(&path).ok());
         if !gateway_entry_needs_rewrite(entry_name, stored, &current, config_text.as_deref()) {
+            // Say so when we're standing down because the entry is the user's, rather
+            // than because it was already current. Both are no-ops here, but they mean
+            // very different things, and a silent skip is what made issue #487's
+            // opposite (a silent rewrite) so hard to diagnose.
+            if entry.is_some() && !command_is_gateway_binary(stored) {
+                eprintln!(
+                    "toolport: leaving {}'s '{}' entry alone - its command ({}) is not a Toolport \
+                     gateway binary, so the entry is treated as user-managed",
+                    client.id,
+                    entry_name,
+                    if stored.is_empty() { "none" } else { stored },
+                );
+            }
             continue;
         }
         let profile = config_text
@@ -4100,6 +4168,96 @@ bad = "not-a-table"
         assert!(!servers2.contains_key(GATEWAY_ENTRY_NAME));
         assert!(servers2.contains_key("existing"));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn customized_gateway_entry_is_never_repointed() {
+        // Regression for issue #487. A user repointed Claude Desktop's `toolport` entry
+        // at the documented HTTP endpoint via an mcp-remote bridge; every launch of the
+        // app reverted it to the default stdio command and left another backup behind.
+        //
+        // The entry is still ours by NAME (that's what keeps it visible and dedup'd),
+        // but not by command, so the launch re-point must stand down.
+        let current = r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.5.exe";
+
+        // The reported command, as Claude Desktop stores it. Note it would fail every
+        // staleness heuristic: `npx` is not a path that exists, and the published-bin
+        // branch calls anything that isn't byte-identical to `current` stale.
+        assert!(!gateway_entry_needs_rewrite(
+            GATEWAY_ENTRY_NAME,
+            "npx",
+            current,
+            Some(
+                r#"{"mcpServers":{"toolport":{"command":"npx","args":["-y","mcp-remote","http://localhost:8765/mcp"]}}}"#
+            )
+        ));
+
+        // Other shapes a user reasonably reaches for, all left alone.
+        for command in [
+            "npx",
+            "cmd",
+            "docker",
+            "node",
+            "uvx",
+            r"C:\Users\me\bin\my-toolport-wrapper.cmd",
+            // Lives in a dir named for the gateway, but is not the gateway. Basename
+            // matching is what keeps this from being mistaken for ours.
+            r"C:\tools\toolport-gateway\wrapper.exe",
+            // A user-written http/sse entry has no command at all.
+            "",
+        ] {
+            assert!(
+                !gateway_entry_needs_rewrite(GATEWAY_ENTRY_NAME, command, current, None),
+                "custom command {command:?} must be treated as user-managed"
+            );
+        }
+
+        // The legacy-name and legacy-env branches must not sneak past the gate either:
+        // a customized entry the user happened to leave named `conduit`, in a config
+        // that still mentions CONDUIT_* elsewhere, is still theirs.
+        assert!(!gateway_entry_needs_rewrite(
+            LEGACY_GATEWAY_ENTRY_NAME,
+            "npx",
+            current,
+            Some(r#"{"env":{"CONDUIT_CLIENT_ID":"claude-desktop"}}"#)
+        ));
+
+        // ...while real migrations still happen. These are the cases the re-point
+        // exists for, and each names one of our binaries.
+        for stale in [
+            r"C:\Users\me\AppData\Local\Toolport\toolport-gateway.exe", // unversioned install dir
+            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.4.exe", // older version
+            r"C:\Users\me\AppData\Roaming\Conduit\bin\toolport-gateway-1.9.5.exe", // pre-rename data dir
+            "/Applications/Toolport.app/Contents/MacOS/conduit-gateway", // pre-rename binary
+        ] {
+            assert!(
+                gateway_entry_needs_rewrite(GATEWAY_ENTRY_NAME, stale, current, None),
+                "{stale:?} is one of ours and must still be re-pointed"
+            );
+        }
+    }
+
+    #[test]
+    fn gateway_binary_provenance_matches_basename_only() {
+        assert!(command_is_gateway_binary("toolport-gateway"));
+        assert!(command_is_gateway_binary("conduit-gateway"));
+        assert!(command_is_gateway_binary(
+            r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.5.exe"
+        ));
+        // Case and quoting as they turn up in real client configs.
+        assert!(command_is_gateway_binary(r#""C:\X\Toolport-Gateway.EXE""#));
+        assert!(command_is_gateway_binary("/opt/toolport/toolport-gateway"));
+
+        assert!(!command_is_gateway_binary(""));
+        assert!(!command_is_gateway_binary("npx"));
+        assert!(!command_is_gateway_binary("cmd"));
+        // A substring match on the full path would wrongly claim these.
+        assert!(!command_is_gateway_binary(
+            r"C:\tools\toolport-gateway\wrapper.exe"
+        ));
+        assert!(!command_is_gateway_binary(
+            "/usr/local/bin/my-toolport-gateway-shim"
+        ));
     }
 
     #[test]
