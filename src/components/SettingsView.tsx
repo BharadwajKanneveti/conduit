@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState, useRef } from "react";
 import {
   Activity,
   Bot,
@@ -31,6 +31,7 @@ import {
 } from "@tauri-apps/plugin-autostart";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
 import { toastError } from "@/lib/toast";
+import { Button } from "@/components/ui/button";
 import {
   addHttpClient,
   clearInspectLog,
@@ -379,9 +380,46 @@ function ProfileToolScope({
   }, [registry.servers]);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [toolsByServer, setToolsByServer] = useState<Record<string, string[]>>({});
-  const [loading, setLoading] = useState<string | null>(null);
+  const [errorByServer, setErrorByServer] = useState<Record<string, boolean>>({});
+  const [loadingByServer, setLoadingByServer] = useState<Record<string, boolean>>({});
+  const requestIdByServer = useRef<Record<string, number>>({});
   const [busy, setBusy] = useState(false);
   const scope = profile.toolScope ?? {};
+
+  async function loadTools(serverId: string) {
+    const requestId = (requestIdByServer.current[serverId] ?? 0) + 1;
+    requestIdByServer.current[serverId] = requestId;
+    setLoadingByServer((m) => ({
+      ...m,
+      [serverId]: true,
+    }));
+    try {
+      const tools = await listServerTools(serverId);
+      if (requestIdByServer.current[serverId] !== requestId) {
+        return;
+      }
+      setToolsByServer((m) => ({ ...m, [serverId]: tools.map((t) => t.name) }));
+      setErrorByServer((m) => {
+        const next = { ...m };
+        delete next[serverId];
+        return next;
+      });
+    } catch (e) {
+      // Ignore stale failures (a newer load for this server is in flight or done).
+      if (requestIdByServer.current[serverId] !== requestId) {
+        return;
+      }
+      toastError(`Couldn't load ${serverName.get(serverId) ?? serverId} tools: ${e}`);
+      setErrorByServer((m) => ({ ...m, [serverId]: true }));
+    } finally {
+      if (requestIdByServer.current[serverId] === requestId) {
+        setLoadingByServer((m) => ({
+          ...m,
+          [serverId]: false,
+        }));
+      }
+    }
+  }
 
   async function expand(serverId: string) {
     if (expanded === serverId) {
@@ -390,15 +428,7 @@ function ProfileToolScope({
     }
     setExpanded(serverId);
     if (!toolsByServer[serverId]) {
-      setLoading(serverId);
-      try {
-        const tools = await listServerTools(serverId);
-        setToolsByServer((m) => ({ ...m, [serverId]: tools.map((t) => t.name) }));
-      } catch (e) {
-        toastError(`Couldn't load ${serverName.get(serverId) ?? serverId} tools: ${e}`);
-      } finally {
-        setLoading(null);
-      }
+      await loadTools(serverId);
     }
   }
 
@@ -455,8 +485,24 @@ function ProfileToolScope({
             </button>
             {open && (
               <div className="border-t border-border/40 px-2 py-1.5">
-                {loading === serverId ? (
+                {loadingByServer[serverId] ? (
                   <p className="text-xs text-muted-foreground">Loading tools…</p>
+                ) : errorByServer[serverId] ? (
+                  <div
+                    role="status"
+                    aria-live="polite"
+                    className="flex flex-col gap-2 rounded-md border border-border p-3"
+                  >
+                    <p className="text-xs text-muted-foreground">Couldn't load tools</p>
+                    <Button
+                      variant="outline"
+                      size="xs"
+                      className="w-fit"
+                      onClick={() => loadTools(serverId)}
+                    >
+                      Retry
+                    </Button>
+                  </div>
                 ) : allTools && allTools.length > 0 ? (
                   <div className="flex flex-col gap-1">
                     {allTools.map((tool) => (
@@ -474,7 +520,7 @@ function ProfileToolScope({
                   </div>
                 ) : (
                   <p className="text-xs text-muted-foreground">
-                    No tools, or the server isn&apos;t reachable right now.
+                    This server exposes no tools.
                   </p>
                 )}
               </div>
