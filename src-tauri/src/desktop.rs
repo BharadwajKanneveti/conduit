@@ -1761,7 +1761,8 @@ fn set_lazy_discovery(state: State<RegistryState>, lazy: bool) -> Result<Registr
 
 /// Enable or disable server-side "code mode" (the `toolport_run_script` meta-tool). The
 /// gateway reads this from the registry and refreshes it live on the next watcher tick, so
-/// it applies to every client without forwarding an env var. Off by default.
+/// it applies to every client without forwarding an env var. On by default (SOU-397);
+/// pass `enabled: false` as the kill switch.
 #[tauri::command]
 fn set_code_mode(state: State<RegistryState>, enabled: bool) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {

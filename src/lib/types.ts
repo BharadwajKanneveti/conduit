@@ -435,8 +435,8 @@ export interface Registry {
   /** Global discovery mode ("full" | "lazy" | "grouped"). Takes precedence over
    * `lazyDiscovery`; absent = fall back to the `lazyDiscovery` bool. */
   discoveryMode?: string | null;
-  /** Opt-in "code mode": advertise the `toolport_run_script` meta-tool so agents can
-   * orchestrate many tool calls in one server-side script. Off by default. */
+  /** Code mode: advertise `toolport_run_script` so agents can orchestrate many tool
+   * calls in one server-side script. On by default (SOU-397); Settings is the kill switch. */
   codeMode?: boolean;
   /** Per-client discovery-mode override, keyed by client id (e.g. "cursor" ->
    * "grouped"). Absent = that client inherits the global mode. */

@@ -6,6 +6,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Discovery
+
+**Code mode on by default.** `toolport_run_script` is advertised unless you turn **Code
+mode** off in Settings (or set `"code_mode": false` in the registry). Each in-script call
+still hits the same scope and approval gates as `toolport_call_tool`. Code mode is not a
+security boundary (agent-supplied JS). `TOOLPORT_CODE_MODE=1` still force-enables.
+Existing registries that already store `"code_mode": false` stay off. (SOU-397)
+
 ## [1.9.5] - 2026-07-25
 
 Finishes the Conduit → Toolport rename for what users and configs see, keeps

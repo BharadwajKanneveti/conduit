@@ -803,13 +803,14 @@ fn grouped_discovery() -> bool {
     discovery_mode() == DiscoveryMode::Grouped
 }
 
-/// Opt-in gate for server-side "code mode" (the `toolport_run_script` meta-tool). Off by
-/// default: code mode runs an agent-supplied JS script that can call many tools in one
-/// round-trip, a powerful capability worth an explicit opt-in even under Toolport's local
-/// trust model. Enabled by the registry's `code_mode` toggle (the Settings switch, synced
-/// into [`CODE_MODE`]); `TOOLPORT_CODE_MODE=1` (or legacy `CONDUIT_CODE_MODE`) still
-/// force-enables regardless, for power users and tests. When off, `run_script` is
-/// neither advertised nor dispatched.
+/// Gate for server-side "code mode" (the `toolport_run_script` meta-tool).
+///
+/// Policy (SOU-397): **on by default** via the registry's `code_mode` field (Settings
+/// switch, synced into [`CODE_MODE`]). Kill switch: turn Settings off. Code mode runs
+/// agent-supplied JS and is not a security boundary; each host call still passes the same
+/// scope / human-approval gates as `toolport_call_tool`. `TOOLPORT_CODE_MODE=1` (or legacy
+/// `CONDUIT_CODE_MODE`) still force-enables for power users and tests. When off, `run_script`
+/// is neither advertised nor dispatched.
 fn code_mode_enabled() -> bool {
     let env_forced = conduit_lib::brand::env_flag("TOOLPORT_CODE_MODE", "CONDUIT_CODE_MODE");
     env_forced || CODE_MODE.load(Ordering::Relaxed)
@@ -3511,9 +3512,8 @@ fn handle_request_with_cancel(
                     call_tool_def(),
                     fetch_result_tool_def(),
                 ];
-                // Opt-in code mode: one script that orchestrates many calls in a single
-                // round-trip. Advertised only when enabled, same visibility discipline as
-                // the agent-control tools below.
+                // Code mode (on by default, Settings kill switch): one script that
+                // orchestrates many calls in a single round-trip.
                 if code_mode_enabled() {
                     tools.push(run_script_tool_def());
                 }
@@ -9605,12 +9605,15 @@ mod tests {
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], false);
     }
 
-    /// With `CONDUIT_CODE_MODE` unset (the default), the dispatch refuses `toolport_run_script`
-    /// so the capability is opt-in. (`handle_request` also passes no router Arc, a second
-    /// fail-closed.)
+    /// Kill switch path: when the live flag is off (test default atomic + no env),
+    /// dispatch refuses `toolport_run_script`. Production seeds the flag from the
+    /// registry at boot (now default true); this covers the Settings-off path.
     #[test]
     fn run_script_is_refused_when_code_mode_disabled() {
-        let reg = Registry::default();
+        // Do not flip the global CODE_MODE atomic here: tests run in parallel.
+        // Atomic defaults false; env must be unset for this assertion.
+        let mut reg = Registry::default();
+        reg.code_mode = false;
         let router = routed_router("s", "tool");
         let req = json!({
             "jsonrpc": "2.0",
@@ -9636,6 +9639,20 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("code mode is disabled"));
+    }
+
+    #[test]
+    fn code_mode_defaults_on_in_registry() {
+        // SOU-397: new registries and missing serde field default on. Explicit
+        // false remains the kill switch (camelCase field name in JSON).
+        assert!(Registry::default().code_mode);
+        let minimal = r#"{"version":1,"servers":[],"profiles":[]}"#;
+        let parsed: Registry = serde_json::from_str(minimal).unwrap();
+        assert!(parsed.code_mode, "missing codeMode field should default true");
+        let explicit_off: Registry =
+            serde_json::from_str(r#"{"version":1,"servers":[],"profiles":[],"codeMode":false}"#)
+                .unwrap();
+        assert!(!explicit_off.code_mode);
     }
 
     fn router() -> Router {

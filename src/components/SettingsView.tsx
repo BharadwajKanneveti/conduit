@@ -491,7 +491,9 @@ function ProfileToolScope({
 export function SettingsView({ registry, onRegistryChange }: Props) {
   const { theme, setTheme } = useTheme();
   const lazyDiscovery = registry?.lazyDiscovery ?? true;
-  const codeMode = registry?.codeMode ?? false;
+  // On by default (SOU-397); only treat explicit false as off when the field is missing
+  // during a partial load, match the registry serde default.
+  const codeMode = registry?.codeMode ?? true;
   const denyDestructive = registry?.denyDestructive ?? false;
   const confirmDestructive = registry?.confirmDestructive ?? false;
   const humanApproval = registry?.humanApproval ?? false;
@@ -855,7 +857,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           codeMode,
           "text-info",
           "Code mode",
-          "Let agents run one server-side script that calls many tools in a single round-trip (sandboxed; each call still respects profile scope and human approval)",
+          "On by default: agents can run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary — turn off to hide toolport_run_script.",
           apply(setCodeMode),
         )}
       </section>
