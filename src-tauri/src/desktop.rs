@@ -671,6 +671,36 @@ fn write_to_client(
     clients::write_servers(&client_id, &servers)
 }
 
+/// Refuse to overwrite a hand-edited gateway entry unless `force` is true (SOU-406).
+fn refuse_if_customized(
+    state: &RegistryState,
+    client_id: &str,
+    force: bool,
+) -> Result<(), String> {
+    if force {
+        return Ok(());
+    }
+    let mut list = clients::detect_clients();
+    let managed = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .client_managed_entries
+        .clone();
+    clients::apply_entry_states(&mut list, &managed);
+    if list
+        .iter()
+        .find(|c| c.id == client_id)
+        .is_some_and(|c| c.entry_state == clients::GatewayEntryState::Customized)
+    {
+        return Err(
+            "This client's Toolport entry has a custom configuration. Confirm to \
+             reset it to the default gateway, or leave it as-is."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Install the Toolport gateway into a client (one click "connect to Toolport").
 /// `profile` scopes that client to one profile (None = all enabled servers).
 /// When the live entry is user-customized, pass `force: true` after the UI confirms
@@ -682,29 +712,7 @@ fn install_gateway(
     profile: Option<String>,
     force: Option<bool>,
 ) -> Result<clients::WriteOutcome, String> {
-    let force = force.unwrap_or(false);
-    if !force {
-        // Refuse to silently clobber a hand-edited gateway entry (Integrations toggle
-        // / apply-scope). The UI must confirm and retry with force=true.
-        let mut list = clients::detect_clients();
-        let managed = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .client_managed_entries
-            .clone();
-        clients::apply_entry_states(&mut list, &managed);
-        if list
-            .iter()
-            .find(|c| c.id == client_id)
-            .is_some_and(|c| c.entry_state == clients::GatewayEntryState::Customized)
-        {
-            return Err(
-                "This client's Toolport entry has a custom configuration. Confirm to \
-                 reset it to the default gateway, or leave it as-is."
-                    .into(),
-            );
-        }
-    }
+    refuse_if_customized(state.inner(), &client_id, force.unwrap_or(false))?;
     let outcome = clients::install_gateway(&client_id, profile.as_deref())?;
     // Record the scope we just wrote into the client's config, so the UI can show
     // and re-apply this client's effective scope without re-reading the config.
@@ -815,12 +823,19 @@ struct MigrateResult {
 /// directly - everything routes through Toolport. Backs the config up first.
 ///
 /// Plugin servers (read-only, outside the config file) are left untouched.
+/// When the live gateway entry is user-customized, pass `force: true` after the
+/// UI confirms overwrite (SOU-406); otherwise migration is refused before any
+/// config rewrite.
 #[tauri::command]
 async fn migrate_client(
     state: State<'_, RegistryState>,
     client_id: String,
     profile: Option<String>,
+    force: Option<bool>,
 ) -> Result<MigrateResult, String> {
+    // Guard before import or rewrite so a hand-edited gateway entry is not wiped.
+    refuse_if_customized(state.inner(), &client_id, force.unwrap_or(false))?;
+
     let detected = tauri::async_runtime::spawn_blocking(clients::detect_clients)
         .await
         .map_err(|e| e.to_string())?;

@@ -204,6 +204,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       onChanged();
     } catch (e) {
       toastError(`${e}`);
+      // Rethrow so ConfirmDialog stays open for retry (SOU-406 / CodeRabbit).
+      throw e;
     } finally {
       setBusy(false);
     }
@@ -215,7 +217,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   async function migrate() {
     setBusy(true);
     try {
-      const result = await migrateClient(client.id, profile || undefined);
+      // Migrate rewrites the whole gateway slot; force only after the user confirmed
+      // the migrate dialog when the entry is customized (SOU-406).
+      const result = await migrateClient(
+        client.id,
+        profile || undefined,
+        customized || undefined,
+      );
       onRegistryChange(result.registry);
       toast.success(
         `Moved ${result.moved.length} server${result.moved.length === 1 ? "" : "s"} into Toolport`,
@@ -561,7 +569,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             </div>
           )}
         </div>
-      ) : scopeServerCount(profile) > 0 ? (
+      ) : !customized && scopeServerCount(profile) > 0 ? (
         <div className="flex flex-col gap-4">
           <p className="max-w-prose text-sm text-muted-foreground">
             Connect {client.name} once and it reaches your{" "}
@@ -577,13 +585,13 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             servers={scopeServers(profile).map((s) => s.name)}
           />
         </div>
-      ) : (
+      ) : !customized ? (
         <p className="max-w-prose text-sm text-muted-foreground">
           Connect {client.name}, then enable servers under{" "}
           <span className="font-medium text-foreground">All servers</span> and
           they&apos;ll all route through Toolport, no per-client setup.
         </p>
-      )}
+      ) : null}
 
       {client.usesConnectors && (
         <Card className="gap-0 border-info/20 bg-info/5">
@@ -718,6 +726,12 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               backed-up config. After migrating, re-enter them under each server's secrets
               so the gateway can connect.
             </p>
+            {customized && (
+              <p className="rounded-md bg-warning/10 p-2 text-xs text-warning">
+                This client has a custom Toolport entry. Migrating replaces it with the
+                default gateway command.
+              </p>
+            )}
             <div className="rounded-md bg-muted/40 p-2 font-mono text-xs text-muted-foreground">
               {movable.map((s) => s.name).join(", ")}
             </div>
