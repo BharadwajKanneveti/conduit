@@ -8,7 +8,7 @@
  * full app restart is unnecessary - a new conversation is enough.
  */
 export function clientRestartHint(clientName: string, clientId?: string): string {
-  if (clientId === "toolport-studio" || clientName === "Toolport Studio") {
+  if (clientId === "toolport-studio") {
     return "Start a new conversation in Toolport Studio so it picks up this scope.";
   }
   return `Restart ${clientName} so it loads Toolport.`;

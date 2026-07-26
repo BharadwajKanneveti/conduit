@@ -26,6 +26,9 @@ describe("clientRestartHint / connectSuccessDescription (SOU-317)", () => {
     expect(clientRestartHint("Toolport Studio", "toolport-studio")).toBe(
       "Start a new conversation in Toolport Studio so it picks up this scope.",
     );
+    expect(clientRestartHint("Toolport Studio", "other-client")).toBe(
+      "Restart Toolport Studio so it loads Toolport.",
+    );
     expect(
       connectSuccessDescription(
         "Toolport Studio",

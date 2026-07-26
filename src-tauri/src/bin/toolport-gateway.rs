@@ -8247,6 +8247,23 @@ mod tests {
             result.get("structuredContent").is_none(),
             "the oversized structured aggregate should move behind the fetch cursor"
         );
+
+        let cursor = text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("shaped result cursor");
+        let fetched = shaping::fetch_result(cursor, 0, usize::MAX, None, Some("result"));
+        let fetched_text = fetched["content"][0]["text"]
+            .as_str()
+            .expect("fetched aggregate text");
+        let aggregate: Value =
+            serde_json::from_str(fetched_text).expect("complete fetched aggregate");
+        let calls = aggregate.as_array().expect("script returned an array");
+        assert_eq!(calls.len(), 4);
+        assert!(calls.iter().all(|call| call["content"][0]["text"]
+            .as_str()
+            .is_some_and(|body| body.contains("Toolport shaped this result"))));
     }
 
     /// The per-client scope guard applies to a call made INSIDE a script exactly as it does
