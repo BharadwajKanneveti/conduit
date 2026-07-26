@@ -23,13 +23,17 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
 const CONFIG = JSON.parse(readFileSync(join(HERE, "compare-local.config.json"), "utf8"));
 const FIXTURE = join(HERE, "fixture-mcp.mjs");
-const DEBUG = join(ROOT, "src-tauri", "target", "debug");
-const RELEASE = join(ROOT, "src-tauri", "target", "release");
+const TARGET = process.env.CARGO_TARGET_DIR
+  ? resolve(process.env.CARGO_TARGET_DIR)
+  : join(ROOT, "src-tauri", "target");
+const DEBUG = join(TARGET, "debug");
+const RELEASE = join(TARGET, "release");
 const RELEASE_GATEWAY = executable(RELEASE, "toolport-gateway");
 const DEBUG_GATEWAY = executable(DEBUG, "toolport-gateway");
 const TOOLPORT_GATEWAY =
@@ -53,6 +57,7 @@ const options = {
   ),
   topK: Math.max(1, Number(valueArg("top-k", CONFIG.defaults.topK))),
   json: argv.includes("--json"),
+  check: argv.includes("--check"),
   installRatel: argv.includes("--install-ratel"),
   out: optionalValueArg("out"),
 };
@@ -114,6 +119,53 @@ const SIGNAL_TOOLS = [
     name: "slack_post_message",
     description: "Post a message to a Slack channel.",
     query: "send an update to our Slack channel",
+  },
+];
+
+// Plausible near-matches make the retrieval fixture test intent, not merely
+// keyword presence. They are deliberately useful tools rather than nonsense
+// distractors, so ranking the requested action first requires the verb and
+// surrounding context to matter.
+const DECOY_TOOLS = [
+  {
+    name: "github_list_pull_requests",
+    description: "List existing open GitHub pull requests and their branches.",
+  },
+  {
+    name: "postgres_explain_query",
+    description: "Explain the execution plan for a PostgreSQL query without running it.",
+  },
+  {
+    name: "stripe_list_refunds",
+    description: "List previous Stripe payment refunds for a customer.",
+  },
+  {
+    name: "resend_list_emails",
+    description: "List transactional email messages previously sent through Resend.",
+  },
+  {
+    name: "filesystem_search_files",
+    description: "Search local file names and paths without reading file content.",
+  },
+  {
+    name: "vercel_get_project",
+    description: "Get configuration for one known Vercel project.",
+  },
+  {
+    name: "sentry_get_issue",
+    description: "Get details for one known Sentry issue identifier.",
+  },
+  {
+    name: "cloudflare_get_cache_rules",
+    description: "Read the configured Cloudflare CDN cache rules for a zone.",
+  },
+  {
+    name: "calendar_list_events",
+    description: "List existing calendar events in a time range.",
+  },
+  {
+    name: "slack_list_messages",
+    description: "List recent messages from a Slack channel.",
   },
 ];
 
@@ -180,6 +232,10 @@ function makeCatalog(size) {
   const tools = selectedSignals.map(({ name, description }) =>
     toolDefinition(name, description),
   );
+  for (const { name, description } of DECOY_TOOLS) {
+    if (tools.length >= size) break;
+    tools.push(toolDefinition(name, description));
+  }
   const domains = [
     "inventory",
     "analytics",
@@ -314,6 +370,10 @@ function toolportAdapter(registryPath) {
     env: {
       ...process.env,
       TOOLPORT_REGISTRY: registryPath,
+      // Keep audit/search traces, result cursors, and cache files inside this
+      // disposable run. Otherwise prior local Toolport activity can change I/O
+      // cost and make repeated benchmark runs drift.
+      TOOLPORT_DATA_DIR: dirname(registryPath),
       TOOLPORT_PROFILE: "benchmark",
       TOOLPORT_DISCOVERY: "lazy",
     },
@@ -322,6 +382,7 @@ function toolportAdapter(registryPath) {
     searchArgs: (query, topK) => ({ query, limit: topK }),
     invokeArgs: (toolId, args) => ({ name: toolId, arguments: args }),
     parseSearch: parseToolportSearch,
+    parseHits: parseToolportHits,
   };
 }
 
@@ -341,15 +402,34 @@ function ratelAdapter(configPath, ratelBin, benchmarkHome) {
     searchArgs: (query, topK) => ({ query, topKTools: topK, topKSkills: 1 }),
     invokeArgs: (toolId, args) => ({ toolId, args }),
     parseSearch: parseRatelSearch,
+    parseHits: parseRatelHits,
   };
 }
 
 function parseToolportSearch(response) {
-  const text = response.result?.content?.map((item) => item.text ?? "").join("\n") ?? "";
-  return [...text.matchAll(/"name"\s*:\s*"([^"]+)"/g)].map((match) => match[1]);
+  return parseToolportHits(response).map((hit) => hit.toolId);
 }
 
 function parseRatelSearch(response) {
+  return parseRatelHits(response).map((hit) => hit.toolId);
+}
+
+function parseToolportHits(response) {
+  const text = response.result?.content?.map((item) => item.text ?? "").join("\n") ?? "";
+  const marker = text.lastIndexOf("\n\n[");
+  if (marker < 0) return [];
+  try {
+    const tools = JSON.parse(text.slice(marker + 2));
+    if (!Array.isArray(tools)) return [];
+    return tools
+      .filter((tool) => tool && typeof tool.name === "string")
+      .map((tool) => ({ toolId: tool.name, inputSchema: tool.inputSchema }));
+  } catch {
+    return [];
+  }
+}
+
+function parseRatelHits(response) {
   let payload = response.result?.structuredContent;
   if (!payload) {
     const text = response.result?.content?.[0]?.text;
@@ -360,7 +440,9 @@ function parseRatelSearch(response) {
     }
   }
   return (payload.tools?.groups ?? []).flatMap((group) =>
-    (group.hits ?? []).map((hit) => hit.toolId),
+    (group.hits ?? [])
+      .filter((hit) => typeof hit?.toolId === "string")
+      .map((hit) => ({ toolId: hit.toolId, inputSchema: hit.inputSchema })),
   );
 }
 
@@ -409,7 +491,13 @@ async function benchmarkDirect(catalogPath, toolName) {
   }
 }
 
-async function benchmarkProduct(adapter, direct, expectedToolId, retrievalCases) {
+async function benchmarkProduct(
+  adapter,
+  direct,
+  expectedToolId,
+  retrievalCases,
+  catalogTools,
+) {
   const processStarted = now();
   const client = new McpProcess(adapter.command, adapter.args, {
     env: adapter.env,
@@ -474,24 +562,61 @@ async function benchmarkProduct(adapter, direct, expectedToolId, retrievalCases)
       searchPayloadBytes.push(Buffer.byteLength(JSON.stringify(response.result ?? {})));
     }, options.iterations);
 
+    const expectedSchemas = new Map(
+      catalogTools.map((tool) => [`fixture__${tool.name}`, tool.inputSchema ?? {}]),
+    );
     const cases = [];
     for (const testCase of retrievalCases) {
       const response = await client.call("tools/call", {
         name: adapter.searchTool,
         arguments: adapter.searchArgs(testCase.query, options.topK),
       });
-      const names = adapter.parseSearch(response);
+      const hits = adapter.parseHits(response);
+      const names = hits.map((hit) => hit.toolId);
       const wanted = `fixture__${testCase.name}`;
       const index = names.indexOf(wanted);
+      const firstResponseBytes = Buffer.byteLength(JSON.stringify(response.result ?? {}));
+      let readyResponseBytes = firstResponseBytes;
+      let readyRoundTrips = 1;
+      let schemaMatches =
+        index >= 0 &&
+        isDeepStrictEqual(hits[index]?.inputSchema ?? null, expectedSchemas.get(wanted));
+
+      // A result without the exact schema is discoverable but not yet actionable.
+      // Measure the real recovery cost instead of rewarding a smaller first response
+      // that forces the agent to search again before it can invoke the tool.
+      if (index >= 0 && !schemaMatches) {
+        const schemaResponse = await client.call("tools/call", {
+          name: adapter.searchTool,
+          arguments: adapter.searchArgs(wanted, options.topK),
+        });
+        readyRoundTrips += 1;
+        readyResponseBytes += Buffer.byteLength(
+          JSON.stringify(schemaResponse.result ?? {}),
+        );
+        const schemaHit = adapter
+          .parseHits(schemaResponse)
+          .find((hit) => hit.toolId === wanted);
+        schemaMatches = isDeepStrictEqual(
+          schemaHit?.inputSchema ?? null,
+          expectedSchemas.get(wanted),
+        );
+      }
       cases.push({
         query: testCase.query,
         expected: wanted,
         rank: index >= 0 ? index + 1 : null,
         topK: names,
+        schemaMatches,
+        readyToInvoke: index >= 0 && schemaMatches,
+        readyRoundTrips,
+        readyResponseBytes,
+        readyEstimatedTokens: Math.ceil(readyResponseBytes / 4),
       });
     }
 
     const hits = cases.filter((item) => item.rank !== null);
+    const ready = cases.filter((item) => item.readyToInvoke);
     const reciprocalRank =
       cases.reduce((sum, item) => sum + (item.rank ? 1 / item.rank : 0), 0) /
       cases.length;
@@ -516,6 +641,9 @@ async function benchmarkProduct(adapter, direct, expectedToolId, retrievalCases)
         hitsAtK: hits.length,
         recallAtK: hits.length / cases.length,
         meanReciprocalRank: reciprocalRank,
+        readyAtK: ready.length / cases.length,
+        readyResponseTokens: stats(cases.map((item) => item.readyEstimatedTokens)),
+        readyRoundTrips: stats(cases.map((item) => item.readyRoundTrips)),
         details: cases,
       },
       routedCall,
@@ -649,6 +777,86 @@ function fileSha256(path) {
   return createHash("sha256").update(readFileSync(path)).digest("hex");
 }
 
+function toolportBudgetViolations(result) {
+  const budget = CONFIG.toolportBudgets;
+  if (!budget) return [];
+  const violations = [];
+  const maximum = (label, actual, limit, catalogSize) => {
+    if (actual > limit) {
+      violations.push(
+        `${catalogSize} tools: ${label} ${actual.toFixed(2)} exceeded ${limit}`,
+      );
+    }
+  };
+  const minimum = (label, actual, limit, catalogSize) => {
+    if (actual < limit) {
+      violations.push(
+        `${catalogSize} tools: ${label} ${actual.toFixed(3)} fell below ${limit}`,
+      );
+    }
+  };
+
+  for (const run of result.runs) {
+    const metrics = run.products.toolport;
+    if (!metrics) continue;
+    maximum(
+      "catalog-ready ms",
+      metrics.catalogReady,
+      budget.maxCatalogReadyMilliseconds,
+      run.catalogSize,
+    );
+    maximum(
+      "always-on estimated tokens",
+      metrics.exposedSurface.estimatedTokens,
+      budget.maxAlwaysOnEstimatedTokens,
+      run.catalogSize,
+    );
+    maximum(
+      "search median ms",
+      metrics.search.median,
+      budget.maxSearchMedianMilliseconds,
+      run.catalogSize,
+    );
+    maximum(
+      "search p95 ms",
+      metrics.search.p95,
+      budget.maxSearchP95Milliseconds,
+      run.catalogSize,
+    );
+    maximum(
+      "search median estimated tokens",
+      metrics.searchPayload.estimatedTokens.median,
+      budget.maxSearchMedianEstimatedTokens,
+      run.catalogSize,
+    );
+    maximum(
+      "search p95 estimated tokens",
+      metrics.searchPayload.estimatedTokens.p95,
+      budget.maxSearchP95EstimatedTokens,
+      run.catalogSize,
+    );
+    minimum(
+      `recall@${result.runtime.topK}`,
+      metrics.retrieval.recallAtK,
+      budget.minRecallAtK,
+      run.catalogSize,
+    );
+    minimum(
+      `schema-ready@${result.runtime.topK}`,
+      metrics.retrieval.readyAtK,
+      budget.minSchemaReadyAtK,
+      run.catalogSize,
+    );
+    maximum(
+      "call overhead p95 ms",
+      metrics.gatewayOverhead.p95,
+      budget.maxCallOverheadP95Milliseconds,
+      run.catalogSize,
+    );
+  }
+  return violations;
+}
+
 function markdown(result) {
   const lines = [
     "# Local MCP gateway comparison",
@@ -656,17 +864,19 @@ function markdown(result) {
     `Same generated MCP server, ${result.runtime.iterations} measured iterations per operation.`,
     "Token counts below estimate the always-exposed MCP tool-definition payload as JSON bytes / 4.",
     "",
-    `| Catalog | Product | Ready ms | Exposed tools | Always-on est. tokens | Search result est. tokens | Search p50 / p95 ms | Recall@${result.runtime.topK} | MRR | Call overhead p50 / p95 ms |`,
-    "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+    `| Catalog | Product | Ready ms | Exposed tools | Always-on est. tokens | Search tokens p50 / p95 | Search p50 / p95 ms | Recall@${result.runtime.topK} | Schema-ready@${result.runtime.topK} | Ready tokens / trips p50 | MRR | Call overhead p50 / p95 ms |`,
+    "| ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
   ];
   for (const run of result.runs) {
     for (const [product, metrics] of Object.entries(run.products)) {
       lines.push(
         `| ${run.catalogSize} | ${product} | ${metrics.catalogReady.toFixed(2)} | ` +
           `${metrics.exposedSurface.toolCount} | ${metrics.exposedSurface.estimatedTokens} | ` +
-          `${metrics.searchPayload.estimatedTokens.median.toFixed(0)} | ` +
+          `${metrics.searchPayload.estimatedTokens.median.toFixed(0)} / ${metrics.searchPayload.estimatedTokens.p95.toFixed(0)} | ` +
           `${metrics.search.median.toFixed(2)} / ${metrics.search.p95.toFixed(2)} | ` +
           `${(metrics.retrieval.recallAtK * 100).toFixed(0)}% | ` +
+          `${(metrics.retrieval.readyAtK * 100).toFixed(0)}% | ` +
+          `${metrics.retrieval.readyResponseTokens.median.toFixed(0)} / ${metrics.retrieval.readyRoundTrips.median.toFixed(0)} | ` +
           `${metrics.retrieval.meanReciprocalRank.toFixed(3)} | ` +
           `${metrics.gatewayOverhead.median.toFixed(2)} / ${metrics.gatewayOverhead.p95.toFixed(2)} |`,
       );
@@ -716,7 +926,8 @@ async function main() {
     const dir = mkdtempSync(join(tmpdir(), `toolport-local-compare-${catalogSize}-`));
     try {
       const catalogPath = join(dir, "catalog.json");
-      writeFileSync(catalogPath, JSON.stringify(makeCatalog(catalogSize)));
+      const catalog = makeCatalog(catalogSize);
+      writeFileSync(catalogPath, JSON.stringify(catalog));
       const { registryPath, ratelPath } = writeConfigs(dir, catalogPath);
       const retrievalCases = SIGNAL_TOOLS.slice(
         0,
@@ -735,6 +946,7 @@ async function main() {
           direct,
           expectedToolId,
           retrievalCases,
+          catalog.tools,
         );
       }
       result.runs.push({ catalogSize, products });
@@ -743,6 +955,14 @@ async function main() {
     }
   }
 
+  const budgetViolations = options.check ? toolportBudgetViolations(result) : [];
+  if (options.check) {
+    result.toolportBudgetCheck = {
+      passed: budgetViolations.length === 0,
+      budgets: CONFIG.toolportBudgets,
+      violations: budgetViolations,
+    };
+  }
   const rendered = options.json
     ? `${JSON.stringify(result, null, 2)}\n`
     : markdown(result);
@@ -752,6 +972,9 @@ async function main() {
     if (!options.json) console.log(`Wrote ${outputPath}`);
   }
   process.stdout.write(rendered);
+  if (budgetViolations.length > 0) {
+    fail(`Toolport regression budget failed:\n- ${budgetViolations.join("\n- ")}`);
+  }
 }
 
 main().catch((error) => {
