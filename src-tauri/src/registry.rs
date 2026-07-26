@@ -338,12 +338,15 @@ pub struct Registry {
     /// browse per-server instead of searching - instead of setting a per-client env var.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_mode: Option<String>,
-    /// Opt-in server-side "code mode": advertise the `toolport_run_script` meta-tool so an
+    /// Server-side "code mode": advertise the `toolport_run_script` meta-tool so an
     /// agent can orchestrate many downstream tool calls in one sandboxed JS script (a single
-    /// round-trip). Off by default, since agent-supplied server-side JS is a powerful surface.
-    /// The gateway reads this from the registry, so it applies to every client; an explicit
-    /// `CONDUIT_CODE_MODE=1` still force-enables regardless.
-    #[serde(default)]
+    /// round-trip). **On by default** (SOU-397): each in-script call still hits the same
+    /// scope / approval gates as `toolport_call_tool`, and Settings is the kill switch.
+    /// Code mode is not a security boundary (agent-supplied JS). Shared/HTTP multi-tenant
+    /// operators who do not want the surface can turn it off in Settings or set
+    /// `"codeMode": false` in the registry. `TOOLPORT_CODE_MODE=1` (legacy
+    /// `CONDUIT_CODE_MODE`) still force-enables regardless of the toggle.
+    #[serde(default = "default_true")]
     pub code_mode: bool,
     /// Opt-in agent control: when true, an agent may turn servers on or off via
     /// the gateway's `conduit_enable_server` / `conduit_disable_server` tools.
@@ -568,7 +571,7 @@ impl Default for Registry {
             quarantine_on_drift: false,
             lazy_discovery: true,
             discovery_mode: None,
-            code_mode: false,
+            code_mode: true,
             allow_agent_control: false,
             integrity_check: true,
             content_defense: true,
