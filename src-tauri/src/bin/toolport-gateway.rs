@@ -1029,6 +1029,7 @@ fn synonym_group(token: &str) -> &'static [&'static str] {
         &["project", "repo", "repository"],
         &["user", "account", "member", "customer"],
         &["team", "org", "organization", "workspace"],
+        &["schedule", "calendar", "meeting", "appointment"],
         &["dispute", "chargeback"],
         &["token", "tokenize"],
     ];
@@ -1038,6 +1039,115 @@ fn synonym_group(token: &str) -> &'static [&'static str] {
         .copied()
         .unwrap_or(&[])
 }
+
+#[derive(Debug)]
+struct SearchDocument {
+    name_tokens: HashSet<String>,
+    description_tokens: HashSet<String>,
+    server_prefix: String,
+}
+
+/// Immutable lexical index paired with one immutable catalog snapshot.
+///
+/// Tool definitions change only when the downstream catalog is rebuilt, so doing
+/// this work in the request path wastes time and creates latency proportional to
+/// catalog size. The index stores only normalized search fields and document
+/// frequencies; schemas remain in the catalog and are projected only for selected
+/// results.
+#[derive(Debug, Default)]
+struct CatalogSearchIndex {
+    documents: Vec<SearchDocument>,
+    document_frequency: HashMap<String, usize>,
+    catalog_address: usize,
+}
+
+impl CatalogSearchIndex {
+    fn build(tools: &[Value]) -> Self {
+        let mut documents = Vec::with_capacity(tools.len());
+        let mut document_frequency = HashMap::new();
+
+        for tool in tools {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let name_tokens: HashSet<String> = search_tokens(name).into_iter().collect();
+            let description_tokens: HashSet<String> =
+                index_tokens(description).into_iter().collect();
+
+            let mut seen = HashSet::with_capacity(name_tokens.len() + description_tokens.len());
+            seen.extend(name_tokens.iter().map(String::as_str));
+            seen.extend(description_tokens.iter().map(String::as_str));
+            for token in seen {
+                *document_frequency.entry(token.to_string()).or_insert(0) += 1;
+            }
+
+            documents.push(SearchDocument {
+                name_tokens,
+                description_tokens,
+                server_prefix: tool_prefix(tool),
+            });
+        }
+
+        Self {
+            documents,
+            document_frequency,
+            catalog_address: tools.as_ptr() as usize,
+        }
+    }
+
+    fn matches_catalog(&self, tools: &[Value]) -> bool {
+        self.documents.len() == tools.len() && self.catalog_address == tools.as_ptr() as usize
+    }
+
+    /// Conservative auxiliary-memory estimate for regression tests and diagnostics.
+    /// This is deliberately not presented as process RSS.
+    fn estimated_auxiliary_bytes(&self) -> usize {
+        let document_bytes = self.documents.iter().map(|doc| {
+            let token_bytes: usize = doc
+                .name_tokens
+                .iter()
+                .chain(&doc.description_tokens)
+                .map(|token| token.capacity())
+                .sum();
+            std::mem::size_of::<SearchDocument>()
+                + doc.server_prefix.capacity()
+                + token_bytes
+                + (doc.name_tokens.capacity() + doc.description_tokens.capacity())
+                    * std::mem::size_of::<String>()
+                    * 2
+        });
+        let df_bytes = self.document_frequency.keys().map(|token| {
+            token.capacity()
+                + std::mem::size_of::<String>()
+                + std::mem::size_of::<usize>()
+                + 2 * std::mem::size_of::<usize>()
+        });
+        document_bytes.sum::<usize>() + df_bytes.sum::<usize>()
+    }
+}
+
+#[derive(Debug)]
+struct CatalogSnapshot {
+    tools: Vec<Value>,
+    search: CatalogSearchIndex,
+}
+
+impl CatalogSnapshot {
+    fn new(tools: Vec<Value>) -> Self {
+        let search = CatalogSearchIndex::build(&tools);
+        Self { tools, search }
+    }
+}
+
+impl Default for CatalogSnapshot {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+type SharedCatalog = Arc<Mutex<Arc<CatalogSnapshot>>>;
 
 /// Rank the cached catalog against a query, optionally scoped to one server.
 /// Ranking is lexical with IDF weighting: query and tools are tokenized (camelCase
@@ -1065,6 +1175,7 @@ fn search_catalog(
 /// As `search_catalog`, with optional semantic re-ranking. When `sem` is None or
 /// inactive, or embeddings are unavailable, ranking is pure lexical and byte-for-byte
 /// identical to before, semantic only ever adds, never degrades.
+#[cfg(test)]
 fn search_catalog_with(
     cached: &[Value],
     query: &str,
@@ -1072,7 +1183,28 @@ fn search_catalog_with(
     limit: usize,
     sem: Option<&semantic::SemanticConfig>,
 ) -> SearchOutcome {
-    use std::collections::HashMap;
+    search_catalog_indexed(cached, query, server, limit, sem, None)
+}
+
+/// Indexed search entry point used by the live gateway. Tests and cold/live
+/// fallbacks may omit `index`; in that case a temporary index is built so behavior
+/// remains identical and there is only one ranking implementation.
+fn search_catalog_indexed(
+    cached: &[Value],
+    query: &str,
+    server: Option<&str>,
+    limit: usize,
+    sem: Option<&semantic::SemanticConfig>,
+    index: Option<&CatalogSearchIndex>,
+) -> SearchOutcome {
+    let fallback_index;
+    let index = match index.filter(|candidate| candidate.matches_catalog(cached)) {
+        Some(index) => index,
+        None => {
+            fallback_index = CatalogSearchIndex::build(cached);
+            &fallback_index
+        }
+    };
     let q = query.to_lowercase();
     let terms: Vec<&str> = q.split_whitespace().filter(|t| !t.is_empty()).collect();
     let server_filter = server
@@ -1080,54 +1212,59 @@ fn search_catalog_with(
         .filter(|s| !s.is_empty());
 
     // Optionally restrict to one server (its prefix contains the filter text).
-    let pool: Vec<&Value> = cached
+    let pool: Vec<usize> = index
+        .documents
         .iter()
-        .filter(|t| match &server_filter {
-            Some(sf) => tool_prefix(t).contains(sf.as_str()),
+        .enumerate()
+        .filter(|(_, doc)| match &server_filter {
+            Some(sf) => doc.server_prefix.contains(sf.as_str()),
             None => true,
         })
+        .map(|(position, _)| position)
         .collect();
 
     // Select an ordered set of tool refs (ranking happens here; projection below).
     let (selected, total, low_confidence, broadened, direct_returned) = if terms.is_empty() {
         // Empty query: list the pool. With `server` set this enumerates that server.
         let total = pool.len();
-        let selected: Vec<&Value> = pool.iter().take(limit).copied().collect();
+        let selected: Vec<&Value> = pool
+            .iter()
+            .take(limit)
+            .filter_map(|position| cached.get(*position))
+            .collect();
         let direct_returned = selected.len();
         (selected, total, false, 0, direct_returned)
     } else {
-        // Tokenize each tool and compute document frequencies, so IDF can weight a
-        // rare token (e.g. "products", "teams") far above a common one (e.g. "list",
-        // "get"). That makes "list products" rank the products tool over the many
-        // generic "list" tools - the keyword-only wandering we hit with Stripe.
-        use std::collections::HashSet;
-        let docs: Vec<(&Value, HashSet<String>, HashSet<String>)> = pool
-            .iter()
-            .map(|t| {
-                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                (
-                    *t,
-                    search_tokens(name).into_iter().collect(),
-                    index_tokens(desc).into_iter().collect(),
-                )
-            })
-            .collect();
-        let n = docs.len().max(1) as f64;
-        let mut df: HashMap<&str, usize> = HashMap::new();
-        for (_, name_set, desc_set) in &docs {
-            for tok in name_set.union(desc_set) {
-                *df.entry(tok.as_str()).or_insert(0) += 1;
+        // The normal local path reuses the precomputed global document frequencies.
+        // A substring server filter can select more than one server, so preserve its
+        // historical ranking by deriving DF over that already-tokenized subset.
+        let scoped_df;
+        let df = if server_filter.is_none() {
+            &index.document_frequency
+        } else {
+            let mut frequencies = HashMap::new();
+            for position in &pool {
+                let doc = &index.documents[*position];
+                for token in doc.name_tokens.union(&doc.description_tokens) {
+                    *frequencies.entry(token.clone()).or_insert(0) += 1;
+                }
             }
-        }
-        let idf = |tok: &str| ((n + 1.0) / (*df.get(tok).unwrap_or(&0) as f64 + 1.0)).ln() + 1.0;
+            scoped_df = frequencies;
+            &scoped_df
+        };
+        let n = pool.len().max(1) as f64;
+        let idf = |tok: &str| {
+            ((n + 1.0) / (*df.get(tok).unwrap_or(&0) as f64 + 1.0)).ln() + 1.0
+        };
 
         let q_tokens = index_tokens(query);
         // Lexical score for EVERY doc (0 if no hit), kept so optional semantic
         // re-ranking can also surface tools the keywords missed entirely.
-        let lex: Vec<(f64, &Value)> = docs
+        let lex: Vec<(f64, &Value)> = pool
             .iter()
-            .map(|(t, name_set, desc_set)| {
+            .filter_map(|position| {
+                let doc = index.documents.get(*position)?;
+                let tool = cached.get(*position)?;
                 let mut score = 0.0_f64;
                 for qt in &q_tokens {
                     // Best field hit across the query token and its synonyms; name
@@ -1136,15 +1273,19 @@ fn search_catalog_with(
                     let cands =
                         std::iter::once(qt.as_str()).chain(synonym_group(qt).iter().copied());
                     for c in cands {
-                        if name_set.contains(c) {
+                        if doc.name_tokens.contains(c) {
                             best = best.max(NAME_W * idf(c));
-                        } else if desc_set.contains(c) {
+                        } else if doc.description_tokens.contains(c) {
                             best = best.max(DESC_W * idf(c));
                         }
                     }
                     // Prefix fallback for partial words ("proj" -> "project").
                     if best == 0.0 && qt.len() >= 3 {
-                        if let Some(tok) = name_set.iter().find(|t| t.starts_with(qt.as_str())) {
+                        if let Some(tok) = doc
+                            .name_tokens
+                            .iter()
+                            .find(|t| t.starts_with(qt.as_str()))
+                        {
                             best = 0.6 * NAME_W * idf(tok);
                         }
                     }
@@ -1157,8 +1298,9 @@ fn search_catalog_with(
                 // since both name-match every query token. Multiplicative so it only
                 // separates near-ties, never overrides a stronger IDF signal; skipped on
                 // a zero score so non-matches stay out.
-                if score > 0.0 && !name_set.is_empty() {
-                    let explained = name_set
+                if score > 0.0 && !doc.name_tokens.is_empty() {
+                    let explained = doc
+                        .name_tokens
                         .iter()
                         .filter(|nt| {
                             q_tokens
@@ -1166,10 +1308,10 @@ fn search_catalog_with(
                                 .any(|qt| qt == *nt || synonym_group(qt).contains(&nt.as_str()))
                         })
                         .count();
-                    let coverage = explained as f64 / name_set.len() as f64;
+                    let coverage = explained as f64 / doc.name_tokens.len() as f64;
                     score *= 1.0 + NAME_SPECIFICITY_W * coverage;
                 }
-                (score, *t)
+                Some((score, tool))
             })
             .collect();
 
@@ -1198,7 +1340,7 @@ fn search_catalog_with(
                     .map(|qt| {
                         let matched_idf = std::iter::once(qt.as_str())
                             .chain(synonym_group(qt).iter().copied())
-                            .filter(|candidate| df.contains_key(candidate))
+                            .filter(|candidate| df.contains_key(*candidate))
                             .map(idf)
                             .fold(0.0_f64, f64::max);
                         if matched_idf > 0.0 {
@@ -1247,7 +1389,7 @@ fn search_catalog_with(
                 .collect();
             let visible_servers = pool
                 .iter()
-                .map(|tool| tool_prefix(tool))
+                .map(|position| index.documents[*position].server_prefix.as_str())
                 .collect::<std::collections::HashSet<_>>()
                 .len()
                 .max(1);
@@ -1256,10 +1398,13 @@ fn search_catalog_with(
             for tool in &selected {
                 *per.entry(tool_prefix(tool)).or_insert(0) += 1;
             }
-            for tool in &pool {
+            for position in &pool {
                 if selected.len() >= target {
                     break;
                 }
+                let Some(tool) = cached.get(*position) else {
+                    continue;
+                };
                 let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
                 if !seen.insert(name.to_string()) {
                     continue;
@@ -1271,7 +1416,7 @@ fn search_catalog_with(
                     }
                     *count += 1;
                 }
-                selected.push(*tool);
+                selected.push(tool);
             }
         }
         let broadened = selected.len().saturating_sub(direct_returned);
@@ -2800,8 +2945,10 @@ fn handle_request(
     // requests can't cross-contaminate and dispatch needn't hold the router lock.
     client: Option<&str>,
 ) -> Option<Value> {
+    let search_index = CatalogSearchIndex::build(cached);
     handle_request_with_cancel(
-        req, reg, router, cached, lazy, profile, guard, confirm, allowed, None, client, None,
+        req, reg, router, cached, lazy, profile, guard, confirm, allowed, None, client,
+        Some(&search_index), None,
     )
 }
 
@@ -2821,6 +2968,10 @@ fn handle_request_with_cancel(
     // label), threaded in rather than stored on the shared router so concurrent
     // requests can't cross-contaminate and dispatch needn't hold the router lock.
     client: Option<&str>,
+    // Immutable index built from the same catalog snapshot as `cached`. Scoped
+    // HTTP clients and cold live-router fallbacks rebuild from their filtered
+    // source rather than risk indexing a tool they cannot see.
+    search_index: Option<&CatalogSearchIndex>,
     // The live router as a shareable Arc, used ONLY to build the `'static` call closure a
     // code-mode script needs (its downstream calls re-enter execute_call). `None` disables
     // code mode for this request (the test wrapper / any caller without the Arc); the
@@ -3110,12 +3261,19 @@ fn handle_request_with_cancel(
                 } else {
                     cached
                 };
-                // Scope the searchable catalog to the client's allowed servers
-                // (a no-op when unscoped), so search can't surface out-of-scope tools.
-                let scoped = scope_tools(base, allowed, |n| {
-                    router.route_of(n).map(|(s, _)| s.to_string())
-                });
-                let source: &[Value] = &scoped;
+                // Avoid cloning the entire catalog for the normal local/unscoped path.
+                // Scoped HTTP callers still get a fail-closed filtered copy and a
+                // temporary index built only from that visible subset.
+                let scoped;
+                let (source, source_index): (&[Value], Option<&CatalogSearchIndex>) =
+                    if allowed.is_none() {
+                        (base, search_index.filter(|index| index.matches_catalog(base)))
+                    } else {
+                        scoped = scope_tools(base, allowed, |n| {
+                            router.route_of(n).map(|(s, _)| s.to_string())
+                        });
+                        (&scoped, None)
+                    };
                 // Semantic re-ranking if the user has configured it (off by default;
                 // falls back to lexical on any failure).
                 let s = &reg.semantic_search;
@@ -3125,7 +3283,14 @@ fn handle_request_with_cancel(
                     s.model.clone(),
                     s.blend,
                 );
-                let outcome = search_catalog_with(source, query, server, limit, Some(&sem_cfg));
+                let outcome = search_catalog_indexed(
+                    source,
+                    query,
+                    server,
+                    limit,
+                    Some(&sem_cfg),
+                    source_index,
+                );
                 let mut matches = outcome.matches;
                 let total = outcome.total;
                 let low_confidence = outcome.low_confidence;
@@ -3962,14 +4127,23 @@ fn reconcile_to(
 
 fn persist_and_emit(
     tools: &[Value],
-    cached_tools: &Arc<Mutex<Vec<Value>>>,
+    cached_tools: &SharedCatalog,
     stdout: &Arc<Mutex<std::io::Stdout>>,
     profile: Option<&str>,
 ) {
     if !tools.is_empty() {
+        let started = Instant::now();
+        let next = Arc::new(CatalogSnapshot::new(tools.to_vec()));
+        let index_bytes = next.search.estimated_auxiliary_bytes();
         *cached_tools
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = tools.to_vec();
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+        gtrace(&format!(
+            "search index rebuilt: {} tools, ~{} KiB auxiliary, {:.2} ms",
+            tools.len(),
+            index_bytes.div_ceil(1024),
+            started.elapsed().as_secs_f64() * 1000.0
+        ));
         save_tool_cache(tools, profile);
     }
     notify_tools_changed(stdout);
@@ -4167,7 +4341,7 @@ fn watch_registry(
     registry: Arc<Mutex<Registry>>,
     router: Arc<Mutex<Arc<Router>>>,
     stdout: Arc<Mutex<std::io::Stdout>>,
-    cached_tools: Arc<Mutex<Vec<Value>>>,
+    cached_tools: SharedCatalog,
     profile: Arc<Mutex<Option<String>>>,
     client_id: Option<String>,
     env_profile: Option<String>,
@@ -4221,7 +4395,7 @@ fn watch_tick(
     registry: &Arc<Mutex<Registry>>,
     router: &Arc<Mutex<Arc<Router>>>,
     stdout: &Arc<Mutex<std::io::Stdout>>,
-    cached_tools: &Arc<Mutex<Vec<Value>>>,
+    cached_tools: &SharedCatalog,
     profile: &Arc<Mutex<Option<String>>>,
     client_id: Option<&str>,
     env_profile: Option<&str>,
@@ -4448,7 +4622,7 @@ struct GatewayState {
     // behind an in-flight request. Rebuilds swap in a new Arc; refresh/requarantine fork
     // via Arc::make_mut.
     router: Arc<Mutex<Arc<Router>>>,
-    cached_tools: Arc<Mutex<Vec<Value>>>,
+    cached_tools: SharedCatalog,
     stdout: Arc<Mutex<std::io::Stdout>>,
     ready: Arc<AtomicBool>,
     downstream_dirty: Arc<AtomicU8>,
@@ -5247,6 +5421,7 @@ fn process_request(
             .cached_tools
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tools
             .is_empty(),
         "tools/call" | "resources/list" | "resources/read" | "prompts/list" | "prompts/get" => true,
         _ => false,
@@ -5317,7 +5492,8 @@ fn process_request(
                     *state
                         .cached_tools
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = tools.clone();
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Arc::new(CatalogSnapshot::new(tools.clone()));
                     save_tool_cache(&tools, profile_snapshot.as_deref());
                 }
                 glog(&format!(
@@ -5360,7 +5536,7 @@ fn process_request(
         req,
         &reg,
         &router,
-        &cache_snapshot,
+        &cache_snapshot.tools,
         state.lazy,
         profile_snapshot.as_deref(),
         guard,
@@ -5368,6 +5544,7 @@ fn process_request(
         allowed,
         cancel,
         client,
+        Some(&cache_snapshot.search),
         // The same live Arc<Router> just cloned off the lock, so a code-mode script's
         // downstream calls run against this request's consistent catalog snapshot.
         Some(&router),
@@ -5521,14 +5698,14 @@ fn http_tool_defs(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if cached.is_empty() {
+        if cached.tools.is_empty() {
             state
                 .router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .aggregated_tools()
         } else {
-            cached
+            cached.tools.clone()
         }
     };
     if state.lazy {
@@ -7299,7 +7476,9 @@ fn main() {
     // request loop, the watcher, and the self-heal path all follow this, so there's
     // no deadlock; keep new code consistent with it.
     let router = Arc::new(Mutex::new(Arc::new(Router::new())));
-    let cached_tools = Arc::new(Mutex::new(load_tool_cache(resolved_profile.as_deref())));
+    let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::new(load_tool_cache(
+        resolved_profile.as_deref(),
+    )))));
     // Shared, live-updated: the watcher re-resolves this from registry.client_scopes
     // on every reload (falling back to `env_profile` if this client has no scope
     // entry), so a profile switch reaches every reader below without a restart.
@@ -7328,6 +7507,7 @@ fn main() {
         cached_tools
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tools
             .len()
     ));
 
@@ -7384,7 +7564,8 @@ fn main() {
             if !tools.is_empty() {
                 *cached_tools
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = tools.clone();
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Arc::new(CatalogSnapshot::new(tools.clone()));
                 save_tool_cache(&tools, p.as_deref());
             } else {
                 glog("background build was empty; keeping previous tool cache");
@@ -8303,7 +8484,7 @@ mod tests {
         GatewayState {
             registry: Arc::new(Mutex::new(Registry::default())),
             router: Arc::new(Mutex::new(Arc::new(Router::new()))),
-            cached_tools: Arc::new(Mutex::new(Vec::new())),
+            cached_tools: Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
             stdout,
             ready: Arc::new(AtomicBool::new(true)),
             downstream_dirty: Arc::new(AtomicU8::new(0)),
@@ -10517,7 +10698,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(reg));
         let router = Arc::new(Mutex::new(Arc::new(Router::new())));
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
-        let cached_tools = Arc::new(Mutex::new(Vec::new()));
+        let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
         let profile_slot = Arc::new(Mutex::new(Some(profile_name.to_string())));
         let downstream_dirty = Arc::new(AtomicU8::new(0));
         let client_root = Arc::new(Mutex::new(None));
@@ -11519,6 +11700,7 @@ mod tests {
             json!({ "name": "gh__listPullRequests", "description": "List PRs", "inputSchema": {} }),
             json!({ "name": "stripe__list_disputes", "description": "List disputes", "inputSchema": {} }),
             json!({ "name": "stripe__create_token", "description": "Create a token", "inputSchema": {} }),
+            json!({ "name": "calendar__create_event", "description": "Create a calendar event", "inputSchema": {} }),
         ];
         // Synonym: "mail" finds the email tool even though it never says "mail".
         let (hits, _) = search_catalog(&cat, "mail", None, 10);
@@ -11538,6 +11720,10 @@ mod tests {
         assert_eq!(hits[0]["name"], "stripe__list_disputes");
         let (hits, _) = search_catalog(&cat, "tokenize", None, 10);
         assert_eq!(hits[0]["name"], "stripe__create_token");
+
+        // Calendar vocabulary varies heavily between users and MCP servers.
+        let (hits, _) = search_catalog(&cat, "schedule a meeting", None, 10);
+        assert_eq!(hits[0]["name"], "calendar__create_event");
     }
 
     #[test]
@@ -11561,6 +11747,103 @@ mod tests {
         ];
         let (hits, _) = search_catalog(&cat, "what are the invoices for this account", None, 10);
         assert_eq!(hits[0]["name"], "billing__list_invoices");
+    }
+
+    #[test]
+    fn indexed_search_preserves_unindexed_results_and_scoping() {
+        let catalog = vec![
+            json!({ "name": "calendar__create_event", "description": "Create a calendar event", "inputSchema": {} }),
+            json!({ "name": "calendar__list_events", "description": "List upcoming calendar entries", "inputSchema": {} }),
+            json!({ "name": "github__create_issue", "description": "Create a repository issue", "inputSchema": {} }),
+            json!({ "name": "mail__send_email", "description": "Send an email message", "inputSchema": {} }),
+        ];
+        let index = CatalogSearchIndex::build(&catalog);
+
+        for (query, server, limit) in [
+            ("create", None, 25),
+            ("schedule a meeting", None, 3),
+            ("list", Some("calendar"), 25),
+            ("", Some("calendar"), 1),
+            ("no lexical match", None, 12),
+        ] {
+            let rebuilt = search_catalog_with(&catalog, query, server, limit, None);
+            let indexed =
+                search_catalog_indexed(&catalog, query, server, limit, None, Some(&index));
+            assert_eq!(
+                indexed.matches, rebuilt.matches,
+                "indexed result mismatch for query {query:?}, server {server:?}"
+            );
+            assert_eq!(indexed.total, rebuilt.total);
+            assert_eq!(indexed.low_confidence, rebuilt.low_confidence);
+            assert_eq!(indexed.broadened, rebuilt.broadened);
+            assert_eq!(indexed.direct_returned, rebuilt.direct_returned);
+        }
+    }
+
+    #[test]
+    fn catalog_snapshot_keeps_tools_and_index_on_the_same_generation() {
+        let old = CatalogSnapshot::new(vec![json!({
+            "name": "old__find_invoice", "description": "Find an invoice", "inputSchema": {}
+        })]);
+        let next = CatalogSnapshot::new(vec![json!({
+            "name": "new__schedule_meeting", "description": "Schedule a meeting", "inputSchema": {}
+        })]);
+
+        assert!(old.search.matches_catalog(&old.tools));
+        assert!(next.search.matches_catalog(&next.tools));
+        assert!(
+            !next.search.matches_catalog(&old.tools),
+            "same-sized catalog generations must never share an index"
+        );
+
+        let old_result =
+            search_catalog_indexed(&old.tools, "invoice", None, 5, None, Some(&old.search));
+        let next_result =
+            search_catalog_indexed(&next.tools, "meeting", None, 5, None, Some(&next.search));
+        assert_eq!(old_result.matches[0]["name"], "old__find_invoice");
+        assert_eq!(next_result.matches[0]["name"], "new__schedule_meeting");
+    }
+
+    #[test]
+    fn search_index_scales_to_ten_thousand_tools_with_bounded_memory() {
+        let catalog: Vec<Value> = (0..10_000)
+            .map(|i| {
+                json!({
+                    "name": format!("server{}__lookup_customer_record_{i}", i % 50),
+                    "description": format!("Look up customer record {i} in account group {}", i % 100),
+                    "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } } }
+                })
+            })
+            .collect();
+        let started = Instant::now();
+        let index = CatalogSearchIndex::build(&catalog);
+        let elapsed = started.elapsed();
+        let estimated = index.estimated_auxiliary_bytes();
+
+        assert_eq!(index.documents.len(), 10_000);
+        assert_eq!(index.document_frequency.get("customer"), Some(&10_000));
+        assert!(
+            estimated < 64 * 1024 * 1024,
+            "auxiliary index estimate unexpectedly large: {estimated} bytes"
+        );
+
+        let outcome = search_catalog_indexed(
+            &catalog,
+            "customer record 9876",
+            None,
+            5,
+            None,
+            Some(&index),
+        );
+        assert_eq!(
+            outcome.matches[0]["name"],
+            "server26__lookup_customer_record_9876"
+        );
+        eprintln!(
+            "10k-tool search index: {:.2} ms build, {:.2} MiB estimated auxiliary memory",
+            elapsed.as_secs_f64() * 1000.0,
+            estimated as f64 / (1024.0 * 1024.0)
+        );
     }
 
     #[test]

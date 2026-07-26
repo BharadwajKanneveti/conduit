@@ -2719,8 +2719,8 @@ fn edit_yaml_gateway(
     atomic_write(path, &out)
 }
 
-/// Parse Continue's `mcpServers` list into servers. Each entry carries
-/// `command`/`args`/`env` in YAML list form.
+/// Parse Continue's `mcpServers` list into servers. Entries may be local stdio
+/// servers (`command`/`args`/`env`) or remote servers (`type`/`url`).
 fn parse_continue_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> {
     if content.trim().is_empty() {
         return Ok(Vec::new());
@@ -2761,6 +2761,11 @@ fn parse_continue_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> 
         };
 
         let command = str_of("command").filter(|s| !s.is_empty());
+        let url = str_of("url").filter(|s| !s.is_empty());
+        if command.is_none() && url.is_none() {
+            continue;
+        }
+        let transport = classify(&command, &url, str_of("type").as_deref());
 
         let args = def
             .get(serde_yaml::Value::String("args".into()))
@@ -2784,11 +2789,11 @@ fn parse_continue_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> 
 
         servers.push(McpServer {
             name,
-            transport: "stdio".into(),
+            transport,
             command,
             args,
             env_keys,
-            url: None,
+            url,
         });
     }
 
@@ -2804,7 +2809,7 @@ fn parse_continue_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> 
     Ok(servers)
 }
 
-/// Build a Continue stdio MCP server record for a server entry.
+/// Build a Continue MCP server record for a server entry.
 fn entry_to_continue_yaml(entry: &ServerEntry) -> serde_yaml::Value {
     let env: serde_json::Map<String, serde_json::Value> = entry
         .env
@@ -2816,12 +2821,33 @@ fn entry_to_continue_yaml(entry: &ServerEntry) -> serde_yaml::Value {
         })
         .collect();
 
-    let v = serde_json::json!({
-        "name": entry.name,
-        "command": entry.command.clone().unwrap_or_default(),
-        "args": entry.args,
-        "env": env,
-    });
+    let v = if let Some(command) = &entry.command {
+        serde_json::json!({
+            "name": entry.name,
+            "command": command,
+            "args": entry.args,
+            "env": env,
+        })
+    } else if let Some(url) = &entry.url {
+        let transport = if entry.transport.eq_ignore_ascii_case("sse") {
+            "sse"
+        } else {
+            "streamable-http"
+        };
+        serde_json::json!({
+            "name": entry.name,
+            "type": transport,
+            "url": url,
+        })
+    } else {
+        // Preserve invalid entries visibly instead of silently dropping them.
+        serde_json::json!({
+            "name": entry.name,
+            "command": "",
+            "args": entry.args,
+            "env": env,
+        })
+    };
 
     serde_yaml::to_value(&v).unwrap_or(serde_yaml::Value::Null)
 }
@@ -4934,6 +4960,29 @@ command = "npx"
     }
 
     #[test]
+    fn continue_yaml_parses_remote_server() {
+        let content = "mcpServers:\n  - name: remote-http\n    type: streamable-http\n    url: https://example.com/mcp\n  - name: remote-sse\n    type: sse\n    url: https://example.com/events\n";
+
+        let parsed = parse_continue_yaml_servers(content).unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "remote-http");
+        assert_eq!(parsed[0].transport, "http");
+        assert_eq!(
+            parsed[0].url.as_deref(),
+            Some("https://example.com/mcp")
+        );
+        assert!(parsed[0].command.is_none());
+        assert_eq!(parsed[1].name, "remote-sse");
+        assert_eq!(parsed[1].transport, "sse");
+        assert_eq!(
+            parsed[1].url.as_deref(),
+            Some("https://example.com/events")
+        );
+        assert!(parsed[1].command.is_none());
+    }
+
+    #[test]
     fn continue_yaml_malformed_entry_returns_error() {
         let content = "mcpServers:\n  - name: fetch\n    command: uvx\n  - not-a-mapping\n";
 
@@ -4955,12 +5004,17 @@ command = "npx"
         )
         .unwrap();
 
-        let servers = vec![stdio("filesystem"), stdio("github")];
+        let servers = vec![
+            stdio("filesystem"),
+            stdio("github"),
+            remote("remote", "http"),
+            remote("remote-sse", "sse"),
+        ];
         write_continue_yaml_servers(&path, &servers).unwrap();
 
         let content = std::fs::read_to_string(&path).unwrap();
         let parsed = parse_continue_yaml_servers(&content).unwrap();
-        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed.len(), 4);
         assert_eq!(parsed[0].name, "filesystem");
         assert_eq!(parsed[0].command.as_deref(), Some("npx"));
         assert_eq!(
@@ -4969,6 +5023,20 @@ command = "npx"
         );
         assert_eq!(parsed[0].env_keys, vec!["TOKEN".to_string()]);
         assert_eq!(parsed[1].name, "github");
+        assert_eq!(parsed[2].name, "remote");
+        assert_eq!(parsed[2].transport, "http");
+        assert_eq!(
+            parsed[2].url.as_deref(),
+            Some("https://remote.example.com/mcp")
+        );
+        assert!(parsed[2].command.is_none());
+        assert_eq!(parsed[3].name, "remote-sse");
+        assert_eq!(parsed[3].transport, "sse");
+        assert_eq!(
+            parsed[3].url.as_deref(),
+            Some("https://remote-sse.example.com/mcp")
+        );
+        assert!(parsed[3].command.is_none());
 
         let root: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
         assert_eq!(
