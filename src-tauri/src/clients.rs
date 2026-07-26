@@ -569,7 +569,8 @@ fn toolport_studio_path() -> Option<PathBuf> {
 /// Electron userData until the first Studio launch creates the home state tree.
 fn toolport_studio_install_marker() -> Option<PathBuf> {
     let home = home()?;
-    let mut candidates: Vec<PathBuf> = vec![home.join(".toolport-studio")];
+    let fallback = home.join(".toolport-studio");
+    let mut candidates: Vec<PathBuf> = vec![fallback.clone()];
 
     if let Some(roaming) = dirs::config_dir() {
         candidates.push(roaming.join("toolport-studio"));
@@ -600,7 +601,17 @@ fn toolport_studio_install_marker() -> Option<PathBuf> {
         ));
     }
 
-    candidates.into_iter().find(|path| path.exists())
+    // Returning `None` would make `read_client` fall back to the config-parent
+    // heuristic. Studio's config parent is the home directory itself when the
+    // state tree is absent, which exists on every machine and would make Studio
+    // appear installed everywhere. Keep the override active with a deterministic
+    // non-existing fallback when no install marker is present.
+    Some(
+        candidates
+            .into_iter()
+            .find(|path| path.exists())
+            .unwrap_or(fallback),
+    )
 }
 
 fn claude_code_path() -> Option<PathBuf> {
@@ -4435,8 +4446,11 @@ command = "npx"
         );
         assert!(install_override("kiro").unwrap().ends_with(".kiro"));
         let _ = install_override("warp"); // env-dependent; just ensure no panic.
-        let _ = install_override("toolport-studio"); // install/state dirs vary by machine.
-                                                     // Well-behaved clients have no override (they use the config-parent heuristic).
+        assert!(
+            install_override("toolport-studio").is_some(),
+            "Toolport Studio must always override the home-parent heuristic"
+        );
+        // Well-behaved clients have no override (they use the config-parent heuristic).
         assert!(install_override("cursor").is_none());
         assert!(install_override("codex").is_none());
         assert!(install_override("vscode").is_none());
