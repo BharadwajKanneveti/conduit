@@ -339,12 +339,24 @@ impl ResourceSubscriptionTable {
             .collect()
     }
 
+    /// First-writer owner recorded at subscribe time, if any (SOU-398).
+    fn owner_for(&self, uri: &str) -> Option<&str> {
+        self.uri_owner.get(uri).map(String::as_str)
+    }
+
     fn set_owner(&mut self, uri: &str, owner: &str) {
         if self.uri_owner.contains_key(uri) {
             self.uri_owner.insert(uri.to_string(), owner.to_string());
         }
     }
 }
+
+/// Shared fanout entry for `notifications/resources/updated`:
+/// `(producer_server_id, uri)`. Ownership is checked before any upstream
+/// delivery so a misbehaving server cannot spoof updates for URIs it does not
+/// own (SOU-398). Bound per downstream at connect time into a
+/// [`ResourceUpdatedSink`] that closes over the producer id.
+type ResourceUpdatedDispatch = Arc<dyn Fn(String, String) + Send + Sync>;
 
 #[derive(Debug, PartialEq, Eq)]
 enum BoundedLine {
@@ -4289,8 +4301,9 @@ fn build_router(
     // already decoded to a filesystem path. `None` in HTTP mode and before the
     // client's roots are known; `${ROOT}` servers then fall back to the gateway cwd.
     root: Option<&str>,
-    // Optional sink for downstream `notifications/resources/updated` (SOU-394).
-    resource_updated: Option<ResourceUpdatedSink>,
+    // Optional dispatch for downstream `notifications/resources/updated`
+    // (SOU-394); bound per server with producer id (SOU-398).
+    resource_updated: Option<ResourceUpdatedDispatch>,
     // Live subscription table so reconnect factories re-issue resources/subscribe.
     resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
 ) -> Router {
@@ -4425,6 +4438,19 @@ fn build_router(
     router
 }
 
+/// Bind a shared resource-updated dispatch to one producer server id so the
+/// transport-level sink only needs the URI (SOU-398).
+fn bind_resource_updated_sink(
+    dispatch: &ResourceUpdatedDispatch,
+    producer: &str,
+) -> ResourceUpdatedSink {
+    let dispatch = Arc::clone(dispatch);
+    let producer = producer.to_string();
+    Arc::new(move |uri: String| {
+        dispatch(producer.clone(), uri);
+    })
+}
+
 /// Connect a single enabled server (stdio with keychain secret injection, or
 /// remote with refresh-aware auth). Returns None on failure.
 fn connect_one(
@@ -4432,8 +4458,12 @@ fn connect_one(
     dirty: &Arc<AtomicU8>,
     server_handler: ServerRequestHandler,
     root: Option<&str>,
-    resource_updated: Option<ResourceUpdatedSink>,
+    resource_updated: Option<ResourceUpdatedDispatch>,
 ) -> Option<DownstreamServer> {
+    // Close over this server's id so fanout can verify the producer (SOU-398).
+    let resource_updated = resource_updated
+        .as_ref()
+        .map(|d| bind_resource_updated_sink(d, &server.id));
     let result = if let Some(command) = &server.command {
         let mut env: Vec<(String, String)> = Vec::new();
         for e in &server.env {
@@ -4563,17 +4593,33 @@ fn fanout_mcp_notification(
 
 /// Deliver `notifications/resources/updated` only to sessions that subscribed
 /// to `uri` (stdio + HTTP SSE). Distinct from list_changed fanout (SOU-394).
+///
+/// `producer` is the downstream server id that emitted the notification. Fanout
+/// only proceeds when that id matches the URI's first-writer owner (SOU-398);
+/// spoofed or colliding updates are dropped and logged.
 fn deliver_resource_updated(
     stdout: &Arc<Mutex<std::io::Stdout>>,
     mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
     subs: &Arc<Mutex<ResourceSubscriptionTable>>,
+    producer: &str,
     uri: &str,
 ) {
     let targets = {
         let table = subs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        table.sessions_for_uri(uri)
+        match table.owner_for(uri) {
+            Some(owner) if owner == producer => table.sessions_for_uri(uri),
+            Some(owner) => {
+                eprintln!(
+                    "toolport: resources/updated for '{uri}' from '{producer}' dropped \
+                     (owned by '{owner}')"
+                );
+                return;
+            }
+            // No active subscription for this URI — same as empty targets.
+            None => return,
+        }
     };
     if targets.is_empty() {
         return;
@@ -4621,15 +4667,16 @@ fn deliver_resource_updated(
     }
 }
 
-/// Build the drain-thread sink that fans resource-updated notifications to
-/// subscribed upstream clients only (SOU-394).
+/// Build the shared dispatch that fans resource-updated notifications to
+/// subscribed upstream clients only (SOU-394), after verifying the producer
+/// owns the URI (SOU-398). Bound per downstream via [`bind_resource_updated_sink`].
 fn make_resource_updated_sink(
     stdout: Arc<Mutex<std::io::Stdout>>,
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
     subs: Arc<Mutex<ResourceSubscriptionTable>>,
-) -> ResourceUpdatedSink {
-    Arc::new(move |uri: String| {
-        deliver_resource_updated(&stdout, &mcp_sessions, &subs, &uri);
+) -> ResourceUpdatedDispatch {
+    Arc::new(move |producer: String, uri: String| {
+        deliver_resource_updated(&stdout, &mcp_sessions, &subs, &producer, &uri);
     })
 }
 
@@ -5297,8 +5344,9 @@ fn watch_registry(
     // Live HTTP MCP sessions so list_changed notifications also fan out over SSE
     // (SOU-328). Empty in pure-stdio mode; same Arc as GatewayState.
     mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
-    // Resource-updated sink re-wired into rebuilds after registry reload (SOU-394).
-    resource_updated: Option<ResourceUpdatedSink>,
+    // Resource-updated dispatch re-wired into rebuilds after registry reload
+    // (SOU-394 / SOU-398).
+    resource_updated: Option<ResourceUpdatedDispatch>,
     // Subscription table so rebuilds re-issue resources/subscribe.
     resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
 ) {
@@ -5357,7 +5405,7 @@ fn watch_tick(
     server_handler: &ServerRequestHandler,
     client_root: &Arc<Mutex<Option<String>>>,
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
-    resource_updated: Option<&ResourceUpdatedSink>,
+    resource_updated: Option<&ResourceUpdatedDispatch>,
     resource_subs: Option<&Arc<Mutex<ResourceSubscriptionTable>>>,
     state: &mut WatchLoopState,
 ) -> TickOutcome {
@@ -5641,9 +5689,10 @@ struct GatewayState {
     env_profile: Option<String>,
     /// Upstream resource subscriptions (session → URI) for SOU-394 fanout.
     resource_subs: Arc<Mutex<ResourceSubscriptionTable>>,
-    /// Drain-thread sink that delivers `notifications/resources/updated` to
-    /// subscribed clients. Shared with every stdio downstream spawn/reconnect.
-    resource_updated_sink: Option<ResourceUpdatedSink>,
+    /// Shared dispatch `(producer, uri)` that delivers `notifications/resources/updated`
+    /// to subscribed clients after ownership check (SOU-394 / SOU-398). Bound per
+    /// server at connect/reconnect.
+    resource_updated_sink: Option<ResourceUpdatedDispatch>,
 }
 
 /// Client capabilities the upstream MCP client declared at `initialize`.
@@ -11718,6 +11767,7 @@ mod tests {
             &state.stdout,
             &state.mcp_sessions,
             &state.resource_subs,
+            "srv",
             "fixture://only-s1",
         );
         let sessions = state.mcp_sessions.lock().unwrap();
@@ -11736,6 +11786,89 @@ mod tests {
             "subscribed session missing update: {chunk1}"
         );
         assert!(chunk2.is_none(), "unsubscribed session must not receive update");
+    }
+
+    #[test]
+    fn deliver_resource_updated_drops_cross_server_spoof() {
+        // SOU-398: a server that does not own the URI must not fan out updates.
+        let state = http_state(false);
+        let s1 = match mint_mcp_session(&state, None) {
+            Ok(s) => s,
+            Err(_) => panic!("mint s1 failed"),
+        };
+        {
+            let mut table = state.resource_subs.lock().unwrap();
+            table
+                .add(&s1, "fixture://owned-by-alpha", "alpha")
+                .unwrap();
+        }
+        // Spoof: beta claims an update for alpha's URI.
+        deliver_resource_updated(
+            &state.stdout,
+            &state.mcp_sessions,
+            &state.resource_subs,
+            "beta",
+            "fixture://owned-by-alpha",
+        );
+        {
+            let sessions = state.mcp_sessions.lock().unwrap();
+            let sess = sessions.get(&s1).unwrap();
+            let out = sess.outbound.lock().unwrap();
+            assert!(
+                out.is_empty(),
+                "cross-server spoof must not reach subscribers (got {} message(s))",
+                out.len()
+            );
+        }
+        // Legitimate owner still fans out.
+        deliver_resource_updated(
+            &state.stdout,
+            &state.mcp_sessions,
+            &state.resource_subs,
+            "alpha",
+            "fixture://owned-by-alpha",
+        );
+        let sessions = state.mcp_sessions.lock().unwrap();
+        let chunk = {
+            let sess = sessions.get(&s1).unwrap();
+            let mut out = sess.outbound.lock().unwrap();
+            out.pop_front().map(|m| m.json).unwrap_or_default()
+        };
+        assert!(
+            chunk.contains("resources/updated") && chunk.contains("fixture://owned-by-alpha"),
+            "owner producer must still deliver: {chunk}"
+        );
+    }
+
+    #[test]
+    fn deliver_resource_updated_silent_when_unsubscribed() {
+        // Unsolicited update for a URI with no local subscription: drop, no panic.
+        let state = http_state(false);
+        let s1 = match mint_mcp_session(&state, None) {
+            Ok(s) => s,
+            Err(_) => panic!("mint s1 failed"),
+        };
+        deliver_resource_updated(
+            &state.stdout,
+            &state.mcp_sessions,
+            &state.resource_subs,
+            "alpha",
+            "fixture://nobody-subbed",
+        );
+        let sessions = state.mcp_sessions.lock().unwrap();
+        let sess = sessions.get(&s1).unwrap();
+        assert!(sess.outbound.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resource_subscription_owner_for_matches_first_writer() {
+        let mut table = ResourceSubscriptionTable::default();
+        table.add("s1", "file://a", "alpha").unwrap();
+        assert_eq!(table.owner_for("file://a"), Some("alpha"));
+        // Second session cannot change owner via insert path.
+        table.add("s2", "file://a", "beta").unwrap();
+        assert_eq!(table.owner_for("file://a"), Some("alpha"));
+        assert_eq!(table.owner_for("file://missing"), None);
     }
 
     #[test]
