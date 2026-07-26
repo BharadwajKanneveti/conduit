@@ -1,5 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { clientRestartHint, connectSuccessDescription } from "./clientConnect";
+import {
+  clientRestartHint,
+  connectSuccessDescription,
+  toolportStudioClientBlurb,
+} from "./clientConnect";
 
 describe("clientRestartHint / connectSuccessDescription (SOU-317)", () => {
   it("puts the restart line first and keeps optional scope/backup notes", () => {
@@ -16,5 +20,28 @@ describe("clientRestartHint / connectSuccessDescription (SOU-317)", () => {
     expect(connectSuccessDescription("Claude Desktop")).toBe(
       "Restart Claude Desktop so it loads Toolport.",
     );
+  });
+
+  it("uses a session-scoped hint for Toolport Studio", () => {
+    expect(clientRestartHint("Toolport Studio", "toolport-studio")).toBe(
+      "Start a new conversation in Toolport Studio so it picks up this scope.",
+    );
+    expect(clientRestartHint("Toolport Studio", "other-client")).toBe(
+      "Restart Toolport Studio so it loads Toolport.",
+    );
+    expect(
+      connectSuccessDescription(
+        "Toolport Studio",
+        ['Scoped to the "Work" profile.'],
+        "toolport-studio",
+      ),
+    ).toBe(
+      'Start a new conversation in Toolport Studio so it picks up this scope. Scoped to the "Work" profile.',
+    );
+  });
+
+  it("explains zero-config tools vs Connect for Studio", () => {
+    expect(toolportStudioClientBlurb()).toMatch(/discovers Toolport automatically/);
+    expect(toolportStudioClientBlurb()).toMatch(/pin a profile/);
   });
 });

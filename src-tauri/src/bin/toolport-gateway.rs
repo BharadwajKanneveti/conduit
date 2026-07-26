@@ -108,6 +108,16 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> std::io::R
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
 }
 
+/// Serialize a complete JSON-RPC frame before touching stdout. Formatting a
+/// `serde_json::Value` directly into a pipe can issue many small writes; clients
+/// with fragile stdio decoders may mistake those chunks for complete frames.
+fn write_json_line<W: Write>(writer: &mut W, value: &Value) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    writer.write_all(&line)?;
+    writer.flush()
+}
+
 /// Validate the model-authored search query in one short-circuiting pass before
 /// it reaches lexical ranking or the optional embedding endpoint. The ranker
 /// splits on whitespace too, so this token bound matches the work it performs.
@@ -2888,7 +2898,7 @@ fn run_script_dispatch(
         savings::record_orchestration((outcome.calls - 1) as u64);
     }
 
-    match outcome.error {
+    let mut result = match outcome.error {
         Some(err) => json!({
             "content": [{ "type": "text", "text": format!("Toolport code mode: the script failed: {err}") }],
             "isError": true,
@@ -2904,7 +2914,18 @@ fn run_script_dispatch(
                 "structuredContent": { "toolportScript": { "ok": true, "calls": outcome.calls }, "result": outcome.value }
             })
         }
+    };
+
+    // Each toolport.call() result is shaped independently, but a script can aggregate
+    // many individually bounded results into one response that is far larger than the
+    // client transport can safely decode. Shape the final aggregate as one unit too.
+    // The full aggregate remains available through toolport_fetch_result's cursor.
+    let (budget, warning) = shaping::budget();
+    if let Some(msg) = warning {
+        eprintln!("{msg}");
     }
+    shaping::shape_result(&mut result, budget, client);
+    result
 }
 
 #[cfg(test)]
@@ -3914,8 +3935,10 @@ fn notify_list_changed(stdout: &Arc<Mutex<std::io::Stdout>>, method: &str) {
     let mut out = stdout
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = writeln!(out, "{}", json!({ "jsonrpc": "2.0", "method": method }));
-    let _ = out.flush();
+    let _ = write_json_line(
+        &mut *out,
+        &json!({ "jsonrpc": "2.0", "method": method }),
+    );
 }
 
 /// Persist a freshly built or refreshed catalog and tell the client it changed.
@@ -4688,9 +4711,7 @@ impl StdioUpstream {
                 .stdout
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            writeln!(out, "{req}")
-                .and_then(|_| out.flush())
-                .map_err(|e| e.to_string())
+            write_json_line(&mut *out, &req).map_err(|e| e.to_string())
         };
         if let Err(e) = send {
             self.pending
@@ -5539,7 +5560,7 @@ fn write_stdio_response(
         let mut out = stdout
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writeln!(out, "{response}").and_then(|_| out.flush())
+        write_json_line(&mut *out, response)
     };
     if let Err(err) = result {
         stdout_broken.store(true, Ordering::SeqCst);
@@ -8193,6 +8214,58 @@ mod tests {
         assert_eq!(result["structuredContent"]["result"]["sum"], 60);
     }
 
+    /// A code-mode script can combine several individually shaped downstream results.
+    /// The final aggregate must itself stay within the gateway result budget, otherwise
+    /// large single-line JSON-RPC responses can break client transport decoders.
+    #[test]
+    fn run_script_shapes_oversized_final_aggregate() {
+        let reg = Registry::default();
+        let router = Arc::new(paging_router("x".repeat(shaping::DEFAULT_BUDGET_BYTES * 2)));
+        let args = json!({
+            "script": "return [ \
+                toolport.call('s__big', {}), \
+                toolport.call('s__big', {}), \
+                toolport.call('s__big', {}), \
+                toolport.call('s__big', {}) \
+            ];"
+        });
+
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args);
+        let serialized = serde_json::to_string(&result).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        assert!(
+            serialized.len() <= shaping::DEFAULT_BUDGET_BYTES,
+            "final aggregate was {} bytes, over the {} byte budget",
+            serialized.len(),
+            shaping::DEFAULT_BUDGET_BYTES
+        );
+        assert!(text.contains("Toolport shaped this result"));
+        assert!(text.contains("\"cursor\":\"r"));
+        assert!(
+            result.get("structuredContent").is_none(),
+            "the oversized structured aggregate should move behind the fetch cursor"
+        );
+
+        let cursor = text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("shaped result cursor");
+        let fetched = shaping::fetch_result(cursor, 0, usize::MAX, None, Some("result"));
+        let fetched_text = fetched["content"][0]["text"]
+            .as_str()
+            .expect("fetched aggregate text");
+        let aggregate: Value =
+            serde_json::from_str(fetched_text).expect("complete fetched aggregate");
+        let calls = aggregate.as_array().expect("script returned an array");
+        assert_eq!(calls.len(), 4);
+        assert!(calls.iter().all(|call| call["content"][0]["text"]
+            .as_str()
+            .is_some_and(|body| body.contains("Toolport shaped this result"))));
+    }
+
     /// The per-client scope guard applies to a call made INSIDE a script exactly as it does
     /// to a direct call: a script can't reach a server the client isn't scoped to. This is
     /// the security-critical property of routing script calls through `execute_call`.
@@ -8732,6 +8805,49 @@ mod tests {
             read_bounded_line(&mut reader, 4).unwrap(),
             BoundedLine::Eof
         );
+    }
+
+    #[test]
+    fn json_rpc_frame_is_serialized_before_the_first_write() {
+        #[derive(Default)]
+        struct RecordingWriter {
+            writes: Vec<Vec<u8>>,
+            flushes: usize,
+        }
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.writes.push(buf.to_vec());
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "schema fragment ".repeat(1_000)
+                }]
+            }
+        });
+        let expected = format!("{}\n", serde_json::to_string(&response).unwrap()).into_bytes();
+        let mut writer = RecordingWriter::default();
+
+        write_json_line(&mut writer, &response).unwrap();
+
+        assert_eq!(
+            writer.writes,
+            vec![expected],
+            "one complete newline-delimited frame should reach the pipe writer"
+        );
+        assert_eq!(writer.flushes, 1);
     }
 
     #[test]
