@@ -274,6 +274,40 @@ pub fn is_gateway_basename(name: &str) -> bool {
         || stem.starts_with("conduit-gateway-")
 }
 
+/// Linux `/proc/<pid>/exe` appends ` (deleted)` after the binary is unlinked
+/// (package upgrade). Strip it so basename matching still sees the real image.
+/// Pure helper — used by the Linux enumerator and unit-tested.
+fn strip_deleted_exe_suffix(s: &str) -> &str {
+    s.strip_suffix(" (deleted)").unwrap_or(s)
+}
+
+/// Last path component of an `exe` symlink target (or any display path), after
+/// stripping a trailing ` (deleted)` marker. Pure for tests (WS4-3).
+fn basename_from_exe_link(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let cleaned = strip_deleted_exe_suffix(raw.as_ref());
+    Path::new(cleaned)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| cleaned.to_string())
+}
+
+/// Parse one line of `ps -ax -o pid= -o ucomm=` (or `comm=`) into `(pid, name)`.
+/// Pure for tests so a broken argv cannot ship without CI noticing (WS4-1 / WS4-8).
+fn parse_ps_pid_name_line(line: &str) -> Option<(u32, String)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let mut parts = line.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    let name = parts.collect::<Vec<_>>().join(" ");
+    if name.is_empty() {
+        return None;
+    }
+    Some((pid, name))
+}
+
 /// True only for names like `toolport-gateway-1.9.4`, not `toolport-gateway-shim`.
 fn is_versioned_gateway_basename(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
@@ -638,13 +672,14 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
             .trim()
             .to_string();
         if !is_gateway_basename(&basename) {
-            // Also check exe basename — comm can be truncated to 15 chars.
+            // Also check exe basename — comm is truncated to 15 chars
+            // (`toolport-gateway` is 16), so post-upgrade detection depends on
+            // the exe symlink. Strip ` (deleted)` (WS4-3).
             let exe = std::fs::read_link(ent.path().join("exe")).ok();
-            let exe_base = exe
-                .as_ref()
-                .and_then(|p| p.file_name())
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
+            let Some(ref exe_path) = exe else {
+                continue;
+            };
+            let exe_base = basename_from_exe_link(exe_path);
             if !is_gateway_basename(&exe_base) {
                 continue;
             }
@@ -656,7 +691,6 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
             continue;
         }
         let path = std::fs::read_link(ent.path().join("exe")).ok();
-        // read_link may append " (deleted)" on some kernels via weird paths — keep as-is.
         out.push(GatewayProcess {
             pid,
             path,
@@ -666,34 +700,36 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
     out
 }
 
-/// macOS: `ps` for pid + comm (no spaces), then `proc_pidpath` for the real
-/// executable path. Do not parse `command=` — default install paths contain
-/// spaces (`Application Support`) and break whitespace splits.
+/// macOS: `ps` for pid + accounting name (`ucomm`), then `proc_pidpath` for the
+/// real executable path. Do not use `-axo pid= comm=` as a single argv word —
+/// Apple's `ps` treats that as a broken `-o` operand and exits 1 with empty
+/// stdout (WS4-1). Prefer `ucomm` (basename) over `comm` (argv[0] full path).
 #[cfg(target_os = "macos")]
 fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
     let Ok(out) = std::process::Command::new("ps")
-        .args(["-axo", "pid=", "comm="])
+        .args(["-ax", "-o", "pid=", "-o", "ucomm="])
         .output()
     else {
         return Vec::new();
     };
+    // Command::output returns Ok even when ps exits non-zero; a usage error
+    // previously returned an empty list with no log (WS4-1 / WS4-8).
+    if !out.status.success() {
+        eprintln!(
+            "toolport: ps failed listing gateway processes (status={}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return Vec::new();
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut procs = Vec::new();
     for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let Some(pid_s) = parts.next() else {
+        let Some((pid, ucomm)) = parse_ps_pid_name_line(line) else {
             continue;
         };
-        let Ok(pid) = pid_s.parse::<u32>() else {
-            continue;
-        };
-        // comm= is a single field (no path, no args).
-        let comm = parts.collect::<Vec<_>>().join(" ");
-        if comm.is_empty() || !is_gateway_basename(&comm) {
+        // ucomm is the accounting basename; filter before the more expensive path lookup.
+        if !is_gateway_basename(&ucomm) {
             continue;
         }
         let path = macos_proc_pidpath(pid);
@@ -701,7 +737,7 @@ fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or(comm);
+            .unwrap_or(ucomm);
         if !is_gateway_basename(&basename) {
             continue;
         }
@@ -1007,6 +1043,50 @@ mod tests {
         assert!(!is_gateway_basename("my-toolport-gateway-shim"));
         // Prefix only — must be exact stem or stem-version
         assert!(!is_gateway_basename("toolport-gatewayed"));
+    }
+
+    /// WS4-3: post-upgrade `/proc/.../exe` ends with ` (deleted)`.
+    #[test]
+    fn strip_deleted_exe_suffix_and_basename() {
+        assert_eq!(
+            strip_deleted_exe_suffix("/usr/bin/toolport-gateway (deleted)"),
+            "/usr/bin/toolport-gateway"
+        );
+        assert_eq!(
+            strip_deleted_exe_suffix("/usr/bin/toolport-gateway"),
+            "/usr/bin/toolport-gateway"
+        );
+        let deleted = PathBuf::from("/usr/bin/toolport-gateway (deleted)");
+        assert_eq!(basename_from_exe_link(&deleted), "toolport-gateway");
+        assert!(is_gateway_basename(&basename_from_exe_link(&deleted)));
+        // Without the strip, file_name keeps the marker and matching fails.
+        assert!(!is_gateway_basename("toolport-gateway (deleted)"));
+        let live = PathBuf::from("/usr/bin/toolport-gateway-1.9.4");
+        assert_eq!(basename_from_exe_link(&live), "toolport-gateway-1.9.4");
+    }
+
+    /// WS4-1 / WS4-8: pure parse of `ps -o pid= -o ucomm=` lines (including padded pid).
+    #[test]
+    fn parse_ps_pid_name_line_accepts_padded_pid_and_ucomm() {
+        assert_eq!(
+            parse_ps_pid_name_line("  123 toolport-gateway"),
+            Some((123, "toolport-gateway".into()))
+        );
+        assert_eq!(
+            parse_ps_pid_name_line("45678 toolport-gateway-1.9.4"),
+            Some((45678, "toolport-gateway-1.9.4".into()))
+        );
+        assert_eq!(parse_ps_pid_name_line(""), None);
+        assert_eq!(parse_ps_pid_name_line("not-a-pid toolport-gateway"), None);
+        assert_eq!(parse_ps_pid_name_line("99"), None);
+        // Full-path comm= style still parses; basename filter is applied by the caller.
+        assert_eq!(
+            parse_ps_pid_name_line("  42 /Applications/Toolport.app/Contents/MacOS/toolport-gateway"),
+            Some((
+                42,
+                "/Applications/Toolport.app/Contents/MacOS/toolport-gateway".into()
+            ))
+        );
     }
 
     #[test]
