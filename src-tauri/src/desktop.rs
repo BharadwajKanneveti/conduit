@@ -2709,6 +2709,18 @@ fn stop_spawned_gateways() -> u32 {
     crate::gateway_publish::stop_spawned_gateways()
 }
 
+/// Stop obsolete gateway processes (older versions / stale paths), keeping the
+/// current resolved binary. Safe to run any time; used from Settings and launch.
+/// Returns labels of processes that were stopped.
+#[tauri::command]
+fn stop_stale_gateways() -> Vec<String> {
+    let mut extra_keep = Vec::new();
+    if let Some(p) = clients::resolve_gateway_path() {
+        extra_keep.push(p);
+    }
+    crate::gateway_publish::stop_stale_gateways_with_keep(&extra_keep)
+}
+
 /// Start `toolport-gateway --http <port>` as a supervised child so HTTP/OpenAPI
 /// clients can connect. Idempotent: if it's already running, returns the current
 /// status; otherwise spawns the bundled gateway binary and tracks it.
@@ -3113,6 +3125,7 @@ pub fn run() {
             stop_http_bridge,
             http_bridge_status,
             stop_spawned_gateways,
+            stop_stale_gateways,
         ])
         // Close-to-tray: the window's X hides it instead of quitting, so the gateway and
         // approval broker keep running (HITL only works while the app is alive). Quit is
@@ -3220,6 +3233,10 @@ pub fn run() {
                 // auto-respawns). Path-based identity on all OS (SOU-414); not gated on
                 // repoint (SOU-306). Pass resolve_gateway_path so the nested macOS helper /
                 // AppImage stable path is kept even when publish is Windows-only.
+                //
+                // Run once immediately, then again after a short delay so a client that
+                // race-respawns an old path between repoint and the first kill is cleaned up
+                // without another full app restart.
                 let mut extra_keep = Vec::new();
                 if let Some(p) = clients::resolve_gateway_path() {
                     extra_keep.push(p);
@@ -3232,6 +3249,19 @@ pub fn run() {
                         stale.join("; ")
                     );
                 }
+                let keep_for_retry = extra_keep.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    let again =
+                        crate::gateway_publish::stop_stale_gateways_with_keep(&keep_for_retry);
+                    if !again.is_empty() {
+                        eprintln!(
+                            "toolport: delayed reaper stopped {} more stale gateway process(es): {}",
+                            again.len(),
+                            again.join("; ")
+                        );
+                    }
+                });
             });
 
             // Start the human-approval broker: it publishes a loopback endpoint that every

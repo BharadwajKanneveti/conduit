@@ -16,6 +16,7 @@ import {
   Moon,
   Pin,
   Power,
+  RefreshCw,
   ShieldAlert,
   ShieldCheck,
   ShieldX,
@@ -56,6 +57,7 @@ import {
   setToolPinned,
   startHttpBridge,
   stopHttpBridge,
+  stopStaleGateways,
   type HttpBridgeStatus,
   type QuarantinedTool,
 } from "@/lib/api";
@@ -566,6 +568,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const [newProfile, setNewProfile] = useState("");
   const [newToken, setNewToken] = useState<string | null>(null);
   const [clientBusy, setClientBusy] = useState(false);
+  const [reapBusy, setReapBusy] = useState(false);
+  const [reapResult, setReapResult] = useState<string | null>(null);
   const [autostartOn, setAutostartOn] = useState(false);
 
   const httpClients = registry?.httpClients ?? [];
@@ -1257,6 +1261,45 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               </div>
             </>
           )}
+        </div>
+        <div className="flex flex-col gap-2 rounded-md border px-3 py-2.5">
+          <div className="flex items-center gap-2.5 text-sm">
+            <RefreshCw
+              className={`size-4 shrink-0 text-muted-foreground ${reapBusy ? "animate-spin" : ""}`}
+            />
+            <span className="flex min-w-0 flex-1 flex-col leading-tight">
+              <span className="font-medium">Stop old gateways</span>
+              <span className="text-xs text-muted-foreground">
+                End leftover gateway processes from earlier installs. Agents that
+                auto-respawn MCP pick up the current binary on the next tool call; no full
+                app restart required for those hosts.
+              </span>
+            </span>
+            <button
+              type="button"
+              disabled={reapBusy}
+              onClick={async () => {
+                setReapBusy(true);
+                setReapResult(null);
+                try {
+                  const stopped = await stopStaleGateways();
+                  setReapResult(
+                    stopped.length === 0
+                      ? "No old gateway processes found."
+                      : `Stopped ${stopped.length}: ${stopped.join("; ")}`,
+                  );
+                } catch (e) {
+                  toastError(`Couldn't stop old gateways: ${e}`);
+                } finally {
+                  setReapBusy(false);
+                }
+              }}
+              className="h-8 shrink-0 rounded-md border bg-background px-2.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
+            >
+              {reapBusy ? "Working…" : "Run"}
+            </button>
+          </div>
+          {reapResult && <p className="text-xs text-muted-foreground">{reapResult}</p>}
         </div>
       </section>
     </div>
