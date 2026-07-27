@@ -249,11 +249,14 @@ fn default_keep_paths() -> Vec<PathBuf> {
 }
 
 fn paths_equal(a: &Path, b: &Path) -> bool {
-    let na = normalize_path(a);
-    let nb = normalize_path(b);
-    na == nb
+    // Resolve symlinks when the files exist so macOS helper vs Contents/MacOS
+    // symlink to the same binary both match a keep path.
+    let ca = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
+    let cb = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
+    normalize_path(&ca) == normalize_path(&cb)
 }
 
+/// Normalize for comparison only. Always uses `\` so callers check one form.
 fn normalize_path(p: &Path) -> String {
     p.to_string_lossy()
         .replace('/', "\\")
@@ -265,20 +268,41 @@ fn normalize_path(p: &Path) -> String {
 pub fn is_gateway_basename(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
-    stem.starts_with("toolport-gateway") || stem.starts_with("conduit-gateway")
+    stem == "toolport-gateway"
+        || stem == "conduit-gateway"
+        || stem.starts_with("toolport-gateway-")
+        || stem.starts_with("conduit-gateway-")
 }
 
+/// True only for names like `toolport-gateway-1.9.4`, not `toolport-gateway-shim`.
 fn is_versioned_gateway_basename(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     let stem = lower.strip_suffix(".exe").unwrap_or(&lower);
-    // toolport-gateway-1.9.4 or conduit-gateway-1.9.4 — not bare toolport-gateway
-    if let Some(rest) = stem.strip_prefix("toolport-gateway-") {
-        return !rest.is_empty();
+    let rest = if let Some(r) = stem.strip_prefix("toolport-gateway-") {
+        r
+    } else if let Some(r) = stem.strip_prefix("conduit-gateway-") {
+        r
+    } else {
+        return false;
+    };
+    looks_like_version_suffix(rest)
+}
+
+/// Version suffix: starts with a digit, contains `.`, and only version-ish chars
+/// (e.g. `1.9.4`, `1.9.4-beta.1`). Rejects `shim`, `helper`, target triples alone.
+fn looks_like_version_suffix(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
     }
-    if let Some(rest) = stem.strip_prefix("conduit-gateway-") {
-        return !rest.is_empty();
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_digit() || !s.contains('.') {
+        return false;
     }
-    false
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '+' | '_'))
 }
 
 fn basename_matches_current_version(name: &str, version: &str) -> bool {
@@ -293,10 +317,7 @@ fn basename_matches_current_version(name: &str, version: &str) -> bool {
 /// `tauri dev` is not murdered by a packaged Toolport on the same machine.
 fn is_dev_target_path(path: &Path) -> bool {
     let n = normalize_path(path);
-    n.contains("\\target\\debug\\")
-        || n.contains("\\target\\release\\")
-        || n.contains("/target/debug/")
-        || n.contains("/target/release/")
+    n.contains("\\target\\debug\\") || n.contains("\\target\\release\\")
 }
 
 /// Path is under a Toolport/Conduit product location (data dir bin, install leaf,
@@ -306,8 +327,6 @@ fn path_looks_like_our_install(path: &Path) -> bool {
     let n = normalize_path(path);
     n.contains("\\toolport\\")
         || n.contains("\\conduit\\")
-        || n.contains("/toolport/")
-        || n.contains("/conduit/")
         || n.contains("toolportgateway.app")
         || n.contains("conduitgateway.app")
         || n.contains("toolport.app")
@@ -337,7 +356,12 @@ pub fn decide_reap(proc: &GatewayProcess, ctx: &ReapContext) -> ReapDecision {
             return ReapDecision::Keep;
         }
         if is_versioned_gateway_basename(&proc.basename) {
-            return ReapDecision::Kill;
+            // Only kill versioned images under our product paths (not toolport-gateway-shim
+            // in /opt/other-vendor, and not non-version suffixes that snuck through).
+            if path_looks_like_our_install(path) {
+                return ReapDecision::Kill;
+            }
+            return ReapDecision::Keep;
         }
         // Unversioned basename (macOS/Linux/AppImage/dev packaged): path is the
         // identity. Not equal to keep_paths and looks like ours → obsolete copy.
@@ -422,9 +446,6 @@ fn log_reap_report(kind: &str, report: &ReapReport) {
             report.failed.len(),
             report.failed.join("; ")
         );
-    }
-    if report.killed.is_empty() && report.failed.is_empty() && !report.kept.is_empty() {
-        // Quiet on the common clean-launch path; only note when debugging would help.
     }
 }
 
@@ -645,11 +666,13 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
     out
 }
 
-/// macOS: `ps` for pid + command line (no /proc).
+/// macOS: `ps` for pid + comm (no spaces), then `proc_pidpath` for the real
+/// executable path. Do not parse `command=` — default install paths contain
+/// spaces (`Application Support`) and break whitespace splits.
 #[cfg(target_os = "macos")]
 fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
     let Ok(out) = std::process::Command::new("ps")
-        .args(["-ax", "-o", "pid=", "-o", "command="])
+        .args(["-axo", "pid=", "comm="])
         .output()
     else {
         return Vec::new();
@@ -668,22 +691,17 @@ fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
         let Ok(pid) = pid_s.parse::<u32>() else {
             continue;
         };
-        let cmd = parts.collect::<Vec<_>>().join(" ");
-        if cmd.is_empty() {
+        // comm= is a single field (no path, no args).
+        let comm = parts.collect::<Vec<_>>().join(" ");
+        if comm.is_empty() || !is_gateway_basename(&comm) {
             continue;
         }
-        // First token is the executable path (or name).
-        let exe = cmd.split_whitespace().next().unwrap_or("");
-        let path = if exe.contains('/') {
-            Some(PathBuf::from(exe))
-        } else {
-            None
-        };
+        let path = macos_proc_pidpath(pid);
         let basename = path
             .as_ref()
             .and_then(|p| p.file_name())
             .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| exe.to_string());
+            .unwrap_or(comm);
         if !is_gateway_basename(&basename) {
             continue;
         }
@@ -694,6 +712,31 @@ fn macos_list_gateway_processes() -> Vec<GatewayProcess> {
         });
     }
     procs
+}
+
+/// Full executable path for a pid via libproc (handles spaces and symlinks).
+#[cfg(target_os = "macos")]
+fn macos_proc_pidpath(pid: u32) -> Option<PathBuf> {
+    // proc_pidpath is in libSystem on macOS; no extra crate needed.
+    extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut std::ffi::c_void, buffersize: u32) -> i32;
+    }
+    let mut buf = [0u8; 4096];
+    let n = unsafe {
+        proc_pidpath(
+            pid as i32,
+            buf.as_mut_ptr() as *mut std::ffi::c_void,
+            buf.len() as u32,
+        )
+    };
+    if n <= 0 {
+        return None;
+    }
+    let s = std::str::from_utf8(&buf[..n as usize]).ok()?;
+    if s.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(s))
 }
 
 #[cfg(unix)]
@@ -899,6 +942,51 @@ mod tests {
     }
 
     #[test]
+    fn decide_keeps_versioned_looking_stranger_outside_install() {
+        // CodeRabbit: versioned branch must not kill /opt/other-vendor/toolport-gateway-1.0.0
+        // style strangers (and non-version suffixes must not count as versioned).
+        let c = ctx(
+            "1.9.6",
+            &[r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-1.9.6.exe"],
+            false,
+        );
+        assert_eq!(
+            decide_reap(
+                &proc(
+                    11,
+                    "toolport-gateway-1.0.0",
+                    Some("/opt/other-vendor/toolport-gateway-1.0.0")
+                ),
+                &c
+            ),
+            ReapDecision::Keep
+        );
+        assert_eq!(
+            decide_reap(
+                &proc(
+                    12,
+                    "toolport-gateway-shim",
+                    Some(r"C:\Users\me\AppData\Roaming\Toolport\bin\toolport-gateway-shim.exe")
+                ),
+                &c
+            ),
+            // Non-version suffix under our path, not in keep list → unversioned-path kill
+            ReapDecision::Kill
+        );
+    }
+
+    #[test]
+    fn version_suffix_requires_digit_and_dot() {
+        assert!(looks_like_version_suffix("1.9.4"));
+        assert!(looks_like_version_suffix("1.9.4-beta.1"));
+        assert!(!looks_like_version_suffix("shim"));
+        assert!(!looks_like_version_suffix("helper"));
+        assert!(!looks_like_version_suffix("aarch64-apple-darwin"));
+        assert!(!is_versioned_gateway_basename("toolport-gateway-shim.exe"));
+        assert!(is_versioned_gateway_basename("toolport-gateway-1.9.4.exe"));
+    }
+
+    #[test]
     fn decide_kill_all_kills_everything_gateway() {
         let c = ctx("1.9.6", &[r"C:\keep\toolport-gateway-1.9.6.exe"], true);
         assert_eq!(
@@ -917,6 +1005,8 @@ mod tests {
         assert!(is_gateway_basename("conduit-gateway"));
         assert!(!is_gateway_basename("cursor.exe"));
         assert!(!is_gateway_basename("my-toolport-gateway-shim"));
+        // Prefix only — must be exact stem or stem-version
+        assert!(!is_gateway_basename("toolport-gatewayed"));
     }
 
     #[test]
