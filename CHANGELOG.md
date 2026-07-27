@@ -6,6 +6,10 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+## [1.9.6] - 2026-07-27
+
+Client config ownership, shared-HTTP transport, and safer vendor matching.
+
 ### Discovery
 
 **Code mode on by default.** `toolport_run_script` is advertised unless you turn **Code
@@ -33,21 +37,26 @@ heuristic. (SOU-406, follow-up to #487)
 
 **A hand-edited gateway entry is no longer reverted on every app launch.** The
 launch-time re-point recognized its own entry by _name_, so an entry still called
-`toolport` but pointed at something else — an `mcp-remote` bridge against the HTTP
-endpoint, a container, a wrapper script — was treated as a stale install and rewritten
+`toolport` but pointed at something else - an `mcp-remote` bridge against the HTTP
+endpoint, a container, a wrapper script - was treated as a stale install and rewritten
 back to the default stdio command every time the app started. Re-pointing now requires
 the stored command to actually name a Toolport gateway binary; anything else is treated
 as user-managed and left exactly as written (and the skip is logged). Genuine
-migrations — an older version, the pre-rename `conduit-gateway`, the pre-rename data
-directory, an unversioned install path — are unaffected. (#487)
+migrations - an older version, the pre-rename `conduit-gateway`, the pre-rename data
+directory, an unversioned install path - are unaffected. (#487, #488)
 
 **A machine-wide `TOOLPORT_HTTP` / `CONDUIT_HTTP` no longer hijacks client-spawned
 gateways.** HTTP mode replaces the stdio transport, so an inherited value left every
 MCP client with a gateway that never answered its pipe, and every gateway after the
-first colliding on the shared port (`WSAEADDRINUSE`) — which some clients treat as
+first colliding on the shared port (`WSAEADDRINUSE`) - which some clients treat as
 fatal. The env forms are now ignored, with a warning, when stdin is a pipe. The
 desktop app, the Docker images, and the documented headless setup all pass `--http`
 explicitly and are unaffected; use the flag in scripts and services too. (#487)
+
+**Vendor auth hints match on domain-label boundaries only.** Bare needles like
+`clerk` / `github` no longer match attacker subdomains (`clerk.evil.com`), and full
+domain needles require a real host suffix. Spoofed hosts can no longer skip the live
+probe via `force_kind`. (#417, #492)
 
 ## [1.9.5] - 2026-07-25
 
