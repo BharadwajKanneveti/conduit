@@ -763,6 +763,10 @@ fn install_gateway(
 
 /// Mint or reuse a bearer token for a managed shared-HTTP client install.
 /// Plaintext lives in the OS keychain; only the hash is in `http_clients`.
+///
+/// When reusing a vaulted token, rewrite the row's `profile` if the caller asked
+/// for a different scope — Shared HTTP scope is derived solely from that row
+/// (WS3-5), not from `client_scopes` / TOOLPORT_PROFILE env.
 fn ensure_client_http_token(
     state: &RegistryState,
     client_id: &str,
@@ -770,34 +774,66 @@ fn ensure_client_http_token(
 ) -> Result<String, String> {
     const VAULT_SERVER: &str = "__toolport_http_clients__";
     let http_id = format!("client:{client_id}");
+    let desired_profile = profile.unwrap_or("").trim().to_string();
     // Reuse vaulted token when we still have a matching http_clients row.
     if let Some(existing) = crate::secrets::get_secret(VAULT_SERVER, client_id) {
-        let reg = state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let hash = registry::sha256_hex(&existing);
-        if reg
-            .http_clients
-            .iter()
-            .any(|c| c.id == http_id && c.token_sha256 == hash)
+        let mut matched = false;
+        let mut profile_stale = false;
         {
+            let reg = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(row) = reg
+                .http_clients
+                .iter()
+                .find(|c| c.id == http_id && c.token_sha256 == hash)
+            {
+                matched = true;
+                profile_stale = row.profile != desired_profile;
+            }
+        }
+        if matched {
+            if profile_stale {
+                write_registry(state, |reg| {
+                    if let Some(row) = reg
+                        .http_clients
+                        .iter_mut()
+                        .find(|c| c.id == http_id && c.token_sha256 == hash)
+                    {
+                        row.profile = desired_profile;
+                    }
+                    Ok(())
+                })?;
+            }
             return Ok(existing);
         }
     }
     let token = random_hex()?;
     crate::secrets::set_secret(VAULT_SERVER, client_id, &token)?;
-    let profile = profile.unwrap_or("").trim().to_string();
     write_registry(state, |reg| {
         reg.http_clients.retain(|c| c.id != http_id);
         reg.http_clients.push(registry::HttpClient {
             id: http_id,
             label: format!("Client: {client_id}"),
             token_sha256: registry::sha256_hex(&token),
-            profile,
+            profile: desired_profile,
         });
         Ok(())
     })?;
     Ok(token)
+}
+
+/// Drop the managed shared-HTTP bearer for this client (registry row + vault).
+/// Best-effort on vault delete so a missing secret never blocks Disconnect (WS3-4).
+fn revoke_client_http_token(state: &RegistryState, client_id: &str) {
+    const VAULT_SERVER: &str = "__toolport_http_clients__";
+    let http_id = format!("client:{client_id}");
+    let _ = crate::secrets::delete_secret(VAULT_SERVER, client_id);
+    let _ = write_registry(state, |reg| {
+        reg.http_clients.retain(|c| c.id != http_id);
+        Ok(())
+    });
 }
 
 /// Remove the Toolport gateway from a client.
@@ -807,6 +843,9 @@ fn uninstall_gateway(
     client_id: String,
 ) -> Result<clients::WriteOutcome, String> {
     let outcome = clients::uninstall_gateway(&client_id)?;
+    // Config entry is gone; also revoke the bridge bearer so a leftover backup or
+    // stale token cannot keep authenticating (WS3-4).
+    revoke_client_http_token(state.inner(), &client_id);
     write_registry(state.inner(), |reg| {
         reg.set_client_scope(&client_id, None);
         reg.clear_client_managed_entry(&client_id);
@@ -889,9 +928,11 @@ struct MigrateResult {
 #[tauri::command]
 async fn migrate_client(
     state: State<'_, RegistryState>,
+    bridge: State<'_, HttpBridgeState>,
     client_id: String,
     profile: Option<String>,
     force: Option<bool>,
+    transport: Option<String>,
 ) -> Result<MigrateResult, String> {
     // Guard before import or rewrite so a hand-edited gateway entry is not wiped.
     refuse_if_customized(state.inner(), &client_id, force.unwrap_or(false))?;
@@ -925,9 +966,25 @@ async fn migrate_client(
         Ok((imported, moved))
     })?;
 
-    // Rewrite the client to only the gateway (backs up first). External to the registry, so
-    // it stays outside the lock; the scope record below is a separate locked write.
-    let migrate_write = clients::migrate_to_gateway(&client_id, profile.as_deref())?;
+    // Rewrite the client to only the gateway (backs up first). Honor transport so
+    // migrate does not silently force stdio when the UI chose Shared HTTP (WS3-2).
+    let transport = transport
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("stdio");
+    let migrate_write = if transport.eq_ignore_ascii_case("sharedHttp")
+        || transport.eq_ignore_ascii_case("shared_http")
+    {
+        let status = start_http_bridge(bridge, None)?;
+        let port = status.port.unwrap_or(8765);
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let token = ensure_client_http_token(state.inner(), &client_id, profile.as_deref())?;
+        let spec = clients::SharedHttpSpec { url, token };
+        clients::migrate_to_gateway_with_transport(&client_id, profile.as_deref(), Some(&spec))?
+    } else {
+        clients::migrate_to_gateway(&client_id, profile.as_deref())?
+    };
 
     // Record the scope now that the client config was rewritten to the gateway.
     // "No profile" becomes an explicit-unscoped marker (not a removal) so a live
