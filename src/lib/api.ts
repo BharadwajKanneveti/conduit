@@ -468,16 +468,19 @@ export function detectClients(): Promise<DetectedClient[]> {
 
 /** Install the Toolport gateway into a client's config, optionally scoped to a
  * profile (by name). Omit profile to expose all enabled servers.
- * Pass `force: true` after the user confirms overwriting a custom entry (SOU-406). */
+ * Pass `force: true` after the user confirms overwriting a custom entry (SOU-406).
+ * `transport` is `"stdio"` (default) or `"sharedHttp"` (SOU-407). */
 export function installGateway(
   clientId: string,
   profile?: string,
   force?: boolean,
+  transport?: "stdio" | "sharedHttp",
 ): Promise<WriteOutcome> {
   return invoke<WriteOutcome>("install_gateway", {
     clientId,
     profile: profile ?? null,
     force: force ?? false,
+    transport: transport ?? "stdio",
   });
 }
 

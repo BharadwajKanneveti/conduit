@@ -451,44 +451,97 @@ pub struct Registry {
 
 /// Snapshot of the gateway entry Toolport last wrote into a client config (SOU-406).
 /// Compared against the live entry on detect so a deliberate hand-edit is not treated
-/// as a stale install.
+/// as a stale install. Bearer tokens are never stored here (stripped from env/args).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagedEntry {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    /// Env key→value pairs we wrote (gateway env is non-secret: client id / profile).
-    /// `BTreeMap` keeps serde order stable for equality checks.
+    /// Env key→value pairs we wrote (non-secret only: client id / profile).
+    /// `BTreeMap` keeps serde order stable for equality checks. Authorization is stripped.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
+    /// `"stdio"` (default) or `"sharedHttp"` (SOU-407).
+    #[serde(default = "managed_transport_stdio")]
+    pub transport: String,
+    /// Shared-HTTP MCP URL when `transport` is `sharedHttp`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
     /// Unix epoch seconds when we last wrote this entry.
     #[serde(default)]
     pub updated_at: u64,
 }
 
+fn managed_transport_stdio() -> String {
+    "stdio".into()
+}
+
 impl ManagedEntry {
     /// Build a record from the [`ServerEntry`] we are about to (or just did) write.
+    /// Strips bearer tokens so the registry never holds HTTP credentials.
     pub fn from_gateway_entry(entry: &ServerEntry) -> Self {
         let env = entry
             .env
             .iter()
+            .filter(|e| !e.key.eq_ignore_ascii_case("authorization"))
             .filter_map(|e| {
                 e.value
                     .as_ref()
                     .map(|v| (e.key.clone(), v.clone()))
             })
             .collect();
+        let args = strip_auth_header_args(&entry.args);
+        let is_bridge = entry
+            .command
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case("npx"))
+            && entry.args.iter().any(|a| a == "mcp-remote");
+        let is_shared = entry.url.is_some() || is_bridge;
         Self {
             command: entry.command.clone().unwrap_or_default(),
-            args: entry.args.clone(),
+            args,
             env,
+            transport: if is_shared {
+                "sharedHttp".into()
+            } else {
+                "stdio".into()
+            },
+            url: entry.url.clone().or_else(|| {
+                // Bridge form: URL is an mcp-remote arg.
+                entry
+                    .args
+                    .iter()
+                    .find(|a| a.starts_with("http://") || a.starts_with("https://"))
+                    .cloned()
+            }),
             updated_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0),
         }
     }
+}
+
+/// Drop `--header` / `Authorization: …` pairs so ownership records stay non-secret.
+pub fn strip_auth_header_args(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--header" {
+            // Skip flag and its value (often `Authorization: Bearer …`).
+            i += 2;
+            continue;
+        }
+        if a.to_ascii_lowercase().starts_with("authorization:") {
+            i += 1;
+            continue;
+        }
+        out.push(a.clone());
+        i += 1;
+    }
+    out
 }
 
 /// A joined Conduit Teams server. Holds only non-secret connection metadata; the
@@ -2266,6 +2319,8 @@ mod tests {
             env: [("TOOLPORT_CLIENT_ID".into(), "claude-desktop".into())]
                 .into_iter()
                 .collect(),
+            transport: "stdio".into(),
+            url: None,
             updated_at: 42,
         };
         r.set_client_managed_entry("claude-desktop", entry.clone());

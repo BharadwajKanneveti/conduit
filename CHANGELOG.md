@@ -14,6 +14,14 @@ still hits the same scope and approval gates as `toolport_call_tool`. Code mode 
 security boundary (agent-supplied JS). `TOOLPORT_CODE_MODE=1` still force-enables.
 Existing registries that already store `"codeMode": false` stay off. (SOU-397)
 
+### Added
+
+**Per-client transport: Spawn (stdio) or Shared HTTP.** Integrations can connect a
+client to the supervised HTTP bridge instead of spawning its own gateway. Native
+remote shapes (VS Code, OpenCode, Qwen, Hermes, Continue) get a url + bearer entry;
+clients that only support stdio (Claude Desktop, etc.) get an opt-in `npx mcp-remote`
+bridge. Tokens are vaulted; ownership records never store bearers. (SOU-407)
+
 ### Fixed
 
 **Client gateway ownership is now a first-class state (Managed / Customized /
