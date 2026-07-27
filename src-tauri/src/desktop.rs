@@ -2702,8 +2702,8 @@ fn http_bridge_alive(bridge: &mut HttpBridge) -> bool {
     alive
 }
 
-/// Stop client-spawned gateway processes before an in-app update (Windows).
-/// MCP clients stay open; only `toolport-gateway` children exit.
+/// Stop client-spawned gateway processes before an in-app update (all platforms).
+/// MCP clients stay open; only `toolport-gateway` / `conduit-gateway` children exit.
 #[tauri::command]
 fn stop_spawned_gateways() -> u32 {
     crate::gateway_publish::stop_spawned_gateways()
@@ -3215,25 +3215,21 @@ pub fn run() {
                         repoint.customized.join(", ")
                     );
                 }
-                // Stop any gateway running a version other than this one, so each client
-                // respawns the freshly-installed gateway on its next request rather than the
-                // user having to relaunch the client. Covers MANUAL updates (running the
-                // installer), which never go through the in-app updater that already calls
-                // stop_spawned_gateways.
-                //
-                // Deliberately NOT gated on `repointed` (SOU-306). That call is idempotent, so
-                // once configs point at the new binary it returns empty forever and the cleanup
-                // became one-shot: it was a proxy for "is a running gateway on an old version?"
-                // and the two come apart precisely after a manual install, or on any launch
-                // after the first. Checking versions directly makes this self-correcting, so a
-                // later launch still cleans up what an earlier one missed. Current-version
-                // gateways are left alone, so a normal launch kills nothing.
-                let stale = crate::gateway_publish::stop_stale_gateways();
+                // Stop obsolete gateway processes so each client respawns the current binary
+                // on its next MCP request (no full agent restart required when the host
+                // auto-respawns). Path-based identity on all OS (SOU-414); not gated on
+                // repoint (SOU-306). Pass resolve_gateway_path so the nested macOS helper /
+                // AppImage stable path is kept even when publish is Windows-only.
+                let mut extra_keep = Vec::new();
+                if let Some(p) = clients::resolve_gateway_path() {
+                    extra_keep.push(p);
+                }
+                let stale = crate::gateway_publish::stop_stale_gateways_with_keep(&extra_keep);
                 if !stale.is_empty() {
                     eprintln!(
-                        "toolport: stopped {} stale gateway process image(s): {}",
+                        "toolport: stopped {} stale gateway process(es): {}",
                         stale.len(),
-                        stale.join(", ")
+                        stale.join("; ")
                     );
                 }
             });
