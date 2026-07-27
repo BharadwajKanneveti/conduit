@@ -66,6 +66,11 @@ const MAX_RESOURCE_SUBS_PER_SESSION: usize = 256;
 /// Process-wide cap on concurrent resource subscriptions (SOU-394).
 const MAX_RESOURCE_SUBS_TOTAL: usize = 4096;
 
+/// How long a waiter blocks for the leader's downstream subscribe before failing
+/// closed (WS1-4). Prevents permanent worker parking if the leader panics or
+/// never finishes the open.
+const OPEN_GATE_WAIT: Duration = Duration::from_secs(60);
+
 /// Coordinates concurrent first-subscriber races for one URI.
 struct OpenGate {
     /// `None` while the leader's downstream subscribe is in flight.
@@ -91,20 +96,80 @@ impl OpenGate {
     }
 
     fn wait(&self) -> Result<(), String> {
+        self.wait_for(OPEN_GATE_WAIT)
+    }
+
+    /// Wait for the leader with an explicit timeout (unit tests use a short one).
+    fn wait_for(&self, timeout: Duration) -> Result<(), String> {
         let mut guard = self
             .result
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = Instant::now() + timeout;
         while guard.is_none() {
-            guard = self
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(
+                    "timed out waiting for another client to open the resource subscription"
+                        .into(),
+                );
+            }
+            let (next, wait_result) = self
                 .cv
-                .wait(guard)
+                .wait_timeout(guard, deadline.saturating_duration_since(now))
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard = next;
+            if wait_result.timed_out() && guard.is_none() {
+                return Err(
+                    "timed out waiting for another client to open the resource subscription"
+                        .into(),
+                );
+            }
         }
         match guard.as_ref() {
             Some(Ok(())) => Ok(()),
             Some(Err(e)) => Err(e.clone()),
             None => unreachable!("loop exits only when result is set"),
+        }
+    }
+}
+
+/// If the leader panics (or otherwise unwinds) between claiming leadership and
+/// calling `finish_open_*`, clear the opening gate and fail waiters (WS1-4).
+struct LeadOpenGuard<'a> {
+    state: &'a GatewayState,
+    uri: String,
+    gate: Arc<OpenGate>,
+    armed: bool,
+}
+
+impl LeadOpenGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LeadOpenGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut table = self
+            .state
+            .resource_subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only finish if this gate is still the in-flight open for the URI.
+        let still_ours = table
+            .opening
+            .get(&self.uri)
+            .is_some_and(|g| Arc::ptr_eq(g, &self.gate));
+        if still_ours {
+            table.finish_open_err(
+                &self.uri,
+                &self.gate,
+                "resource subscribe aborted".into(),
+            );
         }
     }
 }
@@ -4753,6 +4818,14 @@ fn handle_resource_subscription(
                         return Some(success(id, json!({})));
                     }
                     BeginSubscribe::Lead(gate) => {
+                        // If subscribe_resource panics, Drop clears `opening` and
+                        // fails waiters instead of parking them forever (WS1-4).
+                        let mut lead_guard = LeadOpenGuard {
+                            state,
+                            uri: uri.to_string(),
+                            gate: Arc::clone(&gate),
+                            armed: true,
+                        };
                         match router.subscribe_resource(uri) {
                             Ok(_) => {
                                 let mut table = state
@@ -4760,6 +4833,7 @@ fn handle_resource_subscription(
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 table.finish_open_ok(uri, &gate);
+                                lead_guard.disarm();
                                 return Some(success(id, json!({})));
                             }
                             Err(e) => {
@@ -4769,6 +4843,7 @@ fn handle_resource_subscription(
                                     .lock()
                                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                                 table.finish_open_err(uri, &gate, msg.clone());
+                                lead_guard.disarm();
                                 return Some(error(
                                     id,
                                     -32602,
@@ -6048,17 +6123,41 @@ fn new_mcp_session_id() -> String {
 }
 
 /// Mint a new MCP session after TTL cleanup. Returns 503 when at capacity.
+///
+/// Expired/closed sessions are removed and their resource subscriptions cleaned
+/// up the same way as the per-request session lookup path (WS1-1). A bare
+/// `retain` without cleanup left `by_uri` orphans that counted toward the global
+/// subscription cap forever.
 fn mint_mcp_session(
     state: &GatewayState,
     owner: Option<&McpSessionOwner>,
 ) -> Result<String, HttpOut> {
     let sid = new_mcp_session_id();
     let session = Arc::new(McpSession::new(owner.cloned()));
+    // Collect first so we do not hold the sessions lock across cleanup that may
+    // call the router (same ordering as resolve_mcp_session).
+    let stale: Vec<String> = {
+        let mut sessions = state
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stale: Vec<String> = sessions
+            .iter()
+            .filter(|(_, s)| s.is_expired() || s.closed.load(Ordering::SeqCst))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stale {
+            sessions.remove(id);
+        }
+        stale
+    };
+    for id in &stale {
+        cleanup_resource_subs_for_session(state, id);
+    }
     let mut sessions = state
         .mcp_sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    sessions.retain(|_, s| !s.is_expired() && !s.closed.load(Ordering::SeqCst));
     if sessions.len() >= MCP_SESSION_MAX {
         return Err(HttpOut::json_err(503, "too many MCP sessions; retry later"));
     }
@@ -11747,6 +11846,54 @@ mod tests {
         table2.finish_open_err("file://y", &lead2, "downstream refused".into());
         assert!(table2.sessions_for_uri("file://y").is_empty());
         assert_eq!(wait_gate.wait().unwrap_err(), "downstream refused");
+    }
+
+    /// WS1-4: waiters must not park forever when the leader never finishes.
+    #[test]
+    fn open_gate_wait_times_out_when_leader_never_finishes() {
+        let gate = OpenGate::new();
+        let err = gate
+            .wait_for(Duration::from_millis(40))
+            .expect_err("must time out");
+        assert!(err.contains("timed out"), "got: {err}");
+    }
+
+    /// WS1-1: mint_mcp_session must release resource subs held by reaped sessions.
+    #[test]
+    fn mint_mcp_session_cleans_resource_subs_of_closed_sessions() {
+        let state = http_state(false);
+        let s1 = match mint_mcp_session(&state, None) {
+            Ok(s) => s,
+            Err(_) => panic!("mint s1 failed"),
+        };
+        {
+            let mut table = state.resource_subs.lock().unwrap();
+            table.add(&s1, "file://orphan", "srv").unwrap();
+            assert_eq!(table.total_count(), 1);
+        }
+        // Closed sessions are reaped the same way as TTL-expired ones.
+        {
+            let sessions = state.mcp_sessions.lock().unwrap();
+            sessions.get(&s1).expect("s1").close();
+        }
+        let _s2 = match mint_mcp_session(&state, None) {
+            Ok(s) => s,
+            Err(_) => panic!("mint s2 reaps s1 failed"),
+        };
+        {
+            let sessions = state.mcp_sessions.lock().unwrap();
+            assert!(
+                !sessions.contains_key(&s1),
+                "closed session must be removed on mint"
+            );
+        }
+        let table = state.resource_subs.lock().unwrap();
+        assert_eq!(
+            table.total_count(),
+            0,
+            "reaped session must not leave subscription orphans"
+        );
+        assert!(table.sessions_for_uri("file://orphan").is_empty());
     }
 
     #[test]
