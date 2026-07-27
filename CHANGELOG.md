@@ -8,7 +8,8 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [1.9.6] - 2026-07-27
 
-Client config ownership, shared-HTTP transport, and safer vendor matching.
+Client config ownership, Shared HTTP connect, code mode v2 (parallel + typed stubs),
+native resource subscriptions, gateway hardening, and safer vendor matching.
 
 ### Discovery
 
@@ -18,6 +19,10 @@ still hits the same scope and approval gates as `toolport_call_tool`. Code mode 
 security boundary (agent-supplied JS). `TOOLPORT_CODE_MODE=1` still force-enables.
 Existing registries that already store `"codeMode": false` stay off. (SOU-397)
 
+**Code mode parallel calls and typed stubs.** Scripts get `callAsync` / `Promise.all`
+with bounded host parallelism, scoped `servers.*` typed stubs, full intermediate
+results and `fetchResult` handoff. (#480–#483 / SOU-348)
+
 ### Added
 
 **Per-client transport: Spawn (stdio) or Shared HTTP.** Integrations can connect a
@@ -25,6 +30,10 @@ client to the supervised HTTP bridge instead of spawning its own gateway. Native
 remote shapes (VS Code, OpenCode, Qwen, Hermes, Continue) get a url + bearer entry;
 clients that only support stdio (Claude Desktop, etc.) get an opt-in `npx mcp-remote`
 bridge. Tokens are vaulted; ownership records never store bearers. (SOU-407)
+
+**Native MCP resource subscriptions.** Subscribe/unsubscribe and `resources/updated`
+fanout (with producer verification), resource templates + completions, paginated
+catalogs preserved. (#474–#479, #484)
 
 ### Fixed
 
@@ -57,6 +66,13 @@ explicitly and are unaffected; use the flag in scripts and services too. (#487)
 `clerk` / `github` no longer match attacker subdomains (`clerk.evil.com`), and full
 domain needles require a real host suffix. Spoofed hosts can no longer skip the live
 probe via `force_kind`. (#417, #492)
+
+**Headless `secrets.enc` set/delete is locked** against concurrent writers. (SOU-332)
+
+**Profile scope tool-fetch UI** shows failures, ignores stale errors after a newer
+load, and scopes loading state per server. (#468)
+
+**Search efficiency and routed-call audit overhead** improvements. (#472, #473)
 
 ## [1.9.5] - 2026-07-25
 
