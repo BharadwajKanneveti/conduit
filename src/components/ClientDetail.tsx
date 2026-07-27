@@ -184,7 +184,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     }
     setBusy(true);
     try {
-      await installGateway(client.id, profile || undefined);
+      // Pass live transport so Apply scope does not rewrite Shared HTTP → stdio (WS3-2).
+      await installGateway(client.id, profile || undefined, false, transport);
       // Rescope rewrites the client's MCP config the same way Connect does; without a
       // restart hint the change is invisible until the next cold start (SOU-317).
       toast.success(
@@ -232,6 +233,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         client.id,
         profile || undefined,
         customized || undefined,
+        transport,
       );
       onRegistryChange(result.registry);
       toast.success(

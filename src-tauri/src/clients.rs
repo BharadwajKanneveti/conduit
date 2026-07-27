@@ -1154,18 +1154,22 @@ fn json_server_with_values(name: &str, def: &serde_json::Value) -> ParsedSnippet
                 .collect()
         })
         .unwrap_or_default();
-    let env = def
-        .get("env")
-        .and_then(|e| e.as_object())
-        .map(|o| {
-            o.iter()
-                .map(|(k, v)| SnippetEnvVar {
+    // Merge `env` and `headers` keys (remote MCP stores credentials under headers;
+    // ownership matching and import need both visible as env_keys).
+    let mut env: Vec<SnippetEnvVar> = Vec::new();
+    for field in ["env", "headers"] {
+        if let Some(o) = def.get(field).and_then(|e| e.as_object()) {
+            for (k, v) in o {
+                if env.iter().any(|e| e.key == *k) {
+                    continue;
+                }
+                env.push(SnippetEnvVar {
                     key: k.clone(),
                     value: json_value_to_string(v),
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+                });
+            }
+        }
+    }
     let type_hint = def.get("type").and_then(|t| t.as_str());
     let transport = classify(&command, &url, type_hint);
     ParsedSnippetServer {
@@ -2434,8 +2438,22 @@ fn entry_to_json(entry: &ServerEntry) -> serde_json::Value {
     }
     if let Some(url) = &entry.url {
         map.insert("url".into(), serde_json::Value::String(url.clone()));
+        // Native remote (VS Code `servers`, etc.): clients send HTTP headers, not
+        // process env. Writing Authorization under `env` leaves the token on disk
+        // but never on the wire (WS3-3). Prefer `headers` + a type hint.
+        if entry.command.is_none() {
+            let type_hint = if entry.transport.eq_ignore_ascii_case("sse") {
+                "sse"
+            } else {
+                "http"
+            };
+            map.insert(
+                "type".into(),
+                serde_json::Value::String(type_hint.into()),
+            );
+        }
     }
-    let env: serde_json::Map<String, serde_json::Value> = entry
+    let kv: serde_json::Map<String, serde_json::Value> = entry
         .env
         .iter()
         .filter_map(|e| {
@@ -2444,8 +2462,15 @@ fn entry_to_json(entry: &ServerEntry) -> serde_json::Value {
                 .map(|v| (e.key.clone(), serde_json::Value::String(v.clone())))
         })
         .collect();
-    if !env.is_empty() {
-        map.insert("env".into(), serde_json::Value::Object(env));
+    if !kv.is_empty() {
+        // Remote → headers (sent). Stdio → env (subprocess). Qwen remaps headers
+        // further (httpUrl) in entry_to_qwen_json.
+        let key = if entry.command.is_none() && entry.url.is_some() {
+            "headers"
+        } else {
+            "env"
+        };
+        map.insert(key.into(), serde_json::Value::Object(kv));
     }
     serde_json::Value::Object(map)
 }
@@ -2459,9 +2484,13 @@ fn entry_to_qwen_json(entry: &ServerEntry) -> serde_json::Value {
                 object.insert("httpUrl".into(), url);
             }
         }
+        // entry_to_json already emits `headers` for remote; keep a remap of legacy
+        // `env` so older call sites that stuffed auth into env still work.
         if let Some(env) = object.remove("env") {
             object.insert("headers".into(), env);
         }
+        // Qwen does not use a `type` field on remote entries.
+        object.remove("type");
     }
     value
 }
@@ -2953,11 +2982,20 @@ fn entry_to_continue_yaml(entry: &ServerEntry) -> serde_yaml::Value {
         } else {
             "streamable-http"
         };
-        serde_json::json!({
+        // Include env (Authorization + client id) so Shared HTTP tokens reach the
+        // file and re-detect sees the same keys as ManagedEntry (WS3-1).
+        let mut remote = serde_json::json!({
             "name": entry.name,
             "type": transport,
             "url": url,
-        })
+        });
+        if !env.is_empty() {
+            remote
+                .as_object_mut()
+                .unwrap()
+                .insert("env".into(), serde_json::Value::Object(env));
+        }
+        remote
     } else {
         // Preserve invalid entries visibly instead of silently dropping them.
         serde_json::json!({
@@ -3136,9 +3174,9 @@ fn entry_to_hermes_yaml(entry: &ServerEntry) -> serde_yaml::Value {
             serde_yaml::Value::String(url.clone()),
         );
     }
-    // Hermes stores subprocess env vars under `env` (same purpose as Goose's `envs`).
-    // Auth headers for HTTP servers are handled at import time, not reconstructed here.
-    let env: serde_yaml::Mapping = entry
+    // Stdio: env vars go under `env`. Remote: credentials must be under `headers`
+    // or Hermes never sends them (WS3-3). Same split as OpenCode / VS Code.
+    let kv: serde_yaml::Mapping = entry
         .env
         .iter()
         .filter_map(|e| {
@@ -3150,10 +3188,15 @@ fn entry_to_hermes_yaml(entry: &ServerEntry) -> serde_yaml::Value {
             })
         })
         .collect();
-    if !env.is_empty() {
+    if !kv.is_empty() {
+        let key = if entry.command.is_none() && entry.url.is_some() {
+            "headers"
+        } else {
+            "env"
+        };
         cfg.insert(
-            serde_yaml::Value::String("env".into()),
-            serde_yaml::Value::Mapping(env),
+            serde_yaml::Value::String(key.into()),
+            serde_yaml::Value::Mapping(kv),
         );
     }
     serde_yaml::Value::Mapping(cfg)
@@ -3679,8 +3722,24 @@ pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
 /// "migrate": after the client's servers are imported into Toolport, this leaves
 /// the client talking only to the gateway. Backs up first; unrelated config keys
 /// are preserved. Caller is responsible for importing first so nothing is lost.
+///
+/// When `shared` is set, write a Shared HTTP entry instead of stdio so migrate
+/// does not silently downgrade an existing Shared HTTP install (WS3-2).
 pub fn migrate_to_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
-    write_servers(client_id, &[gateway_entry(profile, client_id)?])
+    migrate_to_gateway_with_transport(client_id, profile, None)
+}
+
+/// Like [`migrate_to_gateway`], with an optional Shared HTTP spec (WS3-2).
+pub fn migrate_to_gateway_with_transport(
+    client_id: &str,
+    profile: Option<&str>,
+    shared: Option<&SharedHttpSpec>,
+) -> Result<WriteOutcome, String> {
+    let entry = match shared {
+        Some(spec) => gateway_entry_shared_http(client_id, profile, spec),
+        None => gateway_entry(profile, client_id)?,
+    };
+    write_servers(client_id, &[entry])
 }
 
 /// Whether a stored client-config command is recognizably one of *our* gateway
@@ -4437,6 +4496,125 @@ bad = "not-a-table"
         let rec = ManagedEntry::from_gateway_entry(&entry);
         assert!(!rec.env.contains_key("Authorization"));
         assert_eq!(rec.transport, "sharedHttp");
+    }
+
+    /// WS3-1 / WS3-3: write Shared HTTP to a real config file, re-detect, assert
+    /// the bearer reaches a field that is sent (env/headers), across native formats.
+    #[test]
+    fn shared_http_write_redetect_preserves_token_keys_across_formats() {
+        let spec = SharedHttpSpec {
+            url: "http://127.0.0.1:8765/mcp".into(),
+            token: "roundtrip-secret".into(),
+        };
+        let auth = "Bearer roundtrip-secret";
+
+        // Continue (YamlMcpServersList): env must be present on the url entry (WS3-1).
+        {
+            let path = temp_path("ws3-continue.yaml");
+            std::fs::write(&path, "name: Test\nmcpServers: []\n").unwrap();
+            let entry = gateway_entry_shared_http("continue", Some("Work"), &spec);
+            edit_continue_yaml_gateway(&path, Some(&entry)).unwrap();
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(
+                content.contains(auth),
+                "Continue config must contain the bearer: {content}"
+            );
+            assert!(
+                content.contains("env:") || content.contains("Authorization"),
+                "Continue must write env with Authorization: {content}"
+            );
+            let parsed = parse_continue_yaml_servers(&content).unwrap();
+            let gw = parsed
+                .iter()
+                .find(|s| s.name == GATEWAY_ENTRY_NAME)
+                .expect("gateway entry");
+            assert_eq!(gw.url.as_deref(), Some(spec.url.as_str()));
+            assert!(
+                gw.env_keys.iter().any(|k| k == "Authorization"),
+                "re-detect must see Authorization key: {:?}",
+                gw.env_keys
+            );
+            let rec = ManagedEntry::from_gateway_entry(&entry);
+            assert_eq!(
+                resolve_entry_state(&[gw.clone()], Some(&rec)),
+                GatewayEntryState::Managed
+            );
+            std::fs::remove_file(&path).ok();
+        }
+
+        // VS Code (JsonServers): headers, not env (WS3-3).
+        {
+            let path = temp_path("ws3-vscode.json");
+            std::fs::write(&path, r#"{"servers":{}}"#).unwrap();
+            let entry = gateway_entry_shared_http("vscode", None, &spec);
+            edit_json_gateway(&path, "servers", Some(&entry), false).unwrap();
+            let root: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let slot = &root["servers"][GATEWAY_ENTRY_NAME];
+            assert_eq!(slot["url"], spec.url);
+            assert_eq!(slot["headers"]["Authorization"], auth);
+            assert!(
+                slot.get("env").is_none(),
+                "VS Code must not put the bearer under env: {slot}"
+            );
+            let parsed = parse_json(&std::fs::read_to_string(&path).unwrap(), "servers").unwrap();
+            let gw = parsed
+                .iter()
+                .find(|s| s.name == GATEWAY_ENTRY_NAME)
+                .expect("gateway");
+            assert!(gw.env_keys.iter().any(|k| k == "Authorization"));
+            std::fs::remove_file(&path).ok();
+        }
+
+        // Hermes (YamlMcpServers): headers for remote (WS3-3).
+        {
+            let path = temp_path("ws3-hermes.yaml");
+            std::fs::write(&path, "mcp_servers: {}\n").unwrap();
+            let entry = gateway_entry_shared_http("hermes", None, &spec);
+            edit_hermes_yaml_gateway(&path, Some(&entry)).unwrap();
+            let content = std::fs::read_to_string(&path).unwrap();
+            assert!(content.contains(auth), "Hermes must contain bearer: {content}");
+            assert!(
+                content.contains("headers:"),
+                "Hermes remote auth under headers: {content}"
+            );
+            let parsed = parse_hermes_yaml_servers(&content).unwrap();
+            let gw = parsed
+                .iter()
+                .find(|s| s.name == GATEWAY_ENTRY_NAME)
+                .expect("gateway");
+            assert!(gw.env_keys.iter().any(|k| k == "Authorization"));
+            std::fs::remove_file(&path).ok();
+        }
+
+        // OpenCode: headers on remote type.
+        {
+            let path = temp_path("ws3-opencode.json");
+            std::fs::write(&path, r#"{"mcp":{}}"#).unwrap();
+            let entry = gateway_entry_shared_http("opencode", Some("Work"), &spec);
+            edit_opencode_gateway(&path, Some(&entry)).unwrap();
+            let root: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let slot = &root["mcp"][GATEWAY_ENTRY_NAME];
+            assert_eq!(slot["type"], "remote");
+            assert_eq!(slot["headers"]["Authorization"], auth);
+            std::fs::remove_file(&path).ok();
+        }
+
+        // Qwen: httpUrl + headers.
+        {
+            let path = temp_path("ws3-qwen.json");
+            std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+            let entry = gateway_entry_shared_http("qwen-code", None, &spec);
+            edit_json_gateway(&path, "mcpServers", Some(&entry), true).unwrap();
+            let root: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+            let slot = &root["mcpServers"][GATEWAY_ENTRY_NAME];
+            assert_eq!(slot["httpUrl"], spec.url);
+            assert_eq!(slot["headers"]["Authorization"], auth);
+            assert!(slot.get("env").is_none());
+            std::fs::remove_file(&path).ok();
+        }
     }
 
     #[test]

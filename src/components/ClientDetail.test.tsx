@@ -143,6 +143,61 @@ describe("ClientDetail customized entry (SOU-406)", () => {
       ),
     );
   });
+
+  it("passes live sharedHttp transport when applying scope (WS3-2)", async () => {
+    // Regression: installGateway defaults missing transport to stdio and would
+    // silently rewrite a Shared HTTP client as a stdio spawn.
+    installGateway.mockResolvedValue({ backup: false });
+    const reg = emptyRegistry();
+    // Profile picker only renders when profiles.length > 1.
+    reg.profiles = [
+      { id: "p1", name: "Work", enabledServerIds: [] },
+      { id: "p2", name: "Home", enabledServerIds: [] },
+    ];
+    reg.clientScopes = { "claude-desktop": "Work" };
+    reg.clientManagedEntries = {
+      "claude-desktop": {
+        command: "",
+        args: [],
+        env: {},
+        transport: "sharedHttp",
+        url: "http://127.0.0.1:8765/mcp",
+        updatedAt: 1,
+      },
+    };
+    const connected = {
+      ...client(),
+      gatewayInstalled: true,
+      entryState: "managed" as const,
+    };
+    render(
+      <ClientDetail
+        client={connected}
+        registry={reg}
+        onChanged={() => {}}
+        onRegistryChange={() => {}}
+      />,
+    );
+
+    // Change scope so Apply scope is enabled (profile !== currentScope).
+    // Scope select is the first combobox in the header (w-52); discovery is lower.
+    const scopeSelect = screen.getAllByRole("combobox")[0]!;
+    await userEvent.click(scopeSelect);
+    const home = await screen.findByRole("option", { name: /Only: Home/i });
+    await userEvent.click(home);
+
+    const apply = await screen.findByRole("button", { name: /apply scope/i });
+    await userEvent.click(apply);
+
+    await waitFor(() =>
+      expect(installGateway).toHaveBeenCalledWith(
+        "claude-desktop",
+        "Home",
+        false,
+        "sharedHttp",
+      ),
+    );
+  });
 });
 
 describe("ClientDetail connect toast (SOU-317)", () => {
