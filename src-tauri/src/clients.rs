@@ -2230,18 +2230,43 @@ pub fn detect_clients() -> Vec<DetectedClient> {
 }
 
 /// Whether a detected gateway slot matches the ownership record we last wrote.
+/// Auth headers / bearer args are stripped before compare so shared-HTTP entries
+/// still match without storing tokens on the registry (SOU-406/407).
 fn managed_matches_detected(server: &McpServer, rec: &ManagedEntry) -> bool {
     let cmd = server.command.as_deref().unwrap_or("");
     if cmd != rec.command {
         return false;
     }
-    if server.args != rec.args {
+    let server_args = crate::registry::strip_auth_header_args(&server.args);
+    if server_args != rec.args {
         return false;
     }
-    let mut keys = server.env_keys.clone();
+    // Env keys: ignore Authorization (secret, not in the record).
+    let mut keys: Vec<String> = server
+        .env_keys
+        .iter()
+        .filter(|k| !k.eq_ignore_ascii_case("authorization"))
+        .cloned()
+        .collect();
     keys.sort();
     let rec_keys: Vec<String> = rec.env.keys().cloned().collect();
-    keys == rec_keys
+    if keys != rec_keys {
+        return false;
+    }
+    // Shared-HTTP: URL must agree when both sides have one.
+    if let Some(rec_url) = rec.url.as_deref() {
+        let live_url = server.url.as_deref().or_else(|| {
+            server
+                .args
+                .iter()
+                .find(|a| a.starts_with("http://") || a.starts_with("https://"))
+                .map(String::as_str)
+        });
+        if live_url != Some(rec_url) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Resolve Managed / Customized / Absent for one client (SOU-406).
@@ -2794,12 +2819,7 @@ fn write_yaml_extensions(path: &Path, servers: &[ServerEntry]) -> Result<(), Str
     atomic_write(path, &out)
 }
 
-fn edit_yaml_gateway(
-    path: &Path,
-    install: bool,
-    profile: Option<&str>,
-    client_id: &str,
-) -> Result<(), String> {
+fn edit_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
     let mut root = read_existing_yaml(path)?;
     let exts = yaml_extensions_mut(&mut root);
     let key = serde_yaml::Value::String(GATEWAY_ENTRY_NAME.into());
@@ -2811,11 +2831,8 @@ fn edit_yaml_gateway(
             .and_then(|value| value.as_str());
         !gateway_identity_matches(name, name, command)
     });
-    if install {
-        exts.insert(
-            key,
-            entry_to_goose_yaml(&gateway_entry(profile, client_id)?),
-        );
+    if let Some(entry) = entry {
+        exts.insert(key, entry_to_goose_yaml(entry));
     }
     let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
     atomic_write(path, &out)
@@ -2986,12 +3003,7 @@ fn write_continue_yaml_servers(path: &Path, servers: &[ServerEntry]) -> Result<(
     atomic_write(path, &out)
 }
 
-fn edit_continue_yaml_gateway(
-    path: &Path,
-    install: bool,
-    profile: Option<&str>,
-    client_id: &str,
-) -> Result<(), String> {
+fn edit_continue_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
     let mut root = read_existing_yaml(path)?;
 
     let servers = continue_servers_mut(&mut root);
@@ -3008,8 +3020,8 @@ fn edit_continue_yaml_gateway(
         !gateway_identity_matches(name, name, command)
     });
 
-    if install {
-        servers.push(entry_to_continue_yaml(&gateway_entry(profile, client_id)?));
+    if let Some(entry) = entry {
+        servers.push(entry_to_continue_yaml(entry));
     }
 
     let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
@@ -3181,12 +3193,7 @@ fn write_hermes_yaml_servers(path: &Path, servers: &[ServerEntry]) -> Result<(),
     atomic_write(path, &out)
 }
 
-fn edit_hermes_yaml_gateway(
-    path: &Path,
-    install: bool,
-    profile: Option<&str>,
-    client_id: &str,
-) -> Result<(), String> {
+fn edit_hermes_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
     let mut root = read_existing_hermes_yaml(path)?;
     let mcp_servers = hermes_mcp_servers_mut(&mut root);
     let key = serde_yaml::Value::String(GATEWAY_ENTRY_NAME.into());
@@ -3198,11 +3205,8 @@ fn edit_hermes_yaml_gateway(
             .and_then(|value| value.as_str());
         !gateway_identity_matches(name, name, command)
     });
-    if install {
-        mcp_servers.insert(
-            key,
-            entry_to_hermes_yaml(&gateway_entry(profile, client_id)?),
-        );
+    if let Some(entry) = entry {
+        mcp_servers.insert(key, entry_to_hermes_yaml(entry));
     }
     let out = serde_yaml::to_string(&root).map_err(|e| e.to_string())?;
     atomic_write(path, &out)
@@ -3401,13 +3405,104 @@ fn gateway_entry(profile: Option<&str>, client_id: &str) -> Result<ServerEntry, 
     })
 }
 
+/// Parameters for installing a shared-HTTP gateway entry (SOU-407).
+#[derive(Debug, Clone)]
+pub struct SharedHttpSpec {
+    pub url: String,
+    pub token: String,
+}
+
+/// Whether this client needs the `npx mcp-remote` bridge instead of a native
+/// remote MCP entry. Native: formats with first-class url+headers. Bridge: most
+/// JsonMcpServers clients (Claude Desktop, etc.) that only spawn stdio.
+pub fn client_uses_mcp_remote_bridge(client_id: &str) -> bool {
+    let Some(def) = find_def(client_id) else {
+        return true;
+    };
+    match def.format {
+        // Native remote shapes already exist in our writers.
+        Format::JsonQwenMcpServers
+        | Format::JsonOpenCodeMcp
+        | Format::JsonServers
+        | Format::YamlMcpServers
+        | Format::YamlMcpServersList => false,
+        // JsonMcpServers / TOML / Goose: bridge unless we know better later.
+        Format::JsonMcpServers
+        | Format::JsonContextServers
+        | Format::TomlMcpServers
+        | Format::YamlExtensions => true,
+    }
+}
+
+/// Build a shared-HTTP gateway entry: native url+headers, or `npx mcp-remote` bridge.
+pub fn gateway_entry_shared_http(
+    client_id: &str,
+    profile: Option<&str>,
+    spec: &SharedHttpSpec,
+) -> ServerEntry {
+    let auth = format!("Bearer {}", spec.token);
+    if client_uses_mcp_remote_bridge(client_id) {
+        // Bridge form (Claude Desktop, etc.): third-party mcp-remote is opt-in
+        // only when the user chooses Shared HTTP in Integrations (SOU-407).
+        ServerEntry {
+            id: GATEWAY_ENTRY_NAME.to_string(),
+            name: GATEWAY_ENTRY_NAME.to_string(),
+            transport: "stdio".to_string(),
+            command: Some("npx".into()),
+            args: vec![
+                "-y".into(),
+                "mcp-remote".into(),
+                spec.url.clone(),
+                "--header".into(),
+                format!("Authorization: {auth}"),
+            ],
+            env: Vec::new(),
+            url: None,
+            source: Some("toolport".into()),
+            disabled_tools: Vec::new(),
+            cwd: None,
+            unknown_fields: serde_json::Map::new(),
+        }
+    } else {
+        let mut env = vec![crate::registry::EnvVar {
+            key: "Authorization".into(),
+            value: Some(auth),
+            secret: true,
+        }];
+        // Keep client id for live scope resolution when the client forwards headers/env.
+        env.push(crate::registry::EnvVar {
+            key: crate::brand::CLIENT_ID.to_string(),
+            value: Some(client_id.to_string()),
+            secret: false,
+        });
+        if let Some(p) = profile.map(str::trim).filter(|p| !p.is_empty()) {
+            env.push(crate::registry::EnvVar {
+                key: crate::brand::PROFILE.to_string(),
+                value: Some(p.to_string()),
+                secret: false,
+            });
+        }
+        ServerEntry {
+            id: GATEWAY_ENTRY_NAME.to_string(),
+            name: GATEWAY_ENTRY_NAME.to_string(),
+            transport: "http".to_string(),
+            command: None,
+            args: Vec::new(),
+            env,
+            url: Some(spec.url.clone()),
+            source: Some("toolport".into()),
+            disabled_tools: Vec::new(),
+            cwd: None,
+            unknown_fields: serde_json::Map::new(),
+        }
+    }
+}
+
 fn edit_json_gateway(
     path: &Path,
     key: &str,
-    install: bool,
-    profile: Option<&str>,
+    entry: Option<&ServerEntry>,
     lenient: bool,
-    client_id: &str,
 ) -> Result<(), String> {
     let mut root = if path.exists() {
         let content = read_config_file(path)?;
@@ -3430,23 +3525,26 @@ fn edit_json_gateway(
         let command = definition.get("command").and_then(|value| value.as_str());
         !gateway_identity_matches(name, name, command)
     });
-    if install {
-        servers.insert(
-            GATEWAY_ENTRY_NAME.to_string(),
-            entry_to_json(&gateway_entry(profile, client_id)?),
-        );
+    if let Some(entry) = entry {
+        // Remote-only entries: Qwen wants httpUrl+headers; VS Code "servers" keeps url.
+        // entry_to_qwen_json leaves url as-is for SSE and renames for streamable HTTP.
+        let value = if entry.command.is_none() && entry.url.is_some() {
+            if key == "servers" {
+                entry_to_json(entry)
+            } else {
+                entry_to_qwen_json(entry)
+            }
+        } else {
+            entry_to_json(entry)
+        };
+        servers.insert(GATEWAY_ENTRY_NAME.to_string(), value);
     }
 
     let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     atomic_write(path, &out)
 }
 
-fn edit_opencode_gateway(
-    path: &Path,
-    install: bool,
-    profile: Option<&str>,
-    client_id: &str,
-) -> Result<(), String> {
+fn edit_opencode_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
     let mut root = read_existing_opencode_json(path)?;
     let mcp = opencode_mcp_mut(&mut root)?;
     mcp.retain(|name, definition| {
@@ -3457,22 +3555,17 @@ fn edit_opencode_gateway(
             .and_then(|value| value.as_str());
         !gateway_identity_matches(name, name, command)
     });
-    if install {
+    if let Some(entry) = entry {
         mcp.insert(
             GATEWAY_ENTRY_NAME.into(),
-            entry_to_opencode_json(&gateway_entry(profile, client_id)?),
+            entry_to_opencode_json(entry),
         );
     }
     let output = serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?;
     atomic_write(path, &output)
 }
 
-fn edit_toml_gateway(
-    path: &Path,
-    install: bool,
-    profile: Option<&str>,
-    client_id: &str,
-) -> Result<(), String> {
+fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
     let mut root = if path.exists() {
         let content = read_config_file(path)?;
         read_existing_toml(&content)?
@@ -3502,11 +3595,8 @@ fn edit_toml_gateway(
         let command = definition.get("command").and_then(|value| value.as_str());
         !gateway_identity_matches(name, name, command)
     });
-    if install {
-        servers.insert(
-            GATEWAY_ENTRY_NAME.to_string(),
-            entry_to_toml(&gateway_entry(profile, client_id)?),
-        );
+    if let Some(entry) = entry {
+        servers.insert(GATEWAY_ENTRY_NAME.to_string(), entry_to_toml(entry));
     }
 
     let out = toml::to_string_pretty(&root).map_err(|e| e.to_string())?;
@@ -3532,44 +3622,29 @@ fn config_is_whole_app_state(client_id: &str) -> bool {
 
 fn install_or_remove(
     client_id: &str,
-    install: bool,
-    profile: Option<&str>,
+    entry: Option<&ServerEntry>,
 ) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = (def.path)().ok_or("Could not resolve a config path on this OS")?;
     let backup = backup_file(client_id, &path)?;
     let lenient = config_is_whole_app_state(client_id);
     // Build the snapshot before writing so the ownership record matches the bytes
-    // we put on disk (SOU-406).
-    let managed = if install {
-        Some(ManagedEntry::from_gateway_entry(&gateway_entry(
-            profile, client_id,
-        )?))
-    } else {
-        None
-    };
+    // we put on disk (SOU-406). Strip secrets for the registry record.
+    let managed = entry.map(ManagedEntry::from_gateway_entry);
     match def.format {
         Format::JsonMcpServers => {
-            edit_json_gateway(&path, "mcpServers", install, profile, lenient, client_id)?
+            edit_json_gateway(&path, "mcpServers", entry, lenient)?
         }
-        Format::JsonQwenMcpServers => {
-            edit_json_gateway(&path, "mcpServers", install, profile, true, client_id)?
-        }
-        Format::JsonServers => {
-            edit_json_gateway(&path, "servers", install, profile, lenient, client_id)?
-        }
-        Format::JsonOpenCodeMcp => {
-            edit_opencode_gateway(&path, install, profile, client_id)?
-        }
+        Format::JsonQwenMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
+        Format::JsonServers => edit_json_gateway(&path, "servers", entry, lenient)?,
+        Format::JsonOpenCodeMcp => edit_opencode_gateway(&path, entry)?,
         Format::JsonContextServers => {
-            edit_json_gateway(&path, "context_servers", install, profile, true, client_id)?
+            edit_json_gateway(&path, "context_servers", entry, true)?
         }
-        Format::TomlMcpServers => edit_toml_gateway(&path, install, profile, client_id)?,
-        Format::YamlExtensions => edit_yaml_gateway(&path, install, profile, client_id)?,
-        Format::YamlMcpServers => edit_hermes_yaml_gateway(&path, install, profile, client_id)?,
-        Format::YamlMcpServersList => {
-            edit_continue_yaml_gateway(&path, install, profile, client_id)?
-        }
+        Format::TomlMcpServers => edit_toml_gateway(&path, entry)?,
+        Format::YamlExtensions => edit_yaml_gateway(&path, entry)?,
+        Format::YamlMcpServers => edit_hermes_yaml_gateway(&path, entry)?,
+        Format::YamlMcpServersList => edit_continue_yaml_gateway(&path, entry)?,
     }
     Ok(WriteOutcome {
         path: path.display().to_string(),
@@ -3578,15 +3653,26 @@ fn install_or_remove(
     })
 }
 
-/// Add Toolport's gateway entry to a client's config (preserves existing servers).
+/// Add Toolport's stdio gateway entry to a client's config (preserves existing servers).
 /// `profile` scopes the client to one profile via `TOOLPORT_PROFILE` (None = all).
 pub fn install_gateway(client_id: &str, profile: Option<&str>) -> Result<WriteOutcome, String> {
-    install_or_remove(client_id, true, profile)
+    let entry = gateway_entry(profile, client_id)?;
+    install_or_remove(client_id, Some(&entry))
+}
+
+/// Add a shared-HTTP gateway entry (native remote or `npx mcp-remote` bridge). SOU-407.
+pub fn install_gateway_shared_http(
+    client_id: &str,
+    profile: Option<&str>,
+    spec: &SharedHttpSpec,
+) -> Result<WriteOutcome, String> {
+    let entry = gateway_entry_shared_http(client_id, profile, spec);
+    install_or_remove(client_id, Some(&entry))
 }
 
 /// Remove Toolport's gateway entry from a client's config.
 pub fn uninstall_gateway(client_id: &str) -> Result<WriteOutcome, String> {
-    install_or_remove(client_id, false, None)
+    install_or_remove(client_id, None)
 }
 
 /// Replace a client's entire server list with just the Toolport gateway. Used by
@@ -3825,6 +3911,36 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
 mod tests {
     use super::*;
     use crate::registry::EnvVar;
+
+    fn sample_gateway(profile: Option<&str>, client_id: &str) -> ServerEntry {
+        let mut env = vec![EnvVar {
+            key: crate::brand::CLIENT_ID.to_string(),
+            value: Some(client_id.to_string()),
+            secret: false,
+        }];
+        if let Some(p) = profile.map(str::trim).filter(|p| !p.is_empty()) {
+            env.push(EnvVar {
+                key: crate::brand::PROFILE.to_string(),
+                value: Some(p.to_string()),
+                secret: false,
+            });
+        }
+        ServerEntry {
+            id: GATEWAY_ENTRY_NAME.to_string(),
+            name: GATEWAY_ENTRY_NAME.to_string(),
+            transport: "stdio".to_string(),
+            command: Some("toolport-gateway".into()),
+            args: Vec::new(),
+            env,
+            url: None,
+            source: Some("toolport".into()),
+            disabled_tools: Vec::new(),
+            cwd: None,
+            unknown_fields: serde_json::Map::new(),
+        }
+    }
+
+
 
     #[test]
     fn gateway_command_stale_detection() {
@@ -4254,7 +4370,7 @@ bad = "not-a-table"
         )
         .unwrap();
 
-        edit_json_gateway(&path, "mcpServers", true, Some("Billing"), false, "claude-code").unwrap();
+        { let _e = sample_gateway(Some("Billing"), "claude-code"); edit_json_gateway(&path, "mcpServers", Some(&_e), false) }.unwrap();
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let servers = root["mcpServers"].as_object().unwrap();
@@ -4273,13 +4389,54 @@ bad = "not-a-table"
         assert_eq!(root["theme"], "dark");
         assert_eq!(servers["existing"]["env"]["SECRET"], "keepme");
 
-        edit_json_gateway(&path, "mcpServers", false, None, false, "claude-code").unwrap();
+        edit_json_gateway(&path, "mcpServers", None, false).unwrap();
         let root2: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let servers2 = root2["mcpServers"].as_object().unwrap();
         assert!(!servers2.contains_key(GATEWAY_ENTRY_NAME));
         assert!(servers2.contains_key("existing"));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn shared_http_bridge_entry_for_claude_desktop() {
+        // Claude Desktop has no native remote MCP shape; Shared HTTP writes mcp-remote.
+        let spec = SharedHttpSpec {
+            url: "http://127.0.0.1:8765/mcp".into(),
+            token: "secrettok".into(),
+        };
+        let entry = gateway_entry_shared_http("claude-desktop", None, &spec);
+        assert_eq!(entry.command.as_deref(), Some("npx"));
+        assert!(entry.args.iter().any(|a| a == "mcp-remote"));
+        assert!(entry.args.iter().any(|a| a.contains("8765/mcp")));
+        assert!(entry.args.iter().any(|a| a.contains("Authorization: Bearer secrettok")));
+        // Ownership record must not retain the bearer.
+        let rec = ManagedEntry::from_gateway_entry(&entry);
+        assert_eq!(rec.transport, "sharedHttp");
+        assert_eq!(rec.url.as_deref(), Some("http://127.0.0.1:8765/mcp"));
+        assert!(!rec.args.iter().any(|a| a.contains("Bearer")));
+        assert!(client_uses_mcp_remote_bridge("claude-desktop"));
+        assert!(!client_uses_mcp_remote_bridge("opencode"));
+        assert!(!client_uses_mcp_remote_bridge("vscode"));
+    }
+
+    #[test]
+    fn shared_http_native_entry_for_opencode() {
+        let spec = SharedHttpSpec {
+            url: "http://127.0.0.1:8765/mcp".into(),
+            token: "tok".into(),
+        };
+        let entry = gateway_entry_shared_http("opencode", Some("Work"), &spec);
+        assert!(entry.command.is_none());
+        assert_eq!(entry.url.as_deref(), Some("http://127.0.0.1:8765/mcp"));
+        assert_eq!(entry.transport, "http");
+        assert!(entry
+            .env
+            .iter()
+            .any(|e| e.key == "Authorization" && e.value.as_deref() == Some("Bearer tok")));
+        let rec = ManagedEntry::from_gateway_entry(&entry);
+        assert!(!rec.env.contains_key("Authorization"));
+        assert_eq!(rec.transport, "sharedHttp");
     }
 
     #[test]
@@ -4294,6 +4451,8 @@ bad = "not-a-table"
             ]
             .into_iter()
             .collect(),
+            transport: "stdio".into(),
+            url: None,
             updated_at: 1,
         };
         let matching = McpServer {
@@ -4495,7 +4654,7 @@ bad = "not-a-table"
             r#"{"mcpServers":{"conduit":{"command":"toolport-gateway","env":{"CONDUIT_CLIENT_ID":"claude-code","CONDUIT_PROFILE":"Billing"}},"existing":{"command":"node"}}}"#,
         )
         .unwrap();
-        edit_json_gateway(&path, "mcpServers", true, Some("Billing"), false, "claude-code").unwrap();
+        { let _e = sample_gateway(Some("Billing"), "claude-code"); edit_json_gateway(&path, "mcpServers", Some(&_e), false) }.unwrap();
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let servers = root["mcpServers"].as_object().unwrap();
@@ -4531,7 +4690,7 @@ bad = "not-a-table"
             }"#,
         )
         .unwrap();
-        edit_json_gateway(&json_path, "mcpServers", true, None, false, "claude-code").unwrap();
+        { let _e = sample_gateway(None, "claude-code"); edit_json_gateway(&json_path, "mcpServers", Some(&_e), false) }.unwrap();
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
         let json_servers = json["mcpServers"].as_object().unwrap();
@@ -4542,7 +4701,7 @@ bad = "not-a-table"
             json_servers[GATEWAY_ENTRY_NAME]["env"][crate::brand::CLIENT_ID],
             "claude-code"
         );
-        edit_json_gateway(&json_path, "mcpServers", false, None, false, "claude-code").unwrap();
+        edit_json_gateway(&json_path, "mcpServers", None, false).unwrap();
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
         let json_servers = json["mcpServers"].as_object().unwrap();
@@ -4564,14 +4723,14 @@ command = "npx"
 "#,
         )
         .unwrap();
-        edit_toml_gateway(&toml_path, true, None, "codex").unwrap();
+        { let _e = sample_gateway(None, "codex"); edit_toml_gateway(&toml_path, Some(&_e)) }.unwrap();
         let toml: toml::Value =
             toml::from_str(&std::fs::read_to_string(&toml_path).unwrap()).unwrap();
         let toml_servers = toml["mcp_servers"].as_table().unwrap();
         assert_eq!(toml_servers.len(), 2);
         assert!(toml_servers.contains_key(GATEWAY_ENTRY_NAME));
         assert!(toml_servers.contains_key("existing"));
-        edit_toml_gateway(&toml_path, false, None, "codex").unwrap();
+        edit_toml_gateway(&toml_path, None).unwrap();
         let toml: toml::Value =
             toml::from_str(&std::fs::read_to_string(&toml_path).unwrap()).unwrap();
         let toml_servers = toml["mcp_servers"].as_table().unwrap();
@@ -4583,14 +4742,14 @@ command = "npx"
             "extensions:\n  toolport:\n    cmd: manual-wrapper\n  stale:\n    cmd: C:\\Local\\Toolport\\toolport-gateway.exe\n  fetch:\n    cmd: uvx\n",
         )
         .unwrap();
-        edit_yaml_gateway(&goose_path, true, None, "goose").unwrap();
+        { let _e = sample_gateway(None, "goose"); edit_yaml_gateway(&goose_path, Some(&_e)) }.unwrap();
         let goose: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&goose_path).unwrap()).unwrap();
         let goose_servers = goose["extensions"].as_mapping().unwrap();
         assert_eq!(goose_servers.len(), 2);
         assert!(goose_servers.contains_key(GATEWAY_ENTRY_NAME));
         assert!(goose_servers.contains_key("fetch"));
-        edit_yaml_gateway(&goose_path, false, None, "goose").unwrap();
+        edit_yaml_gateway(&goose_path, None).unwrap();
         let goose: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&goose_path).unwrap()).unwrap();
         let goose_servers = goose["extensions"].as_mapping().unwrap();
@@ -4603,14 +4762,14 @@ command = "npx"
             "mcp_servers:\n  toolport:\n    command: manual-wrapper\n  stale:\n    command: C:\\Local\\Toolport\\conduit-gateway.exe\n  fetch:\n    command: uvx\n",
         )
         .unwrap();
-        edit_hermes_yaml_gateway(&hermes_path, true, None, "hermes").unwrap();
+        { let _e = sample_gateway(None, "hermes"); edit_hermes_yaml_gateway(&hermes_path, Some(&_e)) }.unwrap();
         let hermes: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&hermes_path).unwrap()).unwrap();
         let hermes_servers = hermes["mcp_servers"].as_mapping().unwrap();
         assert_eq!(hermes_servers.len(), 2);
         assert!(hermes_servers.contains_key(GATEWAY_ENTRY_NAME));
         assert!(hermes_servers.contains_key("fetch"));
-        edit_hermes_yaml_gateway(&hermes_path, false, None, "hermes").unwrap();
+        edit_hermes_yaml_gateway(&hermes_path, None).unwrap();
         let hermes: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&hermes_path).unwrap()).unwrap();
         let hermes_servers = hermes["mcp_servers"].as_mapping().unwrap();
@@ -4623,7 +4782,7 @@ command = "npx"
             "mcpServers:\n  - name: toolport\n    command: manual-wrapper\n  - name: stale\n    command: C:\\Local\\Toolport\\toolport-gateway.exe\n  - name: fetch\n    command: uvx\n",
         )
         .unwrap();
-        edit_continue_yaml_gateway(&continue_path, true, None, "continue").unwrap();
+        { let _e = sample_gateway(None, "continue"); edit_continue_yaml_gateway(&continue_path, Some(&_e)) }.unwrap();
         let continue_yaml: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&continue_path).unwrap()).unwrap();
         let continue_servers = continue_yaml["mcpServers"].as_sequence().unwrap();
@@ -4634,7 +4793,7 @@ command = "npx"
         assert!(continue_servers
             .iter()
             .any(|server| server["name"].as_str() == Some("fetch")));
-        edit_continue_yaml_gateway(&continue_path, false, None, "continue").unwrap();
+        edit_continue_yaml_gateway(&continue_path, None).unwrap();
         let continue_yaml: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&continue_path).unwrap()).unwrap();
         let continue_servers = continue_yaml["mcpServers"].as_sequence().unwrap();
@@ -4836,7 +4995,7 @@ command = "npx"
         let path = dir.join("mcp.json");
 
         // Install writes mcpServers.toolport with TOOLPORT_CLIENT_ID=toolport-studio.
-        edit_json_gateway(&path, "mcpServers", true, Some("Work"), false, "toolport-studio")
+        { let _e = sample_gateway(Some("Work"), "toolport-studio"); edit_json_gateway(&path, "mcpServers", Some(&_e), false) }
             .unwrap();
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
@@ -4853,7 +5012,7 @@ command = "npx"
         );
 
         // Uninstall removes the gateway entry and leaves an empty mcpServers map.
-        edit_json_gateway(&path, "mcpServers", false, None, false, "toolport-studio").unwrap();
+        edit_json_gateway(&path, "mcpServers", None, false).unwrap();
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let servers = root["mcpServers"].as_object().unwrap();
@@ -4880,7 +5039,7 @@ command = "npx"
         assert_eq!(parsed[0].name, "existing");
 
         // Installing preserves the unrelated key and the existing server.
-        edit_json_gateway(&path, "context_servers", true, None, true, "zed").unwrap();
+        { let _e = sample_gateway(None, "zed"); edit_json_gateway(&path, "context_servers", Some(&_e), true) }.unwrap();
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(root["ui_font_size"], 16);
@@ -4896,7 +5055,7 @@ command = "npx"
         let garbage = "this is not json or json5 at all {{{";
         std::fs::write(&path, garbage).unwrap();
         // A lenient edit must ERROR, never replace the file with an empty object.
-        assert!(edit_json_gateway(&path, "context_servers", true, None, true, "zed").is_err());
+        assert!({ let _e = sample_gateway(None, "zed"); edit_json_gateway(&path, "context_servers", Some(&_e), true) }.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
         std::fs::remove_file(&path).ok();
     }
@@ -4919,7 +5078,7 @@ command = "npx"
         let path = std::env::temp_dir().join(format!("conduit-claude-{}.json", std::process::id()));
         let garbage = "{ \"projects\": {}, \"oauthAccount\": broken not json";
         std::fs::write(&path, garbage).unwrap();
-        assert!(edit_json_gateway(&path, "mcpServers", true, None, true, "claude-code").is_err());
+        assert!({ let _e = sample_gateway(None, "claude-code"); edit_json_gateway(&path, "mcpServers", Some(&_e), true) }.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
         std::fs::remove_file(&path).ok();
     }
@@ -5028,7 +5187,7 @@ command = "npx"
         )
         .unwrap();
 
-        edit_opencode_gateway(&path, true, Some("Work"), "opencode").unwrap();
+        { let _e = sample_gateway(Some("Work"), "opencode"); edit_opencode_gateway(&path, Some(&_e)) }.unwrap();
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -5062,7 +5221,7 @@ command = "npx"
             "Work"
         );
 
-        edit_opencode_gateway(&path, false, None, "opencode").unwrap();
+        edit_opencode_gateway(&path, None).unwrap();
         let after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(after["mcp"].get(GATEWAY_ENTRY_NAME).is_none());
@@ -5119,12 +5278,12 @@ command = "npx"
         let path = temp_path("opencode-bad.json");
         let garbage = r#"{"model":"keep-me","mcp":{"broken": not-json"#;
         std::fs::write(&path, garbage).unwrap();
-        assert!(edit_opencode_gateway(&path, true, None, "opencode").is_err());
+        assert!({ let _e = sample_gateway(None, "opencode"); edit_opencode_gateway(&path, Some(&_e)) }.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
 
         let wrong_shape = r#"{"model":"keep-me","mcp":"not-an-object"}"#;
         std::fs::write(&path, wrong_shape).unwrap();
-        assert!(edit_opencode_gateway(&path, true, None, "opencode").is_err());
+        assert!({ let _e = sample_gateway(None, "opencode"); edit_opencode_gateway(&path, Some(&_e)) }.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), wrong_shape);
         assert!(write_opencode_json(&path, &[stdio("filesystem")]).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), wrong_shape);
@@ -5151,7 +5310,7 @@ command = "npx"
         let path = std::env::temp_dir().join(format!("conduit-single-{}.json", std::process::id()));
         let garbage = "{ \"mcpServers\": { \"other\": broken not json";
         std::fs::write(&path, garbage).unwrap();
-        assert!(edit_json_gateway(&path, "mcpServers", true, None, false, "claude-desktop").is_err());
+        assert!({ let _e = sample_gateway(None, "claude-desktop"); edit_json_gateway(&path, "mcpServers", Some(&_e), false) }.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage, "unparseable file left untouched");
         std::fs::remove_file(&path).ok();
     }
@@ -5164,7 +5323,7 @@ command = "npx"
         let path = std::env::temp_dir().join(format!("conduit-bad-{}.toml", std::process::id()));
         let garbage = "model = \"o3\"\n[[[ this is not valid toml";
         std::fs::write(&path, garbage).unwrap();
-        assert!(edit_toml_gateway(&path, true, None, "codex").is_err());
+        assert!({ let _e = sample_gateway(None, "codex"); edit_toml_gateway(&path, Some(&_e)) }.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
         std::fs::remove_file(&path).ok();
     }
@@ -5178,7 +5337,7 @@ command = "npx"
             "model = \"o3\"\napproval_policy = \"on-request\"\n\n[profiles.work]\nmodel = \"gpt-5\"\n",
         )
         .unwrap();
-        edit_toml_gateway(&path, true, None, "codex").unwrap();
+        { let _e = sample_gateway(None, "codex"); edit_toml_gateway(&path, Some(&_e)) }.unwrap();
         let v: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v.get("model").and_then(|x| x.as_str()), Some("o3"));
         assert_eq!(
@@ -5245,7 +5404,7 @@ command = "npx"
         assert_eq!(parsed[0].transport, "stdio");
 
         // Installing the gateway preserves the model key and the existing extension.
-        edit_yaml_gateway(&path, true, None, "goose").unwrap();
+        { let _e = sample_gateway(None, "goose"); edit_yaml_gateway(&path, Some(&_e)) }.unwrap();
         let v: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -5263,7 +5422,7 @@ command = "npx"
         assert!(gateway.get("cmd").and_then(|x| x.as_str()).is_some());
 
         // Uninstall removes only the gateway entry.
-        edit_yaml_gateway(&path, false, None, "goose").unwrap();
+        edit_yaml_gateway(&path, None).unwrap();
         let after: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let exts2 = after
@@ -5281,7 +5440,7 @@ command = "npx"
         let garbage = "key: value\n  - [unbalanced flow sequence\n:::not valid";
         std::fs::write(&path, garbage).unwrap();
         // A parse failure must error, never replace config.yaml (it holds model config).
-        assert!(edit_yaml_gateway(&path, true, None, "goose").is_err());
+        assert!({ let _e = sample_gateway(None, "goose"); edit_yaml_gateway(&path, Some(&_e)) }.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
         std::fs::remove_file(&path).ok();
     }
@@ -5455,7 +5614,7 @@ command = "npx"
         assert_eq!(parsed[0].env_keys, vec!["Authorization".to_string()]);
 
         // Installing the gateway preserves the model key and the existing server.
-        edit_hermes_yaml_gateway(&path, true, None, "hermes").unwrap();
+        { let _e = sample_gateway(None, "hermes"); edit_hermes_yaml_gateway(&path, Some(&_e)) }.unwrap();
         let v: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -5473,7 +5632,7 @@ command = "npx"
         assert!(gateway.get("command").and_then(|x| x.as_str()).is_some());
 
         // Uninstall removes only the gateway entry.
-        edit_hermes_yaml_gateway(&path, false, None, "hermes").unwrap();
+        edit_hermes_yaml_gateway(&path, None).unwrap();
         let after: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let servers2 = after
@@ -5491,7 +5650,7 @@ command = "npx"
         let garbage = "key: value\n  - [unbalanced flow sequence\n:::not valid";
         std::fs::write(&path, garbage).unwrap();
         // A parse failure must error, never replace config.yaml (it holds model config).
-        assert!(edit_hermes_yaml_gateway(&path, true, None, "hermes").is_err());
+        assert!({ let _e = sample_gateway(None, "hermes"); edit_hermes_yaml_gateway(&path, Some(&_e)) }.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
         std::fs::remove_file(&path).ok();
     }

@@ -135,7 +135,12 @@ describe("ClientDetail customized entry (SOU-406)", () => {
     await userEvent.click(confirms[confirms.length - 1]!);
 
     await waitFor(() =>
-      expect(installGateway).toHaveBeenCalledWith("claude-desktop", undefined, true),
+      expect(installGateway).toHaveBeenCalledWith(
+        "claude-desktop",
+        undefined,
+        true,
+        "stdio",
+      ),
     );
   });
 });
@@ -157,7 +162,12 @@ describe("ClientDetail connect toast (SOU-317)", () => {
     await userEvent.click(screen.getByRole("button", { name: /connect to toolport/i }));
 
     await waitFor(() =>
-      expect(installGateway).toHaveBeenCalledWith("claude-desktop", undefined),
+      expect(installGateway).toHaveBeenCalledWith(
+        "claude-desktop",
+        undefined,
+        false,
+        "stdio",
+      ),
     );
     expect(toastSuccess).toHaveBeenCalledWith(
       "Connected Toolport to Claude Desktop",
@@ -188,7 +198,12 @@ describe("ClientDetail connect toast (SOU-317)", () => {
     await userEvent.click(screen.getByRole("button", { name: /connect to toolport/i }));
 
     await waitFor(() =>
-      expect(installGateway).toHaveBeenCalledWith("claude-desktop", "Work"),
+      expect(installGateway).toHaveBeenCalledWith(
+        "claude-desktop",
+        "Work",
+        false,
+        "stdio",
+      ),
     );
     expect(toastSuccess).toHaveBeenCalledWith(
       "Connected Toolport to Claude Desktop",

@@ -703,17 +703,38 @@ fn refuse_if_customized(
 
 /// Install the Toolport gateway into a client (one click "connect to Toolport").
 /// `profile` scopes that client to one profile (None = all enabled servers).
+/// `transport` is `"stdio"` (default) or `"sharedHttp"` (SOU-407).
 /// When the live entry is user-customized, pass `force: true` after the UI confirms
 /// overwrite (SOU-406); otherwise the install is refused.
 #[tauri::command]
 fn install_gateway(
     state: State<RegistryState>,
+    bridge: State<HttpBridgeState>,
     client_id: String,
     profile: Option<String>,
     force: Option<bool>,
+    transport: Option<String>,
 ) -> Result<clients::WriteOutcome, String> {
     refuse_if_customized(state.inner(), &client_id, force.unwrap_or(false))?;
-    let outcome = clients::install_gateway(&client_id, profile.as_deref())?;
+    let transport = transport
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("stdio");
+    let outcome = if transport.eq_ignore_ascii_case("sharedHttp")
+        || transport.eq_ignore_ascii_case("shared_http")
+    {
+        // Ensure the supervised bridge is up, mint/reuse a per-client bearer, write
+        // native remote or mcp-remote into the client config (SOU-407).
+        let status = start_http_bridge(bridge, None)?;
+        let port = status.port.unwrap_or(8765);
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let token = ensure_client_http_token(state.inner(), &client_id, profile.as_deref())?;
+        let spec = clients::SharedHttpSpec { url, token };
+        clients::install_gateway_shared_http(&client_id, profile.as_deref(), &spec)?
+    } else {
+        clients::install_gateway(&client_id, profile.as_deref())?
+    };
     // Record the scope we just wrote into the client's config, so the UI can show
     // and re-apply this client's effective scope without re-reading the config.
     // A concrete profile is stored by name; "no profile" is recorded as an
@@ -738,6 +759,45 @@ fn install_gateway(
         Ok(())
     })?;
     Ok(outcome)
+}
+
+/// Mint or reuse a bearer token for a managed shared-HTTP client install.
+/// Plaintext lives in the OS keychain; only the hash is in `http_clients`.
+fn ensure_client_http_token(
+    state: &RegistryState,
+    client_id: &str,
+    profile: Option<&str>,
+) -> Result<String, String> {
+    const VAULT_SERVER: &str = "__toolport_http_clients__";
+    let http_id = format!("client:{client_id}");
+    // Reuse vaulted token when we still have a matching http_clients row.
+    if let Some(existing) = crate::secrets::get_secret(VAULT_SERVER, client_id) {
+        let reg = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let hash = registry::sha256_hex(&existing);
+        if reg
+            .http_clients
+            .iter()
+            .any(|c| c.id == http_id && c.token_sha256 == hash)
+        {
+            return Ok(existing);
+        }
+    }
+    let token = random_hex()?;
+    crate::secrets::set_secret(VAULT_SERVER, client_id, &token)?;
+    let profile = profile.unwrap_or("").trim().to_string();
+    write_registry(state, |reg| {
+        reg.http_clients.retain(|c| c.id != http_id);
+        reg.http_clients.push(registry::HttpClient {
+            id: http_id,
+            label: format!("Client: {client_id}"),
+            token_sha256: registry::sha256_hex(&token),
+            profile,
+        });
+        Ok(())
+    })?;
+    Ok(token)
 }
 
 /// Remove the Toolport gateway from a client.

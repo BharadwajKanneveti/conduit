@@ -93,10 +93,16 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   const [bulkImportServers, setBulkImportServers] = useState<McpServer[] | null>(null);
   // "" = follow the active profile; else scope to one.
   const [profile, setProfile] = useState("");
+  // stdio (spawn per client) or sharedHttp (one bridge, SOU-407).
+  const [transport, setTransport] = useState<"stdio" | "sharedHttp">("stdio");
   const [migrateOpen, setMigrateOpen] = useState(false);
   const [resetOpen, setResetOpen] = useState(false);
   const installed = client.gatewayInstalled;
   const customized = client.entryState === "customized";
+  const managedTransport =
+    registry?.clientManagedEntries?.[client.id]?.transport === "sharedHttp"
+      ? "sharedHttp"
+      : "stdio";
   // Whether the client app is actually on this machine. We allow Disconnect even
   // when absent (to clean up a stale entry), but block a fresh Connect, writing a
   // config into a client that isn't installed just creates a file nothing reads.
@@ -108,6 +114,9 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   useEffect(() => {
     setProfile(currentScope);
   }, [currentScope, client.id]);
+  useEffect(() => {
+    setTransport(managedTransport);
+  }, [managedTransport, client.id]);
 
   // Discovery: the global mode this client falls back to, and its own override (if any).
   // The gateway resolves env > per-client > global, so an override here applies live.
@@ -196,7 +205,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
   async function resetToDefault() {
     setBusy(true);
     try {
-      await installGateway(client.id, profile || undefined, true);
+      await installGateway(client.id, profile || undefined, true, transport);
       toast.success(`Reset ${client.name} to the default Toolport gateway`, {
         description: clientRestartHint(client.name, client.id),
       });
@@ -341,13 +350,21 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
         await uninstallGateway(client.id);
         toast.success(`Disconnected Toolport from ${client.name}`);
       } else {
-        const outcome = await installGateway(client.id, profile || undefined);
+        const outcome = await installGateway(
+          client.id,
+          profile || undefined,
+          false,
+          transport,
+        );
         // Restart is the load-bearing line (SOU-317): MCP clients typically do not
         // pick up a new gateway entry until relaunch. Scope/backup are secondary.
         toast.success(`Connected Toolport to ${client.name}`, {
           description: connectSuccessDescription(
             client.name,
             [
+              transport === "sharedHttp"
+                ? "Uses the shared HTTP bridge (one gateway process)."
+                : null,
               profile ? `Scoped to the "${profile}" profile.` : null,
               !profile && outcome.backup ? "Previous config backed up." : null,
             ],
@@ -409,6 +426,7 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
               </span>{" "}
               · {scopeServerCount(currentScope)} server
               {scopeServerCount(currentScope) === 1 ? "" : "s"}
+              {managedTransport === "sharedHttp" ? " · shared HTTP" : ""}
             </p>
           )}
           {!present && !installed && (
@@ -419,6 +437,22 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           )}
         </div>
         <div className="flex shrink-0 items-center gap-2">
+          {!installed && present && (
+            <Select
+              value={transport}
+              onValueChange={(v) =>
+                setTransport(v === "sharedHttp" ? "sharedHttp" : "stdio")
+              }
+            >
+              <SelectTrigger size="sm" className="w-44">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="stdio">Spawn (stdio)</SelectItem>
+                <SelectItem value="sharedHttp">Shared HTTP</SelectItem>
+              </SelectContent>
+            </Select>
+          )}
           {profiles.length > 1 && !customized && (
             <Select
               value={profile || "__all__"}

@@ -464,11 +464,15 @@ export interface Registry {
   httpClients?: HttpClient[];
 }
 
-/** Snapshot of the gateway entry Toolport last wrote (SOU-406). */
+/** Snapshot of the gateway entry Toolport last wrote (SOU-406/407). */
 export interface ManagedEntry {
   command: string;
   args: string[];
   env: Record<string, string>;
+  /** `"stdio"` (default) or `"sharedHttp"`. */
+  transport?: string;
+  /** Shared-HTTP MCP URL when transport is sharedHttp. */
+  url?: string | null;
   updatedAt: number;
 }
 
