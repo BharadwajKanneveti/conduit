@@ -361,6 +361,16 @@ export function httpBridgeStatus(): Promise<HttpBridgeStatus> {
 }
 
 /**
+ * Stop obsolete Toolport gateway processes (older versions / stale paths).
+ * Keeps the current resolved binary and the supervised HTTP bridge when they
+ * match. Clients that auto-respawn MCP pick up the current binary on the next
+ * tool call. Returns human-readable labels of processes that were stopped.
+ */
+export function stopStaleGateways(): Promise<string[]> {
+  return invoke<string[]>("stop_stale_gateways");
+}
+
+/**
  * Result of {@link teamConnect} / {@link teamJoinPoll}. `status` is:
  * - `connected` — joined; `registry` is the fresh merged state.
  * - `pending` — the link requires admin approval; poll `requestToken` via {@link teamJoinPoll}.
