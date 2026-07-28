@@ -771,6 +771,18 @@ fn set_code_mode_flag(enabled: bool) {
     CODE_MODE.store(enabled, Ordering::Relaxed);
 }
 
+/// Seed [`CODE_MODE`] from a registry load outcome (WS2-5).
+///
+/// Successful loads copy `registry.code_mode`. Load failures must fail closed
+/// (`false`): [`Registry::default`] has `code_mode: true`, so seeding from the
+/// error fallback would silently re-enable code mode after a corrupt registry.
+fn seed_code_mode_after_registry_load(loaded: Result<&Registry, ()>) {
+    match loaded {
+        Ok(reg) => set_code_mode_flag(reg.code_mode),
+        Err(()) => set_code_mode_flag(false),
+    }
+}
+
 /// Parse a registry / per-client override mode string; `None` for empty, `inherit`, or an
 /// unrecognized value (so it falls through to the next precedence level).
 fn parse_mode(s: &str) -> Option<DiscoveryMode> {
@@ -8679,7 +8691,7 @@ fn main() {
             // code_mode: true, so seeding from the error fallback would silently
             // re-enable code mode after a corrupt registry (WS2-5). The watcher
             // already fails safe by not updating the flag on reload failure.
-            set_code_mode_flag(r.code_mode);
+            seed_code_mode_after_registry_load(Ok(&r));
             r
         }
         Err(e) => {
@@ -8693,9 +8705,7 @@ fn main() {
                  Fix or recreate the registry to restore full functionality."
             );
             glog(&format!("load_resolved ERR: {e}"));
-            // Fail closed for code mode: leave CODE_MODE false (static default)
-            // rather than adopting Registry::default().code_mode == true (WS2-5).
-            set_code_mode_flag(false);
+            seed_code_mode_after_registry_load(Err(()));
             registry::Registry::default()
         }
     };
@@ -9763,8 +9773,8 @@ mod tests {
     /// `toolport_run_script`. Production seeds the flag from the registry at boot.
     #[test]
     fn run_script_is_refused_when_code_mode_disabled() {
-        // WS2-6: actually drive the live atomic. Serialize with a mutex so
-        // parallel tests cannot leave CODE_MODE stuck true.
+        // WS2-6: drive the live atomic. Serialize so parallel tests cannot leave
+        // CODE_MODE stuck true (and so tools/list counts stay stable).
         let _guard = CODE_MODE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -9800,7 +9810,9 @@ mod tests {
             .contains("code mode is disabled"));
     }
 
-    /// WS2-6: live CODE_MODE atomic gates dispatch; flipping it on allows a script.
+    /// WS2-6: live CODE_MODE atomic gates `handle_request_with_cancel` (the
+    /// production path that passes a shareable router Arc). Plain `handle_request`
+    /// always passes `router_arc: None`, so it cannot assert a successful run.
     #[test]
     fn run_script_respects_live_code_mode_flag() {
         let _guard = CODE_MODE_TEST_LOCK
@@ -9809,24 +9821,66 @@ mod tests {
         let prev = CODE_MODE.load(Ordering::Relaxed);
         let reg = Registry::default();
         let router = Arc::new(routed_router("s", "tool"));
-        let args = json!({ "script": "return 42;" });
+        let search_index = CatalogSearchIndex::build(&[]);
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "toolport_run_script", "arguments": { "script": "return 42;" } }
+        });
 
         set_code_mode_flag(false);
-        // Direct dispatch still requires the shareable router; kill-switch is
-        // asserted on handle_request in run_script_is_refused_when_code_mode_disabled.
-        // Here: flag on → full path succeeds.
+        let refused = handle_request_with_cancel(
+            &req,
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+            None,
+            Some(&search_index),
+            Some(&router),
+        )
+        .unwrap();
+        assert_eq!(refused["result"]["isError"].as_bool(), Some(true));
+        assert!(refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("code mode is disabled"));
+
         set_code_mode_flag(true);
-        let result =
-            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args);
+        let allowed = handle_request_with_cancel(
+            &req,
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+            None,
+            Some(&search_index),
+            Some(&router),
+        )
+        .unwrap();
         set_code_mode_flag(prev);
 
         assert_eq!(
-            result["isError"].as_bool(),
+            allowed["result"]["isError"].as_bool(),
             Some(false),
-            "live flag on must run script: {result}"
+            "live flag on must run script: {allowed}"
         );
-        assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
-        assert_eq!(result["structuredContent"]["result"], 42);
+        assert_eq!(
+            allowed["result"]["structuredContent"]["toolportScript"]["ok"],
+            true
+        );
+        assert_eq!(allowed["result"]["structuredContent"]["result"], 42);
     }
 
     #[test]
@@ -9843,27 +9897,74 @@ mod tests {
         assert!(!explicit_off.code_mode);
     }
 
-    /// WS2-5: a corrupt-registry fallback must not seed code mode on (default
-    /// Registry has code_mode true). Mirror the boot path: only set_code_mode_flag
-    /// from a successful load; on Err force false.
+    /// WS2-5: corrupt-registry boot must not advertise/run code mode even though
+    /// the fallback [`Registry::default`] has `code_mode: true`.
     #[test]
     fn code_mode_flag_fails_closed_when_registry_load_fails() {
         let _guard = CODE_MODE_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = CODE_MODE.load(Ordering::Relaxed);
-        // Simulate successful load then a later failure path: explicit off first.
         set_code_mode_flag(true);
-        // Err path policy: force false (do not use Registry::default().code_mode).
-        set_code_mode_flag(false);
+
+        // Same helper the boot path uses on Err(load_resolved).
+        seed_code_mode_after_registry_load(Err(()));
+        let reg = Registry::default();
         assert!(
-            !CODE_MODE.load(Ordering::Relaxed),
-            "corrupt-registry path must not leave code mode on"
+            reg.code_mode,
+            "fallback registry struct still defaults code_mode on"
         );
-        // Successful load would set from registry field.
-        set_code_mode_flag(Registry::default().code_mode);
-        assert!(CODE_MODE.load(Ordering::Relaxed));
+
+        let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let list = handle_request(
+            &list_req,
+            &reg,
+            &router(),
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"toolport_run_script"),
+            "corrupt-load path must not advertise run_script: {names:?}"
+        );
+
+        let call_req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "toolport_run_script", "arguments": { "script": "return 1;" } }
+        });
+        let call = handle_request(
+            &call_req,
+            &reg,
+            &routed_router("s", "tool"),
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
         set_code_mode_flag(prev);
+        assert_eq!(call["result"]["isError"].as_bool(), Some(true));
+        assert!(call["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("code mode is disabled"));
     }
 
     fn router() -> Router {
@@ -12265,6 +12366,14 @@ mod tests {
 
     #[test]
     fn lazy_tools_list_returns_only_meta_tools() {
+        // Hold CODE_MODE_TEST_LOCK: other tests flip the global atomic, and an
+        // exact tool count of 4 assumes run_script is not advertised.
+        let _guard = CODE_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = CODE_MODE.load(Ordering::Relaxed);
+        set_code_mode_flag(false);
+
         let reg = Registry::default();
         let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         // Even with a full cached catalog, lazy mode advertises just the meta-tools.
@@ -12281,6 +12390,7 @@ mod tests {
             None,
         )
         .unwrap();
+        set_code_mode_flag(prev);
         let names: Vec<&str> = resp["result"]["tools"]
             .as_array()
             .unwrap()
@@ -12295,6 +12405,7 @@ mod tests {
         assert!(names.contains(&"toolport_call_tool"));
         assert!(names.contains(&"toolport_fetch_result"));
         assert!(!names.contains(&"resend__send_email"));
+        assert!(!names.contains(&"toolport_run_script"));
     }
 
     #[test]
