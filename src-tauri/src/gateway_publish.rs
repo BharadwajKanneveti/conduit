@@ -275,14 +275,18 @@ pub fn is_gateway_basename(name: &str) -> bool {
 }
 
 /// Linux `/proc/<pid>/exe` appends ` (deleted)` after the binary is unlinked
-/// (package upgrade). Strip it so basename matching still sees the real image.
-/// Pure helper — used by the Linux enumerator and unit-tested.
+/// (package upgrade). Strip it for *basename* matching so the process is still
+/// recognized as a gateway. Leave the marker on the stored path: a `(deleted)`
+/// exe must miss keep-paths and be reaped, otherwise an in-place upgrade keeps
+/// the old inode running.
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
 fn strip_deleted_exe_suffix(s: &str) -> &str {
     s.strip_suffix(" (deleted)").unwrap_or(s)
 }
 
 /// Last path component of an `exe` symlink target (or any display path), after
 /// stripping a trailing ` (deleted)` marker. Pure for tests (WS4-3).
+#[cfg(any(all(unix, not(target_os = "macos")), test))]
 fn basename_from_exe_link(path: &Path) -> String {
     let raw = path.to_string_lossy();
     let cleaned = strip_deleted_exe_suffix(raw.as_ref());
@@ -293,7 +297,10 @@ fn basename_from_exe_link(path: &Path) -> String {
 }
 
 /// Parse one line of `ps -ax -o pid= -o ucomm=` (or `comm=`) into `(pid, name)`.
-/// Pure for tests so a broken argv cannot ship without CI noticing (WS4-1 / WS4-8).
+/// Pure helper for the macOS enumerator line format. Does **not** prove the `ps`
+/// argv itself is correct — a broken `-axo pid= comm=` still needs a macOS
+/// smoke / CI job (WS4-1 / WS4-8).
+#[cfg(any(target_os = "macos", test))]
 fn parse_ps_pid_name_line(line: &str) -> Option<(u32, String)> {
     let line = line.trim();
     if line.is_empty() {
@@ -674,7 +681,9 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
         if !is_gateway_basename(&basename) {
             // Also check exe basename — comm is truncated to 15 chars
             // (`toolport-gateway` is 16), so post-upgrade detection depends on
-            // the exe symlink. Strip ` (deleted)` (WS4-3).
+            // the exe symlink. Strip ` (deleted)` for basename matching only;
+            // keep it on `path` so keep-paths miss and the old inode is reaped
+            // (WS4-3).
             let exe = std::fs::read_link(ent.path().join("exe")).ok();
             let Some(ref exe_path) = exe else {
                 continue;
@@ -1045,7 +1054,9 @@ mod tests {
         assert!(!is_gateway_basename("toolport-gatewayed"));
     }
 
-    /// WS4-3: post-upgrade `/proc/.../exe` ends with ` (deleted)`.
+    /// WS4-3: post-upgrade `/proc/.../exe` ends with ` (deleted)`. Strip it for
+    /// basename detection only — leave it on the stored path so keep-paths miss
+    /// and the pre-upgrade inode is killed.
     #[test]
     fn strip_deleted_exe_suffix_and_basename() {
         assert_eq!(
@@ -1056,16 +1067,48 @@ mod tests {
             strip_deleted_exe_suffix("/usr/bin/toolport-gateway"),
             "/usr/bin/toolport-gateway"
         );
-        let deleted = PathBuf::from("/usr/bin/toolport-gateway (deleted)");
+        let deleted = PathBuf::from("/home/u/.local/share/toolport/toolport-gateway (deleted)");
         assert_eq!(basename_from_exe_link(&deleted), "toolport-gateway");
         assert!(is_gateway_basename(&basename_from_exe_link(&deleted)));
         // Without the strip, file_name keeps the marker and matching fails.
         assert!(!is_gateway_basename("toolport-gateway (deleted)"));
         let live = PathBuf::from("/usr/bin/toolport-gateway-1.9.4");
         assert_eq!(basename_from_exe_link(&live), "toolport-gateway-1.9.4");
+
+        let keep = PathBuf::from("/home/u/.local/share/toolport/toolport-gateway");
+        let c = ReapContext {
+            current_version: "1.9.6".into(),
+            keep_paths: vec![keep.clone()],
+            kill_all: false,
+        };
+        // Fresh process at the keep path survives.
+        assert_eq!(
+            decide_reap(
+                &GatewayProcess {
+                    pid: 1,
+                    path: Some(keep),
+                    basename: "toolport-gateway".into(),
+                },
+                &c
+            ),
+            ReapDecision::Keep
+        );
+        // In-place upgrade: raw `(deleted)` path must miss keep-paths → Kill.
+        assert_eq!(
+            decide_reap(
+                &GatewayProcess {
+                    pid: 2,
+                    path: Some(deleted),
+                    basename: "toolport-gateway".into(),
+                },
+                &c
+            ),
+            ReapDecision::Kill
+        );
     }
 
     /// WS4-1 / WS4-8: pure parse of `ps -o pid= -o ucomm=` lines (including padded pid).
+    /// Does not prove the `ps` argv itself — that still needs a macOS smoke.
     #[test]
     fn parse_ps_pid_name_line_accepts_padded_pid_and_ucomm() {
         assert_eq!(
