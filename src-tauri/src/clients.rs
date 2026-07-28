@@ -2416,7 +2416,60 @@ fn backup_file(client_id: &str, path: &Path) -> Result<Option<PathBuf>, String> 
         .unwrap_or("config");
     let dest = dir.join(format!("{}-{}", epoch_millis(), name));
     std::fs::copy(path, &dest).map_err(|e| e.to_string())?;
+    prune_backups(&dir, name);
     Ok(Some(dest))
+}
+
+/// How many backup generations to keep per client config file. Matches the
+/// registry's `BACKUP_GENERATIONS` so both stores bound recovery depth the same way.
+const CONFIG_BACKUP_GENERATIONS: usize = 5;
+
+/// Drop all but the newest [`CONFIG_BACKUP_GENERATIONS`] backups of one config file
+/// (SOU-433).
+///
+/// These copies are not inert: a Shared HTTP client's config carries a live
+/// `Authorization: Bearer <token>`, and since #503 that bearer is the one the client
+/// actually sends. Repoint runs on every launch, so an unpruned directory accumulated
+/// working credentials indefinitely, and `revoke_client_http_token` (which exists
+/// precisely so "a leftover backup" cannot keep authenticating) only covers Disconnect.
+/// Bounding the count bounds how long a rotated-away token survives on disk.
+///
+/// Best-effort: a failure here must never fail the write the backup was protecting.
+/// Names are `<millis>-<file name>`. Age order comes from parsing that prefix as a
+/// number, not from sorting the names: lexical order only equals age order while every
+/// stamp is the same width, so a short prefix (a clock that read near the epoch, or any
+/// future change to the stamp format) would sort as "oldest" and get deleted first
+/// regardless of when it was written.
+fn prune_backups(dir: &Path, name: &str) {
+    let suffix = format!("-{name}");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut mine: Vec<(u128, PathBuf)> = entries
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter_map(|p| {
+            let stamp = p
+                .file_name()
+                .and_then(|f| f.to_str())
+                .and_then(|f| f.strip_suffix(&suffix))
+                // Timestamp prefix only, so backups of `config.yaml` never prune
+                // backups of some other `<x>-config.yaml` in the same directory.
+                .filter(|stamp| !stamp.is_empty() && stamp.bytes().all(|b| b.is_ascii_digit()))
+                // An unparseable stamp means a name we do not own the format of; skip
+                // it rather than guess its age.
+                .and_then(|stamp| stamp.parse::<u128>().ok())?;
+            Some((stamp, p))
+        })
+        .collect();
+    if mine.len() <= CONFIG_BACKUP_GENERATIONS {
+        return;
+    }
+    mine.sort_by_key(|(stamp, _)| *stamp);
+    let excess = mine.len() - CONFIG_BACKUP_GENERATIONS;
+    for (_, stale) in mine.into_iter().take(excess) {
+        let _ = std::fs::remove_file(stale);
+    }
 }
 
 fn entry_to_json(entry: &ServerEntry) -> serde_json::Value {
@@ -4136,6 +4189,94 @@ mod tests {
 
     fn temp_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!("conduit-w-{}-{}.cfg", std::process::id(), label))
+    }
+
+    /// SOU-433: config backups carry a live Shared HTTP bearer, so the directory
+    /// must not grow forever. Prune keeps the newest generations of the file it was
+    /// called for, and never touches a differently-named config's backups.
+    #[test]
+    fn prune_backups_bounds_generations_per_config_file() {
+        let dir = std::env::temp_dir().join(format!("toolport-bk-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // 8 generations of config.yaml, oldest first by timestamp prefix.
+        for stamp in 1000000000001u64..=1000000000008 {
+            std::fs::write(dir.join(format!("{stamp}-config.yaml")), "Authorization: Bearer x")
+                .unwrap();
+        }
+        // A different config whose name ENDS with the same suffix, plus unrelated files.
+        std::fs::write(dir.join("1000000000001-other-config.yaml"), "x").unwrap();
+        std::fs::write(dir.join("notes.txt"), "x").unwrap();
+
+        prune_backups(&dir, "config.yaml");
+
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec![
+                "1000000000001-other-config.yaml".to_string(),
+                "1000000000004-config.yaml".to_string(),
+                "1000000000005-config.yaml".to_string(),
+                "1000000000006-config.yaml".to_string(),
+                "1000000000007-config.yaml".to_string(),
+                "1000000000008-config.yaml".to_string(),
+                "notes.txt".to_string(),
+            ],
+            "keep the newest {CONFIG_BACKUP_GENERATIONS}, drop older, touch nothing else"
+        );
+
+        // Idempotent once at the cap.
+        prune_backups(&dir, "config.yaml");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 7);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Age order must come from the parsed stamp, not the name. When the millisecond
+    /// count gains a digit, lexical order inverts and a plain sort would delete one of
+    /// the NEWEST backups while keeping older ones.
+    #[test]
+    fn prune_backups_orders_by_parsed_timestamp_not_lexically() {
+        let dir = std::env::temp_dir().join(format!("toolport-bk-width-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Straddle a digit-width boundary: 13-digit stamps are numerically OLDER than
+        // the 14-digit ones, but sort AFTER them as strings.
+        let oldest = "9999999999997";
+        for stamp in [
+            oldest,
+            "9999999999998",
+            "9999999999999",
+            "10000000000000",
+            "10000000000001",
+            "10000000000002",
+        ] {
+            std::fs::write(dir.join(format!("{stamp}-config.yaml")), "x").unwrap();
+        }
+
+        prune_backups(&dir, "config.yaml");
+
+        let left: std::collections::BTreeSet<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.file_name().to_str().map(String::from))
+            .collect();
+        assert_eq!(left.len(), CONFIG_BACKUP_GENERATIONS);
+        assert!(
+            !left.contains(&format!("{oldest}-config.yaml")),
+            "the numerically oldest backup must be the one dropped: {left:?}"
+        );
+        assert!(
+            left.contains("10000000000000-config.yaml"),
+            "a lexical sort would have deleted this newer backup instead: {left:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
