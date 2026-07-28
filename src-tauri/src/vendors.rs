@@ -106,6 +106,15 @@ fn vendors() -> &'static [Vendor] {
             token_url: Some("https://github.com/settings/tokens"),
             instructions: "Create a personal access token in GitHub developer settings and paste it.",
         },
+        // Exact SLD for api.githubcopilot.com (cannot use starts_with("github") —
+        // that would match lookalikes like github-mcp.com / evilgithub.com) (WS5-1).
+        Vendor {
+            needle: "githubcopilot",
+            name: "GitHub",
+            force_kind: None,
+            token_url: Some("https://github.com/settings/tokens"),
+            instructions: "Create a personal access token in GitHub developer settings and paste it.",
+        },
         Vendor {
             needle: "linear.app",
             name: "Linear",
@@ -131,7 +140,7 @@ fn vendors() -> &'static [Vendor] {
 }
 
 fn second_level_label(host: &str) -> Option<&str> {
-    let labels: Vec<&str> = host.split('.').collect();
+    let labels: Vec<&str> = host.split('.').filter(|l| !l.is_empty()).collect();
     if labels.len() < 2 {
         return None;
     }
@@ -139,16 +148,24 @@ fn second_level_label(host: &str) -> Option<&str> {
 }
 
 fn match_vendor(url: &str) -> Option<&'static Vendor> {
-    let host = url::Url::parse(url).ok()?.host_str()?.to_lowercase();
+    // FQDN trailing dots (https://mcp.stripe.com./mcp) leave an empty root label
+    // in host_str; strip so vendor detection still works (WS5-2).
+    let host = url::Url::parse(url)
+        .ok()?
+        .host_str()?
+        .trim_end_matches('.')
+        .to_lowercase();
     let sld = second_level_label(&host);
 
     vendors().iter().find(|v| {
         if v.needle.contains('.') {
             host == v.needle || host.ends_with(&format!(".{}", v.needle))
         } else {
-            sld.is_some_and(|label| {
-                label == v.needle || label.starts_with(v.needle) || label.ends_with(v.needle)
-            })
+            // Exact second-level label only. Prefix/suffix matching let lookalike
+            // apex domains (clerkauth.com, evilgithub.com) inherit real vendor
+            // auth hints and token URLs (WS5-1). Special hosts that need a
+            // non-brand SLD (api.githubcopilot.com) get their own needle entries.
+            sld == Some(v.needle)
         }
     })
 }
@@ -210,6 +227,30 @@ mod tests {
 
         assert!(match_vendor("https://clerk.evil.com").is_none());
         assert!(match_vendor("https://stripe.com.evil.dev").is_none());
+    }
+
+    /// WS5-1: lookalike apex domains must not inherit vendor auth hints.
+    #[test]
+    fn lookalike_apex_domains_do_not_match() {
+        assert!(match_vendor("https://clerkauth.com/mcp").is_none());
+        assert!(match_vendor("https://mcp.clerk-sso.com/mcp").is_none());
+        assert!(match_vendor("https://github-mcp.com/mcp").is_none());
+        assert!(match_vendor("https://evilgithub.com/mcp").is_none());
+        // Still match real SLDs.
+        assert_eq!(match_vendor("https://clerk.com").unwrap().name, "Clerk");
+        assert_eq!(
+            match_vendor("https://api.github.com").unwrap().name,
+            "GitHub"
+        );
+    }
+
+    /// WS5-2: trailing-dot FQDN still detects vendors.
+    #[test]
+    fn trailing_dot_host_still_matches() {
+        assert_eq!(
+            match_vendor("https://mcp.stripe.com./mcp").unwrap().name,
+            "Stripe"
+        );
     }
 
     #[test]
