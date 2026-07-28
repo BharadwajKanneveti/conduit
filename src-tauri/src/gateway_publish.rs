@@ -275,8 +275,10 @@ pub fn is_gateway_basename(name: &str) -> bool {
 }
 
 /// Linux `/proc/<pid>/exe` appends ` (deleted)` after the binary is unlinked
-/// (package upgrade). Strip it so basename matching and keep-path compares still
-/// see the real image.
+/// (package upgrade). Strip it for *basename* matching so the process is still
+/// recognized as a gateway. Leave the marker on the stored path: a `(deleted)`
+/// exe must miss keep-paths and be reaped, otherwise an in-place upgrade keeps
+/// the old inode running.
 #[cfg(any(all(unix, not(target_os = "macos")), test))]
 fn strip_deleted_exe_suffix(s: &str) -> &str {
     s.strip_suffix(" (deleted)").unwrap_or(s)
@@ -292,19 +294,6 @@ fn basename_from_exe_link(path: &Path) -> String {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| cleaned.to_string())
-}
-
-/// Drop a trailing ` (deleted)` from a `/proc/.../exe` target so keep-paths can
-/// still match a live process whose binary was replaced in place (WS4-3).
-#[cfg(any(all(unix, not(target_os = "macos")), test))]
-fn path_from_exe_link(path: PathBuf) -> PathBuf {
-    let raw = path.to_string_lossy();
-    let cleaned = strip_deleted_exe_suffix(raw.as_ref());
-    if cleaned.len() == raw.len() {
-        path
-    } else {
-        PathBuf::from(cleaned)
-    }
 }
 
 /// Parse one line of `ps -ax -o pid= -o ucomm=` (or `comm=`) into `(pid, name)`.
@@ -692,11 +681,10 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
         if !is_gateway_basename(&basename) {
             // Also check exe basename — comm is truncated to 15 chars
             // (`toolport-gateway` is 16), so post-upgrade detection depends on
-            // the exe symlink. Strip ` (deleted)` from basename *and* path so
-            // keep-paths still protect a live process after an in-place swap (WS4-3).
-            let exe = std::fs::read_link(ent.path().join("exe"))
-                .ok()
-                .map(path_from_exe_link);
+            // the exe symlink. Strip ` (deleted)` for basename matching only;
+            // keep it on `path` so keep-paths miss and the old inode is reaped
+            // (WS4-3).
+            let exe = std::fs::read_link(ent.path().join("exe")).ok();
             let Some(ref exe_path) = exe else {
                 continue;
             };
@@ -711,9 +699,7 @@ fn linux_list_gateway_processes() -> Vec<GatewayProcess> {
             });
             continue;
         }
-        let path = std::fs::read_link(ent.path().join("exe"))
-            .ok()
-            .map(path_from_exe_link);
+        let path = std::fs::read_link(ent.path().join("exe")).ok();
         out.push(GatewayProcess {
             pid,
             path,
@@ -1068,8 +1054,9 @@ mod tests {
         assert!(!is_gateway_basename("toolport-gatewayed"));
     }
 
-    /// WS4-3: post-upgrade `/proc/.../exe` ends with ` (deleted)`. Basename and
-    /// keep-path matching both need the marker stripped from the stored path.
+    /// WS4-3: post-upgrade `/proc/.../exe` ends with ` (deleted)`. Strip it for
+    /// basename detection only — leave it on the stored path so keep-paths miss
+    /// and the pre-upgrade inode is killed.
     #[test]
     fn strip_deleted_exe_suffix_and_basename() {
         assert_eq!(
@@ -1088,37 +1075,30 @@ mod tests {
         let live = PathBuf::from("/usr/bin/toolport-gateway-1.9.4");
         assert_eq!(basename_from_exe_link(&live), "toolport-gateway-1.9.4");
 
-        let cleaned = path_from_exe_link(deleted);
-        assert_eq!(
-            cleaned,
-            PathBuf::from("/home/u/.local/share/toolport/toolport-gateway")
-        );
         let keep = PathBuf::from("/home/u/.local/share/toolport/toolport-gateway");
         let c = ReapContext {
             current_version: "1.9.6".into(),
             keep_paths: vec![keep.clone()],
             kill_all: false,
         };
-        // Live gateway after binary swap: path must match keep-paths once cleaned.
+        // Fresh process at the keep path survives.
         assert_eq!(
             decide_reap(
                 &GatewayProcess {
                     pid: 1,
-                    path: Some(cleaned),
+                    path: Some(keep),
                     basename: "toolport-gateway".into(),
                 },
                 &c
             ),
             ReapDecision::Keep
         );
-        // Leaving `(deleted)` on the path misses keep-paths and kills the live process.
+        // In-place upgrade: raw `(deleted)` path must miss keep-paths → Kill.
         assert_eq!(
             decide_reap(
                 &GatewayProcess {
-                    pid: 1,
-                    path: Some(PathBuf::from(
-                        "/home/u/.local/share/toolport/toolport-gateway (deleted)"
-                    )),
+                    pid: 2,
+                    path: Some(deleted),
                     basename: "toolport-gateway".into(),
                 },
                 &c
