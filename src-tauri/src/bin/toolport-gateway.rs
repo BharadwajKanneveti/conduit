@@ -2812,17 +2812,24 @@ fn content_binding_decision(
 /// - the live definition fingerprint no longer matches what was approved (or is gone), or
 /// - the live router now blocks the exposed tool (quarantine / policy).
 ///
+/// Fingerprints are taken **only** from `live.aggregated_tools()` — never the request
+/// cache. A cache fallback would treat a tool removed (or quarantined out of the live
+/// aggregation) as still present and miss `StaleState`.
+///
 /// Returns `Some(StaleState)` when the approval is no longer valid to execute; `None` to
 /// proceed on `live`. Pure / broker-free so the COW window can be unit-tested.
 fn post_hitl_revalidation(
     approved_fingerprint: Option<&str>,
     name: &str,
-    cached: &[Value],
     live: &Router,
 ) -> Option<approval::ApprovalDecision> {
-    let live_fp = tool_fingerprint_for(name, cached, live);
+    let live_fp = live
+        .aggregated_tools()
+        .iter()
+        .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
+        .map(integrity::fingerprint);
     match (approved_fingerprint, live_fp.as_deref()) {
-        (Some(approved), Some(live)) if approved == live => {}
+        (Some(approved), Some(live_fp)) if approved == live_fp => {}
         // No fingerprint was capturable at gate time AND still isn't — fall through to the
         // block_reason check (unknown tools fail at routing anyway).
         (None, None) => {}
@@ -2873,8 +2880,8 @@ fn refused_call_result(
         approval::ApprovalDecision::StaleState => (
             true,
             format!(
-                "the call to {name} changed after it was approved, so the stale approval was \
-                 rejected"
+                "the approval for {name} is stale (arguments, tool definition, or policy \
+                 changed after it was approved), so it was rejected"
             ),
         ),
         _ => (
@@ -2884,7 +2891,7 @@ fn refused_call_result(
     };
     let guidance = match decision {
         approval::ApprovalDecision::StaleState => {
-            " Re-form the exact call and get it approved again, then retry."
+            " Re-check the tool in Toolport, re-form the exact call, get it approved again, then retry."
         }
         approval::ApprovalDecision::Denied => "",
         _ => " Ask the user to approve it in the Toolport app, then retry.",
@@ -3154,7 +3161,7 @@ fn execute_call(
             // `requarantine` that forked a new Arc via `make_mut`.
             if let Some(live) = clone_live_router(live_router) {
                 if let Some(stale) =
-                    post_hitl_revalidation(approved_fp.as_deref(), name, cached, &live)
+                    post_hitl_revalidation(approved_fp.as_deref(), name, &live)
                 {
                     audit::record_decision(
                         srv,
@@ -9538,7 +9545,6 @@ mod tests {
             post_hitl_revalidation(
                 approved_fp.as_deref(),
                 "s__wipe",
-                &[],
                 live.lock().unwrap().as_ref(),
             ),
             Some(approval::ApprovalDecision::StaleState),
@@ -9546,7 +9552,7 @@ mod tests {
         );
         // Control: revalidating the stale snapshot alone would wrongly pass.
         assert!(
-            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &[], &snapshot).is_none(),
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &snapshot).is_none(),
             "snapshot-only check would miss the bug this test guards"
         );
     }
@@ -9591,11 +9597,11 @@ mod tests {
             tool_fingerprint_for("s__wipe", &[], &after_drift).as_deref(),
         );
         assert_eq!(
-            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &[], &after_drift),
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &after_drift),
             Some(approval::ApprovalDecision::StaleState),
         );
         assert!(
-            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &[], &at_gate).is_none(),
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &at_gate).is_none(),
             "unchanged definition must still pass"
         );
     }
@@ -9610,10 +9616,27 @@ mod tests {
         assert!(post_hitl_revalidation(
             approved_fp.as_deref(),
             "s__wipe",
-            &[],
             live.lock().unwrap().as_ref(),
         )
         .is_none());
+    }
+
+    /// Live-only fingerprint: a tool still present in the request cache but gone from the
+    /// live aggregation must StaleState (never resurrect via cache fallback).
+    #[test]
+    fn post_hitl_revalidation_ignores_request_cache_for_missing_live_tool() {
+        let snapshot = routed_router("s", "wipe");
+        let approved_fp = tool_fingerprint_for("s__wipe", &[], &snapshot);
+        assert!(approved_fp.is_some());
+        // Empty live router: tool is gone from aggregation (removed / never indexed).
+        let live = Router::new();
+        // Even if the request cache still holds the old definition, revalidation must
+        // not use it — missing live definition is StaleState.
+        let _stale_cache = snapshot.aggregated_tools();
+        assert_eq!(
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &live),
+            Some(approval::ApprovalDecision::StaleState),
+        );
     }
 
     /// Live policy wins: a tool blocked on the pre-hold snapshot but released on live
@@ -9651,14 +9674,13 @@ mod tests {
             post_hitl_revalidation(
                 approved_fp.as_deref(),
                 "s__wipe",
-                &[],
                 live.lock().unwrap().as_ref(),
             )
             .is_none(),
             "a mid-hold release on the live Arc must clear the post-HITL block"
         );
         assert_eq!(
-            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &[], &snapshot),
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &snapshot),
             Some(approval::ApprovalDecision::StaleState),
             "the pre-hold snapshot would still wrongly block"
         );
