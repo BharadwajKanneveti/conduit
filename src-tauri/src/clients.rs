@@ -2925,15 +2925,10 @@ fn parse_continue_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> 
             })
             .unwrap_or_default();
 
-        let env_keys = def
-            .get(serde_yaml::Value::String("env".into()))
-            .and_then(|v| v.as_mapping())
-            .map(|m| {
-                m.keys()
-                    .filter_map(|k| k.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Stdio: Continue reads `env`. Remote: Continue sends
+        // `requestOptions.headers` (not process env) — collect both so ownership
+        // re-detect and Shared HTTP stay in sync (WS3-1).
+        let env_keys = continue_yaml_env_keys(def);
 
         servers.push(McpServer {
             name,
@@ -2955,6 +2950,26 @@ fn parse_continue_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> 
 
     servers.sort_by_key(|s| s.name.to_lowercase());
     Ok(servers)
+}
+
+/// Keys Continue may use for credentials / client identity on one mcpServers entry.
+fn continue_yaml_env_keys(def: &serde_yaml::Mapping) -> Vec<String> {
+    let mut env_keys = Vec::new();
+    let str_key = |k: &str| serde_yaml::Value::String(k.into());
+    if let Some(m) = def.get(str_key("env")).and_then(|v| v.as_mapping()) {
+        env_keys.extend(m.keys().filter_map(|k| k.as_str().map(String::from)));
+    }
+    if let Some(m) = def
+        .get(str_key("requestOptions"))
+        .and_then(|v| v.as_mapping())
+        .and_then(|ro| ro.get(str_key("headers")))
+        .and_then(|v| v.as_mapping())
+    {
+        env_keys.extend(m.keys().filter_map(|k| k.as_str().map(String::from)));
+    }
+    env_keys.sort_unstable();
+    env_keys.dedup();
+    env_keys
 }
 
 /// Build a Continue MCP server record for a server entry.
@@ -2982,18 +2997,19 @@ fn entry_to_continue_yaml(entry: &ServerEntry) -> serde_yaml::Value {
         } else {
             "streamable-http"
         };
-        // Include env (Authorization + client id) so Shared HTTP tokens reach the
-        // file and re-detect sees the same keys as ManagedEntry (WS3-1).
+        // Remote: Continue only forwards `requestOptions.headers` on the wire.
+        // Writing Authorization under `env` leaves a plaintext bearer on disk
+        // that never authenticates (WS3-1) — same trap entry_to_json documents.
         let mut remote = serde_json::json!({
             "name": entry.name,
             "type": transport,
             "url": url,
         });
         if !env.is_empty() {
-            remote
-                .as_object_mut()
-                .unwrap()
-                .insert("env".into(), serde_json::Value::Object(env));
+            remote.as_object_mut().unwrap().insert(
+                "requestOptions".into(),
+                serde_json::json!({ "headers": env }),
+            );
         }
         remote
     } else {
@@ -4508,7 +4524,8 @@ bad = "not-a-table"
         };
         let auth = "Bearer roundtrip-secret";
 
-        // Continue (YamlMcpServersList): env must be present on the url entry (WS3-1).
+        // Continue (YamlMcpServersList): remote bearer under requestOptions.headers
+        // (Continue's wire contract), not env (WS3-1).
         {
             let path = temp_path("ws3-continue.yaml");
             std::fs::write(&path, "name: Test\nmcpServers: []\n").unwrap();
@@ -4519,9 +4536,27 @@ bad = "not-a-table"
                 content.contains(auth),
                 "Continue config must contain the bearer: {content}"
             );
+            let root: serde_yaml::Value = serde_yaml::from_str(&content).unwrap();
+            let slot = root
+                .get("mcpServers")
+                .and_then(|v| v.as_sequence())
+                .and_then(|seq| {
+                    seq.iter().find(|s| {
+                        s.get("name").and_then(|n| n.as_str()) == Some(GATEWAY_ENTRY_NAME)
+                    })
+                })
+                .expect("gateway entry in yaml");
+            assert_eq!(
+                slot.get("requestOptions")
+                    .and_then(|ro| ro.get("headers"))
+                    .and_then(|h| h.get("Authorization"))
+                    .and_then(|v| v.as_str()),
+                Some(auth),
+                "Continue remote must put Authorization under requestOptions.headers: {content}"
+            );
             assert!(
-                content.contains("env:") || content.contains("Authorization"),
-                "Continue must write env with Authorization: {content}"
+                slot.get("env").is_none(),
+                "Continue remote must not put the bearer under env: {content}"
             );
             let parsed = parse_continue_yaml_servers(&content).unwrap();
             let gw = parsed
@@ -5675,6 +5710,24 @@ command = "npx"
     }
 
     #[test]
+    fn continue_yaml_parses_request_options_headers() {
+        // Continue's remote auth contract (not top-level env / headers).
+        let content = "mcpServers:\n  - name: secured\n    type: streamable-http\n    url: https://example.com/mcp\n    requestOptions:\n      headers:\n        Authorization: Bearer remote-tok\n        TOOLPORT_CLIENT_ID: continue\n";
+
+        let parsed = parse_continue_yaml_servers(content).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "secured");
+        assert_eq!(
+            parsed[0].env_keys,
+            vec![
+                "Authorization".to_string(),
+                "TOOLPORT_CLIENT_ID".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn continue_yaml_malformed_entry_returns_error() {
         let content = "mcpServers:\n  - name: fetch\n    command: uvx\n  - not-a-mapping\n";
 
@@ -5722,6 +5775,7 @@ command = "npx"
             Some("https://remote.example.com/mcp")
         );
         assert!(parsed[2].command.is_none());
+        assert_eq!(parsed[2].env_keys, vec!["Authorization".to_string()]);
         assert_eq!(parsed[3].name, "remote-sse");
         assert_eq!(parsed[3].transport, "sse");
         assert_eq!(
@@ -5747,6 +5801,30 @@ command = "npx"
             Some("Keep responses concise")
         );
         assert!(content.contains("plain-value"));
+        // Remote credentials must be under requestOptions.headers (Continue wire contract).
+        let remotes: Vec<_> = root
+            .get("mcpServers")
+            .and_then(|v| v.as_sequence())
+            .into_iter()
+            .flatten()
+            .filter(|s| s.get("url").is_some())
+            .collect();
+        assert_eq!(remotes.len(), 2);
+        for remote in remotes {
+            assert_eq!(
+                remote
+                    .get("requestOptions")
+                    .and_then(|ro| ro.get("headers"))
+                    .and_then(|h| h.get("Authorization"))
+                    .and_then(|v| v.as_str()),
+                Some("Bearer fixture"),
+                "remote Continue entry must use requestOptions.headers: {content}"
+            );
+            assert!(
+                remote.get("env").is_none(),
+                "remote Continue entry must not use env: {content}"
+            );
+        }
 
         std::fs::remove_file(&path).ok();
     }
