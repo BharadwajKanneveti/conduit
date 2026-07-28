@@ -2803,6 +2803,57 @@ fn content_binding_decision(
     }
 }
 
+/// Post-HITL revalidation against the *live* router (SOU-321 / SOU-322).
+///
+/// After a human approves, the world may have changed during the hold: quarantine may have
+/// forked a new `Arc<Router>` via `Arc::make_mut`, or the tool definition may have drifted.
+/// The request-scoped snapshot used for the gate is intentionally kept for pre-HITL
+/// consistency, but execution must fail closed if:
+/// - the live definition fingerprint no longer matches what was approved (or is gone), or
+/// - the live router now blocks the exposed tool (quarantine / policy).
+///
+/// Fingerprints are taken **only** from `live.aggregated_tools()` — never the request
+/// cache. A cache fallback would treat a tool removed (or quarantined out of the live
+/// aggregation) as still present and miss `StaleState`.
+///
+/// Returns `Some(StaleState)` when the approval is no longer valid to execute; `None` to
+/// proceed on `live`. Pure / broker-free so the COW window can be unit-tested.
+fn post_hitl_revalidation(
+    approved_fingerprint: Option<&str>,
+    name: &str,
+    live: &Router,
+) -> Option<approval::ApprovalDecision> {
+    let live_fp = live
+        .aggregated_tools()
+        .iter()
+        .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
+        .map(integrity::fingerprint);
+    match (approved_fingerprint, live_fp.as_deref()) {
+        (Some(approved), Some(live_fp)) if approved == live_fp => {}
+        // No fingerprint was capturable at gate time AND still isn't — fall through to the
+        // block_reason check (unknown tools fail at routing anyway).
+        (None, None) => {}
+        // Missing live definition, or any mismatch: the human approved a different shape.
+        _ => return Some(approval::ApprovalDecision::StaleState),
+    }
+    if live.block_reason(name).is_some() {
+        return Some(approval::ApprovalDecision::StaleState);
+    }
+    None
+}
+
+/// Clone the current live `Arc<Router>` from the swappable slot, releasing the mutex
+/// immediately. Returns `None` only if `live_router` itself is `None` (test harnesses).
+fn clone_live_router(
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+) -> Option<Arc<Router>> {
+    live_router.map(|slot| {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    })
+}
+
 /// Build the agent-facing tool RESULT for a call the gateway refused to run (the inner
 /// `{content, isError, structuredContent}`, which the caller wraps in a JSON-RPC envelope or
 /// hands to a code-mode script as its `toolport.call()` return). Carries a machine-readable
@@ -2829,8 +2880,8 @@ fn refused_call_result(
         approval::ApprovalDecision::StaleState => (
             true,
             format!(
-                "the call to {name} changed after it was approved, so the stale approval was \
-                 rejected"
+                "the approval for {name} is stale (arguments, tool definition, or policy \
+                 changed after it was approved), so it was rejected"
             ),
         ),
         _ => (
@@ -2840,7 +2891,7 @@ fn refused_call_result(
     };
     let guidance = match decision {
         approval::ApprovalDecision::StaleState => {
-            " Re-form the exact call and get it approved again, then retry."
+            " Re-check the tool in Toolport, re-form the exact call, get it approved again, then retry."
         }
         approval::ApprovalDecision::Denied => "",
         _ => " Ask the user to approve it in the Toolport app, then retry.",
@@ -2954,6 +3005,10 @@ fn execute_call(
     name: &str,
     arguments: Value,
     opts: CallOpts,
+    // Live swappable router slot (SOU-321). After HITL approval we re-clone this so
+    // quarantine applied via `Arc::make_mut` during the hold is visible before execute.
+    // `None` only in test wrappers that lack `GatewayState`.
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Value {
     let mut confirmed = opts.confirmed;
     let shape = opts.shape;
@@ -3020,6 +3075,10 @@ fn execute_call(
         }
     }
 
+    // After HITL approval we may swap to a freshly cloned live Arc so quarantine applied
+    // during the hold is enforced (SOU-321). Non-HITL calls keep the request snapshot.
+    let mut exec_router_owned: Option<Arc<Router>> = None;
+
     // Human-in-the-loop approval: hold a gated call (destructive, or from an
     // untrusted-provenance server) until a person approves it in the Toolport app.
     // Takes precedence over the agent-facing confirm below, and is fail-closed
@@ -3051,6 +3110,9 @@ fn execute_call(
             // The exact call being approved, content-bound: the bytes that RUN must
             // hash-match these. Captured before the (blocking) human decision.
             let approved_args_hash = audit::args_hash(&arguments);
+            // Definition fingerprint the human is approving (SOU-322): rebound against
+            // the live router after approve, before execute.
+            let approved_fp = tool_fingerprint_for(name, cached, router);
             let t0 = std::time::Instant::now();
             let decision = request_human_decision(approval::ApprovalRequest {
                 token: String::new(),
@@ -3060,7 +3122,7 @@ fn execute_call(
                 tool: tool.to_string(),
                 reason,
                 arguments: arguments.clone(),
-                tool_fingerprint: tool_fingerprint_for(name, cached, router),
+                tool_fingerprint: approved_fp.clone(),
             });
             let held_ms = t0.elapsed().as_millis() as u64;
             if !decision.is_approved() {
@@ -3094,6 +3156,26 @@ fn execute_call(
                 );
                 return refused_call_result(name, stale, reason_str);
             }
+            // Rebind to the live router and re-check fingerprint + quarantine
+            // (SOU-321 / SOU-322). The request snapshot may predate a mid-hold
+            // `requarantine` that forked a new Arc via `make_mut`.
+            if let Some(live) = clone_live_router(live_router) {
+                if let Some(stale) =
+                    post_hitl_revalidation(approved_fp.as_deref(), name, &live)
+                {
+                    audit::record_decision(
+                        srv,
+                        tool,
+                        client,
+                        reason_str,
+                        decision_token(stale),
+                        &arguments,
+                        Some(held_ms),
+                    );
+                    return refused_call_result(name, stale, reason_str);
+                }
+                exec_router_owned = Some(live);
+            }
             // Approved calls are audited too, so the trail shows what actually ran,
             // not only what was blocked.
             audit::record_decision(
@@ -3110,6 +3192,8 @@ fn execute_call(
         }
     }
 
+    let exec_router: &Router = exec_router_owned.as_deref().unwrap_or(router);
+
     // Per-call confirmation for destructive tools: intercept the first
     // call with these arguments, store it, and return a preview. The
     // agent calls toolport_confirm { token } to replay the stored call.
@@ -3122,7 +3206,7 @@ fn execute_call(
         // Resolve destructiveness robustly (cache, then live router, else
         // fail-closed), so a cold/stale cache can't skip the confirm step for a
         // destructive tool.
-        let dest = tool_is_destructive_fail_closed(name, cached, router);
+        let dest = tool_is_destructive_fail_closed(name, cached, exec_router);
         if dest {
             match confirm {
                 Some(confirm) => {
@@ -3178,7 +3262,7 @@ fn execute_call(
     }
 
     let started = Instant::now();
-    match router.route_call_with_cancel(name, arguments, cancel.clone()) {
+    match exec_router.route_call_with_cancel(name, arguments, cancel.clone()) {
         Ok(result) => {
             if let Some(profiler) = &mut call_profiler {
                 profiler.mark_downstream();
@@ -3385,7 +3469,9 @@ fn script_catalog_tools(
 /// downstream call, so every call passes the identical scope + approval gates a direct call
 /// would - a script never widens the client's reach. Returns one aggregated tool result;
 /// the intermediate call results never enter model context. `router_arc` is the shareable
-/// router used to build the `'static` closure the sandbox requires (`None` -> unavailable).
+/// request-scoped router used to build the `'static` closure the sandbox requires
+/// (`None` -> unavailable). `live_router` is the swappable live slot so post-HITL
+/// revalidation (SOU-321) sees quarantine applied during an approval hold.
 fn run_script_dispatch(
     reg: &Registry,
     router_arc: Option<&Arc<Router>>,
@@ -3394,6 +3480,7 @@ fn run_script_dispatch(
     allowed: Option<&std::collections::HashSet<String>>,
     cancel: Option<downstream::CancelContext>,
     arguments: &Value,
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Value {
     let Some(router_arc) = router_arc else {
         return json!({
@@ -3418,6 +3505,7 @@ fn run_script_dispatch(
     // which can't complete inside a single script round-trip.
     let reg_owned = reg.clone();
     let router_owned = Arc::clone(router_arc);
+    let live_owned = live_router.cloned();
     let cached_owned = cached.to_vec();
     let client_owned = client.map(str::to_string);
     let allowed_owned = allowed.cloned();
@@ -3449,6 +3537,7 @@ fn run_script_dispatch(
                         confirmed: false,
                         shape: false,
                     },
+                    live_owned.as_ref(),
                 )
             };
             match active_session.as_ref() {
@@ -3543,7 +3632,7 @@ fn handle_request(
     let search_index = CatalogSearchIndex::build(cached);
     handle_request_with_cancel(
         req, reg, router, cached, lazy, profile, guard, confirm, allowed, None, client,
-        Some(&search_index), None,
+        Some(&search_index), None, None,
     )
 }
 
@@ -3572,6 +3661,9 @@ fn handle_request_with_cancel(
     // code mode for this request (the test wrapper / any caller without the Arc); the
     // production dispatch passes `Some(&router)`, the same Arc it already cloned off the lock.
     router_arc: Option<&Arc<Router>>,
+    // Swappable live router slot for post-HITL revalidation (SOU-321). Production
+    // passes `Some(&state.router)`; tests may omit it.
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Option<Value> {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
@@ -4142,7 +4234,16 @@ fn handle_request_with_cancel(
                 }
                 return Some(success(
                     id,
-                    run_script_dispatch(reg, router_arc, cached, client, allowed, cancel, &arguments),
+                    run_script_dispatch(
+                        reg,
+                        router_arc,
+                        cached,
+                        client,
+                        allowed,
+                        cancel,
+                        &arguments,
+                        live_router,
+                    ),
                 ));
             }
 
@@ -4170,6 +4271,7 @@ fn handle_request_with_cancel(
                         confirmed,
                         shape: true,
                     },
+                    live_router,
                 ),
             ))
         }
@@ -6704,9 +6806,11 @@ fn process_request(
     // calling handle_request: a tools/call can block on the downstream server or a
     // human-approval hold (up to 120s), and holding the router/registry lock across
     // that would wedge config reloads, setting toggles, and every other request. The
-    // cloned Arc<Router> keeps this call on a consistent catalog even if a concurrent
-    // rebuild swaps the live one; the client label is threaded in, not stored on the
-    // shared router.
+    // cloned Arc<Router> keeps this call on a consistent catalog for pre-HITL work
+    // even if a concurrent rebuild swaps the live one. After a human Approves,
+    // execute_call re-clones the live Arc (via `live_router`) so mid-hold quarantine
+    // / definition drift fail closed (SOU-321 / SOU-322). The client label is
+    // threaded in, not stored on the shared router.
     let cache_snapshot = state
         .cached_tools
         .lock()
@@ -6743,6 +6847,8 @@ fn process_request(
         // The same live Arc<Router> just cloned off the lock, so a code-mode script's
         // downstream calls run against this request's consistent catalog snapshot.
         Some(&router),
+        // Swappable slot for post-HITL rebind (SOU-321); distinct from the snapshot above.
+        Some(&state.router),
     )
 }
 
@@ -9405,6 +9511,181 @@ mod tests {
         );
     }
 
+    /// SOU-321: prove the Arc::make_mut COW window, then that post-HITL revalidation
+    /// fail-closes against the *live* Arc (not the pre-hold snapshot).
+    #[test]
+    fn post_hitl_revalidation_sees_cow_quarantine_on_live_arc() {
+        let live = Arc::new(Mutex::new(Arc::new(routed_router("s", "wipe"))));
+        // Mimic process_request: clone the Arc before a long HITL hold (strong count ≥ 2).
+        let snapshot = live.lock().unwrap().clone();
+        assert!(
+            snapshot.block_reason("s__wipe").is_none(),
+            "tool must be exposed at gate time"
+        );
+        let approved_fp = tool_fingerprint_for("s__wipe", &[], &snapshot);
+
+        // Mid-hold: live requarantine forks a new Arc via make_mut.
+        {
+            let mut guard = live.lock().unwrap();
+            let r = Arc::make_mut(&mut guard);
+            r.requarantine(["s__wipe".to_string()].into_iter().collect());
+        }
+
+        assert!(
+            snapshot.block_reason("s__wipe").is_none(),
+            "pre-hold snapshot must still allow the tool (the SOU-321 window)"
+        );
+        assert_eq!(
+            live.lock().unwrap().block_reason("s__wipe").map(|r| r.contains("quarantined")),
+            Some(true),
+            "live Arc must block after make_mut requarantine"
+        );
+
+        assert_eq!(
+            post_hitl_revalidation(
+                approved_fp.as_deref(),
+                "s__wipe",
+                live.lock().unwrap().as_ref(),
+            ),
+            Some(approval::ApprovalDecision::StaleState),
+            "approval must not execute against a mid-hold quarantine"
+        );
+        // Control: revalidating the stale snapshot alone would wrongly pass.
+        assert!(
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &snapshot).is_none(),
+            "snapshot-only check would miss the bug this test guards"
+        );
+    }
+
+    /// SOU-322: definition fingerprint must still match the live router after approve.
+    #[test]
+    fn post_hitl_revalidation_rejects_fingerprint_rug_pull() {
+        let at_gate = {
+            let ds = DownstreamServer::connect(
+                "s".into(),
+                Box::new(MockRoute {
+                    tools: vec![json!({
+                        "name": "wipe",
+                        "description": "delete rows",
+                    })],
+                }),
+            )
+            .unwrap();
+            let mut r = Router::new();
+            r.add(ds);
+            r
+        };
+        let after_drift = {
+            let ds = DownstreamServer::connect(
+                "s".into(),
+                Box::new(MockRoute {
+                    tools: vec![json!({
+                        "name": "wipe",
+                        "description": "delete ALL rows and backups",
+                    })],
+                }),
+            )
+            .unwrap();
+            let mut r = Router::new();
+            r.add(ds);
+            r
+        };
+        let approved_fp = tool_fingerprint_for("s__wipe", &[], &at_gate);
+        assert!(approved_fp.is_some());
+        assert_ne!(
+            approved_fp.as_deref(),
+            tool_fingerprint_for("s__wipe", &[], &after_drift).as_deref(),
+        );
+        assert_eq!(
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &after_drift),
+            Some(approval::ApprovalDecision::StaleState),
+        );
+        assert!(
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &at_gate).is_none(),
+            "unchanged definition must still pass"
+        );
+    }
+
+    /// Happy path: live router unchanged across the hold → revalidation allows execute.
+    #[test]
+    fn post_hitl_revalidation_allows_unchanged_live_router() {
+        let live = Arc::new(Mutex::new(Arc::new(routed_router("s", "wipe"))));
+        let snapshot = live.lock().unwrap().clone();
+        let approved_fp = tool_fingerprint_for("s__wipe", &[], &snapshot);
+        // No make_mut / requarantine — live Arc is still the snapshot.
+        assert!(post_hitl_revalidation(
+            approved_fp.as_deref(),
+            "s__wipe",
+            live.lock().unwrap().as_ref(),
+        )
+        .is_none());
+    }
+
+    /// Live-only fingerprint: a tool still present in the request cache but gone from the
+    /// live aggregation must StaleState (never resurrect via cache fallback).
+    #[test]
+    fn post_hitl_revalidation_ignores_request_cache_for_missing_live_tool() {
+        let snapshot = routed_router("s", "wipe");
+        let approved_fp = tool_fingerprint_for("s__wipe", &[], &snapshot);
+        assert!(approved_fp.is_some());
+        // Empty live router: tool is gone from aggregation (removed / never indexed).
+        let live = Router::new();
+        // Even if the request cache still holds the old definition, revalidation must
+        // not use it — missing live definition is StaleState.
+        let _stale_cache = snapshot.aggregated_tools();
+        assert_eq!(
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &live),
+            Some(approval::ApprovalDecision::StaleState),
+        );
+    }
+
+    /// Live policy wins: a tool blocked on the pre-hold snapshot but released on live
+    /// during the hold is allowed to run after revalidation (follow live, not snapshot).
+    #[test]
+    fn post_hitl_revalidation_follows_live_release_during_hold() {
+        let mut policy = ToolPolicy::default();
+        policy.quarantined = ["s__wipe".to_string()].into_iter().collect();
+        let mut router = Router::with_policy(policy);
+        let ds = DownstreamServer::connect(
+            "s".into(),
+            Box::new(MockRoute {
+                tools: vec![json!({ "name": "wipe", "description": "delete rows" })],
+            }),
+        )
+        .unwrap();
+        router.add(ds);
+
+        let live = Arc::new(Mutex::new(Arc::new(router)));
+        let snapshot = live.lock().unwrap().clone();
+        assert!(
+            snapshot
+                .block_reason("s__wipe")
+                .is_some_and(|r| r.contains("quarantined"))
+        );
+
+        {
+            let mut guard = live.lock().unwrap();
+            Arc::make_mut(&mut guard).requarantine(BTreeSet::new());
+        }
+        assert!(live.lock().unwrap().block_reason("s__wipe").is_none());
+
+        let approved_fp = tool_fingerprint_for("s__wipe", &[], live.lock().unwrap().as_ref());
+        assert!(
+            post_hitl_revalidation(
+                approved_fp.as_deref(),
+                "s__wipe",
+                live.lock().unwrap().as_ref(),
+            )
+            .is_none(),
+            "a mid-hold release on the live Arc must clear the post-HITL block"
+        );
+        assert_eq!(
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &snapshot),
+            Some(approval::ApprovalDecision::StaleState),
+            "the pre-hold snapshot would still wrongly block"
+        );
+    }
+
     /// The refusal envelope is machine-readable: a code-mode script (or any agent) can read
     /// `structuredContent.toolportDecision` + `retriable` to pick a recovery instead of
     /// blind-retrying a flat error string. Every non-approval stays `isError: true`.
@@ -9476,7 +9757,7 @@ mod tests {
                        return { name: a.structuredContent.user.name, \
                                 sum: a.structuredContent.user.age + b.structuredContent.user.age };"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
         assert_eq!(result["isError"].as_bool(), Some(false));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         assert_eq!(result["structuredContent"]["toolportScript"]["calls"], 2);
@@ -9501,7 +9782,7 @@ mod tests {
             ];"
         });
 
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
         let serialized = serde_json::to_string(&result).unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
 
@@ -9551,7 +9832,7 @@ mod tests {
                        var t = r.content[0].text; \
                        return { len: t.length, head: t.slice(0, 8), shaped: t.indexOf('Toolport shaped') >= 0 };"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
         assert_eq!(result["isError"].as_bool(), Some(false));
         let v = &result["structuredContent"]["result"];
         assert_eq!(v["shaped"], false);
@@ -9597,6 +9878,7 @@ mod tests {
             None,
             None,
             &args,
+            None,
         );
         assert_eq!(result["isError"].as_bool(), Some(false));
         let text = result["structuredContent"]["result"]
@@ -9617,7 +9899,7 @@ mod tests {
         allowed.insert("other".to_string()); // NOT "s"
         let args = json!({ "script": "return toolport.call('s__big', {});" });
         let result =
-            run_script_dispatch(&reg, Some(&router), &[], Some("scoped"), Some(&allowed), None, &args);
+            run_script_dispatch(&reg, Some(&router), &[], Some("scoped"), Some(&allowed), None, &args, None);
         // The script itself ran; the value it returned is the scope-denied tool result.
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         let call_result = &result["structuredContent"]["result"];
@@ -9658,6 +9940,7 @@ mod tests {
             Some(&allowed),
             None,
             &args,
+            None,
         );
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         let v = &result["structuredContent"]["result"];
@@ -9702,7 +9985,7 @@ mod tests {
             "script": "var a = servers.s.big({}); return a.structuredContent.user.name;"
         });
         let result =
-            run_script_dispatch(&reg, Some(&router), &cached, None, None, None, &args);
+            run_script_dispatch(&reg, Some(&router), &cached, None, None, None, &args, None);
         assert_eq!(result["isError"].as_bool(), Some(false));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         assert_eq!(result["structuredContent"]["toolportScript"]["calls"], 1);
@@ -9721,7 +10004,7 @@ mod tests {
         // Mark the tool destructive via the cached catalog the fail-closed resolver checks.
         let cached = vec![json!({ "name": "s__big", "annotations": { "destructiveHint": true } })];
         let args = json!({ "script": "return toolport.call('s__big', {});" });
-        let result = run_script_dispatch(&reg, Some(&router), &cached, None, None, None, &args);
+        let result = run_script_dispatch(&reg, Some(&router), &cached, None, None, None, &args, None);
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         let call_result = &result["structuredContent"]["result"];
         assert_eq!(call_result["isError"].as_bool(), Some(true));
@@ -9737,7 +10020,7 @@ mod tests {
         let reg = Registry::default();
         let router = Arc::new(paging_router("x".to_string()));
         let result =
-            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &json!({ "script": "   " }));
+            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &json!({ "script": "   " }), None);
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert!(result["content"][0]["text"]
             .as_str()
@@ -9751,7 +10034,7 @@ mod tests {
     fn run_script_without_router_is_unavailable() {
         let reg = Registry::default();
         let result =
-            run_script_dispatch(&reg, None, &[], None, None, None, &json!({ "script": "return 1;" }));
+            run_script_dispatch(&reg, None, &[], None, None, None, &json!({ "script": "return 1;" }), None);
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert!(result["content"][0]["text"]
             .as_str()
@@ -9766,7 +10049,7 @@ mod tests {
         let reg = Registry::default();
         let router = Arc::new(paging_router("x".to_string()));
         let args = json!({ "script": "this is not valid javascript )(" });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], false);
     }
@@ -9846,6 +10129,7 @@ mod tests {
             None,
             Some(&search_index),
             Some(&router),
+            None,
         )
         .unwrap();
         assert_eq!(refused["result"]["isError"].as_bool(), Some(true));
@@ -9869,6 +10153,7 @@ mod tests {
             None,
             Some(&search_index),
             Some(&router),
+            None,
         )
         .unwrap();
         set_code_mode_flag(prev);
