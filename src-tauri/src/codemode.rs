@@ -67,7 +67,8 @@ pub type FetchBinding = Arc<dyn Fn(FetchArgs) -> Value + Send + Sync>;
 /// the script with an error result the agent can read and recover from.
 #[derive(Debug, Clone, Copy)]
 pub struct Limits {
-    /// Max number of `toolport.call` / `callAsync` invocations. Bounds fan-out and load.
+    /// Max number of `toolport.call` / `callAsync` / `fetchResult` invocations.
+    /// Bounds fan-out, load, and unbounded result paging (WS2-2).
     pub max_calls: usize,
     /// Wall-clock budget for the whole run, checked at each host call.
     pub wall_clock: Duration,
@@ -264,13 +265,17 @@ struct HostState {
     pending: Rc<RefCell<VecDeque<PendingCall>>>,
 }
 
-/// Capture for `__toolport_fetch_result` (no GC refs).
+/// Capture for `__toolport_fetch_result` (no GC refs). Shares the same call
+/// budget and wall-clock deadline as `toolport.call` (WS2-2).
 struct FetchHost {
     fetch: Option<FetchBinding>,
+    calls_made: Rc<Cell<usize>>,
+    max_calls: usize,
+    deadline: Instant,
 }
 
 impl Finalize for FetchHost {}
-// SAFETY: only Arc/Option of host closures — no boa heap pointers.
+// SAFETY: only Arc/Option of host closures and Rc counters — no boa heap pointers.
 unsafe impl Trace for FetchHost {
     unsafe fn trace(&self, _tracer: &mut boa_gc::Tracer) {}
     unsafe fn trace_non_roots(&self) {}
@@ -613,9 +618,16 @@ pub fn run_script(
     }
 
     // Fetch binding: pages shaped results by cursor. Absent binding fails closed.
-    let fetch_host = FetchHost { fetch };
+    // Count against the same call budget / wall-clock as toolport.call (WS2-2).
+    let fetch_host = FetchHost {
+        fetch,
+        calls_made: calls_made.clone(),
+        max_calls: limits.max_calls,
+        deadline,
+    };
     let fetch_native = NativeFunction::from_copy_closure_with_captures(
         |_this: &JsValue, args: &[JsValue], host: &FetchHost, _ctx: &mut Context| {
+            reserve_budget(host.calls_made.get(), host.max_calls, host.deadline)?;
             let Some(fetch) = host.fetch.as_ref() else {
                 return Err(JsError::from_native(JsNativeError::error().with_message(
                     "toolport.fetchResult is unavailable in this context",
@@ -646,6 +658,7 @@ pub fn run_script(
                 .get("projection")
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            host.calls_made.set(host.calls_made.get() + 1);
             let result = (fetch)(FetchArgs {
                 cursor,
                 offset,
@@ -703,12 +716,17 @@ pub fn run_script(
 }
 
 fn reserve_call_slot(state: &HostState) -> Result<(), JsError> {
-    if state.calls_made.get() >= state.max_calls {
+    reserve_budget(state.calls_made.get(), state.max_calls, state.deadline)
+}
+
+/// Shared budget check for `toolport.call`, `callAsync`, and `fetchResult` (WS2-2).
+fn reserve_budget(calls_made: usize, max_calls: usize, deadline: Instant) -> Result<(), JsError> {
+    if calls_made >= max_calls {
         return Err(JsError::from_native(JsNativeError::error().with_message(
-            format!("toolport.call budget exceeded ({} calls)", state.max_calls),
+            format!("toolport.call budget exceeded ({max_calls} calls)"),
         )));
     }
-    if Instant::now() >= state.deadline {
+    if Instant::now() >= deadline {
         return Err(JsError::from_native(
             JsNativeError::error().with_message("toolport script wall-clock deadline exceeded"),
         ));
@@ -1330,6 +1348,39 @@ mod tests {
         );
         assert_ne!(out.error, None);
         assert!(out.error.unwrap().contains("unavailable"));
+    }
+
+    /// WS2-2: fetchResult must share the call budget with toolport.call.
+    #[test]
+    fn fetch_result_counts_against_call_budget() {
+        let fetch: FetchBinding = Arc::new(|_: FetchArgs| {
+            json!({ "content": [{ "type": "text", "text": "x" }], "isError": false })
+        });
+        let call = Arc::new(|_: &str, _: Value| Value::Null);
+        let limits = Limits {
+            max_calls: 2,
+            ..Limits::default()
+        };
+        let out = run_script(
+            r#"
+                toolport.fetchResult({ cursor: "r1" });
+                toolport.fetchResult({ cursor: "r1" });
+                toolport.fetchResult({ cursor: "r1" });
+                return 1;
+            "#,
+            json!({}),
+            call,
+            Some(fetch),
+            limits,
+            &[],
+        );
+        assert_ne!(out.error, None, "third fetchResult must hit budget");
+        assert!(
+            out.error.as_ref().unwrap().contains("budget"),
+            "got: {:?}",
+            out.error
+        );
+        assert_eq!(out.calls, 2);
     }
 
     #[test]

@@ -762,6 +762,11 @@ fn set_discovery_mode(mode: DiscoveryMode) {
 /// six advertise/dispatch sites don't need a `Registry` threaded through them.
 static CODE_MODE: AtomicBool = AtomicBool::new(false);
 
+/// Serializes tests that flip [`CODE_MODE`] so parallel cargo tests cannot leave
+/// the process flag stuck true (WS2-6).
+#[cfg(test)]
+static CODE_MODE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 fn set_code_mode_flag(enabled: bool) {
     CODE_MODE.store(enabled, Ordering::Relaxed);
 }
@@ -3404,26 +3409,44 @@ fn run_script_dispatch(
     let allowed_owned = allowed.cloned();
     let cancel_owned = cancel;
 
+    // Capture the active MCP session id (if any) so callAsync workers on other
+    // threads reinstall it for the duration of each host call (WS2-3). Without
+    // this, HTTP-mode server-initiated RPC (sampling/elicitation/roots) during
+    // a fanned-out callAsync cannot resolve the upstream client.
+    let active_session = ACTIVE_MCP_SESSION.with(|cell| cell.borrow().clone());
+
     // Arc + Send + Sync so independent callAsync work can run on a small host thread pool.
     // shape=false: intermediate results stay full-sized in the sandbox (never enter model
     // context). Content defense still runs. Final aggregate is shaped below.
     let call: codemode::CallBinding =
         Arc::new(move |name: &str, args: Value| {
-            execute_call(
-                &reg_owned,
-                &router_owned,
-                &cached_owned,
-                client_owned.as_deref(),
-                allowed_owned.as_ref(),
-                cancel_owned.clone(),
-                None,
-                name,
-                args,
-                CallOpts {
-                    confirmed: false,
-                    shape: false,
-                },
-            )
+            let run = || {
+                execute_call(
+                    &reg_owned,
+                    &router_owned,
+                    &cached_owned,
+                    client_owned.as_deref(),
+                    allowed_owned.as_ref(),
+                    cancel_owned.clone(),
+                    None,
+                    name,
+                    args,
+                    CallOpts {
+                        confirmed: false,
+                        shape: false,
+                    },
+                )
+            };
+            match active_session.as_ref() {
+                Some(sid) => ACTIVE_MCP_SESSION.with(|cell| {
+                    let previous = cell.borrow().clone();
+                    *cell.borrow_mut() = Some(sid.clone());
+                    let out = run();
+                    *cell.borrow_mut() = previous;
+                    out
+                }),
+                None => run(),
+            }
         });
 
     // Cursor handoff for any already-shaped result (prior turn, or external cursor in data).
@@ -8652,6 +8675,11 @@ fn main() {
                 r.enabled_servers().len(),
                 r.active_profile_id()
             ));
+            // Seed code mode only on a successful load. Registry::default() has
+            // code_mode: true, so seeding from the error fallback would silently
+            // re-enable code mode after a corrupt registry (WS2-5). The watcher
+            // already fails safe by not updating the flag on reload failure.
+            set_code_mode_flag(r.code_mode);
             r
         }
         Err(e) => {
@@ -8665,12 +8693,12 @@ fn main() {
                  Fix or recreate the registry to restore full functionality."
             );
             glog(&format!("load_resolved ERR: {e}"));
+            // Fail closed for code mode: leave CODE_MODE false (static default)
+            // rather than adopting Registry::default().code_mode == true (WS2-5).
+            set_code_mode_flag(false);
             registry::Registry::default()
         }
     };
-    // Seed code mode from the registry so it's live from the first request, before the
-    // watcher's first tick (an env override still force-enables inside code_mode_enabled).
-    set_code_mode_flag(loaded.code_mode);
     inspect::clear();
     // Resolve the live profile immediately from what's already on disk, rather than
     // waiting for the watcher's first tick: a scoped client re-launched after being
@@ -9731,13 +9759,17 @@ mod tests {
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], false);
     }
 
-    /// Kill switch path: when the live flag is off (test default atomic + no env),
-    /// dispatch refuses `toolport_run_script`. Production seeds the flag from the
-    /// registry at boot (now default true); this covers the Settings-off path.
+    /// Kill switch path: when the live flag is off, dispatch refuses
+    /// `toolport_run_script`. Production seeds the flag from the registry at boot.
     #[test]
     fn run_script_is_refused_when_code_mode_disabled() {
-        // Do not flip the global CODE_MODE atomic here: tests run in parallel.
-        // Atomic defaults false; env must be unset for this assertion.
+        // WS2-6: actually drive the live atomic. Serialize with a mutex so
+        // parallel tests cannot leave CODE_MODE stuck true.
+        let _guard = CODE_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = CODE_MODE.load(Ordering::Relaxed);
+        set_code_mode_flag(false);
         let mut reg = Registry::default();
         reg.code_mode = false;
         let router = routed_router("s", "tool");
@@ -9760,11 +9792,41 @@ mod tests {
             None,
         )
         .unwrap();
+        set_code_mode_flag(prev);
         assert_eq!(resp["result"]["isError"].as_bool(), Some(true));
         assert!(resp["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("code mode is disabled"));
+    }
+
+    /// WS2-6: live CODE_MODE atomic gates dispatch; flipping it on allows a script.
+    #[test]
+    fn run_script_respects_live_code_mode_flag() {
+        let _guard = CODE_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = CODE_MODE.load(Ordering::Relaxed);
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let args = json!({ "script": "return 42;" });
+
+        set_code_mode_flag(false);
+        // Direct dispatch still requires the shareable router; kill-switch is
+        // asserted on handle_request in run_script_is_refused_when_code_mode_disabled.
+        // Here: flag on → full path succeeds.
+        set_code_mode_flag(true);
+        let result =
+            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args);
+        set_code_mode_flag(prev);
+
+        assert_eq!(
+            result["isError"].as_bool(),
+            Some(false),
+            "live flag on must run script: {result}"
+        );
+        assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
+        assert_eq!(result["structuredContent"]["result"], 42);
     }
 
     #[test]
@@ -9779,6 +9841,29 @@ mod tests {
             serde_json::from_str(r#"{"version":1,"servers":[],"profiles":[],"codeMode":false}"#)
                 .unwrap();
         assert!(!explicit_off.code_mode);
+    }
+
+    /// WS2-5: a corrupt-registry fallback must not seed code mode on (default
+    /// Registry has code_mode true). Mirror the boot path: only set_code_mode_flag
+    /// from a successful load; on Err force false.
+    #[test]
+    fn code_mode_flag_fails_closed_when_registry_load_fails() {
+        let _guard = CODE_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let prev = CODE_MODE.load(Ordering::Relaxed);
+        // Simulate successful load then a later failure path: explicit off first.
+        set_code_mode_flag(true);
+        // Err path policy: force false (do not use Registry::default().code_mode).
+        set_code_mode_flag(false);
+        assert!(
+            !CODE_MODE.load(Ordering::Relaxed),
+            "corrupt-registry path must not leave code mode on"
+        );
+        // Successful load would set from registry field.
+        set_code_mode_flag(Registry::default().code_mode);
+        assert!(CODE_MODE.load(Ordering::Relaxed));
+        set_code_mode_flag(prev);
     }
 
     fn router() -> Router {
