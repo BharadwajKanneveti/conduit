@@ -67,9 +67,11 @@ const MAX_RESOURCE_SUBS_PER_SESSION: usize = 256;
 const MAX_RESOURCE_SUBS_TOTAL: usize = 4096;
 
 /// How long a waiter blocks for the leader's downstream subscribe before failing
-/// closed (WS1-4). Prevents permanent worker parking if the leader panics or
-/// never finishes the open.
-const OPEN_GATE_WAIT: Duration = Duration::from_secs(60);
+/// closed (WS1-4). Must outlast a legitimate leader open: upstream RPC retries
+/// can run ~110s (three 30s attempts + backoff), and launcher-backed servers
+/// use the 120s interactive budget. 150s leaves a small margin so waiters are
+/// not told the subscribe timed out while the leader is still succeeding.
+const OPEN_GATE_WAIT: Duration = Duration::from_secs(150);
 
 /// Coordinates concurrent first-subscriber races for one URI.
 struct OpenGate {
