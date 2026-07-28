@@ -656,6 +656,9 @@ impl Registry {
             // Drop any tool-scope allow-list for the removed server so it can't orphan.
             profile.tool_scope.remove(id);
         }
+        self.tool_overrides.remove(id);
+        self.pinned_tools.remove(id);
+        self.human_approval_allow.retain(|k| !k.starts_with(&format!("{id}/")));
         Ok(())
     }
 
@@ -1879,6 +1882,7 @@ pub(crate) fn redact_url_userinfo(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::fingerprint_allow_key;
 
     fn sample_server(name: &str) -> ServerEntry {
         ServerEntry {
@@ -1984,6 +1988,65 @@ mod tests {
         assert_eq!(a, "file-system");
         assert_eq!(b, "file-system-2");
         assert_eq!(r.servers.len(), 2);
+    }
+
+    #[test]
+    fn remove_server_cleans_up_server_state() {
+        let mut r = Registry::default();
+        let id = r.add_server(sample_server("Github"));
+        r.set_tool_override(
+        id.clone(),
+        "search".to_string(),
+        ToolOverride {
+            name: Some("repo-search".to_string()),
+            description: None,
+          },
+        );
+        r.set_tool_pinned(&id, "create_issue", true);
+        let key = fingerprint_allow_key(&id, "create_issue", "v2:testfp");
+        r.allow_tool(key.clone());
+
+        // Assert setup 
+        assert!(r.tool_overrides.get(&id).is_some());
+        assert!(r.is_tool_pinned(&id, "create_issue"));
+        assert!(r.is_tool_allowed(&key));
+
+        // Act
+        r.remove_server(&id).unwrap();
+
+        // Assert cleanup
+        assert!(r.tool_overrides.get(&id).is_none());
+        assert!(!r.is_tool_pinned(&id, "create_issue"));
+        assert!(!r.is_tool_allowed(&key));
+    }
+
+    #[test]
+    fn remove_server_does_not_restore_state_when_id_is_reused() {
+        let mut r = Registry::default();
+        let id = r.add_server(sample_server("Github"));
+        r.set_tool_override(
+        id.clone(),
+        "search".to_string(),
+        ToolOverride {
+            name: Some("repo-search".to_string()),
+            description: None,
+          },
+        );
+        r.set_tool_pinned(&id, "create_issue", true);
+        let key = fingerprint_allow_key(&id, "create_issue", "v2:testfp");
+        r.allow_tool(key.clone());
+
+        // Act
+        r.remove_server(&id).unwrap();
+
+        let new_id = r.add_server(sample_server("GitHub"));
+        // Assert
+        assert_eq!(new_id, id);
+        assert!(r.tool_overrides.get(&new_id).is_none());
+        assert!(!r.is_tool_pinned(&new_id, "create_issue"));
+        let new_key = fingerprint_allow_key(&new_id, "create_issue", "v2:testfp");
+        assert!(!r.is_tool_allowed(&new_key));
+
     }
 
     #[test]
