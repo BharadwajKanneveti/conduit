@@ -776,6 +776,14 @@ impl Router {
         &self.policy.quarantined
     }
 
+    /// Why an exposed tool is hidden from the catalog / refused by [`Self::route_call`],
+    /// if it is. Same `blocked` map `route_call` consults — used by post-HITL revalidation
+    /// (SOU-321) so an approval held across a live `requarantine` can fail closed without
+    /// attempting the downstream call.
+    pub fn block_reason(&self, exposed_name: &str) -> Option<&str> {
+        self.blocked.get(exposed_name).map(String::as_str)
+    }
+
     /// Re-derive the exposed tool/resource/template/prompt aggregation from the
     /// current servers' (possibly refreshed) lists, in the original add order so
     /// exposed names and their `_2` collision suffixes stay stable. The server
@@ -1897,6 +1905,19 @@ mod tests {
 
         router.requarantine(BTreeSet::new());
         assert!(router.quarantined().is_empty());
+    }
+
+    #[test]
+    fn block_reason_matches_route_call_blocked_map() {
+        let mut policy = ToolPolicy::default();
+        policy.quarantined = ["github__echo".to_string()].into_iter().collect();
+        let mut router = Router::with_policy(policy);
+        router.add(mock_server("github"));
+
+        assert!(router.block_reason("github__add").is_none());
+        assert_eq!(router.block_reason("github__echo").map(|r| r.contains("quarantined")), Some(true));
+        let err = router.route_call("github__echo", json!({})).unwrap_err();
+        assert!(err.contains("quarantined"), "unexpected: {err}");
     }
 
     #[test]
