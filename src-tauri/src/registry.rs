@@ -9,6 +9,7 @@
 //! the OS keychain; this file only records that a secret exists.
 
 use std::collections::HashMap;
+use crate::router::sanitize_segment;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -658,7 +659,12 @@ impl Registry {
         }
         self.tool_overrides.remove(id);
         self.pinned_tools.remove(id);
-        self.human_approval_allow.retain(|k| !k.starts_with(&format!("{id}/")));
+
+        let sanitized_id = sanitize_segment(id);
+        let prefix = format!("{sanitized_id}/");
+        self.injection_block_exempt.remove(&sanitized_id);
+        self.result_budgets.remove(&sanitized_id);
+        self.human_approval_allow.retain(|k| !k.starts_with(&prefix));
         Ok(())
     }
 
@@ -1993,7 +1999,8 @@ mod tests {
     #[test]
     fn remove_server_cleans_up_server_state() {
         let mut r = Registry::default();
-        let id = r.add_server(sample_server("Github"));
+        let id = r.add_server(sample_server("Github MCP"));
+        let sanitized_id = sanitize_segment(&id);
         r.set_tool_override(
         id.clone(),
         "search".to_string(),
@@ -2003,13 +2010,17 @@ mod tests {
           },
         );
         r.set_tool_pinned(&id, "create_issue", true);
-        let key = fingerprint_allow_key(&id, "create_issue", "v2:testfp");
+        let key = fingerprint_allow_key(&sanitized_id, "create_issue", "v2:testfp");
         r.allow_tool(key.clone());
+        r.injection_block_exempt.insert(sanitized_id.clone(), true);
+        r.result_budgets.insert(sanitized_id.clone(), 100);
 
         // Assert setup 
         assert!(r.tool_overrides.get(&id).is_some());
         assert!(r.is_tool_pinned(&id, "create_issue"));
         assert!(r.is_tool_allowed(&key));
+        assert!(r.injection_block_exempt.contains_key(&sanitized_id));
+        assert!(r.result_budgets.contains_key(&sanitized_id));
 
         // Act
         r.remove_server(&id).unwrap();
@@ -2018,12 +2029,15 @@ mod tests {
         assert!(r.tool_overrides.get(&id).is_none());
         assert!(!r.is_tool_pinned(&id, "create_issue"));
         assert!(!r.is_tool_allowed(&key));
+        assert!(!r.injection_block_exempt.contains_key(&sanitized_id));
+        assert!(!r.result_budgets.contains_key(&sanitized_id));
     }
 
     #[test]
     fn remove_server_does_not_restore_state_when_id_is_reused() {
         let mut r = Registry::default();
-        let id = r.add_server(sample_server("Github"));
+        let id = r.add_server(sample_server("Github MCP"));
+        let sanitized_id = sanitize_segment(&id);
         r.set_tool_override(
         id.clone(),
         "search".to_string(),
@@ -2033,20 +2047,23 @@ mod tests {
           },
         );
         r.set_tool_pinned(&id, "create_issue", true);
-        let key = fingerprint_allow_key(&id, "create_issue", "v2:testfp");
+        let key = fingerprint_allow_key(&sanitized_id, "create_issue", "v2:testfp");
         r.allow_tool(key.clone());
+        r.injection_block_exempt.insert(sanitized_id.clone(), true);
+        r.result_budgets.insert(sanitized_id.clone(), 100);
 
         // Act
         r.remove_server(&id).unwrap();
 
-        let new_id = r.add_server(sample_server("GitHub"));
+        let new_id = r.add_server(sample_server("GitHub MCP"));
         // Assert
         assert_eq!(new_id, id);
         assert!(r.tool_overrides.get(&new_id).is_none());
         assert!(!r.is_tool_pinned(&new_id, "create_issue"));
-        let new_key = fingerprint_allow_key(&new_id, "create_issue", "v2:testfp");
+        let new_key = fingerprint_allow_key(&sanitize_segment(&new_id), "create_issue", "v2:testfp");
         assert!(!r.is_tool_allowed(&new_key));
-
+        assert!(!r.injection_block_exempt.contains_key(&sanitized_id));
+        assert!(!r.result_budgets.contains_key(&sanitized_id));
     }
 
     #[test]
