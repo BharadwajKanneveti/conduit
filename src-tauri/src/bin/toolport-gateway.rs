@@ -32,7 +32,8 @@ use conduit_lib::audit;
 use conduit_lib::clients;
 use conduit_lib::codemode;
 use conduit_lib::downstream::{
-    self, DownstreamServer, ServerRequestHandler, StdioTransport, Transport, PROTOCOL_VERSION,
+    self, DownstreamServer, ResourceUpdatedSink, ServerRequestHandler, StdioTransport, Transport,
+    PROTOCOL_VERSION,
 };
 use conduit_lib::inspect;
 use conduit_lib::integrity;
@@ -57,6 +58,379 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 const MAX_SEARCH_QUERY_CHARS: usize = 512;
 const MAX_SEARCH_QUERY_TOKENS: usize = 64;
 const MAX_STDIO_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Session key for the single stdio MCP client (HTTP uses real `Mcp-Session-Id`).
+const RESOURCE_SUB_STDIO: &str = "stdio";
+/// Per-client cap on concurrent resource subscriptions (SOU-394).
+const MAX_RESOURCE_SUBS_PER_SESSION: usize = 256;
+/// Process-wide cap on concurrent resource subscriptions (SOU-394).
+const MAX_RESOURCE_SUBS_TOTAL: usize = 4096;
+
+/// Margin on top of the leader's open budget, so a waiter is not told the subscribe
+/// timed out while the leader is still succeeding.
+const OPEN_GATE_MARGIN: Duration = Duration::from_secs(30);
+
+/// How long a waiter blocks for the leader's downstream subscribe before failing
+/// closed (WS1-4). Derived from [`downstream::LEADER_OPEN_BUDGET`] rather than
+/// hardcoded, so raising the launcher budget can never silently make waiters give
+/// up before the leader they are waiting on (SOU-434).
+///
+/// Note this is longer than any client request timeout, so a waiter can outlive the
+/// caller that queued it; bounding parked waiters is the remaining half of SOU-434.
+const OPEN_GATE_WAIT: Duration =
+    Duration::from_secs(downstream::LEADER_OPEN_BUDGET.as_secs() + OPEN_GATE_MARGIN.as_secs());
+
+/// Coordinates concurrent first-subscriber races for one URI.
+struct OpenGate {
+    /// `None` while the leader's downstream subscribe is in flight.
+    result: Mutex<Option<Result<(), String>>>,
+    cv: Condvar,
+}
+
+impl OpenGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            result: Mutex::new(None),
+            cv: Condvar::new(),
+        })
+    }
+
+    fn finish(&self, outcome: Result<(), String>) {
+        let mut guard = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *guard = Some(outcome);
+        self.cv.notify_all();
+    }
+
+    fn wait(&self) -> Result<(), String> {
+        self.wait_for(OPEN_GATE_WAIT)
+    }
+
+    /// Wait for the leader with an explicit timeout (unit tests use a short one).
+    fn wait_for(&self, timeout: Duration) -> Result<(), String> {
+        let mut guard = self
+            .result
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let deadline = Instant::now() + timeout;
+        while guard.is_none() {
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(
+                    "timed out waiting for another client to open the resource subscription"
+                        .into(),
+                );
+            }
+            let (next, wait_result) = self
+                .cv
+                .wait_timeout(guard, deadline.saturating_duration_since(now))
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard = next;
+            if wait_result.timed_out() && guard.is_none() {
+                return Err(
+                    "timed out waiting for another client to open the resource subscription"
+                        .into(),
+                );
+            }
+        }
+        match guard.as_ref() {
+            Some(Ok(())) => Ok(()),
+            Some(Err(e)) => Err(e.clone()),
+            None => unreachable!("loop exits only when result is set"),
+        }
+    }
+}
+
+/// If the leader panics (or otherwise unwinds) between claiming leadership and
+/// calling `finish_open_*`, clear the opening gate and fail waiters (WS1-4).
+struct LeadOpenGuard<'a> {
+    state: &'a GatewayState,
+    uri: String,
+    gate: Arc<OpenGate>,
+    armed: bool,
+}
+
+impl LeadOpenGuard<'_> {
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for LeadOpenGuard<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let mut table = self
+            .state
+            .resource_subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Only finish if this gate is still the in-flight open for the URI.
+        let still_ours = table
+            .opening
+            .get(&self.uri)
+            .is_some_and(|g| Arc::ptr_eq(g, &self.gate));
+        if still_ours {
+            table.finish_open_err(
+                &self.uri,
+                &self.gate,
+                "resource subscribe aborted".into(),
+            );
+        }
+    }
+}
+
+/// Outcome of [`ResourceSubscriptionTable::begin_subscribe`].
+enum BeginSubscribe {
+    /// This session already holds the URI (idempotent).
+    AlreadyLocal,
+    /// Session joined an already-open downstream subscription.
+    Joined,
+    /// This session is the first; must open downstream then call finish_open_*.
+    Lead(Arc<OpenGate>),
+    /// Another session is opening; wait on the gate then call begin again.
+    Wait(Arc<OpenGate>),
+}
+
+/// Per-session / per-URI resource subscription tracking for SOU-394.
+///
+/// Policy: always-on proxy. The gateway advertises `resources.subscribe` and
+/// fails closed when no owner can subscribe (unknown URI, out of scope, or
+/// downstream reject). Downstream subscribe is reference-counted: first
+/// upstream session for a URI opens the downstream sub; last close drops it.
+/// Concurrent first-subscribers single-flight via [`OpenGate`].
+#[derive(Default)]
+struct ResourceSubscriptionTable {
+    /// session_id -> subscribed URIs
+    by_session: HashMap<String, HashSet<String>>,
+    /// uri -> sessions interested in updates
+    by_uri: HashMap<String, HashSet<String>>,
+    /// uri -> owning downstream server id (set when the first session subscribes)
+    uri_owner: HashMap<String, String>,
+    /// uri -> gate while the first downstream subscribe is in flight
+    opening: HashMap<String, Arc<OpenGate>>,
+}
+
+impl ResourceSubscriptionTable {
+    fn total_count(&self) -> usize {
+        self.by_uri.values().map(|s| s.len()).sum()
+    }
+
+    fn check_limits(&self, session: &str) -> Result<(), String> {
+        let session_count = self.by_session.get(session).map(|s| s.len()).unwrap_or(0);
+        if session_count >= MAX_RESOURCE_SUBS_PER_SESSION {
+            return Err(format!(
+                "subscription limit ({MAX_RESOURCE_SUBS_PER_SESSION}) reached for this session"
+            ));
+        }
+        if self.total_count() >= MAX_RESOURCE_SUBS_TOTAL {
+            return Err(format!(
+                "global subscription limit ({MAX_RESOURCE_SUBS_TOTAL}) reached"
+            ));
+        }
+        Ok(())
+    }
+
+    fn insert_local(&mut self, session: &str, uri: &str, owner: &str) {
+        self.by_session
+            .entry(session.to_string())
+            .or_default()
+            .insert(uri.to_string());
+        self.by_uri
+            .entry(uri.to_string())
+            .or_default()
+            .insert(session.to_string());
+        self.uri_owner
+            .entry(uri.to_string())
+            .or_insert_with(|| owner.to_string());
+    }
+
+    /// Register local interest without coordinating an opening race (tests /
+    /// simple paths). `Ok(true)` when this is the first session for `uri`.
+    fn add(&mut self, session: &str, uri: &str, owner: &str) -> Result<bool, String> {
+        if self
+            .by_session
+            .get(session)
+            .is_some_and(|s| s.contains(uri))
+        {
+            return Ok(false);
+        }
+        self.check_limits(session)?;
+        let first_global = !self.uri_owner.contains_key(uri);
+        self.insert_local(session, uri, owner);
+        Ok(first_global)
+    }
+
+    /// Begin a subscribe with single-flight for the first downstream open.
+    fn begin_subscribe(
+        &mut self,
+        session: &str,
+        uri: &str,
+        owner: &str,
+    ) -> Result<BeginSubscribe, String> {
+        if self
+            .by_session
+            .get(session)
+            .is_some_and(|s| s.contains(uri))
+        {
+            return Ok(BeginSubscribe::AlreadyLocal);
+        }
+        self.check_limits(session)?;
+        if let Some(gate) = self.opening.get(uri) {
+            return Ok(BeginSubscribe::Wait(Arc::clone(gate)));
+        }
+        if self.uri_owner.contains_key(uri) {
+            // Downstream already open for other sessions.
+            self.insert_local(session, uri, owner);
+            return Ok(BeginSubscribe::Joined);
+        }
+        // First global subscriber: claim leadership.
+        let gate = OpenGate::new();
+        self.opening.insert(uri.to_string(), Arc::clone(&gate));
+        self.insert_local(session, uri, owner);
+        Ok(BeginSubscribe::Lead(gate))
+    }
+
+    /// Downstream open succeeded; release waiters.
+    fn finish_open_ok(&mut self, uri: &str, gate: &OpenGate) {
+        self.opening.remove(uri);
+        gate.finish(Ok(()));
+    }
+
+    /// Downstream open failed; drop every local holder for `uri` and release
+    /// waiters with the error so they must retry rather than stay half-subscribed.
+    fn finish_open_err(&mut self, uri: &str, gate: &OpenGate, err: String) {
+        self.clear_uri(uri);
+        self.opening.remove(uri);
+        gate.finish(Err(err));
+    }
+
+    /// After a successful wait, join the now-open subscription.
+    fn join_open(&mut self, session: &str, uri: &str, owner: &str) -> Result<(), String> {
+        if self
+            .by_session
+            .get(session)
+            .is_some_and(|s| s.contains(uri))
+        {
+            return Ok(());
+        }
+        if !self.uri_owner.contains_key(uri) {
+            return Err("downstream resource subscription is not open".to_string());
+        }
+        self.check_limits(session)?;
+        self.insert_local(session, uri, owner);
+        Ok(())
+    }
+
+    /// Remove one subscription. Returns the owner when this was the last session
+    /// for the URI (caller should drop the downstream subscription).
+    fn remove(&mut self, session: &str, uri: &str) -> Option<String> {
+        let had = self
+            .by_session
+            .get_mut(session)
+            .is_some_and(|s| s.remove(uri));
+        if !had {
+            return None;
+        }
+        if let Some(set) = self.by_session.get(session) {
+            if set.is_empty() {
+                self.by_session.remove(session);
+            }
+        }
+        if let Some(sessions) = self.by_uri.get_mut(uri) {
+            sessions.remove(session);
+            if sessions.is_empty() {
+                self.by_uri.remove(uri);
+                self.opening.remove(uri);
+                return self.uri_owner.remove(uri);
+            }
+        }
+        None
+    }
+
+    /// Drop every subscription for a disconnected session. Returns `(uri, owner)`
+    /// pairs that need a downstream unsubscribe.
+    fn drop_session(&mut self, session: &str) -> Vec<(String, String)> {
+        let Some(uris) = self.by_session.remove(session) else {
+            return Vec::new();
+        };
+        let mut need_unsub = Vec::new();
+        for uri in uris {
+            if let Some(sessions) = self.by_uri.get_mut(&uri) {
+                sessions.remove(session);
+                if sessions.is_empty() {
+                    self.by_uri.remove(&uri);
+                    self.opening.remove(&uri);
+                    if let Some(owner) = self.uri_owner.remove(&uri) {
+                        need_unsub.push((uri, owner));
+                    }
+                }
+            }
+        }
+        need_unsub
+    }
+
+    /// Drop all local state for `uri` (failed open / lost ownership).
+    fn clear_uri(&mut self, uri: &str) {
+        if let Some(sessions) = self.by_uri.remove(uri) {
+            for sid in sessions {
+                if let Some(set) = self.by_session.get_mut(&sid) {
+                    set.remove(uri);
+                    if set.is_empty() {
+                        self.by_session.remove(&sid);
+                    }
+                }
+            }
+        }
+        self.uri_owner.remove(uri);
+        self.opening.remove(uri);
+    }
+
+    fn sessions_for_uri(&self, uri: &str) -> Vec<String> {
+        self.by_uri
+            .get(uri)
+            .map(|s| s.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Every tracked `(uri, owner)` pair for re-subscribe after rebuild.
+    fn tracked_uri_owners(&self) -> Vec<(String, String)> {
+        self.uri_owner
+            .iter()
+            .map(|(u, o)| (u.clone(), o.clone()))
+            .collect()
+    }
+
+    /// URIs currently tracked for a given owner server id (reconnect path).
+    fn uris_for_owner(&self, owner: &str) -> Vec<String> {
+        self.uri_owner
+            .iter()
+            .filter(|(_, o)| o.as_str() == owner)
+            .map(|(u, _)| u.clone())
+            .collect()
+    }
+
+    /// First-writer owner recorded at subscribe time, if any (SOU-398).
+    fn owner_for(&self, uri: &str) -> Option<&str> {
+        self.uri_owner.get(uri).map(String::as_str)
+    }
+
+    fn set_owner(&mut self, uri: &str, owner: &str) {
+        if self.uri_owner.contains_key(uri) {
+            self.uri_owner.insert(uri.to_string(), owner.to_string());
+        }
+    }
+}
+
+/// Shared fanout entry for `notifications/resources/updated`:
+/// `(producer_server_id, uri)`. Ownership is checked before any upstream
+/// delivery so a misbehaving server cannot spoof updates for URIs it does not
+/// own (SOU-398). Bound per downstream at connect time into a
+/// [`ResourceUpdatedSink`] that closes over the producer id.
+type ResourceUpdatedDispatch = Arc<dyn Fn(String, String) + Send + Sync>;
 
 #[derive(Debug, PartialEq, Eq)]
 enum BoundedLine {
@@ -106,6 +480,16 @@ fn read_bounded_line<R: BufRead>(reader: &mut R, max_bytes: usize) -> std::io::R
     String::from_utf8(bytes)
         .map(BoundedLine::Line)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))
+}
+
+/// Serialize a complete JSON-RPC frame before touching stdout. Formatting a
+/// `serde_json::Value` directly into a pipe can issue many small writes; clients
+/// with fragile stdio decoders may mistake those chunks for complete frames.
+fn write_json_line<W: Write>(writer: &mut W, value: &Value) -> std::io::Result<()> {
+    let mut line = serde_json::to_vec(value).map_err(std::io::Error::other)?;
+    line.push(b'\n');
+    writer.write_all(&line)?;
+    writer.flush()
 }
 
 /// Validate the model-authored search query in one short-circuiting pass before
@@ -245,21 +629,20 @@ fn run_script_tool_def() -> Value {
     json!({
         "name": "toolport_run_script",
         "description": "Run ONE JavaScript orchestration script server-side instead of making \
-            many separate tool calls. Inside the script, call downstream tools with \
-            `toolport.call(name, args)` (name = the exact tool name from toolport_search_tools, \
-            args = its arguments object); it returns that tool's result as a value. Loop, branch, \
-            and combine results, then `return` a single aggregated value - only the returned value \
-            comes back, so intermediate results never fill your context and a multi-step task \
-            costs one round-trip. Each call still passes the same gates as toolport_call_tool \
-            (scope, human approval). Synchronous: call tools one after another (no await / \
-            Promises). Best when you already know the steps; use toolport_search_tools + \
-            toolport_call_tool while you are still exploring.",
+            many separate tool calls. Prefer the typed surface when you know the server: \
+            `servers.stripe.create_refund({...})` (sync) or `servers.stripe.createRefund.async({...})` \
+            (Promise; fan out with Promise.all / await). Also: `toolport.call`, `callAsync`, \
+            `callAll`, `fetchResult({cursor, offset, projection})`, `listTools()`, `listServers()`. \
+            Intermediate tool results are full-sized inside the script (not context-budget shaped); \
+            only your returned aggregate is shaped for the model. Loop, branch, project, then \
+            `return` one value. Top-level await works. Gates match toolport_call_tool (scope, human \
+            approval). Best when you already know the steps; explore with toolport_search_tools first.",
         "inputSchema": {
             "type": "object",
             "properties": {
                 "script": {
                     "type": "string",
-                    "description": "JavaScript body. Call tools with toolport.call(name, args) and `return` the final value. The optional `data` payload below is available as the global `data`."
+                    "description": "JavaScript body. Prefer servers.<server>.<tool>(args) or toolport.call / callAsync / callAll / fetchResult; `return` the final value (top-level await ok). Intermediate results are full-sized in-script. Global `data` is the optional payload below."
                 },
                 "data": {
                     "type": "object",
@@ -388,8 +771,58 @@ fn set_discovery_mode(mode: DiscoveryMode) {
 /// six advertise/dispatch sites don't need a `Registry` threaded through them.
 static CODE_MODE: AtomicBool = AtomicBool::new(false);
 
+/// Serializes tests that flip [`CODE_MODE`] so parallel cargo tests cannot leave
+/// the process flag stuck true (WS2-6).
+#[cfg(test)]
+static CODE_MODE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Holds [`CODE_MODE_TEST_LOCK`] and restores the flag's prior value on drop.
+///
+/// Restoring with a plain call after the assertions is not enough: a failing
+/// assertion unwinds past it and leaks the flag into every later test, and since
+/// every lock site recovers from poisoning with `PoisonError::into_inner`, those
+/// tests then run against state the failure left behind. One real failure would
+/// cascade into unrelated ones.
+#[cfg(test)]
+struct CodeModeGuard {
+    prev: bool,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl CodeModeGuard {
+    fn acquire() -> Self {
+        let lock = CODE_MODE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self {
+            prev: CODE_MODE.load(Ordering::Relaxed),
+            _lock: lock,
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for CodeModeGuard {
+    fn drop(&mut self) {
+        set_code_mode_flag(self.prev);
+    }
+}
+
 fn set_code_mode_flag(enabled: bool) {
     CODE_MODE.store(enabled, Ordering::Relaxed);
+}
+
+/// Seed [`CODE_MODE`] from a registry load outcome (WS2-5).
+///
+/// Successful loads copy `registry.code_mode`. Load failures must fail closed
+/// (`false`): [`Registry::default`] has `code_mode: true`, so seeding from the
+/// error fallback would silently re-enable code mode after a corrupt registry.
+fn seed_code_mode_after_registry_load(loaded: Result<&Registry, ()>) {
+    match loaded {
+        Ok(reg) => set_code_mode_flag(reg.code_mode),
+        Err(()) => set_code_mode_flag(false),
+    }
 }
 
 /// Parse a registry / per-client override mode string; `None` for empty, `inherit`, or an
@@ -494,13 +927,14 @@ fn grouped_discovery() -> bool {
     discovery_mode() == DiscoveryMode::Grouped
 }
 
-/// Opt-in gate for server-side "code mode" (the `toolport_run_script` meta-tool). Off by
-/// default: code mode runs an agent-supplied JS script that can call many tools in one
-/// round-trip, a powerful capability worth an explicit opt-in even under Toolport's local
-/// trust model. Enabled by the registry's `code_mode` toggle (the Settings switch, synced
-/// into [`CODE_MODE`]); `TOOLPORT_CODE_MODE=1` (or legacy `CONDUIT_CODE_MODE`) still
-/// force-enables regardless, for power users and tests. When off, `run_script` is
-/// neither advertised nor dispatched.
+/// Gate for server-side "code mode" (the `toolport_run_script` meta-tool).
+///
+/// Policy (SOU-397): **on by default** via the registry's `code_mode` field (Settings
+/// switch, synced into [`CODE_MODE`]). Kill switch: turn Settings off. Code mode runs
+/// agent-supplied JS and is not a security boundary; each host call still passes the same
+/// scope / human-approval gates as `toolport_call_tool`. `TOOLPORT_CODE_MODE=1` (or legacy
+/// `CONDUIT_CODE_MODE`) still force-enables for power users and tests. When off, `run_script`
+/// is neither advertised nor dispatched.
 fn code_mode_enabled() -> bool {
     let env_forced = conduit_lib::brand::env_flag("TOOLPORT_CODE_MODE", "CONDUIT_CODE_MODE");
     env_forced || CODE_MODE.load(Ordering::Relaxed)
@@ -1019,6 +1453,7 @@ fn synonym_group(token: &str) -> &'static [&'static str] {
         &["project", "repo", "repository"],
         &["user", "account", "member", "customer"],
         &["team", "org", "organization", "workspace"],
+        &["schedule", "calendar", "meeting", "appointment"],
         &["dispute", "chargeback"],
         &["token", "tokenize"],
     ];
@@ -1028,6 +1463,115 @@ fn synonym_group(token: &str) -> &'static [&'static str] {
         .copied()
         .unwrap_or(&[])
 }
+
+#[derive(Debug)]
+struct SearchDocument {
+    name_tokens: HashSet<String>,
+    description_tokens: HashSet<String>,
+    server_prefix: String,
+}
+
+/// Immutable lexical index paired with one immutable catalog snapshot.
+///
+/// Tool definitions change only when the downstream catalog is rebuilt, so doing
+/// this work in the request path wastes time and creates latency proportional to
+/// catalog size. The index stores only normalized search fields and document
+/// frequencies; schemas remain in the catalog and are projected only for selected
+/// results.
+#[derive(Debug, Default)]
+struct CatalogSearchIndex {
+    documents: Vec<SearchDocument>,
+    document_frequency: HashMap<String, usize>,
+    catalog_address: usize,
+}
+
+impl CatalogSearchIndex {
+    fn build(tools: &[Value]) -> Self {
+        let mut documents = Vec::with_capacity(tools.len());
+        let mut document_frequency = HashMap::new();
+
+        for tool in tools {
+            let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let name_tokens: HashSet<String> = search_tokens(name).into_iter().collect();
+            let description_tokens: HashSet<String> =
+                index_tokens(description).into_iter().collect();
+
+            let mut seen = HashSet::with_capacity(name_tokens.len() + description_tokens.len());
+            seen.extend(name_tokens.iter().map(String::as_str));
+            seen.extend(description_tokens.iter().map(String::as_str));
+            for token in seen {
+                *document_frequency.entry(token.to_string()).or_insert(0) += 1;
+            }
+
+            documents.push(SearchDocument {
+                name_tokens,
+                description_tokens,
+                server_prefix: tool_prefix(tool),
+            });
+        }
+
+        Self {
+            documents,
+            document_frequency,
+            catalog_address: tools.as_ptr() as usize,
+        }
+    }
+
+    fn matches_catalog(&self, tools: &[Value]) -> bool {
+        self.documents.len() == tools.len() && self.catalog_address == tools.as_ptr() as usize
+    }
+
+    /// Conservative auxiliary-memory estimate for regression tests and diagnostics.
+    /// This is deliberately not presented as process RSS.
+    fn estimated_auxiliary_bytes(&self) -> usize {
+        let document_bytes = self.documents.iter().map(|doc| {
+            let token_bytes: usize = doc
+                .name_tokens
+                .iter()
+                .chain(&doc.description_tokens)
+                .map(|token| token.capacity())
+                .sum();
+            std::mem::size_of::<SearchDocument>()
+                + doc.server_prefix.capacity()
+                + token_bytes
+                + (doc.name_tokens.capacity() + doc.description_tokens.capacity())
+                    * std::mem::size_of::<String>()
+                    * 2
+        });
+        let df_bytes = self.document_frequency.keys().map(|token| {
+            token.capacity()
+                + std::mem::size_of::<String>()
+                + std::mem::size_of::<usize>()
+                + 2 * std::mem::size_of::<usize>()
+        });
+        document_bytes.sum::<usize>() + df_bytes.sum::<usize>()
+    }
+}
+
+#[derive(Debug)]
+struct CatalogSnapshot {
+    tools: Vec<Value>,
+    search: CatalogSearchIndex,
+}
+
+impl CatalogSnapshot {
+    fn new(tools: Vec<Value>) -> Self {
+        let search = CatalogSearchIndex::build(&tools);
+        Self { tools, search }
+    }
+}
+
+impl Default for CatalogSnapshot {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+type SharedCatalog = Arc<Mutex<Arc<CatalogSnapshot>>>;
 
 /// Rank the cached catalog against a query, optionally scoped to one server.
 /// Ranking is lexical with IDF weighting: query and tools are tokenized (camelCase
@@ -1055,6 +1599,7 @@ fn search_catalog(
 /// As `search_catalog`, with optional semantic re-ranking. When `sem` is None or
 /// inactive, or embeddings are unavailable, ranking is pure lexical and byte-for-byte
 /// identical to before, semantic only ever adds, never degrades.
+#[cfg(test)]
 fn search_catalog_with(
     cached: &[Value],
     query: &str,
@@ -1062,7 +1607,28 @@ fn search_catalog_with(
     limit: usize,
     sem: Option<&semantic::SemanticConfig>,
 ) -> SearchOutcome {
-    use std::collections::HashMap;
+    search_catalog_indexed(cached, query, server, limit, sem, None)
+}
+
+/// Indexed search entry point used by the live gateway. Tests and cold/live
+/// fallbacks may omit `index`; in that case a temporary index is built so behavior
+/// remains identical and there is only one ranking implementation.
+fn search_catalog_indexed(
+    cached: &[Value],
+    query: &str,
+    server: Option<&str>,
+    limit: usize,
+    sem: Option<&semantic::SemanticConfig>,
+    index: Option<&CatalogSearchIndex>,
+) -> SearchOutcome {
+    let fallback_index;
+    let index = match index.filter(|candidate| candidate.matches_catalog(cached)) {
+        Some(index) => index,
+        None => {
+            fallback_index = CatalogSearchIndex::build(cached);
+            &fallback_index
+        }
+    };
     let q = query.to_lowercase();
     let terms: Vec<&str> = q.split_whitespace().filter(|t| !t.is_empty()).collect();
     let server_filter = server
@@ -1070,54 +1636,59 @@ fn search_catalog_with(
         .filter(|s| !s.is_empty());
 
     // Optionally restrict to one server (its prefix contains the filter text).
-    let pool: Vec<&Value> = cached
+    let pool: Vec<usize> = index
+        .documents
         .iter()
-        .filter(|t| match &server_filter {
-            Some(sf) => tool_prefix(t).contains(sf.as_str()),
+        .enumerate()
+        .filter(|(_, doc)| match &server_filter {
+            Some(sf) => doc.server_prefix.contains(sf.as_str()),
             None => true,
         })
+        .map(|(position, _)| position)
         .collect();
 
     // Select an ordered set of tool refs (ranking happens here; projection below).
     let (selected, total, low_confidence, broadened, direct_returned) = if terms.is_empty() {
         // Empty query: list the pool. With `server` set this enumerates that server.
         let total = pool.len();
-        let selected: Vec<&Value> = pool.iter().take(limit).copied().collect();
+        let selected: Vec<&Value> = pool
+            .iter()
+            .take(limit)
+            .filter_map(|position| cached.get(*position))
+            .collect();
         let direct_returned = selected.len();
         (selected, total, false, 0, direct_returned)
     } else {
-        // Tokenize each tool and compute document frequencies, so IDF can weight a
-        // rare token (e.g. "products", "teams") far above a common one (e.g. "list",
-        // "get"). That makes "list products" rank the products tool over the many
-        // generic "list" tools - the keyword-only wandering we hit with Stripe.
-        use std::collections::HashSet;
-        let docs: Vec<(&Value, HashSet<String>, HashSet<String>)> = pool
-            .iter()
-            .map(|t| {
-                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
-                let desc = t.get("description").and_then(|v| v.as_str()).unwrap_or("");
-                (
-                    *t,
-                    search_tokens(name).into_iter().collect(),
-                    index_tokens(desc).into_iter().collect(),
-                )
-            })
-            .collect();
-        let n = docs.len().max(1) as f64;
-        let mut df: HashMap<&str, usize> = HashMap::new();
-        for (_, name_set, desc_set) in &docs {
-            for tok in name_set.union(desc_set) {
-                *df.entry(tok.as_str()).or_insert(0) += 1;
+        // The normal local path reuses the precomputed global document frequencies.
+        // A substring server filter can select more than one server, so preserve its
+        // historical ranking by deriving DF over that already-tokenized subset.
+        let scoped_df;
+        let df = if server_filter.is_none() {
+            &index.document_frequency
+        } else {
+            let mut frequencies = HashMap::new();
+            for position in &pool {
+                let doc = &index.documents[*position];
+                for token in doc.name_tokens.union(&doc.description_tokens) {
+                    *frequencies.entry(token.clone()).or_insert(0) += 1;
+                }
             }
-        }
-        let idf = |tok: &str| ((n + 1.0) / (*df.get(tok).unwrap_or(&0) as f64 + 1.0)).ln() + 1.0;
+            scoped_df = frequencies;
+            &scoped_df
+        };
+        let n = pool.len().max(1) as f64;
+        let idf = |tok: &str| {
+            ((n + 1.0) / (*df.get(tok).unwrap_or(&0) as f64 + 1.0)).ln() + 1.0
+        };
 
         let q_tokens = index_tokens(query);
         // Lexical score for EVERY doc (0 if no hit), kept so optional semantic
         // re-ranking can also surface tools the keywords missed entirely.
-        let lex: Vec<(f64, &Value)> = docs
+        let lex: Vec<(f64, &Value)> = pool
             .iter()
-            .map(|(t, name_set, desc_set)| {
+            .filter_map(|position| {
+                let doc = index.documents.get(*position)?;
+                let tool = cached.get(*position)?;
                 let mut score = 0.0_f64;
                 for qt in &q_tokens {
                     // Best field hit across the query token and its synonyms; name
@@ -1126,15 +1697,19 @@ fn search_catalog_with(
                     let cands =
                         std::iter::once(qt.as_str()).chain(synonym_group(qt).iter().copied());
                     for c in cands {
-                        if name_set.contains(c) {
+                        if doc.name_tokens.contains(c) {
                             best = best.max(NAME_W * idf(c));
-                        } else if desc_set.contains(c) {
+                        } else if doc.description_tokens.contains(c) {
                             best = best.max(DESC_W * idf(c));
                         }
                     }
                     // Prefix fallback for partial words ("proj" -> "project").
                     if best == 0.0 && qt.len() >= 3 {
-                        if let Some(tok) = name_set.iter().find(|t| t.starts_with(qt.as_str())) {
+                        if let Some(tok) = doc
+                            .name_tokens
+                            .iter()
+                            .find(|t| t.starts_with(qt.as_str()))
+                        {
                             best = 0.6 * NAME_W * idf(tok);
                         }
                     }
@@ -1147,8 +1722,9 @@ fn search_catalog_with(
                 // since both name-match every query token. Multiplicative so it only
                 // separates near-ties, never overrides a stronger IDF signal; skipped on
                 // a zero score so non-matches stay out.
-                if score > 0.0 && !name_set.is_empty() {
-                    let explained = name_set
+                if score > 0.0 && !doc.name_tokens.is_empty() {
+                    let explained = doc
+                        .name_tokens
                         .iter()
                         .filter(|nt| {
                             q_tokens
@@ -1156,10 +1732,10 @@ fn search_catalog_with(
                                 .any(|qt| qt == *nt || synonym_group(qt).contains(&nt.as_str()))
                         })
                         .count();
-                    let coverage = explained as f64 / name_set.len() as f64;
+                    let coverage = explained as f64 / doc.name_tokens.len() as f64;
                     score *= 1.0 + NAME_SPECIFICITY_W * coverage;
                 }
-                (score, *t)
+                Some((score, tool))
             })
             .collect();
 
@@ -1167,39 +1743,59 @@ fn search_catalog_with(
         // pure lexical (positive scores only, highest first), identical to before.
         let semantic_ranked = semantic_rerank(sem, query, &lex);
         let used_semantic = semantic_ranked.is_some();
-        let ranked: Vec<(f64, &Value)> = semantic_ranked.unwrap_or_else(|| {
+        let mut ranked: Vec<(f64, &Value)> = semantic_ranked.unwrap_or_else(|| {
             let mut s: Vec<(f64, &Value)> =
                 lex.iter().filter(|(sc, _)| *sc > 0.0).cloned().collect();
             s.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
             s
         });
+        // An agent follows schemaOmitted recovery by searching the exact exposed
+        // name it was given. Make that contract deterministic: an exact name must
+        // lead even when another tool happens to score higher on shared tokens.
+        // This also guarantees project_budgeted keeps the requested tool's schema.
+        let exact_position = ranked.iter().position(|(_, tool)| {
+            tool.get("name")
+                .and_then(Value::as_str)
+                .map(|name| name.eq_ignore_ascii_case(query.trim()))
+                .unwrap_or(false)
+        });
+        if let Some(position) = exact_position.filter(|position| *position > 0) {
+            let exact = ranked.remove(position);
+            ranked.insert(0, exact);
+        }
         let total = ranked.len();
 
-        let low_confidence = match ranked.first() {
-            None => true,
-            Some((top_score, _)) if used_semantic => *top_score < LOW_CONFIDENCE_HYBRID_SCORE,
-            Some((top_score, _)) => {
-                // Normalize the raw lexical score against an ideal result where
-                // every meaningful query token hits a tool name. Missing query
-                // terms still contribute to the denominator, which is exactly the
-                // weak-evidence case that should broaden.
-                let ideal_idf: f64 = q_tokens
-                    .iter()
-                    .map(|qt| {
-                        let matched_idf = std::iter::once(qt.as_str())
-                            .chain(synonym_group(qt).iter().copied())
-                            .filter(|candidate| df.contains_key(candidate))
-                            .map(idf)
-                            .fold(0.0_f64, f64::max);
-                        if matched_idf > 0.0 {
-                            matched_idf
-                        } else {
-                            idf(qt)
-                        }
-                    })
-                    .sum();
-                let ideal = NAME_W * ideal_idf * (1.0 + NAME_SPECIFICITY_W);
-                ideal <= f64::EPSILON || *top_score / ideal < LOW_CONFIDENCE_LEXICAL_RATIO
+        let low_confidence = if exact_position.is_some() {
+            false
+        } else {
+            match ranked.first() {
+                None => true,
+                Some((top_score, _)) if used_semantic => {
+                    *top_score < LOW_CONFIDENCE_HYBRID_SCORE
+                }
+                Some((top_score, _)) => {
+                    // Normalize the raw lexical score against an ideal result where
+                    // every meaningful query token hits a tool name. Missing query
+                    // terms still contribute to the denominator, which is exactly the
+                    // weak-evidence case that should broaden.
+                    let ideal_idf: f64 = q_tokens
+                        .iter()
+                        .map(|qt| {
+                            let matched_idf = std::iter::once(qt.as_str())
+                                .chain(synonym_group(qt).iter().copied())
+                                .filter(|candidate| df.contains_key(*candidate))
+                                .map(idf)
+                                .fold(0.0_f64, f64::max);
+                            if matched_idf > 0.0 {
+                                matched_idf
+                            } else {
+                                idf(qt)
+                            }
+                        })
+                        .sum();
+                    let ideal = NAME_W * ideal_idf * (1.0 + NAME_SPECIFICITY_W);
+                    ideal <= f64::EPSILON || *top_score / ideal < LOW_CONFIDENCE_LEXICAL_RATIO
+                }
             }
         };
 
@@ -1237,7 +1833,7 @@ fn search_catalog_with(
                 .collect();
             let visible_servers = pool
                 .iter()
-                .map(|tool| tool_prefix(tool))
+                .map(|position| index.documents[*position].server_prefix.as_str())
                 .collect::<std::collections::HashSet<_>>()
                 .len()
                 .max(1);
@@ -1246,10 +1842,13 @@ fn search_catalog_with(
             for tool in &selected {
                 *per.entry(tool_prefix(tool)).or_insert(0) += 1;
             }
-            for tool in &pool {
+            for position in &pool {
                 if selected.len() >= target {
                     break;
                 }
+                let Some(tool) = cached.get(*position) else {
+                    continue;
+                };
                 let name = tool.get("name").and_then(Value::as_str).unwrap_or("");
                 if !seen.insert(name.to_string()) {
                     continue;
@@ -1261,7 +1860,7 @@ fn search_catalog_with(
                     }
                     *count += 1;
                 }
-                selected.push(*tool);
+                selected.push(tool);
             }
         }
         let broadened = selected.len().saturating_sub(direct_returned);
@@ -1618,8 +2217,9 @@ struct PendingCall {
     name: String,
     /// The exact arguments from the preview call (serialized for replay).
     arguments: Value,
-    /// The registered HTTP client that created this confirmation. `None` covers
-    /// stdio and the legacy unscoped HTTP bearer, which each have one shared caller.
+    /// Stable security principal that created this confirmation (e.g.
+    /// `client:{id}`), never a display label. `None` covers stdio and the
+    /// legacy unscoped HTTP bearer, which each have one shared caller.
     owner: Option<String>,
     /// When this entry was created (for expiry).
     created: Instant,
@@ -1975,8 +2575,12 @@ struct McpSessionOwner {
     scope: Option<Vec<String>>,
 }
 
-/// Per-request HTTP attribution. The audit label stays human-readable while the
-/// session owner uses a stable id and effective scope for authorization checks.
+/// Per-request HTTP attribution.
+///
+/// * `audit_label` — human-readable name for Activity / audit display only.
+/// * `session_owner.identity` — stable security principal (`client:{id}`) for
+///   MCP sessions, confirm tokens, and shaped-result stash isolation (SOU-324).
+///   Two clients may share a display label; they must never share this identity.
 struct HttpCaller {
     audit_label: Option<String>,
     session_owner: McpSessionOwner,
@@ -2239,6 +2843,57 @@ fn content_binding_decision(
     }
 }
 
+/// Post-HITL revalidation against the *live* router (SOU-321 / SOU-322).
+///
+/// After a human approves, the world may have changed during the hold: quarantine may have
+/// forked a new `Arc<Router>` via `Arc::make_mut`, or the tool definition may have drifted.
+/// The request-scoped snapshot used for the gate is intentionally kept for pre-HITL
+/// consistency, but execution must fail closed if:
+/// - the live definition fingerprint no longer matches what was approved (or is gone), or
+/// - the live router now blocks the exposed tool (quarantine / policy).
+///
+/// Fingerprints are taken **only** from `live.aggregated_tools()` — never the request
+/// cache. A cache fallback would treat a tool removed (or quarantined out of the live
+/// aggregation) as still present and miss `StaleState`.
+///
+/// Returns `Some(StaleState)` when the approval is no longer valid to execute; `None` to
+/// proceed on `live`. Pure / broker-free so the COW window can be unit-tested.
+fn post_hitl_revalidation(
+    approved_fingerprint: Option<&str>,
+    name: &str,
+    live: &Router,
+) -> Option<approval::ApprovalDecision> {
+    let live_fp = live
+        .aggregated_tools()
+        .iter()
+        .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(name))
+        .map(integrity::fingerprint);
+    match (approved_fingerprint, live_fp.as_deref()) {
+        (Some(approved), Some(live_fp)) if approved == live_fp => {}
+        // No fingerprint was capturable at gate time AND still isn't — fall through to the
+        // block_reason check (unknown tools fail at routing anyway).
+        (None, None) => {}
+        // Missing live definition, or any mismatch: the human approved a different shape.
+        _ => return Some(approval::ApprovalDecision::StaleState),
+    }
+    if live.block_reason(name).is_some() {
+        return Some(approval::ApprovalDecision::StaleState);
+    }
+    None
+}
+
+/// Clone the current live `Arc<Router>` from the swappable slot, releasing the mutex
+/// immediately. Returns `None` only if `live_router` itself is `None` (test harnesses).
+fn clone_live_router(
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
+) -> Option<Arc<Router>> {
+    live_router.map(|slot| {
+        slot.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    })
+}
+
 /// Build the agent-facing tool RESULT for a call the gateway refused to run (the inner
 /// `{content, isError, structuredContent}`, which the caller wraps in a JSON-RPC envelope or
 /// hands to a code-mode script as its `toolport.call()` return). Carries a machine-readable
@@ -2265,8 +2920,8 @@ fn refused_call_result(
         approval::ApprovalDecision::StaleState => (
             true,
             format!(
-                "the call to {name} changed after it was approved, so the stale approval was \
-                 rejected"
+                "the approval for {name} is stale (arguments, tool definition, or policy \
+                 changed after it was approved), so it was rejected"
             ),
         ),
         _ => (
@@ -2276,7 +2931,7 @@ fn refused_call_result(
     };
     let guidance = match decision {
         approval::ApprovalDecision::StaleState => {
-            " Re-form the exact call and get it approved again, then retry."
+            " Re-check the tool in Toolport, re-form the exact call, get it approved again, then retry."
         }
         approval::ApprovalDecision::Denied => "",
         _ => " Ask the user to approve it in the Toolport app, then retry.",
@@ -2293,6 +2948,76 @@ fn refused_call_result(
     })
 }
 
+/// Opt-in stage timer for diagnosing Toolport's own routed-call overhead. Disabled
+/// by default and cached once per process; the normal call path pays only an
+/// `Option` branch. Timings go to stderr (never the MCP protocol stream) and contain
+/// no arguments or result data.
+struct RoutedCallProfiler {
+    tool: String,
+    started: Instant,
+    checkpoint: Instant,
+    preflight_us: u64,
+    downstream_us: u64,
+    postprocess_us: u64,
+}
+
+impl RoutedCallProfiler {
+    fn start(tool: &str) -> Option<Self> {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let enabled = *ENABLED.get_or_init(|| {
+            conduit_lib::brand::env_var("TOOLPORT_PROFILE_CALLS", "CONDUIT_PROFILE_CALLS")
+                .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true"))
+                .unwrap_or(false)
+        });
+        enabled.then(|| {
+            let now = Instant::now();
+            Self {
+                tool: tool.to_string(),
+                started: now,
+                checkpoint: now,
+                preflight_us: 0,
+                downstream_us: 0,
+                postprocess_us: 0,
+            }
+        })
+    }
+
+    fn elapsed_since_checkpoint(&mut self) -> u64 {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.checkpoint).as_micros() as u64;
+        self.checkpoint = now;
+        elapsed
+    }
+
+    fn mark_preflight(&mut self) {
+        self.preflight_us = self.elapsed_since_checkpoint();
+    }
+
+    fn mark_downstream(&mut self) {
+        self.downstream_us = self.elapsed_since_checkpoint();
+    }
+
+    fn mark_postprocess(&mut self) {
+        self.postprocess_us = self.elapsed_since_checkpoint();
+    }
+
+    fn finish(mut self) {
+        let audit_us = self.elapsed_since_checkpoint();
+        let total_us = self.started.elapsed().as_micros() as u64;
+        eprintln!(
+            "toolport-call-profile {}",
+            json!({
+                "tool": self.tool,
+                "preflightUs": self.preflight_us,
+                "downstreamUs": self.downstream_us,
+                "postprocessUs": self.postprocess_us,
+                "auditUs": audit_us,
+                "totalUs": total_us,
+            })
+        );
+    }
+}
+
 /// Execute ONE already-resolved tool call and return the MCP tool RESULT (the inner
 /// `{content, isError, structuredContent}`), NOT a JSON-RPC envelope. This is the single
 /// path both a direct `toolport_call_tool` dispatch and a code-mode script's
@@ -2305,8 +3030,9 @@ fn refused_call_result(
 /// `confirm` is `Some` only on the interactive direct path, where a destructive tool can be
 /// held for the agent's `toolport_confirm` token replay. Inside a script that two-step
 /// handshake can't happen, so `confirm` is `None` and such a call fails closed rather than
-/// running unconfirmed. `confirmed` is true only when the call already came back through
+/// running unconfirmed. `opts.confirmed` is true only when the call already came back through
 /// `toolport_confirm` (skips the approval + confirm gates so it isn't re-intercepted).
+/// `opts.shape` controls byte-budget shaping (see [`CallOpts`]).
 #[allow(clippy::too_many_arguments)]
 fn execute_call(
     reg: &Registry,
@@ -2318,19 +3044,22 @@ fn execute_call(
     confirm: Option<&ConfirmGuard>,
     name: &str,
     arguments: Value,
-    mut confirmed: bool,
+    opts: CallOpts,
+    // Live swappable router slot (SOU-321). After HITL approval we re-clone this so
+    // quarantine applied via `Arc::make_mut` during the hold is visible before execute.
+    // `None` only in test wrappers that lack `GatewayState`.
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Value {
+    let mut confirmed = opts.confirmed;
+    let shape = opts.shape;
+    let mut call_profiler = RoutedCallProfiler::start(name);
     // Resolve the call's real (server, original tool) from the router's route map,
     // NOT by splitting the exposed name on `__`. A renamed tool (via a tool override)
     // or a server id containing `__` would otherwise mis-derive the server and
     // silently weaken the scope guard and the HITL untrusted-provenance check below.
-    let (server_id, tool_name) = router
-        .route_of(name)
-        .map(|(s, t)| (s.to_string(), t.to_string()))
-        .unwrap_or_else(|| (String::new(), name.to_string()));
-    let srv_owned = sanitize_segment(&server_id);
+    let (server_id, tool) = router.route_of(name).unwrap_or(("", name));
+    let srv_owned = sanitize_segment(server_id);
     let srv = srv_owned.as_str();
-    let tool = tool_name.as_str();
 
     // Scope guard: a registered HTTP client may only call tools on the
     // servers its token is allowed to see (a no-op when unscoped). Search
@@ -2374,7 +3103,7 @@ fn execute_call(
     if let Some(team) = reg.team.as_ref() {
         if !team.rate_limits.is_empty() {
             if let Err(msg) =
-                conduit_lib::rate_limits::check_and_count(&team.rate_limits, &server_id, tool)
+                conduit_lib::rate_limits::check_and_count(&team.rate_limits, server_id, tool)
             {
                 // Count as a failed call with a clear reason so Activity / export show the block.
                 audit::record_timed(srv, tool, false, None, Some("rate_limit"), client);
@@ -2385,6 +3114,10 @@ fn execute_call(
             }
         }
     }
+
+    // After HITL approval we may swap to a freshly cloned live Arc so quarantine applied
+    // during the hold is enforced (SOU-321). Non-HITL calls keep the request snapshot.
+    let mut exec_router_owned: Option<Arc<Router>> = None;
 
     // Human-in-the-loop approval: hold a gated call (destructive, or from an
     // untrusted-provenance server) until a person approves it in the Toolport app.
@@ -2417,6 +3150,9 @@ fn execute_call(
             // The exact call being approved, content-bound: the bytes that RUN must
             // hash-match these. Captured before the (blocking) human decision.
             let approved_args_hash = audit::args_hash(&arguments);
+            // Definition fingerprint the human is approving (SOU-322): rebound against
+            // the live router after approve, before execute.
+            let approved_fp = tool_fingerprint_for(name, cached, router);
             let t0 = std::time::Instant::now();
             let decision = request_human_decision(approval::ApprovalRequest {
                 token: String::new(),
@@ -2426,7 +3162,7 @@ fn execute_call(
                 tool: tool.to_string(),
                 reason,
                 arguments: arguments.clone(),
-                tool_fingerprint: tool_fingerprint_for(name, cached, router),
+                tool_fingerprint: approved_fp.clone(),
             });
             let held_ms = t0.elapsed().as_millis() as u64;
             if !decision.is_approved() {
@@ -2460,6 +3196,26 @@ fn execute_call(
                 );
                 return refused_call_result(name, stale, reason_str);
             }
+            // Rebind to the live router and re-check fingerprint + quarantine
+            // (SOU-321 / SOU-322). The request snapshot may predate a mid-hold
+            // `requarantine` that forked a new Arc via `make_mut`.
+            if let Some(live) = clone_live_router(live_router) {
+                if let Some(stale) =
+                    post_hitl_revalidation(approved_fp.as_deref(), name, &live)
+                {
+                    audit::record_decision(
+                        srv,
+                        tool,
+                        client,
+                        reason_str,
+                        decision_token(stale),
+                        &arguments,
+                        Some(held_ms),
+                    );
+                    return refused_call_result(name, stale, reason_str);
+                }
+                exec_router_owned = Some(live);
+            }
             // Approved calls are audited too, so the trail shows what actually ran,
             // not only what was blocked.
             audit::record_decision(
@@ -2476,6 +3232,8 @@ fn execute_call(
         }
     }
 
+    let exec_router: &Router = exec_router_owned.as_deref().unwrap_or(router);
+
     // Per-call confirmation for destructive tools: intercept the first
     // call with these arguments, store it, and return a preview. The
     // agent calls toolport_confirm { token } to replay the stored call.
@@ -2488,7 +3246,7 @@ fn execute_call(
         // Resolve destructiveness robustly (cache, then live router, else
         // fail-closed), so a cold/stale cache can't skip the confirm step for a
         // destructive tool.
-        let dest = tool_is_destructive_fail_closed(name, cached, router);
+        let dest = tool_is_destructive_fail_closed(name, cached, exec_router);
         if dest {
             match confirm {
                 Some(confirm) => {
@@ -2539,10 +3297,16 @@ fn execute_call(
     };
     // Hash args for the audit line (and SOU-171 org export) without storing them.
     let call_args_hash = audit::args_hash(&arguments);
+    if let Some(profiler) = &mut call_profiler {
+        profiler.mark_preflight();
+    }
 
     let started = Instant::now();
-    match router.route_call_with_cancel(name, arguments, cancel.clone()) {
+    match exec_router.route_call_with_cancel(name, arguments, cancel.clone()) {
         Ok(result) => {
+            if let Some(profiler) = &mut call_profiler {
+                profiler.mark_downstream();
+            }
             let ms = started.elapsed().as_millis() as u64;
             // Downstream success flag (before content defense may flip isError on a
             // high-confidence injection block — SOU-345). Live inspect keeps the RAW
@@ -2564,7 +3328,10 @@ fn execute_call(
             } else {
                 recovery_hint(cached, srv)
             };
-            let out = defend_and_shape(reg, srv, tool, client, result, &trailer);
+            let out = defend_and_shape(reg, srv, tool, client, result, &trailer, shape);
+            if let Some(profiler) = &mut call_profiler {
+                profiler.mark_postprocess();
+            }
             // Audit the agent-facing outcome: a content-defense block is a failed call
             // for governance / SOU-171 export even when the downstream returned ok.
             let ok = !out
@@ -2585,6 +3352,9 @@ fn execute_call(
                 client,
                 Some(&call_args_hash),
             );
+            if let Some(profiler) = call_profiler {
+                profiler.finish();
+            }
             out
         }
         Err(e) => {
@@ -2613,9 +3383,28 @@ fn execute_call(
                 "content": [{ "type": "text", "text": e }],
                 "isError": true,
             });
-            defend_and_shape(reg, srv, tool, client, result, &recovery_hint(cached, srv))
+            defend_and_shape(
+                reg,
+                srv,
+                tool,
+                client,
+                result,
+                &recovery_hint(cached, srv),
+                shape,
+            )
         }
     }
+}
+
+/// Flags for [`execute_call`] that would otherwise be adjacent bools (easy to swap).
+#[derive(Clone, Copy)]
+struct CallOpts {
+    /// True after a successful `toolport_confirm` replay (skip re-approval/confirm).
+    confirmed: bool,
+    /// When false, content defense still runs but result-shaping is skipped. Code-mode
+    /// intermediate calls pass full bodies into the sandbox (they never enter model
+    /// context); only the script's final aggregate is shaped for the client.
+    shape: bool,
 }
 
 /// Run untrusted tool-call output through content defense and result shaping, then
@@ -2635,6 +3424,7 @@ fn defend_and_shape(
     client: Option<&str>,
     mut result: Value,
     trailer: &str,
+    shape: bool,
 ) -> Value {
     // Scan untrusted output for injection; label always, optionally fail closed.
     // Block mode alone must still run the scanner: an org forceBlockOnInjection (or a
@@ -2652,20 +3442,24 @@ fn defend_and_shape(
     }
     // Cap an oversized result, cache the full body, hand back a head + fetch cursor.
     // A per-server resultBudget overrides the global default (Some(0) = never shape).
-    let budget = reg
-        .result_budgets
-        .get(srv)
-        .map(|&b| b as usize)
-        .unwrap_or_else(|| {
-        let (budget, warning) = shaping::budget();
+    // Code-mode intermediate calls pass `shape = false`: full bodies stay in the
+    // sandbox; only the script's final aggregate is shaped for the model.
+    if shape {
+        let budget = reg
+            .result_budgets
+            .get(srv)
+            .map(|&b| b as usize)
+            .unwrap_or_else(|| {
+                let (budget, warning) = shaping::budget();
 
-        if let Some(msg) = warning {
-            eprintln!("{msg}");
-        }
+                if let Some(msg) = warning {
+                    eprintln!("{msg}");
+                }
 
-        budget
-    });
-    shaping::shape_result(&mut result, budget, client);
+                budget
+            });
+        shaping::shape_result(&mut result, budget, client);
+    }
     // Toolport-authored trailer, appended last so it survives both passes intact.
     let trailer = trailer.trim();
     if !trailer.is_empty() {
@@ -2676,12 +3470,48 @@ fn defend_and_shape(
     result
 }
 
+/// Exposed tool names for code-mode `servers.*` stubs: full catalog minus gateway
+/// meta-tools, optionally filtered to the client's allowed server prefixes.
+///
+/// Scope matching uses [`server_in_allowed_scope`] (SOU-327) so hyphenated server ids
+/// sanitize the same way as `execute_call` / tools-list filtering. Bare names (no
+/// `server__tool` separator) are dropped: they cannot become `servers.*` stubs and must
+/// not appear in `listTools` as if they were catalog entries.
+fn script_catalog_tools(
+    cached: &[Value],
+    allowed: Option<&std::collections::HashSet<String>>,
+) -> Vec<String> {
+    let mut names: Vec<String> = cached
+        .iter()
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
+        .filter(|n| !codemode::is_code_mode_meta_tool(n))
+        .filter(|n| {
+            let Some((server, tool)) = codemode::split_exposed_name(n) else {
+                return false;
+            };
+            if server.is_empty() || tool.is_empty() {
+                return false;
+            }
+            match allowed {
+                Some(set) => server_in_allowed_scope(server, set),
+                None => true,
+            }
+        })
+        .map(str::to_string)
+        .collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// Dispatch a `toolport_run_script` "code mode" call: run the agent's script in the boa
 /// sandbox with a `toolport.call()` binding that re-enters [`execute_call`] for each
 /// downstream call, so every call passes the identical scope + approval gates a direct call
 /// would - a script never widens the client's reach. Returns one aggregated tool result;
 /// the intermediate call results never enter model context. `router_arc` is the shareable
-/// router used to build the `'static` closure the sandbox requires (`None` -> unavailable).
+/// request-scoped router used to build the `'static` closure the sandbox requires
+/// (`None` -> unavailable). `live_router` is the swappable live slot so post-HITL
+/// revalidation (SOU-321) sees quarantine applied during an approval hold.
 fn run_script_dispatch(
     reg: &Registry,
     router_arc: Option<&Arc<Router>>,
@@ -2690,6 +3520,7 @@ fn run_script_dispatch(
     allowed: Option<&std::collections::HashSet<String>>,
     cancel: Option<downstream::CancelContext>,
     arguments: &Value,
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Value {
     let Some(router_arc) = router_arc else {
         return json!({
@@ -2714,28 +3545,76 @@ fn run_script_dispatch(
     // which can't complete inside a single script round-trip.
     let reg_owned = reg.clone();
     let router_owned = Arc::clone(router_arc);
+    let live_owned = live_router.cloned();
     let cached_owned = cached.to_vec();
     let client_owned = client.map(str::to_string);
     let allowed_owned = allowed.cloned();
     let cancel_owned = cancel;
 
-    let call: std::rc::Rc<dyn Fn(&str, Value) -> Value> =
-        std::rc::Rc::new(move |name: &str, args: Value| {
-            execute_call(
-                &reg_owned,
-                &router_owned,
-                &cached_owned,
-                client_owned.as_deref(),
-                allowed_owned.as_ref(),
-                cancel_owned.clone(),
-                None,
-                name,
-                args,
-                false,
-            )
+    // Capture the active MCP session id (if any) so callAsync workers on other
+    // threads reinstall it for the duration of each host call (WS2-3). Without
+    // this, HTTP-mode server-initiated RPC (sampling/elicitation/roots) during
+    // a fanned-out callAsync cannot resolve the upstream client.
+    let active_session = ACTIVE_MCP_SESSION.with(|cell| cell.borrow().clone());
+
+    // Arc + Send + Sync so independent callAsync work can run on a small host thread pool.
+    // shape=false: intermediate results stay full-sized in the sandbox (never enter model
+    // context). Content defense still runs. Final aggregate is shaped below.
+    let call: codemode::CallBinding =
+        Arc::new(move |name: &str, args: Value| {
+            let run = || {
+                execute_call(
+                    &reg_owned,
+                    &router_owned,
+                    &cached_owned,
+                    client_owned.as_deref(),
+                    allowed_owned.as_ref(),
+                    cancel_owned.clone(),
+                    None,
+                    name,
+                    args,
+                    CallOpts {
+                        confirmed: false,
+                        shape: false,
+                    },
+                    live_owned.as_ref(),
+                )
+            };
+            match active_session.as_ref() {
+                Some(sid) => ACTIVE_MCP_SESSION.with(|cell| {
+                    let previous = cell.borrow().clone();
+                    *cell.borrow_mut() = Some(sid.clone());
+                    let out = run();
+                    *cell.borrow_mut() = previous;
+                    out
+                }),
+                None => run(),
+            }
         });
 
-    let outcome = codemode::run_script(&script, data, call, codemode::Limits::default());
+    // Cursor handoff for any already-shaped result (prior turn, or external cursor in data).
+    let client_for_fetch = client.map(str::to_string);
+    let fetch: codemode::FetchBinding = Arc::new(move |args: codemode::FetchArgs| {
+        shaping::fetch_result(
+            &args.cursor,
+            args.offset,
+            args.len,
+            client_for_fetch.as_deref(),
+            args.projection.as_deref(),
+        )
+    });
+
+    // Typed `servers.*` stubs from the client-scoped catalog (meta-tools excluded).
+    let catalog = script_catalog_tools(cached, allowed);
+
+    let outcome = codemode::run_script(
+        &script,
+        data,
+        call,
+        Some(fetch),
+        codemode::Limits::default(),
+        &catalog,
+    );
 
     // Account the round-trips this one call replaced (calls - 1), composing with the
     // lazy-discovery savings in the same log + counter.
@@ -2743,7 +3622,7 @@ fn run_script_dispatch(
         savings::record_orchestration((outcome.calls - 1) as u64);
     }
 
-    match outcome.error {
+    let mut result = match outcome.error {
         Some(err) => json!({
             "content": [{ "type": "text", "text": format!("Toolport code mode: the script failed: {err}") }],
             "isError": true,
@@ -2759,7 +3638,18 @@ fn run_script_dispatch(
                 "structuredContent": { "toolportScript": { "ok": true, "calls": outcome.calls }, "result": outcome.value }
             })
         }
+    };
+
+    // Intermediate calls were not shaped (full bodies stayed in the sandbox). The
+    // script's aggregate can still blow the transport/context budget, so shape only
+    // this final result; the full aggregate remains available via toolport_fetch_result
+    // (or toolport.fetchResult inside a later script).
+    let (budget, warning) = shaping::budget();
+    if let Some(msg) = warning {
+        eprintln!("{msg}");
     }
+    shaping::shape_result(&mut result, budget, client);
+    result
 }
 
 #[cfg(test)]
@@ -2779,8 +3669,10 @@ fn handle_request(
     // requests can't cross-contaminate and dispatch needn't hold the router lock.
     client: Option<&str>,
 ) -> Option<Value> {
+    let search_index = CatalogSearchIndex::build(cached);
     handle_request_with_cancel(
-        req, reg, router, cached, lazy, profile, guard, confirm, allowed, None, client, None,
+        req, reg, router, cached, lazy, profile, guard, confirm, allowed, None, client,
+        Some(&search_index), None, None,
     )
 }
 
@@ -2800,11 +3692,18 @@ fn handle_request_with_cancel(
     // label), threaded in rather than stored on the shared router so concurrent
     // requests can't cross-contaminate and dispatch needn't hold the router lock.
     client: Option<&str>,
+    // Immutable index built from the same catalog snapshot as `cached`. Scoped
+    // HTTP clients and cold live-router fallbacks rebuild from their filtered
+    // source rather than risk indexing a tool they cannot see.
+    search_index: Option<&CatalogSearchIndex>,
     // The live router as a shareable Arc, used ONLY to build the `'static` call closure a
     // code-mode script needs (its downstream calls re-enter execute_call). `None` disables
     // code mode for this request (the test wrapper / any caller without the Arc); the
     // production dispatch passes `Some(&router)`, the same Arc it already cloned off the lock.
     router_arc: Option<&Arc<Router>>,
+    // Swappable live router slot for post-HITL revalidation (SOU-321). Production
+    // passes `Some(&state.router)`; tests may omit it.
+    live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Option<Value> {
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
@@ -2826,8 +3725,11 @@ fn handle_request_with_cancel(
                     "protocolVersion": proto,
                     "capabilities": {
                         "tools": { "listChanged": true },
-                        "resources": { "listChanged": true },
-                        "prompts": { "listChanged": true }
+                        // Always-on proxy for resource subscriptions (SOU-394):
+                        // advertise subscribe, fail closed when no owner can.
+                        "resources": { "listChanged": true, "subscribe": true },
+                        "prompts": { "listChanged": true },
+                        "completions": {}
                     },
                     "serverInfo": { "name": "toolport-gateway", "version": env!("CARGO_PKG_VERSION") }
                 }),
@@ -2844,9 +3746,8 @@ fn handle_request_with_cancel(
                     call_tool_def(),
                     fetch_result_tool_def(),
                 ];
-                // Opt-in code mode: one script that orchestrates many calls in a single
-                // round-trip. Advertised only when enabled, same visibility discipline as
-                // the agent-control tools below.
+                // Code mode (on by default, Settings kill switch): one script that
+                // orchestrates many calls in a single round-trip.
                 if code_mode_enabled() {
                     tools.push(run_script_tool_def());
                 }
@@ -3089,12 +3990,19 @@ fn handle_request_with_cancel(
                 } else {
                     cached
                 };
-                // Scope the searchable catalog to the client's allowed servers
-                // (a no-op when unscoped), so search can't surface out-of-scope tools.
-                let scoped = scope_tools(base, allowed, |n| {
-                    router.route_of(n).map(|(s, _)| s.to_string())
-                });
-                let source: &[Value] = &scoped;
+                // Avoid cloning the entire catalog for the normal local/unscoped path.
+                // Scoped HTTP callers still get a fail-closed filtered copy and a
+                // temporary index built only from that visible subset.
+                let scoped;
+                let (source, source_index): (&[Value], Option<&CatalogSearchIndex>) =
+                    if allowed.is_none() {
+                        (base, search_index.filter(|index| index.matches_catalog(base)))
+                    } else {
+                        scoped = scope_tools(base, allowed, |n| {
+                            router.route_of(n).map(|(s, _)| s.to_string())
+                        });
+                        (&scoped, None)
+                    };
                 // Semantic re-ranking if the user has configured it (off by default;
                 // falls back to lexical on any failure).
                 let s = &reg.semantic_search;
@@ -3104,7 +4012,14 @@ fn handle_request_with_cancel(
                     s.model.clone(),
                     s.blend,
                 );
-                let outcome = search_catalog_with(source, query, server, limit, Some(&sem_cfg));
+                let outcome = search_catalog_indexed(
+                    source,
+                    query,
+                    server,
+                    limit,
+                    Some(&sem_cfg),
+                    source_index,
+                );
                 let mut matches = outcome.matches;
                 let total = outcome.total;
                 let low_confidence = outcome.low_confidence;
@@ -3260,14 +4175,17 @@ fn handle_request_with_cancel(
                     // commits instead of re-searching (the v0.3.6 keep-searching nudges
                     // overcorrected and made compliant models thrash).
                     format!(
-                        "Found {total} matching tool(s){scope}. Top match: `{top}` - its full input \
-                         schema is included below, so call it now with toolport_call_tool (name: \
-                         \"{top}\") if it fits. Only search again if none of these match.{pin_note}{more}{schema_note}"
+                        "Found {total} matching tool(s){scope}. Top match: `{top}`. Its complete \
+                         schema is below; if it fits, call it with toolport_call_tool using name \
+                         \"{top}\". Only search again if none match.{pin_note}{more}{schema_note}"
                     )
                 };
                 let text = format!(
                     "{lead}\n\n{}",
-                    serde_json::to_string_pretty(&matches).unwrap_or_default()
+                    // This JSON is model input, not a human-facing log. Compact encoding
+                    // preserves every field and the complete top schema while avoiding
+                    // spending tokens on indentation and line breaks on every search.
+                    serde_json::to_string(&matches).unwrap_or_default()
                 );
                 // Record the trace: the ground-truth cost of what THIS search returned
                 // vs. what advertising the whole (scoped) catalog would cost per turn.
@@ -3356,7 +4274,16 @@ fn handle_request_with_cancel(
                 }
                 return Some(success(
                     id,
-                    run_script_dispatch(reg, router_arc, cached, client, allowed, cancel, &arguments),
+                    run_script_dispatch(
+                        reg,
+                        router_arc,
+                        cached,
+                        client,
+                        allowed,
+                        cancel,
+                        &arguments,
+                        live_router,
+                    ),
                 ));
             }
 
@@ -3380,7 +4307,11 @@ fn handle_request_with_cancel(
                     Some(confirm),
                     name.as_str(),
                     arguments,
-                    confirmed,
+                    CallOpts {
+                        confirmed,
+                        shape: true,
+                    },
+                    live_router,
                 ),
             ))
         }
@@ -3388,17 +4319,39 @@ fn handle_request_with_cancel(
             let mut resources = router.aggregated_resources();
             // Scope to the client's allowed servers (a no-op when unscoped), so a
             // registered HTTP client can't list another server's resources.
+            // Compare sanitized server ids: `allowed` stores sanitize_segment form
+            // (SOU-327), same as the tools path.
             if let Some(set) = allowed {
                 resources.retain(|r| {
                     r.get("uri")
                         .and_then(|u| u.as_str())
                         .and_then(|uri| router.resource_server(uri))
-                        .map(|srv| set.contains(srv))
+                        .map(|srv| server_in_allowed_scope(srv, set))
                         .unwrap_or(false)
                 });
             }
             gtrace(&format!("resources/list -> {} resources", resources.len()));
             Some(success(id, json!({ "resources": resources })))
+        }
+        "resources/templates/list" => {
+            let mut templates = router.aggregated_resource_templates();
+            // Same server-scoping rules as resources/list (SOU-327).
+            if let Some(set) = allowed {
+                templates.retain(|t| {
+                    t.get("uriTemplate")
+                        .and_then(|u| u.as_str())
+                        .and_then(|uri| router.resource_template_server(uri))
+                        .map(|srv| server_in_allowed_scope(srv, set))
+                        .unwrap_or(false)
+                });
+            }
+            gtrace(&format!(
+                "resources/templates/list -> {} templates",
+                templates.len()
+            ));
+            // Backward compatible: full aggregated list in one response (no
+            // nextCursor), matching tools/resources/prompts list behavior.
+            Some(success(id, json!({ "resourceTemplates": templates })))
         }
         "resources/read" => {
             let uri = req
@@ -3412,7 +4365,7 @@ fn handle_request_with_cancel(
             if let Some(set) = allowed {
                 let in_scope = router
                     .resource_server(uri)
-                    .map(|srv| set.contains(srv))
+                    .map(|srv| server_in_allowed_scope(srv, set))
                     .unwrap_or(false);
                 if !in_scope {
                     return Some(error(id, -32602, &format!("Toolport: no server owns resource '{uri}'")));
@@ -3448,12 +4401,13 @@ fn handle_request_with_cancel(
         "prompts/list" => {
             let mut prompts = router.aggregated_prompts();
             // Scope to the client's allowed servers (a no-op when unscoped).
+            // Sanitize owner ids before comparing (SOU-327).
             if let Some(set) = allowed {
                 prompts.retain(|p| {
                     p.get("name")
                         .and_then(|n| n.as_str())
                         .and_then(|name| router.prompt_server(name))
-                        .map(|srv| set.contains(srv))
+                        .map(|srv| server_in_allowed_scope(srv, set))
                         .unwrap_or(false)
                 });
             }
@@ -3475,7 +4429,7 @@ fn handle_request_with_cancel(
             if let Some(set) = allowed {
                 let in_scope = router
                     .prompt_server(name)
-                    .map(|srv| set.contains(srv))
+                    .map(|srv| server_in_allowed_scope(srv, set))
                     .unwrap_or(false);
                 if !in_scope {
                     return Some(error(id, -32602, &format!("Toolport: no route for prompt '{name}'")));
@@ -3507,9 +4461,53 @@ fn handle_request_with_cancel(
                 )),
             }
         }
+        "completion/complete" => {
+            let params = req.get("params").cloned().unwrap_or_else(|| json!({}));
+            // Scope: resolve the owning server first, then check allowed (no leak of
+            // out-of-scope prompt/template names beyond a generic invalid-params error).
+            match router.resolve_completion(&params) {
+                Ok((server_id, _)) => {
+                    if let Some(set) = allowed {
+                        if !server_in_allowed_scope(&server_id, set) {
+                            return Some(error(
+                                id,
+                                -32602,
+                                "Toolport: completion reference is not in scope",
+                            ));
+                        }
+                    }
+                    match router.complete_with_cancel(params, cancel.clone()) {
+                        Ok(result) => Some(success(id, result)),
+                        Err(e) => Some(error(
+                            id,
+                            -32602,
+                            &format!(
+                                "Toolport: {}",
+                                integrity::defend_error_text("completion", &e)
+                            ),
+                        )),
+                    }
+                }
+                Err(e) => Some(error(
+                    id,
+                    -32602,
+                    &format!(
+                        "Toolport: {}",
+                        integrity::defend_error_text("completion", &e)
+                    ),
+                )),
+            }
+        }
         "ping" => Some(success(id, json!({}))),
         other => Some(error(id, -32601, &format!("Method not found: {other}"))),
     }
+}
+
+/// Whether a downstream server id is in a registered HTTP client's allowed set.
+/// `allowed` always stores [`sanitize_segment`] form (see tools scoping); raw
+/// server ids with hyphens must be sanitized before comparison (SOU-327).
+fn server_in_allowed_scope(server_id: &str, allowed: &std::collections::HashSet<String>) -> bool {
+    allowed.contains(sanitize_segment(server_id).as_str())
 }
 
 /// Fail-closed merge of every profile's `tool_scope` for the shared HTTP-bridge router.
@@ -3547,6 +4545,11 @@ fn build_router(
     // already decoded to a filesystem path. `None` in HTTP mode and before the
     // client's roots are known; `${ROOT}` servers then fall back to the gateway cwd.
     root: Option<&str>,
+    // Optional dispatch for downstream `notifications/resources/updated`
+    // (SOU-394); bound per server with producer id (SOU-398).
+    resource_updated: Option<ResourceUpdatedDispatch>,
+    // Live subscription table so reconnect factories re-issue resources/subscribe.
+    resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
 ) -> Router {
     // In HTTP mode one process serves every registered client, so connect the
     // union of all their profiles (per-request filtering scopes each one down).
@@ -3632,9 +4635,16 @@ fn build_router(
             let dirty = Arc::clone(dirty);
             let handler = Arc::clone(&server_handler);
             let root_t = root_owned.clone();
+            let resource_updated = resource_updated.clone();
             std::thread::spawn(move || {
-                let ds = connect_one(&server, &dirty, handler, root_t.as_deref());
-                (server, dirty, ds)
+                let ds = connect_one(
+                    &server,
+                    &dirty,
+                    handler,
+                    root_t.as_deref(),
+                    resource_updated.clone(),
+                );
+                (server, dirty, resource_updated, ds)
             })
         })
         .collect();
@@ -3644,18 +4654,45 @@ fn build_router(
     // since they're applied as each server's tools are added.
     router.set_overrides(reg.tool_overrides.clone());
     for handle in handles {
-        if let Ok((server, dirty, Some(ds))) = handle.join() {
+        if let Ok((server, dirty, resource_updated, Some(ds))) = handle.join() {
             // The same `connect_one` used for the initial spawn is the reconnect
             // factory, so a re-spawn re-injects keychain secrets and re-handshakes
-            // exactly like a fresh connect.
+            // exactly like a fresh connect, then re-issues resource subscriptions
+            // this server still owns.
             let handler = Arc::clone(&server_handler);
             let root_c = root_owned.clone();
-            let reconnect: Reconnect =
-                Box::new(move || connect_one(&server, &dirty, Arc::clone(&handler), root_c.as_deref()));
+            let subs = resource_subs.clone();
+            let server_id = server.id.clone();
+            let reconnect: Reconnect = Box::new(move || {
+                let mut ds = connect_one(
+                    &server,
+                    &dirty,
+                    Arc::clone(&handler),
+                    root_c.as_deref(),
+                    resource_updated.clone(),
+                )?;
+                if let Some(ref table) = subs {
+                    resubscribe_server_resources(&mut ds, &server_id, table);
+                }
+                Some(ds)
+            });
             router.add_with_reconnect(ds, Some(reconnect));
         }
     }
     router
+}
+
+/// Bind a shared resource-updated dispatch to one producer server id so the
+/// transport-level sink only needs the URI (SOU-398).
+fn bind_resource_updated_sink(
+    dispatch: &ResourceUpdatedDispatch,
+    producer: &str,
+) -> ResourceUpdatedSink {
+    let dispatch = Arc::clone(dispatch);
+    let producer = producer.to_string();
+    Arc::new(move |uri: String| {
+        dispatch(producer.clone(), uri);
+    })
 }
 
 /// Connect a single enabled server (stdio with keychain secret injection, or
@@ -3665,7 +4702,12 @@ fn connect_one(
     dirty: &Arc<AtomicU8>,
     server_handler: ServerRequestHandler,
     root: Option<&str>,
+    resource_updated: Option<ResourceUpdatedDispatch>,
 ) -> Option<DownstreamServer> {
+    // Close over this server's id so fanout can verify the producer (SOU-398).
+    let resource_updated = resource_updated
+        .as_ref()
+        .map(|d| bind_resource_updated_sink(d, &server.id));
     let result = if let Some(command) = &server.command {
         let mut env: Vec<(String, String)> = Vec::new();
         for e in &server.env {
@@ -3702,6 +4744,7 @@ fn connect_one(
             &env,
             resolved_cwd.as_deref(),
             Arc::clone(dirty),
+            resource_updated,
         ) {
             Ok(mut t) => {
                 t.set_server_request_handler(server_handler);
@@ -3710,7 +4753,11 @@ fn connect_one(
             Err(e) => Err(e),
         }
     } else if server.url.is_some() {
-        remote::connect_remote_with_handler(server, Some(Arc::clone(&server_handler)))
+        remote::connect_remote_with_handler(
+            server,
+            Some(Arc::clone(&server_handler)),
+            resource_updated,
+        )
     } else {
         Err("no command or url".to_string())
     };
@@ -3738,19 +4785,399 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-fn notify_tools_changed(stdout: &Arc<Mutex<std::io::Stdout>>) {
-    notify_list_changed(stdout, "notifications/tools/list_changed");
+fn notify_tools_changed(
+    stdout: &Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
+) {
+    notify_list_changed(stdout, mcp_sessions, "notifications/tools/list_changed");
 }
 
 /// Emit a bare JSON-RPC `list_changed` notification to the client so it re-fetches
 /// the named list. Used for resources/prompts (which have no persisted cache) and,
-/// via `notify_tools_changed`, for tools.
-fn notify_list_changed(stdout: &Arc<Mutex<std::io::Stdout>>, method: &str) {
+/// via `notify_tools_changed`, for tools. Always writes stdio; when HTTP MCP
+/// sessions are present, also fans the same notification over every live session's
+/// SSE queue (SOU-328) so streamable-HTTP clients see list changes.
+fn notify_list_changed(
+    stdout: &Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
+    method: &str,
+) {
+    let msg = json!({ "jsonrpc": "2.0", "method": method });
     let mut out = stdout
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = writeln!(out, "{}", json!({ "jsonrpc": "2.0", "method": method }));
-    let _ = out.flush();
+    let _ = write_json_line(&mut *out, &msg);
+    if let Some(sessions) = mcp_sessions {
+        fanout_mcp_notification(sessions, &msg);
+    }
+}
+
+/// Queue a server→client JSON-RPC notification on every non-expired HTTP MCP
+/// session (SOU-328). Best-effort: a full outbound queue drops that session's
+/// copy and continues so one stuck client cannot block the others.
+fn fanout_mcp_notification(
+    mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    msg: &Value,
+) {
+    let Ok(json) = serde_json::to_string(msg) else {
+        return;
+    };
+    let sessions = mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for session in sessions.values() {
+        if session.is_expired() || session.closed.load(Ordering::SeqCst) {
+            continue;
+        }
+        if !session.push_message(json.clone(), request_id_key(msg)) {
+            eprintln!("toolport: MCP session outbound queue full; list_changed dropped");
+        }
+    }
+}
+
+/// Deliver `notifications/resources/updated` only to sessions that subscribed
+/// to `uri` (stdio + HTTP SSE). Distinct from list_changed fanout (SOU-394).
+///
+/// `producer` is the downstream server id that emitted the notification. Fanout
+/// only proceeds when that id matches the URI's first-writer owner (SOU-398);
+/// spoofed or colliding updates are dropped and logged.
+fn deliver_resource_updated(
+    stdout: &Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: &Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    subs: &Arc<Mutex<ResourceSubscriptionTable>>,
+    producer: &str,
+    uri: &str,
+) {
+    let targets = {
+        let table = subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match table.owner_for(uri) {
+            Some(owner) if owner == producer => table.sessions_for_uri(uri),
+            Some(owner) => {
+                eprintln!(
+                    "toolport: resources/updated for '{uri}' from '{producer}' dropped \
+                     (owned by '{owner}')"
+                );
+                return;
+            }
+            // No active subscription for this URI — same as empty targets.
+            None => return,
+        }
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/resources/updated",
+        "params": { "uri": uri }
+    });
+    let Ok(json) = serde_json::to_string(&msg) else {
+        return;
+    };
+    let mut need_stdio = false;
+    let mut http_ids: Vec<String> = Vec::new();
+    for sid in targets {
+        if sid == RESOURCE_SUB_STDIO {
+            need_stdio = true;
+        } else {
+            http_ids.push(sid);
+        }
+    }
+    if need_stdio {
+        let mut out = stdout
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _ = write_json_line(&mut *out, &msg);
+    }
+    if !http_ids.is_empty() {
+        let sessions = mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for sid in http_ids {
+            let Some(session) = sessions.get(&sid) else {
+                continue;
+            };
+            if session.is_expired() || session.closed.load(Ordering::SeqCst) {
+                continue;
+            }
+            if !session.push_message(json.clone(), None) {
+                eprintln!(
+                    "toolport: MCP session outbound queue full; resources/updated dropped"
+                );
+            }
+        }
+    }
+}
+
+/// Build the shared dispatch that fans resource-updated notifications to
+/// subscribed upstream clients only (SOU-394), after verifying the producer
+/// owns the URI (SOU-398). Bound per downstream via [`bind_resource_updated_sink`].
+fn make_resource_updated_sink(
+    stdout: Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    subs: Arc<Mutex<ResourceSubscriptionTable>>,
+) -> ResourceUpdatedDispatch {
+    Arc::new(move |producer: String, uri: String| {
+        deliver_resource_updated(&stdout, &mcp_sessions, &subs, &producer, &uri);
+    })
+}
+
+/// Active MCP session key for resource subscription bookkeeping: real HTTP
+/// session id when set, otherwise the stdio sentinel.
+fn active_resource_session_id() -> String {
+    ACTIVE_MCP_SESSION.with(|cell| {
+        cell.borrow()
+            .clone()
+            .unwrap_or_else(|| RESOURCE_SUB_STDIO.to_string())
+    })
+}
+
+/// Handle `resources/subscribe` / `resources/unsubscribe` with ownership routing,
+/// HTTP scope, and fail-closed downstream proxying (SOU-394). Concurrent first
+/// subscribers single-flight so followers never report success without an open
+/// downstream sub.
+fn handle_resource_subscription(
+    state: &GatewayState,
+    router: &Router,
+    req: &Value,
+    allowed: Option<&std::collections::HashSet<String>>,
+    method: &str,
+) -> Option<Value> {
+    let id = match req.get("id") {
+        Some(id) if !id.is_null() => id.clone(),
+        _ => return None,
+    };
+    let uri = req
+        .get("params")
+        .and_then(|p| p.get("uri"))
+        .and_then(|u| u.as_str())
+        .unwrap_or("");
+    if uri.is_empty() {
+        return Some(error(id, -32602, "Toolport: resources subscription requires params.uri"));
+    }
+    // Same ownership + scope rules as resources/read (fail closed / not-found).
+    let Some(owner) = router.resource_server(uri).map(str::to_string) else {
+        return Some(error(
+            id,
+            -32602,
+            &format!("Toolport: no server owns resource '{uri}'"),
+        ));
+    };
+    if let Some(set) = allowed {
+        if !server_in_allowed_scope(&owner, set) {
+            return Some(error(
+                id,
+                -32602,
+                &format!("Toolport: no server owns resource '{uri}'"),
+            ));
+        }
+    }
+    let session = active_resource_session_id();
+    match method {
+        "resources/subscribe" => {
+            // Single-flight loop: leaders open downstream; waiters re-enter after
+            // the gate resolves so they either join or see a fail-closed error.
+            loop {
+                let begin = {
+                    let mut table = state
+                        .resource_subs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    match table.begin_subscribe(&session, uri, &owner) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            return Some(error(id, -32602, &format!("Toolport: {e}")));
+                        }
+                    }
+                };
+                match begin {
+                    BeginSubscribe::AlreadyLocal | BeginSubscribe::Joined => {
+                        return Some(success(id, json!({})));
+                    }
+                    BeginSubscribe::Lead(gate) => {
+                        // If subscribe_resource panics, Drop clears `opening` and
+                        // fails waiters instead of parking them forever (WS1-4).
+                        let mut lead_guard = LeadOpenGuard {
+                            state,
+                            uri: uri.to_string(),
+                            gate: Arc::clone(&gate),
+                            armed: true,
+                        };
+                        match router.subscribe_resource(uri) {
+                            Ok(_) => {
+                                let mut table = state
+                                    .resource_subs
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                table.finish_open_ok(uri, &gate);
+                                lead_guard.disarm();
+                                return Some(success(id, json!({})));
+                            }
+                            Err(e) => {
+                                let msg = integrity::defend_error_text(uri, &e);
+                                let mut table = state
+                                    .resource_subs
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                                table.finish_open_err(uri, &gate, msg.clone());
+                                lead_guard.disarm();
+                                return Some(error(
+                                    id,
+                                    -32602,
+                                    &format!("Toolport: {msg}"),
+                                ));
+                            }
+                        }
+                    }
+                    BeginSubscribe::Wait(gate) => match gate.wait() {
+                        Ok(()) => {
+                            let mut table = state
+                                .resource_subs
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            match table.join_open(&session, uri, &owner) {
+                                Ok(()) => return Some(success(id, json!({}))),
+                                Err(e) => {
+                                    return Some(error(id, -32602, &format!("Toolport: {e}")));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            return Some(error(id, -32602, &format!("Toolport: {e}")));
+                        }
+                    },
+                }
+            }
+        }
+        "resources/unsubscribe" => {
+            let last_owner = {
+                let mut table = state
+                    .resource_subs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                table.remove(&session, uri)
+            };
+            if let Some(owner) = last_owner {
+                // Best-effort: local bookkeeping already dropped; a downstream
+                // unsubscribe failure must not leave the client stuck subscribed.
+                // Use the owner recorded at subscribe time so rebuild ownership
+                // drift cannot redirect the unsub to a different server.
+                if let Err(e) = router.unsubscribe_resource_on_server(&owner, uri) {
+                    eprintln!(
+                        "toolport: downstream resources/unsubscribe failed for '{uri}' on '{owner}': {e}"
+                    );
+                }
+            }
+            // Idempotent success when the session was not subscribed.
+            Some(success(id, json!({})))
+        }
+        _ => Some(error(id, -32601, &format!("Method not found: {method}"))),
+    }
+}
+
+/// Re-issue `resources/subscribe` for every tracked URI against a live router
+/// (after full rebuild). Fail closed per URI: drop local tracking when the
+/// owner is gone or the downstream rejects the re-subscribe.
+fn reestablish_all_resource_subscriptions(
+    router: &Router,
+    subs: &Arc<Mutex<ResourceSubscriptionTable>>,
+) {
+    let tracked = {
+        let table = subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        table.tracked_uri_owners()
+    };
+    if tracked.is_empty() {
+        return;
+    }
+    for (uri, old_owner) in tracked {
+        match router.resource_server(&uri) {
+            Some(owner) => {
+                if owner != old_owner {
+                    let mut table = subs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    table.set_owner(&uri, owner);
+                }
+                if let Err(e) = router.subscribe_resource(&uri) {
+                    eprintln!(
+                        "toolport: re-subscribe '{uri}' after rebuild failed: {e}; dropping local holders"
+                    );
+                    let mut table = subs
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    table.clear_uri(&uri);
+                }
+            }
+            None => {
+                eprintln!(
+                    "toolport: resource '{uri}' no longer owned after rebuild; dropping subscriptions"
+                );
+                let mut table = subs
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                table.clear_uri(&uri);
+            }
+        }
+    }
+}
+
+/// After reconnecting one downstream, re-subscribe URIs that server owns.
+/// Fail closed: if the fresh connection rejects a re-subscribe, drop local
+/// holders for that URI so clients are not left half-subscribed (asymmetric
+/// with rebuild until this path cleared tracking on error).
+fn resubscribe_server_resources(
+    ds: &mut DownstreamServer,
+    server_id: &str,
+    subs: &Arc<Mutex<ResourceSubscriptionTable>>,
+) {
+    let uris = {
+        let table = subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        table.uris_for_owner(server_id)
+    };
+    for uri in uris {
+        if let Err(e) = ds.subscribe_resource(&uri) {
+            eprintln!(
+                "toolport: re-subscribe '{uri}' on '{server_id}' after reconnect failed: {e}; dropping local holders"
+            );
+            let mut table = subs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            table.clear_uri(&uri);
+        }
+    }
+}
+
+/// Best-effort downstream unsubscribes after a session disconnect (SOU-394).
+/// Uses the owner recorded at subscribe time, not live URI re-resolution.
+fn cleanup_resource_subs_for_session(state: &GatewayState, session: &str) {
+    let need_unsub = {
+        let mut table = state
+            .resource_subs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        table.drop_session(session)
+    };
+    if need_unsub.is_empty() {
+        return;
+    }
+    let router = state
+        .router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    for (uri, owner) in need_unsub {
+        if let Err(e) = router.unsubscribe_resource_on_server(&owner, &uri) {
+            eprintln!(
+                "toolport: cleanup resources/unsubscribe failed for '{uri}' on '{owner}': {e}"
+            );
+        }
+    }
 }
 
 /// Persist a freshly built or refreshed catalog and tell the client it changed.
@@ -3893,9 +5320,10 @@ fn reconcile_quarantine(
     router: &Arc<Mutex<Arc<Router>>>,
     stdout: &Arc<Mutex<std::io::Stdout>>,
     profile: Option<&str>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
 ) -> bool {
     match effective_quarantine(registry, profile) {
-        Some(want) => reconcile_to(router, stdout, want),
+        Some(want) => reconcile_to(router, stdout, mcp_sessions, want),
         // Store unreadable: keep enforcing the current set rather than weakening it.
         None => false,
     }
@@ -3908,6 +5336,7 @@ fn reconcile_quarantine(
 fn reconcile_to(
     router: &Arc<Mutex<Arc<Router>>>,
     stdout: &Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
     want: BTreeSet<String>,
 ) -> bool {
     let changed = {
@@ -3932,24 +5361,36 @@ fn reconcile_to(
         // success path visible too.
         glog("quarantine set changed on disk; re-filtering exposed tools");
         eprintln!("toolport: quarantine set changed on disk; re-filtering exposed tools");
-        notify_tools_changed(stdout);
+        // Fan to HTTP MCP sessions too (SOU-328): quarantine/re-approval must not
+        // leave streamable-HTTP clients on a stale tools/list.
+        notify_tools_changed(stdout, mcp_sessions);
     }
     changed
 }
 
-fn persist_and_emit(
+fn persist_and_emit_with_sessions(
     tools: &[Value],
-    cached_tools: &Arc<Mutex<Vec<Value>>>,
+    cached_tools: &SharedCatalog,
     stdout: &Arc<Mutex<std::io::Stdout>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
     profile: Option<&str>,
 ) {
     if !tools.is_empty() {
+        let started = Instant::now();
+        let next = Arc::new(CatalogSnapshot::new(tools.to_vec()));
+        let index_bytes = next.search.estimated_auxiliary_bytes();
         *cached_tools
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = tools.to_vec();
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = next;
+        gtrace(&format!(
+            "search index rebuilt: {} tools, ~{} KiB auxiliary, {:.2} ms",
+            tools.len(),
+            index_bytes.div_ceil(1024),
+            started.elapsed().as_secs_f64() * 1000.0
+        ));
         save_tool_cache(tools, profile);
     }
-    notify_tools_changed(stdout);
+    notify_tools_changed(stdout, mcp_sessions);
 }
 
 /// Keep the always-on gateway log bounded; trimmed to roughly the back half once
@@ -4144,7 +5585,7 @@ fn watch_registry(
     registry: Arc<Mutex<Registry>>,
     router: Arc<Mutex<Arc<Router>>>,
     stdout: Arc<Mutex<std::io::Stdout>>,
-    cached_tools: Arc<Mutex<Vec<Value>>>,
+    cached_tools: SharedCatalog,
     profile: Arc<Mutex<Option<String>>>,
     client_id: Option<String>,
     env_profile: Option<String>,
@@ -4154,6 +5595,14 @@ fn watch_registry(
     // Shared ${ROOT} path (issue #239) so a registry-change rebuild keeps placing
     // ${ROOT} servers in the client's project root instead of resetting to fallback.
     client_root: Arc<Mutex<Option<String>>>,
+    // Live HTTP MCP sessions so list_changed notifications also fan out over SSE
+    // (SOU-328). Empty in pure-stdio mode; same Arc as GatewayState.
+    mcp_sessions: Arc<Mutex<HashMap<String, Arc<McpSession>>>>,
+    // Resource-updated dispatch re-wired into rebuilds after registry reload
+    // (SOU-394 / SOU-398).
+    resource_updated: Option<ResourceUpdatedDispatch>,
+    // Subscription table so rebuilds re-issue resources/subscribe.
+    resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
 ) {
     eprintln!("toolport: watching registry at {}", path.display());
     let mut state = WatchLoopState {
@@ -4181,6 +5630,9 @@ fn watch_registry(
             &downstream_dirty,
             &server_handler,
             &client_root,
+            Some(&mcp_sessions),
+            resource_updated.as_ref(),
+            resource_subs.as_ref(),
             &mut state,
         );
     }
@@ -4198,7 +5650,7 @@ fn watch_tick(
     registry: &Arc<Mutex<Registry>>,
     router: &Arc<Mutex<Arc<Router>>>,
     stdout: &Arc<Mutex<std::io::Stdout>>,
-    cached_tools: &Arc<Mutex<Vec<Value>>>,
+    cached_tools: &SharedCatalog,
     profile: &Arc<Mutex<Option<String>>>,
     client_id: Option<&str>,
     env_profile: Option<&str>,
@@ -4206,6 +5658,9 @@ fn watch_tick(
     downstream_dirty: &Arc<AtomicU8>,
     server_handler: &ServerRequestHandler,
     client_root: &Arc<Mutex<Option<String>>>,
+    mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
+    resource_updated: Option<&ResourceUpdatedDispatch>,
+    resource_subs: Option<&Arc<Mutex<ResourceSubscriptionTable>>>,
     state: &mut WatchLoopState,
 ) -> TickOutcome {
     // Re-approving a tool rewrites quarantine.json, which is NOT the registry file
@@ -4217,7 +5672,7 @@ fn watch_tick(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        reconcile_quarantine(registry, router, stdout, p.as_deref())
+        reconcile_quarantine(registry, router, stdout, p.as_deref(), mcp_sessions)
     };
     // A live downstream server that changed its own tool set (sent
     // tools/list_changed) sets this. Swap before acting so a notification
@@ -4309,7 +5764,13 @@ fn watch_tick(
             downstream_dirty,
             Arc::clone(server_handler),
             root.as_deref(),
+            resource_updated.cloned(),
+            resource_subs.cloned(),
         );
+        // Re-issue tracked resource subscriptions against the fresh connections.
+        if let Some(subs) = resource_subs {
+            reestablish_all_resource_subscriptions(&new_router, subs);
+        }
         let server_count = new_router.server_count();
         let tools = new_router.aggregated_tools();
         *registry
@@ -4319,7 +5780,13 @@ fn watch_tick(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(new_router);
         let tools = requarantine_if_needed(registry, router, tools, resolved.as_deref());
-        persist_and_emit(&tools, cached_tools, stdout, resolved.as_deref());
+        persist_and_emit_with_sessions(
+            &tools,
+            cached_tools,
+            stdout,
+            mcp_sessions,
+            resolved.as_deref(),
+        );
         let fmt_profile = |p: &Option<String>| match p {
             Some(name) => format!("'{name}'"),
             None => "(active profile / unscoped)".to_string(),
@@ -4368,7 +5835,13 @@ fn watch_tick(
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
             let tools = requarantine_if_needed(registry, router, tools, resolved.as_deref());
-            persist_and_emit(&tools, cached_tools, stdout, resolved.as_deref());
+            persist_and_emit_with_sessions(
+                &tools,
+                cached_tools,
+                stdout,
+                mcp_sessions,
+                resolved.as_deref(),
+            );
             eprintln!("toolport: downstream tools/list_changed, refreshed + sent");
         }
         if downstream_changed & downstream::change::RESOURCES != 0 {
@@ -4378,11 +5851,17 @@ fn watch_tick(
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 (**guard).clone()
             };
+            // Also refreshes resource templates (MCP has no separate templates
+            // list_changed; they ride on resources/list_changed).
             next.refresh_resources();
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-            notify_list_changed(stdout, "notifications/resources/list_changed");
+            notify_list_changed(
+                stdout,
+                mcp_sessions,
+                "notifications/resources/list_changed",
+            );
             eprintln!("toolport: downstream resources/list_changed, refreshed + sent");
         }
         if downstream_changed & downstream::change::PROMPTS != 0 {
@@ -4396,7 +5875,7 @@ fn watch_tick(
             *router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(next);
-            notify_list_changed(stdout, "notifications/prompts/list_changed");
+            notify_list_changed(stdout, mcp_sessions, "notifications/prompts/list_changed");
             eprintln!("toolport: downstream prompts/list_changed, refreshed + sent");
         }
     }
@@ -4425,7 +5904,7 @@ struct GatewayState {
     // behind an in-flight request. Rebuilds swap in a new Arc; refresh/requarantine fork
     // via Arc::make_mut.
     router: Arc<Mutex<Arc<Router>>>,
-    cached_tools: Arc<Mutex<Vec<Value>>>,
+    cached_tools: SharedCatalog,
     stdout: Arc<Mutex<std::io::Stdout>>,
     ready: Arc<AtomicBool>,
     downstream_dirty: Arc<AtomicU8>,
@@ -4462,6 +5941,12 @@ struct GatewayState {
     /// request thread without re-reading env. Process constants; unused in HTTP mode.
     client_id: Option<String>,
     env_profile: Option<String>,
+    /// Upstream resource subscriptions (session → URI) for SOU-394 fanout.
+    resource_subs: Arc<Mutex<ResourceSubscriptionTable>>,
+    /// Shared dispatch `(producer, uri)` that delivers `notifications/resources/updated`
+    /// to subscribed clients after ownership check (SOU-394 / SOU-398). Bound per
+    /// server at connect/reconnect.
+    resource_updated_sink: Option<ResourceUpdatedDispatch>,
 }
 
 /// Client capabilities the upstream MCP client declared at `initialize`.
@@ -4514,9 +5999,7 @@ impl StdioUpstream {
                 .stdout
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            writeln!(out, "{req}")
-                .and_then(|_| out.flush())
-                .map_err(|e| e.to_string())
+            write_json_line(&mut *out, &req).map_err(|e| e.to_string())
         };
         if let Err(e) = send {
             self.pending
@@ -4819,17 +6302,41 @@ fn new_mcp_session_id() -> String {
 }
 
 /// Mint a new MCP session after TTL cleanup. Returns 503 when at capacity.
+///
+/// Expired/closed sessions are removed and their resource subscriptions cleaned
+/// up the same way as the per-request session lookup path (WS1-1). A bare
+/// `retain` without cleanup left `by_uri` orphans that counted toward the global
+/// subscription cap forever.
 fn mint_mcp_session(
     state: &GatewayState,
     owner: Option<&McpSessionOwner>,
 ) -> Result<String, HttpOut> {
     let sid = new_mcp_session_id();
     let session = Arc::new(McpSession::new(owner.cloned()));
+    // Collect first so we do not hold the sessions lock across cleanup that may
+    // call the router (same ordering as resolve_mcp_session).
+    let stale: Vec<String> = {
+        let mut sessions = state
+            .mcp_sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let stale: Vec<String> = sessions
+            .iter()
+            .filter(|(_, s)| s.is_expired() || s.closed.load(Ordering::SeqCst))
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &stale {
+            sessions.remove(id);
+        }
+        stale
+    };
+    for id in &stale {
+        cleanup_resource_subs_for_session(state, id);
+    }
     let mut sessions = state
         .mcp_sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    sessions.retain(|_, s| !s.is_expired() && !s.closed.load(Ordering::SeqCst));
     if sessions.len() >= MCP_SESSION_MAX {
         return Err(HttpOut::json_err(503, "too many MCP sessions; retry later"));
     }
@@ -5069,14 +6576,23 @@ fn rebuild_router_for_root(state: &GatewayState) {
         &state.downstream_dirty,
         Arc::clone(&state.server_handler),
         root.as_deref(),
+        state.resource_updated_sink.clone(),
+        Some(Arc::clone(&state.resource_subs)),
     );
+    reestablish_all_resource_subscriptions(&new_router, &state.resource_subs);
     let tools = new_router.aggregated_tools();
     *state
         .router
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(new_router);
     let tools = requarantine_if_needed(&state.registry, &state.router, tools, profile.as_deref());
-    persist_and_emit(&tools, &state.cached_tools, &state.stdout, profile.as_deref());
+    persist_and_emit_with_sessions(
+        &tools,
+        &state.cached_tools,
+        &state.stdout,
+        Some(&state.mcp_sessions),
+        profile.as_deref(),
+    );
     glog(&format!("toolport: ${{ROOT}} rebuild (root={root:?}, {} tools)", tools.len()));
 }
 
@@ -5226,8 +6742,17 @@ fn process_request(
             .cached_tools
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tools
             .is_empty(),
-        "tools/call" | "resources/list" | "resources/read" | "prompts/list" | "prompts/get" => true,
+        "tools/call"
+        | "resources/list"
+        | "resources/templates/list"
+        | "resources/read"
+        | "resources/subscribe"
+        | "resources/unsubscribe"
+        | "prompts/list"
+        | "prompts/get"
+        | "completion/complete" => true,
         _ => false,
     };
     if wait {
@@ -5285,8 +6810,11 @@ fn process_request(
                 &state.downstream_dirty,
                 Arc::clone(&state.server_handler),
                 root.as_deref(),
+                state.resource_updated_sink.clone(),
+                Some(Arc::clone(&state.resource_subs)),
             );
             if built.server_count() > 0 {
+                reestablish_all_resource_subscriptions(&built, &state.resource_subs);
                 let tools = built.aggregated_tools();
                 *state
                     .router
@@ -5296,7 +6824,8 @@ fn process_request(
                     *state
                         .cached_tools
                         .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = tools.clone();
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Arc::new(CatalogSnapshot::new(tools.clone()));
                     save_tool_cache(&tools, profile_snapshot.as_deref());
                 }
                 glog(&format!(
@@ -5308,7 +6837,7 @@ fn process_request(
                         .server_count(),
                     tools.len()
                 ));
-                notify_tools_changed(&state.stdout);
+                notify_tools_changed(&state.stdout, Some(&state.mcp_sessions));
             }
         }
     }
@@ -5317,9 +6846,11 @@ fn process_request(
     // calling handle_request: a tools/call can block on the downstream server or a
     // human-approval hold (up to 120s), and holding the router/registry lock across
     // that would wedge config reloads, setting toggles, and every other request. The
-    // cloned Arc<Router> keeps this call on a consistent catalog even if a concurrent
-    // rebuild swaps the live one; the client label is threaded in, not stored on the
-    // shared router.
+    // cloned Arc<Router> keeps this call on a consistent catalog for pre-HITL work
+    // even if a concurrent rebuild swaps the live one. After a human Approves,
+    // execute_call re-clones the live Arc (via `live_router`) so mid-hold quarantine
+    // / definition drift fail closed (SOU-321 / SOU-322). The client label is
+    // threaded in, not stored on the shared router.
     let cache_snapshot = state
         .cached_tools
         .lock()
@@ -5335,11 +6866,16 @@ fn process_request(
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
+    // Resource subscriptions need the live GatewayState (session table + sink)
+    // and the same ownership/scope path as resources/read (SOU-394).
+    if method == "resources/subscribe" || method == "resources/unsubscribe" {
+        return handle_resource_subscription(state, &router, req, allowed, method);
+    }
     handle_request_with_cancel(
         req,
         &reg,
         &router,
-        &cache_snapshot,
+        &cache_snapshot.tools,
         state.lazy,
         profile_snapshot.as_deref(),
         guard,
@@ -5347,9 +6883,12 @@ fn process_request(
         allowed,
         cancel,
         client,
+        Some(&cache_snapshot.search),
         // The same live Arc<Router> just cloned off the lock, so a code-mode script's
         // downstream calls run against this request's consistent catalog snapshot.
         Some(&router),
+        // Swappable slot for post-HITL rebind (SOU-321); distinct from the snapshot above.
+        Some(&state.router),
     )
 }
 
@@ -5362,7 +6901,7 @@ fn write_stdio_response(
         let mut out = stdout
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        writeln!(out, "{response}").and_then(|_| out.flush())
+        write_json_line(&mut *out, response)
     };
     if let Err(err) = result {
         stdout_broken.store(true, Ordering::SeqCst);
@@ -5414,10 +6953,13 @@ fn handle_stdio_request(
     }
 }
 
+/// `stdio_peer` is true when stdin is a pipe rather than a terminal, i.e. an MCP
+/// client spawned this process and is waiting to speak JSON-RPC on it.
 fn resolve_http_port(
     cli_port: Option<u16>,
     http: Option<&str>,
     http_port: Option<&str>,
+    stdio_peer: bool,
 ) -> (Option<u16>, Option<String>) {
     // CLI flag has highest priority.
     if let Some(port) = cli_port {
@@ -5429,6 +6971,27 @@ fn resolve_http_port(
     let v = v.trim();
     if v.is_empty() {
         return (None, None);
+    }
+    // Ambient env + a client on the other end of stdin: ignore the env (issue #487).
+    // HTTP mode REPLACES the stdio loop rather than running beside it, so honoring a
+    // machine-wide TOOLPORT_HTTP here hands the client a gateway that never answers
+    // its pipe - and every client that starts after the first also collides on the
+    // shared port (WSAEADDRINUSE / os error 10048), which some clients treat as fatal.
+    // The env var is a global, so one stray `setx` breaks every client at once.
+    //
+    // The desktop app starts its bridge with an explicit `--http`, handled above and
+    // unaffected. A human running the gateway by hand has a terminal on stdin and
+    // still gets the env form. Anything else - a service, or a detached run with stdin
+    // redirected from null - now has to say `--http` out loud, which the warning says.
+    if stdio_peer {
+        return (
+            None,
+            Some(format!(
+                "toolport: ignoring TOOLPORT_HTTP/CONDUIT_HTTP='{v}' from the environment - this \
+                 gateway was spawned by a client on stdio, and HTTP mode would replace the stdio \
+                 transport that client is waiting on. Pass --http explicitly to run the HTTP bridge."
+            )),
+        );
     }
     if let Ok(port) = v.parse::<u16>() {
         if port > 0 {
@@ -5456,7 +7019,12 @@ fn resolve_http_port(
 /// Resolve the HTTP port. `--http [port]` on the command line wins; otherwise
 /// `CONDUIT_HTTP=<port>` is the direct env form, and a truthy `CONDUIT_HTTP`
 /// falls back to `CONDUIT_HTTP_PORT` or 8765. Absent everywhere -> stdio mode.
+///
+/// The env forms are ignored (with a warning) when a client spawned us on stdio, so a
+/// machine-wide `TOOLPORT_HTTP` can't silently turn every client's gateway into a
+/// racing HTTP server - see [`resolve_http_port`] and issue #487.
 fn http_port() -> (Option<u16>, Option<String>) {
+    use std::io::IsTerminal;
     // CLI flag: `toolport-gateway --http` (default 8765) or `--http 9000`.
     let args: Vec<String> = std::env::args().collect();
     let cli_port = args
@@ -5472,11 +7040,9 @@ fn http_port() -> (Option<u16>, Option<String>) {
         });
     let http = conduit_lib::brand::env_var("TOOLPORT_HTTP", "CONDUIT_HTTP");
     let http_port = conduit_lib::brand::env_var("TOOLPORT_HTTP_PORT", "CONDUIT_HTTP_PORT");
-    resolve_http_port(
-        cli_port,
-        http.as_deref(),
-        http_port.as_deref(),
-    )
+    // A client that spawns us over stdio gives us a pipe; a human gets a terminal.
+    let stdio_peer = !std::io::stdin().is_terminal();
+    resolve_http_port(cli_port, http.as_deref(), http_port.as_deref(), stdio_peer)
 }
 
 /// The tools the HTTP surface exposes, mirroring `tools/list`: the meta-tools
@@ -5500,14 +7066,14 @@ fn http_tool_defs(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        if cached.is_empty() {
+        if cached.tools.is_empty() {
             state
                 .router
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .aggregated_tools()
         } else {
-            cached
+            cached.tools.clone()
         }
     };
     if state.lazy {
@@ -5769,7 +7335,25 @@ fn mcp_require_session(
         .mcp_sessions
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    sessions.retain(|_, s| !s.is_expired() && !s.closed.load(Ordering::SeqCst));
+    // Drop expired/closed sessions and release any last-holder resource subs
+    // they held (SOU-394). Collect first so we do not hold the sessions lock
+    // across cleanup that may call the router.
+    let stale: Vec<String> = sessions
+        .iter()
+        .filter(|(_, s)| s.is_expired() || s.closed.load(Ordering::SeqCst))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in &stale {
+        sessions.remove(id);
+    }
+    drop(sessions);
+    for id in &stale {
+        cleanup_resource_subs_for_session(state, id);
+    }
+    let sessions = state
+        .mcp_sessions
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     match sessions.get(sid).filter(|session| session.owner.as_ref() == owner) {
         Some(sess) => {
             sess.touch();
@@ -5879,6 +7463,9 @@ fn handle_mcp_http(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .remove(&sid);
+                // Drop resource subscriptions for this HTTP session and release
+                // any last-holder downstream subs (SOU-394).
+                cleanup_resource_subs_for_session(state, &sid);
                 HttpOut::new(204, "text/plain", String::new())
             }
             Err(e) => e,
@@ -6008,7 +7595,10 @@ fn handle_http(
     allowed: Option<&std::collections::HashSet<String>>,
     caller: Option<&HttpCaller>,
 ) -> HttpOut {
-    let client = caller.and_then(|value| value.audit_label.as_deref());
+    // SOU-324: confirm tokens and shaped-result stash must key on stable client
+    // identity, not the display label (labels are not unique across HTTP clients).
+    // Audit still receives this same id string; Activity may show `client:{id}`.
+    let client = caller.map(|value| value.session_owner.identity.as_str());
     let session_owner = caller.map(|value| &value.session_owner);
     if method == "OPTIONS" {
         return HttpOut::new(204, "text/plain", String::new());
@@ -7245,6 +8835,11 @@ fn main() {
                 r.enabled_servers().len(),
                 r.active_profile_id()
             ));
+            // Seed code mode only on a successful load. Registry::default() has
+            // code_mode: true, so seeding from the error fallback would silently
+            // re-enable code mode after a corrupt registry (WS2-5). The watcher
+            // already fails safe by not updating the flag on reload failure.
+            seed_code_mode_after_registry_load(Ok(&r));
             r
         }
         Err(e) => {
@@ -7258,12 +8853,10 @@ fn main() {
                  Fix or recreate the registry to restore full functionality."
             );
             glog(&format!("load_resolved ERR: {e}"));
+            seed_code_mode_after_registry_load(Err(()));
             registry::Registry::default()
         }
     };
-    // Seed code mode from the registry so it's live from the first request, before the
-    // watcher's first tick (an env override still force-enables inside code_mode_enabled).
-    set_code_mode_flag(loaded.code_mode);
     inspect::clear();
     // Resolve the live profile immediately from what's already on disk, rather than
     // waiting for the watcher's first tick: a scoped client re-launched after being
@@ -7278,7 +8871,9 @@ fn main() {
     // request loop, the watcher, and the self-heal path all follow this, so there's
     // no deadlock; keep new code consistent with it.
     let router = Arc::new(Mutex::new(Arc::new(Router::new())));
-    let cached_tools = Arc::new(Mutex::new(load_tool_cache(resolved_profile.as_deref())));
+    let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::new(load_tool_cache(
+        resolved_profile.as_deref(),
+    )))));
     // Shared, live-updated: the watcher re-resolves this from registry.client_scopes
     // on every reload (falling back to `env_profile` if this client has no scope
     // entry), so a profile switch reaches every reader below without a restart.
@@ -7292,6 +8887,13 @@ fn main() {
     let mcp_sessions = Arc::new(Mutex::new(HashMap::new()));
     let client_upstream = Arc::new(Mutex::new(ClientUpstreamCaps::default()));
     let client_root = Arc::new(Mutex::new(None::<String>));
+    // Resource subscription tracking + drain-thread sink (SOU-394).
+    let resource_subs = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
+    let resource_updated_sink = Some(make_resource_updated_sink(
+        Arc::clone(&stdout),
+        Arc::clone(&mcp_sessions),
+        Arc::clone(&resource_subs),
+    ));
     // Single-flight for every router build/swap (startup, watcher self-heal, and
     // ${ROOT} rebuilds). Created up front so the startup build can share it.
     let rebuild_lock = Arc::new(Mutex::new(()));
@@ -7307,6 +8909,7 @@ fn main() {
         cached_tools
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tools
             .len()
     ));
 
@@ -7321,6 +8924,9 @@ fn main() {
         let profile = Arc::clone(&profile);
         let client_root = Arc::clone(&client_root);
         let rebuild_lock = Arc::clone(&rebuild_lock);
+        let mcp_sessions = Arc::clone(&mcp_sessions);
+        let resource_updated = resource_updated_sink.clone();
+        let resource_subs_for_build = Arc::clone(&resource_subs);
         std::thread::spawn(move || {
             let reg = registry
                 .lock()
@@ -7347,6 +8953,10 @@ fn main() {
                 &downstream_dirty,
                 server_handler,
                 root.as_deref(),
+                resource_updated,
+                // Cold start: no upstream clients yet; reconnect factories still
+                // capture the shared table for later re-subscribes.
+                Some(resource_subs_for_build),
             );
             let tools = built.aggregated_tools();
             glog(&format!(
@@ -7363,13 +8973,14 @@ fn main() {
             if !tools.is_empty() {
                 *cached_tools
                     .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner) = tools.clone();
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Arc::new(CatalogSnapshot::new(tools.clone()));
                 save_tool_cache(&tools, p.as_deref());
             } else {
                 glog("background build was empty; keeping previous tool cache");
             }
             ready.store(true, Ordering::SeqCst);
-            notify_tools_changed(&stdout);
+            notify_tools_changed(&stdout, Some(&mcp_sessions));
         });
     }
 
@@ -7384,6 +8995,9 @@ fn main() {
         let client_id = client_id.clone();
         let env_profile = env_profile.clone();
         let client_root = Arc::clone(&client_root);
+        let mcp_sessions = Arc::clone(&mcp_sessions);
+        let resource_updated = resource_updated_sink.clone();
+        let resource_subs_watch = Arc::clone(&resource_subs);
         std::thread::spawn(move || {
             watch_registry(
                 path,
@@ -7398,6 +9012,9 @@ fn main() {
                 downstream_dirty,
                 server_handler,
                 client_root,
+                mcp_sessions,
+                resource_updated,
+                Some(resource_subs_watch),
             )
         });
     }
@@ -7420,6 +9037,8 @@ fn main() {
         server_handler,
         client_id: client_id.clone(),
         env_profile: env_profile.clone(),
+        resource_subs,
+        resource_updated_sink,
     };
 
     // Native HTTP/OpenAPI transport: a first-class path for HTTP tool clients
@@ -7591,7 +9210,7 @@ mod tests {
             "content": [{ "type": "text", "text": payload }],
             "isError": true,
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("external data"), "error text must be labeled as data");
         assert!(text.contains("evil-server"), "wrapper names the originating server");
@@ -7602,7 +9221,7 @@ mod tests {
             "content": [{ "type": "text", "text": "e".repeat(200_000) }],
             "isError": true,
         });
-        let shaped = defend_and_shape(&reg, "srv", "srv__t", None, huge, "");
+        let shaped = defend_and_shape(&reg, "srv", "srv__t", None, huge, "", true);
         let shaped_text = shaped["content"][0]["text"].as_str().unwrap();
         assert!(
             shaped_text.len() < 200_000,
@@ -7613,7 +9232,7 @@ mod tests {
         // The Toolport-authored trailer is appended after the scan, as its own block,
         // so it is never wrapped as external data.
         let clean = json!({ "content": [{ "type": "text", "text": "not found" }], "isError": true });
-        let with_hint = defend_and_shape(&reg, "srv", "srv__t", None, clean, "Try list_things first.");
+        let with_hint = defend_and_shape(&reg, "srv", "srv__t", None, clean, "Try list_things first.", true);
         let blocks = with_hint["content"].as_array().unwrap();
         let trailer = blocks.last().unwrap()["text"].as_str().unwrap();
         assert_eq!(trailer, "Try list_things first.");
@@ -7630,7 +9249,7 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         assert_eq!(out["isError"], true, "blocked call must be isError");
         let text = out["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("blocked"), "security message");
@@ -7650,7 +9269,7 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         assert_ne!(
             out["content"][0]["text"].as_str().unwrap().starts_with("Toolport: blocked"),
             true,
@@ -7669,7 +9288,7 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         assert!(
             out["content"][0]["text"]
                 .as_str()
@@ -7690,7 +9309,7 @@ mod tests {
         let result = json!({
             "content": [{ "type": "text", "text": payload }],
         });
-        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "");
+        let out = defend_and_shape(&reg, "evil-server", "evil__tool", None, result, "", true);
         assert_eq!(out["isError"], true);
         assert!(
             out["content"][0]["text"]
@@ -7932,6 +9551,181 @@ mod tests {
         );
     }
 
+    /// SOU-321: prove the Arc::make_mut COW window, then that post-HITL revalidation
+    /// fail-closes against the *live* Arc (not the pre-hold snapshot).
+    #[test]
+    fn post_hitl_revalidation_sees_cow_quarantine_on_live_arc() {
+        let live = Arc::new(Mutex::new(Arc::new(routed_router("s", "wipe"))));
+        // Mimic process_request: clone the Arc before a long HITL hold (strong count ≥ 2).
+        let snapshot = live.lock().unwrap().clone();
+        assert!(
+            snapshot.block_reason("s__wipe").is_none(),
+            "tool must be exposed at gate time"
+        );
+        let approved_fp = tool_fingerprint_for("s__wipe", &[], &snapshot);
+
+        // Mid-hold: live requarantine forks a new Arc via make_mut.
+        {
+            let mut guard = live.lock().unwrap();
+            let r = Arc::make_mut(&mut guard);
+            r.requarantine(["s__wipe".to_string()].into_iter().collect());
+        }
+
+        assert!(
+            snapshot.block_reason("s__wipe").is_none(),
+            "pre-hold snapshot must still allow the tool (the SOU-321 window)"
+        );
+        assert_eq!(
+            live.lock().unwrap().block_reason("s__wipe").map(|r| r.contains("quarantined")),
+            Some(true),
+            "live Arc must block after make_mut requarantine"
+        );
+
+        assert_eq!(
+            post_hitl_revalidation(
+                approved_fp.as_deref(),
+                "s__wipe",
+                live.lock().unwrap().as_ref(),
+            ),
+            Some(approval::ApprovalDecision::StaleState),
+            "approval must not execute against a mid-hold quarantine"
+        );
+        // Control: revalidating the stale snapshot alone would wrongly pass.
+        assert!(
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &snapshot).is_none(),
+            "snapshot-only check would miss the bug this test guards"
+        );
+    }
+
+    /// SOU-322: definition fingerprint must still match the live router after approve.
+    #[test]
+    fn post_hitl_revalidation_rejects_fingerprint_rug_pull() {
+        let at_gate = {
+            let ds = DownstreamServer::connect(
+                "s".into(),
+                Box::new(MockRoute {
+                    tools: vec![json!({
+                        "name": "wipe",
+                        "description": "delete rows",
+                    })],
+                }),
+            )
+            .unwrap();
+            let mut r = Router::new();
+            r.add(ds);
+            r
+        };
+        let after_drift = {
+            let ds = DownstreamServer::connect(
+                "s".into(),
+                Box::new(MockRoute {
+                    tools: vec![json!({
+                        "name": "wipe",
+                        "description": "delete ALL rows and backups",
+                    })],
+                }),
+            )
+            .unwrap();
+            let mut r = Router::new();
+            r.add(ds);
+            r
+        };
+        let approved_fp = tool_fingerprint_for("s__wipe", &[], &at_gate);
+        assert!(approved_fp.is_some());
+        assert_ne!(
+            approved_fp.as_deref(),
+            tool_fingerprint_for("s__wipe", &[], &after_drift).as_deref(),
+        );
+        assert_eq!(
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &after_drift),
+            Some(approval::ApprovalDecision::StaleState),
+        );
+        assert!(
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &at_gate).is_none(),
+            "unchanged definition must still pass"
+        );
+    }
+
+    /// Happy path: live router unchanged across the hold → revalidation allows execute.
+    #[test]
+    fn post_hitl_revalidation_allows_unchanged_live_router() {
+        let live = Arc::new(Mutex::new(Arc::new(routed_router("s", "wipe"))));
+        let snapshot = live.lock().unwrap().clone();
+        let approved_fp = tool_fingerprint_for("s__wipe", &[], &snapshot);
+        // No make_mut / requarantine — live Arc is still the snapshot.
+        assert!(post_hitl_revalidation(
+            approved_fp.as_deref(),
+            "s__wipe",
+            live.lock().unwrap().as_ref(),
+        )
+        .is_none());
+    }
+
+    /// Live-only fingerprint: a tool still present in the request cache but gone from the
+    /// live aggregation must StaleState (never resurrect via cache fallback).
+    #[test]
+    fn post_hitl_revalidation_ignores_request_cache_for_missing_live_tool() {
+        let snapshot = routed_router("s", "wipe");
+        let approved_fp = tool_fingerprint_for("s__wipe", &[], &snapshot);
+        assert!(approved_fp.is_some());
+        // Empty live router: tool is gone from aggregation (removed / never indexed).
+        let live = Router::new();
+        // Even if the request cache still holds the old definition, revalidation must
+        // not use it — missing live definition is StaleState.
+        let _stale_cache = snapshot.aggregated_tools();
+        assert_eq!(
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &live),
+            Some(approval::ApprovalDecision::StaleState),
+        );
+    }
+
+    /// Live policy wins: a tool blocked on the pre-hold snapshot but released on live
+    /// during the hold is allowed to run after revalidation (follow live, not snapshot).
+    #[test]
+    fn post_hitl_revalidation_follows_live_release_during_hold() {
+        let mut policy = ToolPolicy::default();
+        policy.quarantined = ["s__wipe".to_string()].into_iter().collect();
+        let mut router = Router::with_policy(policy);
+        let ds = DownstreamServer::connect(
+            "s".into(),
+            Box::new(MockRoute {
+                tools: vec![json!({ "name": "wipe", "description": "delete rows" })],
+            }),
+        )
+        .unwrap();
+        router.add(ds);
+
+        let live = Arc::new(Mutex::new(Arc::new(router)));
+        let snapshot = live.lock().unwrap().clone();
+        assert!(
+            snapshot
+                .block_reason("s__wipe")
+                .is_some_and(|r| r.contains("quarantined"))
+        );
+
+        {
+            let mut guard = live.lock().unwrap();
+            Arc::make_mut(&mut guard).requarantine(BTreeSet::new());
+        }
+        assert!(live.lock().unwrap().block_reason("s__wipe").is_none());
+
+        let approved_fp = tool_fingerprint_for("s__wipe", &[], live.lock().unwrap().as_ref());
+        assert!(
+            post_hitl_revalidation(
+                approved_fp.as_deref(),
+                "s__wipe",
+                live.lock().unwrap().as_ref(),
+            )
+            .is_none(),
+            "a mid-hold release on the live Arc must clear the post-HITL block"
+        );
+        assert_eq!(
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &snapshot),
+            Some(approval::ApprovalDecision::StaleState),
+            "the pre-hold snapshot would still wrongly block"
+        );
+    }
+
     /// The refusal envelope is machine-readable: a code-mode script (or any agent) can read
     /// `structuredContent.toolportDecision` + `retriable` to pick a recovery instead of
     /// blind-retrying a flat error string. Every non-approval stays `isError: true`.
@@ -8003,13 +9797,135 @@ mod tests {
                        return { name: a.structuredContent.user.name, \
                                 sum: a.structuredContent.user.age + b.structuredContent.user.age };"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
         assert_eq!(result["isError"].as_bool(), Some(false));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         assert_eq!(result["structuredContent"]["toolportScript"]["calls"], 2);
         // The aggregate the script returned, not two intermediate tool results.
         assert_eq!(result["structuredContent"]["result"]["name"], "Alice");
         assert_eq!(result["structuredContent"]["result"]["sum"], 60);
+    }
+
+    /// Intermediate tool results stay full-sized inside the script; only the final
+    /// aggregate is shaped for the model. Scripts can filter/project huge bodies in JS.
+    #[test]
+    fn run_script_shapes_oversized_final_aggregate() {
+        let reg = Registry::default();
+        let body = "x".repeat(shaping::DEFAULT_BUDGET_BYTES * 2);
+        let router = Arc::new(paging_router(body.clone()));
+        let args = json!({
+            "script": "return [ \
+                toolport.call('s__big', {}), \
+                toolport.call('s__big', {}), \
+                toolport.call('s__big', {}), \
+                toolport.call('s__big', {}) \
+            ];"
+        });
+
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+        let serialized = serde_json::to_string(&result).unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        assert!(
+            serialized.len() <= shaping::DEFAULT_BUDGET_BYTES,
+            "final aggregate was {} bytes, over the {} byte budget",
+            serialized.len(),
+            shaping::DEFAULT_BUDGET_BYTES
+        );
+        assert!(text.contains("Toolport shaped this result"));
+        assert!(text.contains("\"cursor\":\"r"));
+        assert!(
+            result.get("structuredContent").is_none(),
+            "the oversized structured aggregate should move behind the fetch cursor"
+        );
+
+        let cursor = text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("shaped result cursor");
+        let fetched = shaping::fetch_result(cursor, 0, usize::MAX, None, Some("result"));
+        let fetched_text = fetched["content"][0]["text"]
+            .as_str()
+            .expect("fetched aggregate text");
+        let aggregate: Value =
+            serde_json::from_str(fetched_text).expect("complete fetched aggregate");
+        let calls = aggregate.as_array().expect("script returned an array");
+        assert_eq!(calls.len(), 4);
+        // Intermediates were NOT shaped: full bodies (or structured) available to the script.
+        assert!(calls.iter().all(|call| {
+            let text = call["content"][0]["text"].as_str().unwrap_or("");
+            !text.contains("Toolport shaped this result")
+                && (text.contains(&body) || call.get("structuredContent").is_some())
+        }));
+    }
+
+    /// Script sees the full oversized intermediate and can return a small projection.
+    #[test]
+    fn run_script_can_project_large_intermediate_without_cursor() {
+        let reg = Registry::default();
+        let big = "y".repeat(shaping::DEFAULT_BUDGET_BYTES * 2);
+        let router = Arc::new(paging_router(big.clone()));
+        let args = json!({
+            "script": "var r = toolport.call('s__big', {}); \
+                       var t = r.content[0].text; \
+                       return { len: t.length, head: t.slice(0, 8), shaped: t.indexOf('Toolport shaped') >= 0 };"
+        });
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        let v = &result["structuredContent"]["result"];
+        assert_eq!(v["shaped"], false);
+        assert_eq!(v["len"], big.chars().count() as u64); // or as number
+        assert_eq!(v["head"], "yyyyyyyy");
+    }
+
+    /// toolport.fetchResult pages a shaped stash (same owner rules as toolport_fetch_result).
+    #[test]
+    fn run_script_fetch_result_reads_shaped_cursor() {
+        let reg = Registry::default();
+        let router = Arc::new(paging_router("z".to_string()));
+        // Seed the shaping cache as a prior shaped agent-facing result would.
+        // Body must dominate the envelope so shape_result actually caches (half-size rule).
+        let payload = format!("hello{}", "x".repeat(2000));
+        let mut seeded = json!({
+            "content": [{ "type": "text", "text": payload }],
+            "isError": false
+        });
+        assert!(
+            shaping::shape_result(&mut seeded, 512, Some("alice")),
+            "seed must shape so a cursor exists"
+        );
+        let seed_text = seeded["content"][0]["text"].as_str().unwrap();
+        let cursor = seed_text
+            .split("\"cursor\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .expect("seed cursor");
+
+        let args = json!({
+            "script": format!(
+                "var page = toolport.fetchResult({{ cursor: '{cursor}', offset: 0, len: 5 }}); \
+                 return page.content[0].text;"
+            ),
+        });
+        // Client owner must match the stash owner.
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &[],
+            Some("alice"),
+            None,
+            None,
+            &args,
+            None,
+        );
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        let text = result["structuredContent"]["result"]
+            .as_str()
+            .unwrap_or("");
+        // fetch_result returns the page plus a Toolport footer; head is the body slice.
+        assert!(text.starts_with("hello"), "got {text}");
     }
 
     /// The per-client scope guard applies to a call made INSIDE a script exactly as it does
@@ -8023,7 +9939,7 @@ mod tests {
         allowed.insert("other".to_string()); // NOT "s"
         let args = json!({ "script": "return toolport.call('s__big', {});" });
         let result =
-            run_script_dispatch(&reg, Some(&router), &[], Some("scoped"), Some(&allowed), None, &args);
+            run_script_dispatch(&reg, Some(&router), &[], Some("scoped"), Some(&allowed), None, &args, None);
         // The script itself ran; the value it returned is the scope-denied tool result.
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         let call_result = &result["structuredContent"]["result"];
@@ -8032,6 +9948,88 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("not available to this client"));
+    }
+
+    /// Typed stubs only list tools on servers the client is scoped to; out-of-scope
+    /// servers are absent from `servers` / listServers even if present in the full cache.
+    #[test]
+    fn run_script_servers_stubs_are_scope_filtered() {
+        let reg = Registry::default();
+        let router = Arc::new(paging_router("hi".to_string()));
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("other".to_string());
+        let cached = vec![
+            json!({ "name": "s__big" }),
+            json!({ "name": "other__thing" }),
+            json!({ "name": "toolport_status" }),
+            json!({ "name": "bare_override" }), // no server__tool shape
+        ];
+        let args = json!({
+            "script": "return { \
+                servers: toolport.listServers().sort(), \
+                tools: toolport.listTools().sort(), \
+                hasS: typeof servers.s, \
+                hasOther: typeof servers.other \
+            };"
+        });
+        let result = run_script_dispatch(
+            &reg,
+            Some(&router),
+            &cached,
+            Some("scoped"),
+            Some(&allowed),
+            None,
+            &args,
+            None,
+        );
+        assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
+        let v = &result["structuredContent"]["result"];
+        assert_eq!(v["servers"], json!(["other"]));
+        assert_eq!(v["tools"], json!(["other__thing"]));
+        assert_eq!(v["hasS"], json!("undefined"));
+        assert_eq!(v["hasOther"], json!("object"));
+    }
+
+    /// SOU-327 / CodeRabbit #481: catalog scope must sanitize like tools-list filtering.
+    /// Allowed stores sanitize_segment form; raw or already-sanitized server segments match.
+    #[test]
+    fn script_catalog_tools_uses_server_in_allowed_scope() {
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("file_system".to_string());
+        let cached = vec![
+            json!({ "name": "file_system__read" }),
+            json!({ "name": "other__tool" }),
+            json!({ "name": "toolport_call_tool" }),
+            json!({ "name": "no_separator" }),
+        ];
+        let names = script_catalog_tools(&cached, Some(&allowed));
+        assert_eq!(names, vec!["file_system__read".to_string()]);
+        // Unscoped sees every namespaced non-meta tool, still drops bare + meta.
+        let all = script_catalog_tools(&cached, None);
+        assert_eq!(
+            all,
+            vec![
+                "file_system__read".to_string(),
+                "other__tool".to_string(),
+            ]
+        );
+    }
+
+    /// End-to-end: a typed stub routes through execute_call like toolport.call.
+    #[test]
+    fn run_script_servers_stub_aggregates_downstream() {
+        let reg = Registry::default();
+        let router = Arc::new(paging_router("hello".to_string()));
+        let cached = vec![json!({ "name": "s__big" })];
+        let args = json!({
+            "script": "var a = servers.s.big({}); return a.structuredContent.user.name;"
+        });
+        let result =
+            run_script_dispatch(&reg, Some(&router), &cached, None, None, None, &args, None);
+        assert_eq!(result["isError"].as_bool(), Some(false));
+        assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
+        assert_eq!(result["structuredContent"]["toolportScript"]["calls"], 1);
+        assert_eq!(result["structuredContent"]["result"], "Alice");
     }
 
     /// Safety: a destructive tool called INSIDE a script fails closed when per-call
@@ -8046,7 +10044,7 @@ mod tests {
         // Mark the tool destructive via the cached catalog the fail-closed resolver checks.
         let cached = vec![json!({ "name": "s__big", "annotations": { "destructiveHint": true } })];
         let args = json!({ "script": "return toolport.call('s__big', {});" });
-        let result = run_script_dispatch(&reg, Some(&router), &cached, None, None, None, &args);
+        let result = run_script_dispatch(&reg, Some(&router), &cached, None, None, None, &args, None);
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         let call_result = &result["structuredContent"]["result"];
         assert_eq!(call_result["isError"].as_bool(), Some(true));
@@ -8062,7 +10060,7 @@ mod tests {
         let reg = Registry::default();
         let router = Arc::new(paging_router("x".to_string()));
         let result =
-            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &json!({ "script": "   " }));
+            run_script_dispatch(&reg, Some(&router), &[], None, None, None, &json!({ "script": "   " }), None);
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert!(result["content"][0]["text"]
             .as_str()
@@ -8076,7 +10074,7 @@ mod tests {
     fn run_script_without_router_is_unavailable() {
         let reg = Registry::default();
         let result =
-            run_script_dispatch(&reg, None, &[], None, None, None, &json!({ "script": "return 1;" }));
+            run_script_dispatch(&reg, None, &[], None, None, None, &json!({ "script": "return 1;" }), None);
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert!(result["content"][0]["text"]
             .as_str()
@@ -8091,17 +10089,21 @@ mod tests {
         let reg = Registry::default();
         let router = Arc::new(paging_router("x".to_string()));
         let args = json!({ "script": "this is not valid javascript )(" });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], false);
     }
 
-    /// With `CONDUIT_CODE_MODE` unset (the default), the dispatch refuses `toolport_run_script`
-    /// so the capability is opt-in. (`handle_request` also passes no router Arc, a second
-    /// fail-closed.)
+    /// Kill switch path: when the live flag is off, dispatch refuses
+    /// `toolport_run_script`. Production seeds the flag from the registry at boot.
     #[test]
     fn run_script_is_refused_when_code_mode_disabled() {
-        let reg = Registry::default();
+        // WS2-6: drive the live atomic. Serialize so parallel tests cannot leave
+        // CODE_MODE stuck true (and so tools/list counts stay stable).
+        let _guard = CodeModeGuard::acquire();
+        set_code_mode_flag(false);
+        let mut reg = Registry::default();
+        reg.code_mode = false;
         let router = routed_router("s", "tool");
         let req = json!({
             "jsonrpc": "2.0",
@@ -8124,6 +10126,157 @@ mod tests {
         .unwrap();
         assert_eq!(resp["result"]["isError"].as_bool(), Some(true));
         assert!(resp["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("code mode is disabled"));
+    }
+
+    /// WS2-6: live CODE_MODE atomic gates `handle_request_with_cancel` (the
+    /// production path that passes a shareable router Arc). Plain `handle_request`
+    /// always passes `router_arc: None`, so it cannot assert a successful run.
+    #[test]
+    fn run_script_respects_live_code_mode_flag() {
+        let _guard = CodeModeGuard::acquire();
+        let reg = Registry::default();
+        let router = Arc::new(routed_router("s", "tool"));
+        let search_index = CatalogSearchIndex::build(&[]);
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "toolport_run_script", "arguments": { "script": "return 42;" } }
+        });
+
+        set_code_mode_flag(false);
+        let refused = handle_request_with_cancel(
+            &req,
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+            None,
+            Some(&search_index),
+            Some(&router),
+            None,
+        )
+        .unwrap();
+        assert_eq!(refused["result"]["isError"].as_bool(), Some(true));
+        assert!(refused["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("code mode is disabled"));
+
+        set_code_mode_flag(true);
+        let allowed = handle_request_with_cancel(
+            &req,
+            &reg,
+            &router,
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+            None,
+            Some(&search_index),
+            Some(&router),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            allowed["result"]["isError"].as_bool(),
+            Some(false),
+            "live flag on must run script: {allowed}"
+        );
+        assert_eq!(
+            allowed["result"]["structuredContent"]["toolportScript"]["ok"],
+            true
+        );
+        assert_eq!(allowed["result"]["structuredContent"]["result"], 42);
+    }
+
+    #[test]
+    fn code_mode_defaults_on_in_registry() {
+        // SOU-397: new registries and missing serde field default on. Explicit
+        // false remains the kill switch (camelCase field name in JSON).
+        assert!(Registry::default().code_mode);
+        let minimal = r#"{"version":1,"servers":[],"profiles":[]}"#;
+        let parsed: Registry = serde_json::from_str(minimal).unwrap();
+        assert!(parsed.code_mode, "missing codeMode field should default true");
+        let explicit_off: Registry =
+            serde_json::from_str(r#"{"version":1,"servers":[],"profiles":[],"codeMode":false}"#)
+                .unwrap();
+        assert!(!explicit_off.code_mode);
+    }
+
+    /// WS2-5: corrupt-registry boot must not advertise/run code mode even though
+    /// the fallback [`Registry::default`] has `code_mode: true`.
+    #[test]
+    fn code_mode_flag_fails_closed_when_registry_load_fails() {
+        let _guard = CodeModeGuard::acquire();
+        set_code_mode_flag(true);
+
+        // Same helper the boot path uses on Err(load_resolved).
+        seed_code_mode_after_registry_load(Err(()));
+        let reg = Registry::default();
+        assert!(
+            reg.code_mode,
+            "fallback registry struct still defaults code_mode on"
+        );
+
+        let list_req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
+        let list = handle_request(
+            &list_req,
+            &reg,
+            &router(),
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        let names: Vec<&str> = list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|t| t["name"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"toolport_run_script"),
+            "corrupt-load path must not advertise run_script: {names:?}"
+        );
+
+        let call_req = json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "toolport_run_script", "arguments": { "script": "return 1;" } }
+        });
+        let call = handle_request(
+            &call_req,
+            &reg,
+            &routed_router("s", "tool"),
+            &[],
+            true,
+            None,
+            &SearchGuard::default(),
+            &ConfirmGuard::new(),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(call["result"]["isError"].as_bool(), Some(true));
+        assert!(call["result"]["content"][0]["text"]
             .as_str()
             .unwrap()
             .contains("code mode is disabled"));
@@ -8244,10 +10397,16 @@ mod tests {
             Arc::clone(&mcp_sessions),
             true,
         );
+        let resource_subs = Arc::new(Mutex::new(ResourceSubscriptionTable::default()));
+        let resource_updated_sink = Some(make_resource_updated_sink(
+            Arc::clone(&stdout),
+            Arc::clone(&mcp_sessions),
+            Arc::clone(&resource_subs),
+        ));
         GatewayState {
             registry: Arc::new(Mutex::new(Registry::default())),
             router: Arc::new(Mutex::new(Arc::new(Router::new()))),
-            cached_tools: Arc::new(Mutex::new(Vec::new())),
+            cached_tools: Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default()))),
             stdout,
             ready: Arc::new(AtomicBool::new(true)),
             downstream_dirty: Arc::new(AtomicU8::new(0)),
@@ -8262,6 +10421,8 @@ mod tests {
             server_handler,
             client_id: None,
             env_profile: None,
+            resource_subs,
+            resource_updated_sink,
         }
     }
 
@@ -8551,6 +10712,49 @@ mod tests {
             read_bounded_line(&mut reader, 4).unwrap(),
             BoundedLine::Eof
         );
+    }
+
+    #[test]
+    fn json_rpc_frame_is_serialized_before_the_first_write() {
+        #[derive(Default)]
+        struct RecordingWriter {
+            writes: Vec<Vec<u8>>,
+            flushes: usize,
+        }
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.writes.push(buf.to_vec());
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.flushes += 1;
+                Ok(())
+            }
+        }
+
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "result": {
+                "content": [{
+                    "type": "text",
+                    "text": "schema fragment ".repeat(1_000)
+                }]
+            }
+        });
+        let expected = format!("{}\n", serde_json::to_string(&response).unwrap()).into_bytes();
+        let mut writer = RecordingWriter::default();
+
+        write_json_line(&mut writer, &response).unwrap();
+
+        assert_eq!(
+            writer.writes,
+            vec![expected],
+            "one complete newline-delimited frame should reach the pipe writer"
+        );
+        assert_eq!(writer.flushes, 1);
     }
 
     #[test]
@@ -8977,8 +11181,62 @@ mod tests {
             first.session_owner.identity, second.session_owner.identity,
             "duplicate display labels must not collapse distinct clients"
         );
+        assert_eq!(first.session_owner.identity, "client:c1");
+        assert_eq!(second.session_owner.identity, "client:c2");
         assert_eq!(first.session_owner.scope, Some(Vec::new()));
         assert_eq!(second.session_owner.scope, None);
+    }
+
+    #[test]
+    fn confirm_tokens_are_scoped_to_stable_identity_not_display_label() {
+        // SOU-324: two clients can share the label "Open WebUI"; tokens must not.
+        let confirm = ConfirmGuard::new();
+        let token = confirm.store(
+            "stripe__delete_customer".into(),
+            json!({ "id": "cus_x" }),
+            Some("client:c1"),
+        );
+        // Peer with a different stable id cannot redeem (and does not consume).
+        assert!(
+            confirm
+                .take(&token, Some("client:c2"))
+                .is_none(),
+            "same display label must not unlock another client's confirm token"
+        );
+        // Rightful owner still redeems.
+        let (name, args) = confirm
+            .take(&token, Some("client:c1"))
+            .expect("owner must redeem");
+        assert_eq!(name, "stripe__delete_customer");
+        assert_eq!(args["id"], "cus_x");
+    }
+
+    #[test]
+    fn http_security_owner_for_dispatch_is_stable_identity() {
+        // handle_http must pass session_owner.identity (not audit_label) into
+        // process_request so confirm/shaping match ConfirmGuard + shaping stash.
+        let mut reg = Registry::default();
+        reg.http_clients.push(registry::HttpClient {
+            id: "alpha".into(),
+            label: "Open WebUI".into(),
+            token_sha256: registry::sha256_hex("t-a"),
+            profile: String::new(),
+        });
+        reg.http_clients.push(registry::HttpClient {
+            id: "beta".into(),
+            label: "Open WebUI".into(),
+            token_sha256: registry::sha256_hex("t-b"),
+            profile: String::new(),
+        });
+        let (_, a) = resolve_http_caller(&reg, None, Some("t-a"), false).unwrap();
+        let (_, b) = resolve_http_caller(&reg, None, Some("t-b"), false).unwrap();
+        // What handle_http must pass into process_request (stable id, not label).
+        assert_eq!(a.session_owner.identity, "client:alpha");
+        assert_eq!(b.session_owner.identity, "client:beta");
+        assert_ne!(
+            a.session_owner.identity.as_str(),
+            a.audit_label.as_deref().unwrap()
+        );
     }
 
     #[test]
@@ -9600,6 +11858,38 @@ mod tests {
     }
 
     #[test]
+    fn fanout_mcp_notification_reaches_every_live_session() {
+        // SOU-328: list_changed must fan over HTTP MCP sessions, not only stdio.
+        let state = http_state(true);
+        let sid_a = mint_mcp_session(&state, None).ok().unwrap();
+        let sid_b = mint_mcp_session(&state, None).ok().unwrap();
+        let msg = json!({"jsonrpc":"2.0","method":"notifications/resources/list_changed"});
+        fanout_mcp_notification(&state.mcp_sessions, &msg);
+        for sid in [sid_a, sid_b] {
+            let sessions = state.mcp_sessions.lock().unwrap();
+            let session = sessions.get(&sid).unwrap();
+            let mut reader = McpSseReader::new(Arc::clone(session));
+            let mut buf = [0u8; 512];
+            let n = reader.read(&mut buf).unwrap();
+            let chunk = String::from_utf8_lossy(&buf[..n]);
+            assert!(
+                chunk.contains("resources/list_changed"),
+                "session {sid} missing fanout: {chunk}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_in_allowed_scope_sanitizes_server_ids() {
+        // SOU-327: allowed set stores sanitize_segment form; raw hyphenated ids must match.
+        let mut allowed = std::collections::HashSet::new();
+        allowed.insert("file_system".to_string());
+        assert!(server_in_allowed_scope("file-system", &allowed));
+        assert!(server_in_allowed_scope("file_system", &allowed));
+        assert!(!server_in_allowed_scope("other-server", &allowed));
+    }
+
+    #[test]
     fn mcp_session_outbound_queue_is_bounded() {
         let session = McpSession::new(None);
         for i in 0..MCP_SESSION_OUTBOUND_MAX {
@@ -9990,6 +12280,287 @@ mod tests {
         assert_eq!(resp["id"], 1);
         assert_eq!(resp["result"]["protocolVersion"], "2025-06-18");
         assert_eq!(resp["result"]["capabilities"]["tools"]["listChanged"], true);
+        // Always-on proxy policy for resource subscriptions (SOU-394).
+        assert_eq!(resp["result"]["capabilities"]["resources"]["subscribe"], true);
+        assert_eq!(resp["result"]["capabilities"]["resources"]["listChanged"], true);
+    }
+
+    #[test]
+    fn resource_subscription_table_tracks_refcount_and_session_drop() {
+        let mut table = ResourceSubscriptionTable::default();
+        assert!(table.add("s1", "file://a", "alpha").unwrap());
+        assert!(!table.add("s1", "file://a", "alpha").unwrap()); // idempotent
+        assert!(!table.add("s2", "file://a", "alpha").unwrap()); // second session
+        assert_eq!(table.sessions_for_uri("file://a").len(), 2);
+        assert!(table.remove("s1", "file://a").is_none()); // still held by s2
+        assert_eq!(table.remove("s2", "file://a").as_deref(), Some("alpha"));
+        assert!(table.sessions_for_uri("file://a").is_empty());
+
+        assert!(table.add("http-1", "file://b", "beta").unwrap());
+        assert!(table.add("http-1", "file://c", "beta").unwrap());
+        let dropped = table.drop_session("http-1");
+        assert_eq!(dropped.len(), 2);
+        assert!(table.sessions_for_uri("file://b").is_empty());
+    }
+
+    #[test]
+    fn resource_subscription_begin_subscribe_single_flights_first_open() {
+        let mut table = ResourceSubscriptionTable::default();
+        let lead = match table
+            .begin_subscribe("s1", "file://x", "alpha")
+            .expect("lead")
+        {
+            BeginSubscribe::Lead(g) => g,
+            _ => panic!("expected Lead, got non-lead"),
+        };
+        // Concurrent second session must wait, not join as if already open.
+        match table
+            .begin_subscribe("s2", "file://x", "alpha")
+            .expect("wait")
+        {
+            BeginSubscribe::Wait(g) => assert!(Arc::ptr_eq(&lead, &g)),
+            _ => panic!("expected Wait while leader opens"),
+        }
+        // Leader succeeds: waiters may join.
+        table.finish_open_ok("file://x", &lead);
+        table
+            .join_open("s2", "file://x", "alpha")
+            .expect("join after open");
+        assert_eq!(table.sessions_for_uri("file://x").len(), 2);
+
+        // Failed open clears everyone and surfaces the error to waiters.
+        let mut table2 = ResourceSubscriptionTable::default();
+        let lead2 = match table2
+            .begin_subscribe("a", "file://y", "beta")
+            .expect("lead2")
+        {
+            BeginSubscribe::Lead(g) => g,
+            _ => panic!("expected Lead"),
+        };
+        let wait_gate = match table2
+            .begin_subscribe("b", "file://y", "beta")
+            .expect("wait2")
+        {
+            BeginSubscribe::Wait(g) => g,
+            _ => panic!("expected Wait"),
+        };
+        table2.finish_open_err("file://y", &lead2, "downstream refused".into());
+        assert!(table2.sessions_for_uri("file://y").is_empty());
+        assert_eq!(wait_gate.wait().unwrap_err(), "downstream refused");
+    }
+
+    /// WS1-4: waiters must not park forever when the leader never finishes.
+    #[test]
+    fn open_gate_wait_times_out_when_leader_never_finishes() {
+        let gate = OpenGate::new();
+        let err = gate
+            .wait_for(Duration::from_millis(40))
+            .expect_err("must time out");
+        assert!(err.contains("timed out"), "got: {err}");
+    }
+
+    /// WS1-1: mint_mcp_session must release resource subs held by reaped sessions.
+    #[test]
+    fn mint_mcp_session_cleans_resource_subs_of_closed_sessions() {
+        let state = http_state(false);
+        let s1 = match mint_mcp_session(&state, None) {
+            Ok(s) => s,
+            Err(_) => panic!("mint s1 failed"),
+        };
+        {
+            let mut table = state.resource_subs.lock().unwrap();
+            table.add(&s1, "file://orphan", "srv").unwrap();
+            assert_eq!(table.total_count(), 1);
+        }
+        // Closed sessions are reaped the same way as TTL-expired ones.
+        {
+            let sessions = state.mcp_sessions.lock().unwrap();
+            sessions.get(&s1).expect("s1").close();
+        }
+        let _s2 = match mint_mcp_session(&state, None) {
+            Ok(s) => s,
+            Err(_) => panic!("mint s2 reaps s1 failed"),
+        };
+        {
+            let sessions = state.mcp_sessions.lock().unwrap();
+            assert!(
+                !sessions.contains_key(&s1),
+                "closed session must be removed on mint"
+            );
+        }
+        let table = state.resource_subs.lock().unwrap();
+        assert_eq!(
+            table.total_count(),
+            0,
+            "reaped session must not leave subscription orphans"
+        );
+        assert!(table.sessions_for_uri("file://orphan").is_empty());
+    }
+
+    #[test]
+    fn resource_subscription_tracked_uris_and_clear() {
+        let mut table = ResourceSubscriptionTable::default();
+        table.add("s1", "file://a", "alpha").unwrap();
+        table.add("s1", "file://b", "alpha").unwrap();
+        table.add("s2", "file://a", "alpha").unwrap();
+        let tracked = table.tracked_uri_owners();
+        assert_eq!(tracked.len(), 2);
+        assert_eq!(table.uris_for_owner("alpha").len(), 2);
+        table.clear_uri("file://a");
+        assert!(table.sessions_for_uri("file://a").is_empty());
+        assert_eq!(table.sessions_for_uri("file://b").len(), 1);
+    }
+
+    #[test]
+    fn resource_subscription_remove_returns_recorded_owner_not_current_route() {
+        // Last-holder unsub must hand back the owner stored at subscribe time
+        // so cleanup can target that server even if aggregation ownership drifts.
+        let mut table = ResourceSubscriptionTable::default();
+        table.add("s1", "file://x", "alpha").unwrap();
+        table.set_owner("file://x", "alpha");
+        assert_eq!(table.remove("s1", "file://x").as_deref(), Some("alpha"));
+        // Drop session returns (uri, owner) pairs for owner-aware unsub.
+        table.add("http-1", "file://y", "beta").unwrap();
+        table.add("http-1", "file://z", "gamma").unwrap();
+        let dropped = table.drop_session("http-1");
+        assert!(dropped.contains(&("file://y".into(), "beta".into())));
+        assert!(dropped.contains(&("file://z".into(), "gamma".into())));
+    }
+
+    #[test]
+    fn resubscribe_failure_clears_local_holders_like_rebuild() {
+        // Mirrors resubscribe_server_resources fail-closed: after a failed
+        // re-subscribe the URI must not remain tracked.
+        let mut table = ResourceSubscriptionTable::default();
+        table.add("s1", "file://a", "srv").unwrap();
+        table.add("s2", "file://a", "srv").unwrap();
+        assert_eq!(table.sessions_for_uri("file://a").len(), 2);
+        table.clear_uri("file://a");
+        assert!(table.sessions_for_uri("file://a").is_empty());
+        assert!(table.uris_for_owner("srv").is_empty());
+    }
+
+    #[test]
+    fn deliver_resource_updated_reaches_only_subscribed_http_sessions() {
+        let state = http_state(false);
+        let s1 = match mint_mcp_session(&state, None) {
+            Ok(s) => s,
+            Err(_) => panic!("mint s1 failed"),
+        };
+        let s2 = match mint_mcp_session(&state, None) {
+            Ok(s) => s,
+            Err(_) => panic!("mint s2 failed"),
+        };
+        {
+            let mut table = state.resource_subs.lock().unwrap();
+            table.add(&s1, "fixture://only-s1", "srv").unwrap();
+        }
+        deliver_resource_updated(
+            &state.stdout,
+            &state.mcp_sessions,
+            &state.resource_subs,
+            "srv",
+            "fixture://only-s1",
+        );
+        let sessions = state.mcp_sessions.lock().unwrap();
+        let chunk1 = {
+            let sess = sessions.get(&s1).unwrap();
+            let mut out = sess.outbound.lock().unwrap();
+            out.pop_front().map(|m| m.json).unwrap_or_default()
+        };
+        let chunk2 = {
+            let sess = sessions.get(&s2).unwrap();
+            let mut out = sess.outbound.lock().unwrap();
+            out.pop_front().map(|m| m.json)
+        };
+        assert!(
+            chunk1.contains("resources/updated") && chunk1.contains("fixture://only-s1"),
+            "subscribed session missing update: {chunk1}"
+        );
+        assert!(chunk2.is_none(), "unsubscribed session must not receive update");
+    }
+
+    #[test]
+    fn deliver_resource_updated_drops_cross_server_spoof() {
+        // SOU-398: a server that does not own the URI must not fan out updates.
+        let state = http_state(false);
+        let s1 = match mint_mcp_session(&state, None) {
+            Ok(s) => s,
+            Err(_) => panic!("mint s1 failed"),
+        };
+        {
+            let mut table = state.resource_subs.lock().unwrap();
+            table
+                .add(&s1, "fixture://owned-by-alpha", "alpha")
+                .unwrap();
+        }
+        // Spoof: beta claims an update for alpha's URI.
+        deliver_resource_updated(
+            &state.stdout,
+            &state.mcp_sessions,
+            &state.resource_subs,
+            "beta",
+            "fixture://owned-by-alpha",
+        );
+        {
+            let sessions = state.mcp_sessions.lock().unwrap();
+            let sess = sessions.get(&s1).unwrap();
+            let out = sess.outbound.lock().unwrap();
+            assert!(
+                out.is_empty(),
+                "cross-server spoof must not reach subscribers (got {} message(s))",
+                out.len()
+            );
+        }
+        // Legitimate owner still fans out.
+        deliver_resource_updated(
+            &state.stdout,
+            &state.mcp_sessions,
+            &state.resource_subs,
+            "alpha",
+            "fixture://owned-by-alpha",
+        );
+        let sessions = state.mcp_sessions.lock().unwrap();
+        let chunk = {
+            let sess = sessions.get(&s1).unwrap();
+            let mut out = sess.outbound.lock().unwrap();
+            out.pop_front().map(|m| m.json).unwrap_or_default()
+        };
+        assert!(
+            chunk.contains("resources/updated") && chunk.contains("fixture://owned-by-alpha"),
+            "owner producer must still deliver: {chunk}"
+        );
+    }
+
+    #[test]
+    fn deliver_resource_updated_silent_when_unsubscribed() {
+        // Unsolicited update for a URI with no local subscription: drop, no panic.
+        let state = http_state(false);
+        let s1 = match mint_mcp_session(&state, None) {
+            Ok(s) => s,
+            Err(_) => panic!("mint s1 failed"),
+        };
+        deliver_resource_updated(
+            &state.stdout,
+            &state.mcp_sessions,
+            &state.resource_subs,
+            "alpha",
+            "fixture://nobody-subbed",
+        );
+        let sessions = state.mcp_sessions.lock().unwrap();
+        let sess = sessions.get(&s1).unwrap();
+        assert!(sess.outbound.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn resource_subscription_owner_for_matches_first_writer() {
+        let mut table = ResourceSubscriptionTable::default();
+        table.add("s1", "file://a", "alpha").unwrap();
+        assert_eq!(table.owner_for("file://a"), Some("alpha"));
+        // Second session cannot change owner via insert path.
+        table.add("s2", "file://a", "beta").unwrap();
+        assert_eq!(table.owner_for("file://a"), Some("alpha"));
+        assert_eq!(table.owner_for("file://missing"), None);
     }
 
     #[test]
@@ -10110,6 +12681,11 @@ mod tests {
 
     #[test]
     fn lazy_tools_list_returns_only_meta_tools() {
+        // Hold CODE_MODE_TEST_LOCK: other tests flip the global atomic, and an
+        // exact tool count of 4 assumes run_script is not advertised.
+        let _guard = CodeModeGuard::acquire();
+        set_code_mode_flag(false);
+
         let reg = Registry::default();
         let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" });
         // Even with a full cached catalog, lazy mode advertises just the meta-tools.
@@ -10140,6 +12716,7 @@ mod tests {
         assert!(names.contains(&"toolport_call_tool"));
         assert!(names.contains(&"toolport_fetch_result"));
         assert!(!names.contains(&"resend__send_email"));
+        assert!(!names.contains(&"toolport_run_script"));
     }
 
     #[test]
@@ -10278,17 +12855,17 @@ mod tests {
         let (router, stdout) = reconcile_harness();
 
         // A drift quarantines a tool.
-        assert!(reconcile_to(&router, &stdout, set_of(&["srv__wipe"])));
+        assert!(reconcile_to(&router, &stdout, None, set_of(&["srv__wipe"])));
         assert_eq!(router.lock().unwrap().quarantined(), &set_of(&["srv__wipe"]));
 
         // The same set again is a no-op, so the gateway's own quarantine writes can't
         // churn the catalog or spam the client with list_changed.
-        assert!(!reconcile_to(&router, &stdout, set_of(&["srv__wipe"])));
+        assert!(!reconcile_to(&router, &stdout, None, set_of(&["srv__wipe"])));
 
         // The user re-approves and the set SHRINKS. This is the assertion that fails
         // without the fix.
         assert!(
-            reconcile_to(&router, &stdout, BTreeSet::new()),
+            reconcile_to(&router, &stdout, None, BTreeSet::new()),
             "a release must be reconciled into the live router"
         );
         assert!(
@@ -10297,7 +12874,7 @@ mod tests {
         );
 
         // Idempotent: the next watcher tick does nothing.
-        assert!(!reconcile_to(&router, &stdout, BTreeSet::new()));
+        assert!(!reconcile_to(&router, &stdout, None, BTreeSet::new()));
     }
 
     #[test]
@@ -10305,11 +12882,11 @@ mod tests {
         // Releasing one of several must still re-filter. A cheaper "is it empty vs
         // non-empty" check would miss this and leave the released tool blocked.
         let (router, stdout) = reconcile_harness();
-        assert!(reconcile_to(&router, &stdout, set_of(&["a__x", "b__y"])));
+        assert!(reconcile_to(&router, &stdout, None, set_of(&["a__x", "b__y"])));
 
-        assert!(reconcile_to(&router, &stdout, set_of(&["a__x"])));
+        assert!(reconcile_to(&router, &stdout, None, set_of(&["a__x"])));
         assert_eq!(router.lock().unwrap().quarantined(), &set_of(&["a__x"]));
-        assert!(!reconcile_to(&router, &stdout, set_of(&["a__x"])));
+        assert!(!reconcile_to(&router, &stdout, None, set_of(&["a__x"])));
     }
 
     #[test]
@@ -10358,7 +12935,7 @@ mod tests {
         let router = Arc::new(Mutex::new(Arc::new(Router::new())));
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
 
-        assert!(reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(reconcile_quarantine(&registry, &router, &stdout, profile, None));
         assert!(router.lock().unwrap().quarantined().contains("srv__wipe"));
 
         // Corrupt the store underneath the running gateway.
@@ -10372,7 +12949,7 @@ mod tests {
             "an unreadable store must be reported as unknown, not as empty"
         );
         assert!(
-            !reconcile_quarantine(&registry, &router, &stdout, profile),
+            !reconcile_quarantine(&registry, &router, &stdout, profile, None),
             "a corrupt store must not trigger a re-filter"
         );
         assert!(
@@ -10382,7 +12959,7 @@ mod tests {
 
         // And it must recover once the store is readable again.
         std::fs::write(&path, "{}").unwrap();
-        assert!(reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(reconcile_quarantine(&registry, &router, &stdout, profile, None));
         assert!(router.lock().unwrap().quarantined().is_empty());
 
         drop(_data_dir);
@@ -10418,7 +12995,7 @@ mod tests {
         let registry = Arc::new(Mutex::new(reg));
         let router = Arc::new(Mutex::new(Arc::new(Router::new())));
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
-        let cached_tools = Arc::new(Mutex::new(Vec::new()));
+        let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
         let profile_slot = Arc::new(Mutex::new(Some(profile_name.to_string())));
         let downstream_dirty = Arc::new(AtomicU8::new(0));
         let client_root = Arc::new(Mutex::new(None));
@@ -10446,6 +13023,9 @@ mod tests {
             &downstream_dirty,
             &server_handler,
             &client_root,
+            None,
+            None,
+            None,
             &mut state,
         );
         assert!(
@@ -10472,6 +13052,9 @@ mod tests {
             &downstream_dirty,
             &server_handler,
             &client_root,
+            None,
+            None,
+            None,
             &mut state,
         );
         assert!(steady.idle_after_quarantine);
@@ -10492,6 +13075,9 @@ mod tests {
             &downstream_dirty,
             &server_handler,
             &client_root,
+            None,
+            None,
+            None,
             &mut state,
         );
         assert!(
@@ -10544,15 +13130,15 @@ mod tests {
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
 
         // Picks the persisted set up off disk (effective_quarantine's ON branch).
-        assert!(reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(reconcile_quarantine(&registry, &router, &stdout, profile, None));
         assert!(router.lock().unwrap().quarantined().contains("srv__wipe"));
 
         // Steady state: no churn while nothing changes.
-        assert!(!reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(!reconcile_quarantine(&registry, &router, &stdout, profile, None));
 
         // The user re-approves. This is the SOU-292 regression, end to end.
         assert!(conduit_lib::integrity::release(profile, "srv__wipe"));
-        assert!(reconcile_quarantine(&registry, &router, &stdout, profile));
+        assert!(reconcile_quarantine(&registry, &router, &stdout, profile, None));
         assert!(
             router.lock().unwrap().quarantined().is_empty(),
             "a released tool must stop being enforced"
@@ -10895,6 +13481,26 @@ mod tests {
     }
 
     #[test]
+    fn exact_exposed_name_promotes_tool_and_restores_schema() {
+        let cat = vec![
+            json!({
+                "name": "filesystem__search_files",
+                "description": "Search local file names and paths.",
+                "inputSchema": { "type": "object", "properties": { "query": { "type": "string" } } }
+            }),
+            json!({
+                "name": "filesystem__read_file",
+                "description": "Read one local file.",
+                "inputSchema": { "type": "object", "properties": { "path": { "type": "string" } } }
+            }),
+        ];
+        let (hits, _) = search_catalog(&cat, "filesystem__read_file", None, 5);
+        assert_eq!(hits[0]["name"], "filesystem__read_file");
+        assert_eq!(hits[0]["inputSchema"]["properties"]["path"]["type"], "string");
+        assert!(hits[0].get("schemaOmitted").is_none());
+    }
+
+    #[test]
     fn search_diversifies_across_servers_when_unscoped() {
         // One server with many matching tools shouldn't crowd the others out.
         let mut cat = catalog();
@@ -11023,6 +13629,18 @@ mod tests {
         assert!(
             text.to_lowercase().contains("only search again"),
             "should signal not to keep searching"
+        );
+        let (_, payload) = text
+            .split_once("\n\n")
+            .expect("guidance and compact JSON payload");
+        assert!(
+            !payload.contains('\n'),
+            "search JSON should not spend context on pretty-print whitespace"
+        );
+        let tools: Value = serde_json::from_str(payload).expect("valid search result JSON");
+        assert!(
+            tools[0]["inputSchema"].is_object(),
+            "the top match must remain ready to invoke with its complete schema"
         );
     }
 
@@ -11330,17 +13948,29 @@ mod tests {
     #[test]
     fn resolve_http_port_cases() {
         // CLI port wins over everything.
-        assert_eq!(resolve_http_port(Some(9000), Some("8000"), Some("7000")), (Some(9000), None));
+        assert_eq!(
+            resolve_http_port(Some(9000), Some("8000"), Some("7000"), false),
+            (Some(9000), None)
+        );
         // Direct port form: CONDUIT_HTTP=9000.
-        assert_eq!(resolve_http_port(None, Some("9000"), None), (Some(9000), None));
+        assert_eq!(
+            resolve_http_port(None, Some("9000"), None, false),
+            (Some(9000), None)
+        );
         // Truthy CONDUIT_HTTP uses CONDUIT_HTTP_PORT.
-        assert_eq!(resolve_http_port(None, Some("true"), Some("9001")), (Some(9001), None));
+        assert_eq!(
+            resolve_http_port(None, Some("true"), Some("9001"), false),
+            (Some(9001), None)
+        );
         // Truthy CONDUIT_HTTP without a port falls back to default.
-        assert_eq!(resolve_http_port(None, Some("yes"), None), (Some(8765), None));
+        assert_eq!(
+            resolve_http_port(None, Some("yes"), None, false),
+            (Some(8765), None)
+        );
         // No HTTP configuration means stdio mode.
-        assert_eq!(resolve_http_port(None, None, None), (None, None));
+        assert_eq!(resolve_http_port(None, None, None, false), (None, None));
         // Invalid value returns no port and warning.
-        let (port, warning) = resolve_http_port(None, Some("invalid"), None);
+        let (port, warning) = resolve_http_port(None, Some("invalid"), None, false);
         assert_eq!(port, None);
         assert_eq!(
             warning.as_deref(),
@@ -11348,6 +13978,40 @@ mod tests {
                 "toolport: unrecognized TOOLPORT_HTTP/CONDUIT_HTTP value 'invalid', HTTP bridge disabled"
             )
         );
+    }
+
+    #[test]
+    fn ambient_http_env_is_ignored_when_a_client_spawned_us() {
+        // Regression for issue #487. A machine-wide TOOLPORT_HTTP/CONDUIT_HTTP is
+        // inherited by every client, and every gateway those clients spawn. HTTP mode
+        // REPLACES the stdio loop, so honoring it here would leave each client with a
+        // gateway that never answers its pipe, and every gateway after the first
+        // colliding on the shared port (WSAEADDRINUSE) - which some clients treat as
+        // fatal. Ignore the env and serve stdio, loudly.
+        for value in ["1", "true", "on", "yes", "9000", "invalid"] {
+            let (port, warning) = resolve_http_port(None, Some(value), Some("9001"), true);
+            assert_eq!(
+                port, None,
+                "env value {value:?} must not enable HTTP on a stdio spawn"
+            );
+            let warning = warning.expect("ignoring the env must be reported, not silent");
+            assert!(
+                warning.contains("spawned by a client on stdio") && warning.contains("--http"),
+                "warning should name the cause and the fix, got: {warning}"
+            );
+        }
+
+        // The desktop app's own bridge passes --http explicitly and is unaffected,
+        // even though it is itself spawned with piped stdio.
+        assert_eq!(
+            resolve_http_port(Some(8765), Some("1"), None, true),
+            (Some(8765), None)
+        );
+
+        // No HTTP configuration at all stays a silent stdio start - a client spawn is
+        // the normal case and must not warn.
+        assert_eq!(resolve_http_port(None, None, None, true), (None, None));
+        assert_eq!(resolve_http_port(None, Some(""), None, true), (None, None));
     }
 
     #[test]
@@ -11420,6 +14084,7 @@ mod tests {
             json!({ "name": "gh__listPullRequests", "description": "List PRs", "inputSchema": {} }),
             json!({ "name": "stripe__list_disputes", "description": "List disputes", "inputSchema": {} }),
             json!({ "name": "stripe__create_token", "description": "Create a token", "inputSchema": {} }),
+            json!({ "name": "calendar__create_event", "description": "Create a calendar event", "inputSchema": {} }),
         ];
         // Synonym: "mail" finds the email tool even though it never says "mail".
         let (hits, _) = search_catalog(&cat, "mail", None, 10);
@@ -11439,6 +14104,10 @@ mod tests {
         assert_eq!(hits[0]["name"], "stripe__list_disputes");
         let (hits, _) = search_catalog(&cat, "tokenize", None, 10);
         assert_eq!(hits[0]["name"], "stripe__create_token");
+
+        // Calendar vocabulary varies heavily between users and MCP servers.
+        let (hits, _) = search_catalog(&cat, "schedule a meeting", None, 10);
+        assert_eq!(hits[0]["name"], "calendar__create_event");
     }
 
     #[test]
@@ -11462,6 +14131,103 @@ mod tests {
         ];
         let (hits, _) = search_catalog(&cat, "what are the invoices for this account", None, 10);
         assert_eq!(hits[0]["name"], "billing__list_invoices");
+    }
+
+    #[test]
+    fn indexed_search_preserves_unindexed_results_and_scoping() {
+        let catalog = vec![
+            json!({ "name": "calendar__create_event", "description": "Create a calendar event", "inputSchema": {} }),
+            json!({ "name": "calendar__list_events", "description": "List upcoming calendar entries", "inputSchema": {} }),
+            json!({ "name": "github__create_issue", "description": "Create a repository issue", "inputSchema": {} }),
+            json!({ "name": "mail__send_email", "description": "Send an email message", "inputSchema": {} }),
+        ];
+        let index = CatalogSearchIndex::build(&catalog);
+
+        for (query, server, limit) in [
+            ("create", None, 25),
+            ("schedule a meeting", None, 3),
+            ("list", Some("calendar"), 25),
+            ("", Some("calendar"), 1),
+            ("no lexical match", None, 12),
+        ] {
+            let rebuilt = search_catalog_with(&catalog, query, server, limit, None);
+            let indexed =
+                search_catalog_indexed(&catalog, query, server, limit, None, Some(&index));
+            assert_eq!(
+                indexed.matches, rebuilt.matches,
+                "indexed result mismatch for query {query:?}, server {server:?}"
+            );
+            assert_eq!(indexed.total, rebuilt.total);
+            assert_eq!(indexed.low_confidence, rebuilt.low_confidence);
+            assert_eq!(indexed.broadened, rebuilt.broadened);
+            assert_eq!(indexed.direct_returned, rebuilt.direct_returned);
+        }
+    }
+
+    #[test]
+    fn catalog_snapshot_keeps_tools_and_index_on_the_same_generation() {
+        let old = CatalogSnapshot::new(vec![json!({
+            "name": "old__find_invoice", "description": "Find an invoice", "inputSchema": {}
+        })]);
+        let next = CatalogSnapshot::new(vec![json!({
+            "name": "new__schedule_meeting", "description": "Schedule a meeting", "inputSchema": {}
+        })]);
+
+        assert!(old.search.matches_catalog(&old.tools));
+        assert!(next.search.matches_catalog(&next.tools));
+        assert!(
+            !next.search.matches_catalog(&old.tools),
+            "same-sized catalog generations must never share an index"
+        );
+
+        let old_result =
+            search_catalog_indexed(&old.tools, "invoice", None, 5, None, Some(&old.search));
+        let next_result =
+            search_catalog_indexed(&next.tools, "meeting", None, 5, None, Some(&next.search));
+        assert_eq!(old_result.matches[0]["name"], "old__find_invoice");
+        assert_eq!(next_result.matches[0]["name"], "new__schedule_meeting");
+    }
+
+    #[test]
+    fn search_index_scales_to_ten_thousand_tools_with_bounded_memory() {
+        let catalog: Vec<Value> = (0..10_000)
+            .map(|i| {
+                json!({
+                    "name": format!("server{}__lookup_customer_record_{i}", i % 50),
+                    "description": format!("Look up customer record {i} in account group {}", i % 100),
+                    "inputSchema": { "type": "object", "properties": { "id": { "type": "string" } } }
+                })
+            })
+            .collect();
+        let started = Instant::now();
+        let index = CatalogSearchIndex::build(&catalog);
+        let elapsed = started.elapsed();
+        let estimated = index.estimated_auxiliary_bytes();
+
+        assert_eq!(index.documents.len(), 10_000);
+        assert_eq!(index.document_frequency.get("customer"), Some(&10_000));
+        assert!(
+            estimated < 64 * 1024 * 1024,
+            "auxiliary index estimate unexpectedly large: {estimated} bytes"
+        );
+
+        let outcome = search_catalog_indexed(
+            &catalog,
+            "customer record 9876",
+            None,
+            5,
+            None,
+            Some(&index),
+        );
+        assert_eq!(
+            outcome.matches[0]["name"],
+            "server26__lookup_customer_record_9876"
+        );
+        eprintln!(
+            "10k-tool search index: {:.2} ms build, {:.2} MiB estimated auxiliary memory",
+            elapsed.as_secs_f64() * 1000.0,
+            estimated as f64 / (1024.0 * 1024.0)
+        );
     }
 
     #[test]

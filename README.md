@@ -16,9 +16,10 @@ every AI client, with far fewer tokens.
 ![Toolport: every tool from all your servers, collapsed to the handful your agent loads](docs/lazy-discovery.svg)
 
 Toolport is a local MCP (Model Context Protocol) gateway. You set up and
-authenticate each server once, and every AI client (Claude, Cursor, Codex, and
-the rest) points at Toolport and shares them, so you stop configuring the same
-servers separately in each app.
+authenticate each server once, and every AI client (Claude, Cursor, Codex,
+[Toolport Studio](https://github.com/tsouth89/toolport-studio), and the rest)
+points at Toolport and shares them, so you stop configuring the same servers
+separately in each app.
 
 ![Toolport demo: add a server once, connect every AI client, lazy tool discovery, and a destructive call blocked by human approval](docs/demo.gif)
 
@@ -246,7 +247,10 @@ gateway entry, written for you when you connect a client:
   loopback listener; it never permits an open non-loopback bind.
 - `TOOLPORT_METRICS=1` - opt-in Prometheus `GET /metrics` on the HTTP surface.
 - `TOOLPORT_DEBUG=1` - per-request gateway trace logging.
-- `TOOLPORT_CODE_MODE=1` - force-enable code mode (`toolport_run_script`); Settings can also toggle this.
+- `TOOLPORT_CODE_MODE=1` - force-enable code mode (`toolport_run_script`) even if Settings
+  has it off. Code mode is **on by default** (Settings kill switch turns it off). Each
+  in-script tool call still respects profile scope and human approval; code mode is not a
+  security boundary.
 
 Every `TOOLPORT_*` name still accepts the pre-rename `CONDUIT_*` alias (for example
 `CONDUIT_HTTP_TOKEN` continues to work). Prefer `TOOLPORT_*` in new configs.

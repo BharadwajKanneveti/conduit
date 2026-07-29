@@ -386,11 +386,21 @@ async fn test_server(entry: ServerEntry) -> Result<ProbeResult, String> {
 
 /// Probe every supported MCP client and return its current server configuration.
 #[tauri::command]
-async fn detect_clients() -> Result<Vec<clients::DetectedClient>, String> {
+async fn detect_clients(
+    state: State<'_, RegistryState>,
+) -> Result<Vec<clients::DetectedClient>, String> {
     // Reads several config files and scans plugin dirs - off the UI thread.
-    tauri::async_runtime::spawn_blocking(clients::detect_clients)
+    let mut list = tauri::async_runtime::spawn_blocking(clients::detect_clients)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    // Ownership record lives on the registry (SOU-406).
+    let managed = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .client_managed_entries
+        .clone();
+    clients::apply_entry_states(&mut list, &managed);
+    Ok(list)
 }
 
 #[tauri::command]
@@ -661,15 +671,70 @@ fn write_to_client(
     clients::write_servers(&client_id, &servers)
 }
 
+/// Refuse to overwrite a hand-edited gateway entry unless `force` is true (SOU-406).
+fn refuse_if_customized(
+    state: &RegistryState,
+    client_id: &str,
+    force: bool,
+) -> Result<(), String> {
+    if force {
+        return Ok(());
+    }
+    let mut list = clients::detect_clients();
+    let managed = state
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .client_managed_entries
+        .clone();
+    clients::apply_entry_states(&mut list, &managed);
+    if list
+        .iter()
+        .find(|c| c.id == client_id)
+        .is_some_and(|c| c.entry_state == clients::GatewayEntryState::Customized)
+    {
+        return Err(
+            "This client's Toolport entry has a custom configuration. Confirm to \
+             reset it to the default gateway, or leave it as-is."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Install the Toolport gateway into a client (one click "connect to Toolport").
 /// `profile` scopes that client to one profile (None = all enabled servers).
+/// `transport` is `"stdio"` (default) or `"sharedHttp"` (SOU-407).
+/// When the live entry is user-customized, pass `force: true` after the UI confirms
+/// overwrite (SOU-406); otherwise the install is refused.
 #[tauri::command]
 fn install_gateway(
     state: State<RegistryState>,
+    bridge: State<HttpBridgeState>,
     client_id: String,
     profile: Option<String>,
+    force: Option<bool>,
+    transport: Option<String>,
 ) -> Result<clients::WriteOutcome, String> {
-    let outcome = clients::install_gateway(&client_id, profile.as_deref())?;
+    refuse_if_customized(state.inner(), &client_id, force.unwrap_or(false))?;
+    let transport = transport
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("stdio");
+    let outcome = if transport.eq_ignore_ascii_case("sharedHttp")
+        || transport.eq_ignore_ascii_case("shared_http")
+    {
+        // Ensure the supervised bridge is up, mint/reuse a per-client bearer, write
+        // native remote or mcp-remote into the client config (SOU-407).
+        let status = start_http_bridge_at(bridge.inner(), None)?;
+        let port = status.port.unwrap_or(8765);
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let token = ensure_client_http_token(state.inner(), &client_id, profile.as_deref())?;
+        let spec = clients::SharedHttpSpec { url, token };
+        clients::install_gateway_shared_http(&client_id, profile.as_deref(), &spec)?
+    } else {
+        clients::install_gateway(&client_id, profile.as_deref())?
+    };
     // Record the scope we just wrote into the client's config, so the UI can show
     // and re-apply this client's effective scope without re-reading the config.
     // A concrete profile is stored by name; "no profile" is recorded as an
@@ -682,14 +747,93 @@ fn install_gateway(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(str::to_string);
+    let managed = outcome.managed.clone();
     write_registry(state.inner(), |reg| {
         match scope.as_deref() {
             Some(p) => reg.set_client_scope(&client_id, Some(p)),
             None => reg.set_client_unscoped(&client_id),
         }
+        if let Some(m) = managed {
+            reg.set_client_managed_entry(&client_id, m);
+        }
         Ok(())
     })?;
     Ok(outcome)
+}
+
+/// Mint or reuse a bearer token for a managed shared-HTTP client install.
+/// Plaintext lives in the OS keychain; only the hash is in `http_clients`.
+///
+/// When reusing a vaulted token, rewrite the row's `profile` if the caller asked
+/// for a different scope — Shared HTTP scope is derived solely from that row
+/// (WS3-5), not from `client_scopes` / TOOLPORT_PROFILE env.
+fn ensure_client_http_token(
+    state: &RegistryState,
+    client_id: &str,
+    profile: Option<&str>,
+) -> Result<String, String> {
+    const VAULT_SERVER: &str = "__toolport_http_clients__";
+    let http_id = format!("client:{client_id}");
+    let desired_profile = profile.unwrap_or("").trim().to_string();
+    // Reuse vaulted token when we still have a matching http_clients row.
+    if let Some(existing) = crate::secrets::get_secret(VAULT_SERVER, client_id) {
+        let hash = registry::sha256_hex(&existing);
+        let mut matched = false;
+        let mut profile_stale = false;
+        {
+            let reg = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(row) = reg
+                .http_clients
+                .iter()
+                .find(|c| c.id == http_id && c.token_sha256 == hash)
+            {
+                matched = true;
+                profile_stale = row.profile != desired_profile;
+            }
+        }
+        if matched {
+            if profile_stale {
+                write_registry(state, |reg| {
+                    if let Some(row) = reg
+                        .http_clients
+                        .iter_mut()
+                        .find(|c| c.id == http_id && c.token_sha256 == hash)
+                    {
+                        row.profile = desired_profile;
+                    }
+                    Ok(())
+                })?;
+            }
+            return Ok(existing);
+        }
+    }
+    let token = random_hex()?;
+    crate::secrets::set_secret(VAULT_SERVER, client_id, &token)?;
+    write_registry(state, |reg| {
+        reg.http_clients.retain(|c| c.id != http_id);
+        reg.http_clients.push(registry::HttpClient {
+            id: http_id,
+            label: format!("Client: {client_id}"),
+            token_sha256: registry::sha256_hex(&token),
+            profile: desired_profile,
+        });
+        Ok(())
+    })?;
+    Ok(token)
+}
+
+/// Drop the managed shared-HTTP bearer for this client (registry row + vault).
+/// Best-effort on vault delete so a missing secret never blocks Disconnect (WS3-4).
+fn revoke_client_http_token(state: &RegistryState, client_id: &str) {
+    const VAULT_SERVER: &str = "__toolport_http_clients__";
+    let http_id = format!("client:{client_id}");
+    let _ = crate::secrets::delete_secret(VAULT_SERVER, client_id);
+    let _ = write_registry(state, |reg| {
+        reg.http_clients.retain(|c| c.id != http_id);
+        Ok(())
+    });
 }
 
 /// Remove the Toolport gateway from a client.
@@ -699,8 +843,12 @@ fn uninstall_gateway(
     client_id: String,
 ) -> Result<clients::WriteOutcome, String> {
     let outcome = clients::uninstall_gateway(&client_id)?;
+    // Config entry is gone; also revoke the bridge bearer so a leftover backup or
+    // stale token cannot keep authenticating (WS3-4).
+    revoke_client_http_token(state.inner(), &client_id);
     write_registry(state.inner(), |reg| {
         reg.set_client_scope(&client_id, None);
+        reg.clear_client_managed_entry(&client_id);
         Ok(())
     })?;
     Ok(outcome)
@@ -768,18 +916,53 @@ struct MigrateResult {
     moved: Vec<String>,
 }
 
+/// Import the servers a client directly manages before its config is replaced
+/// with the Toolport gateway. Gateway identities must be skipped before they
+/// reach `moved`, otherwise migration reports moving a server it never imported.
+fn import_client_servers_for_migration(
+    reg: &mut Registry,
+    client: &clients::DetectedClient,
+) -> (usize, Vec<String>) {
+    let mut imported = 0;
+    let mut moved = Vec::new();
+    for server in &client.servers {
+        if clients::detected_is_gateway(server) {
+            continue;
+        }
+        moved.push(server.name.clone());
+        let exists = reg
+            .servers
+            .iter()
+            .any(|e| e.name.eq_ignore_ascii_case(&server.name));
+        if !exists {
+            reg.add_server(server_from_detected(server, &client.id));
+            imported += 1;
+        }
+    }
+    (imported, moved)
+}
+
 /// Migrate a client to Toolport: import its directly-configured servers into the
 /// registry, then rewrite the client's config to contain only the Toolport
 /// gateway (optionally scoped to `profile`). The client is left managing nothing
 /// directly - everything routes through Toolport. Backs the config up first.
 ///
 /// Plugin servers (read-only, outside the config file) are left untouched.
+/// When the live gateway entry is user-customized, pass `force: true` after the
+/// UI confirms overwrite (SOU-406); otherwise migration is refused before any
+/// config rewrite.
 #[tauri::command]
 async fn migrate_client(
     state: State<'_, RegistryState>,
+    bridge: State<'_, HttpBridgeState>,
     client_id: String,
     profile: Option<String>,
+    force: Option<bool>,
+    transport: Option<String>,
 ) -> Result<MigrateResult, String> {
+    // Guard before import or rewrite so a hand-edited gateway entry is not wiped.
+    refuse_if_customized(state.inner(), &client_id, force.unwrap_or(false))?;
+
     let detected = tauri::async_runtime::spawn_blocking(clients::detect_clients)
         .await
         .map_err(|e| e.to_string())?;
@@ -790,28 +973,28 @@ async fn migrate_client(
 
     // Import the client's servers under the lock (a fresh load-modify-save).
     let (_, (imported, moved)) = write_registry(state.inner(), |reg| {
-        let mut imported = 0;
-        let mut moved = Vec::new();
-        for server in &client.servers {
-            if clients::detected_is_gateway(server) {
-                continue;
-            }
-            moved.push(server.name.clone());
-            let exists = reg
-                .servers
-                .iter()
-                .any(|e| e.name.eq_ignore_ascii_case(&server.name));
-            if !exists {
-                reg.add_server(server_from_detected(server, &client_id));
-                imported += 1;
-            }
-        }
-        Ok((imported, moved))
+        Ok(import_client_servers_for_migration(reg, &client))
     })?;
 
-    // Rewrite the client to only the gateway (backs up first). External to the registry, so
-    // it stays outside the lock; the scope record below is a separate locked write.
-    clients::migrate_to_gateway(&client_id, profile.as_deref())?;
+    // Rewrite the client to only the gateway (backs up first). Honor transport so
+    // migrate does not silently force stdio when the UI chose Shared HTTP (WS3-2).
+    let transport = transport
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .unwrap_or("stdio");
+    let migrate_write = if transport.eq_ignore_ascii_case("sharedHttp")
+        || transport.eq_ignore_ascii_case("shared_http")
+    {
+        let status = start_http_bridge_at(bridge.inner(), None)?;
+        let port = status.port.unwrap_or(8765);
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let token = ensure_client_http_token(state.inner(), &client_id, profile.as_deref())?;
+        let spec = clients::SharedHttpSpec { url, token };
+        clients::migrate_to_gateway_with_transport(&client_id, profile.as_deref(), Some(&spec))?
+    } else {
+        clients::migrate_to_gateway(&client_id, profile.as_deref())?
+    };
 
     // Record the scope now that the client config was rewritten to the gateway.
     // "No profile" becomes an explicit-unscoped marker (not a removal) so a live
@@ -821,10 +1004,14 @@ async fn migrate_client(
         .map(str::trim)
         .filter(|p| !p.is_empty())
         .map(str::to_string);
+    let managed = migrate_write.managed;
     let (registry, _) = write_registry(state.inner(), |reg| {
         match scope.as_deref() {
             Some(p) => reg.set_client_scope(&client_id, Some(p)),
             None => reg.set_client_unscoped(&client_id),
+        }
+        if let Some(m) = managed {
+            reg.set_client_managed_entry(&client_id, m);
         }
         Ok(())
     })?;
@@ -1761,7 +1948,8 @@ fn set_lazy_discovery(state: State<RegistryState>, lazy: bool) -> Result<Registr
 
 /// Enable or disable server-side "code mode" (the `toolport_run_script` meta-tool). The
 /// gateway reads this from the registry and refreshes it live on the next watcher tick, so
-/// it applies to every client without forwarding an env var. Off by default.
+/// it applies to every client without forwarding an env var. On by default (SOU-397);
+/// pass `enabled: false` as the kill switch.
 #[tauri::command]
 fn set_code_mode(state: State<RegistryState>, enabled: bool) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
@@ -2581,11 +2769,79 @@ fn http_bridge_alive(bridge: &mut HttpBridge) -> bool {
     alive
 }
 
-/// Stop client-spawned gateway processes before an in-app update (Windows).
-/// MCP clients stay open; only `toolport-gateway` children exit.
+/// Stop client-spawned gateway processes before an in-app update (all platforms).
+/// MCP clients stay open; only `toolport-gateway` / `conduit-gateway` children exit.
 #[tauri::command]
 fn stop_spawned_gateways() -> u32 {
     crate::gateway_publish::stop_spawned_gateways()
+}
+
+/// Stop obsolete gateway processes (older versions / stale paths), keeping the
+/// current resolved binary. Safe to run any time; used from Settings and launch.
+/// Returns labels of processes that were stopped.
+#[tauri::command]
+fn stop_stale_gateways(bridge: State<HttpBridgeState>) -> Vec<String> {
+    reap_stale_and_restore_bridge(bridge.inner())
+}
+
+/// Run the stale reaper, then bring the supervised HTTP bridge back if the reaper
+/// stopped it (SOU-418 / SOU-432).
+///
+/// The reaper is *supposed* to kill a bridge running a replaced binary - that is the
+/// whole point of SOU-414, and on Linux `2ba9f95` guarantees it, because an exe ending
+/// in ` (deleted)` deliberately misses keep-paths after an in-place upgrade. But nothing
+/// respawns it: `http_bridge_alive` only clears the tracking state, so HTTP/OpenAPI
+/// clients would stay dark until someone re-opened Settings. Restarting on the same port
+/// keeps SOU-414's guarantee (the old image dies) without stranding the transport.
+///
+/// Connected clients are unaffected by the new process: they authenticate with the
+/// per-client bearers in `http_clients`, not the bridge's own env token.
+fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState) -> Vec<String> {
+    let mut extra_keep = Vec::new();
+    if let Some(p) = clients::resolve_gateway_path() {
+        extra_keep.push(p);
+    }
+    // Port of a bridge that is alive *before* the reap; None means there is nothing
+    // to restore and the reaper's outcome is final.
+    let was_serving = {
+        let mut b = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        http_bridge_alive(&mut b).then(|| b.port).flatten()
+    };
+    let killed = crate::gateway_publish::stop_stale_gateways_with_keep(&extra_keep);
+    if let Some(port) = was_serving {
+        let still_serving = {
+            let mut b = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            http_bridge_alive(&mut b)
+        };
+        if !still_serving {
+            // The just-killed child may not have released the port yet, and
+            // `start_http_bridge_at` deliberately fails fast on a taken port (a
+            // user-initiated start must not report success against someone else's
+            // listener). Retry briefly so a teardown race does not turn into a
+            // spurious "could not be restarted".
+            let mut last = String::new();
+            for attempt in 0..5 {
+                match start_http_bridge_at(bridge, Some(port)) {
+                    Ok(_) => {
+                        eprintln!(
+                            "toolport: restarted the HTTP endpoint on port {port} after the stale \
+                             reaper stopped its previous (replaced) binary"
+                        );
+                        return killed;
+                    }
+                    Err(e) => last = e,
+                }
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+            eprintln!(
+                "toolport: the stale reaper stopped the HTTP endpoint on port {port} and it could \
+                 not be restarted: {last}. Start it again from Settings."
+            );
+        }
+    }
+    killed
 }
 
 /// Start `toolport-gateway --http <port>` as a supervised child so HTTP/OpenAPI
@@ -2594,6 +2850,15 @@ fn stop_spawned_gateways() -> u32 {
 #[tauri::command]
 fn start_http_bridge(
     state: State<HttpBridgeState>,
+    port: Option<u16>,
+) -> Result<HttpBridgeStatus, String> {
+    start_http_bridge_at(state.inner(), port)
+}
+
+/// Body of [`start_http_bridge`], taking the state directly so non-command callers
+/// (the reaper's bridge restore) can reach it without a `State` wrapper.
+fn start_http_bridge_at(
+    state: &HttpBridgeState,
     port: Option<u16>,
 ) -> Result<HttpBridgeStatus, String> {
     let port = port.unwrap_or(8765);
@@ -2992,6 +3257,7 @@ pub fn run() {
             stop_http_bridge,
             http_bridge_status,
             stop_spawned_gateways,
+            stop_stale_gateways,
         ])
         // Close-to-tray: the window's X hides it instead of quitting, so the gateway and
         // approval broker keep running (HITL only works while the app is alive). Quit is
@@ -3046,7 +3312,10 @@ pub fn run() {
             //   3. Re-point client configs that still use the conduit entry name,
             //      CONDUIT_* env keys, conduit-gateway binary, or the old data-dir
             //      path. Surgical + backed up; a no-op once every client is current.
-            std::thread::spawn(|| {
+            // Handle for the migration thread: the reaper at the end of it needs
+            // HttpBridgeState so a stopped bridge can be brought back (SOU-418).
+            let migrate_handle = app.handle().clone();
+            std::thread::spawn(move || {
                 // Prefer a quiet data-dir rename before publishing/repointing so the
                 // new bin path is under Toolport and client configs get that path.
                 // Gateways holding files open may block the rename; we then keep the
@@ -3063,35 +3332,71 @@ pub fn run() {
                         published.display()
                     );
                 }
-                let repointed = clients::repoint_stale_gateways();
-                if !repointed.is_empty() {
+                // Ownership map from disk (this launch thread has no RegistryState handle).
+                let managed_snapshot = registry::load()
+                    .map(|r| r.client_managed_entries)
+                    .unwrap_or_default();
+                let repoint = clients::repoint_stale_gateways(&managed_snapshot);
+                if !repoint.repointed.is_empty() {
+                    let ids: Vec<&str> = repoint
+                        .repointed
+                        .iter()
+                        .map(|(id, _)| id.as_str())
+                        .collect();
                     eprintln!(
                         "toolport: re-pointed {} client config(s) to the renamed gateway: {}",
-                        repointed.len(),
-                        repointed.join(", ")
+                        repoint.repointed.len(),
+                        ids.join(", ")
+                    );
+                    // Refresh ownership records for everything we rewrote (SOU-406).
+                    let _ = registry::update(|reg| {
+                        for (id, entry) in &repoint.repointed {
+                            reg.set_client_managed_entry(id, entry.clone());
+                        }
+                        Ok(())
+                    });
+                }
+                if !repoint.customized.is_empty() {
+                    eprintln!(
+                        "toolport: left {} client config(s) alone (custom configuration): {}",
+                        repoint.customized.len(),
+                        repoint.customized.join(", ")
                     );
                 }
-                // Stop any gateway running a version other than this one, so each client
-                // respawns the freshly-installed gateway on its next request rather than the
-                // user having to relaunch the client. Covers MANUAL updates (running the
-                // installer), which never go through the in-app updater that already calls
-                // stop_spawned_gateways.
+                // Stop obsolete gateway processes so each client respawns the current binary
+                // on its next MCP request (no full agent restart required when the host
+                // auto-respawns). Path-based identity on all OS (SOU-414); not gated on
+                // repoint (SOU-306). Pass resolve_gateway_path so the nested macOS helper /
+                // AppImage stable path is kept even when publish is Windows-only.
                 //
-                // Deliberately NOT gated on `repointed` (SOU-306). That call is idempotent, so
-                // once configs point at the new binary it returns empty forever and the cleanup
-                // became one-shot: it was a proxy for "is a running gateway on an old version?"
-                // and the two come apart precisely after a manual install, or on any launch
-                // after the first. Checking versions directly makes this self-correcting, so a
-                // later launch still cleans up what an earlier one missed. Current-version
-                // gateways are left alone, so a normal launch kills nothing.
-                let stale = crate::gateway_publish::stop_stale_gateways();
+                // Run once immediately, then again after a short delay so a client that
+                // race-respawns an old path between repoint and the first kill is cleaned up
+                // without another full app restart.
+                //
+                // Both passes go through `reap_stale_and_restore_bridge` so a supervised
+                // HTTP bridge the reaper stops (correctly, when its binary was replaced)
+                // comes back instead of leaving HTTP/OpenAPI clients dark (SOU-418).
+                let stale = reap_stale_and_restore_bridge(migrate_handle.state::<HttpBridgeState>().inner());
                 if !stale.is_empty() {
                     eprintln!(
-                        "toolport: stopped {} stale gateway process image(s): {}",
+                        "toolport: stopped {} stale gateway process(es): {}",
                         stale.len(),
-                        stale.join(", ")
+                        stale.join("; ")
                     );
                 }
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    let again = reap_stale_and_restore_bridge(
+                        migrate_handle.state::<HttpBridgeState>().inner(),
+                    );
+                    if !again.is_empty() {
+                        eprintln!(
+                            "toolport: delayed reaper stopped {} more stale gateway process(es): {}",
+                            again.len(),
+                            again.join("; ")
+                        );
+                    }
+                });
             });
 
             // Start the human-approval broker: it publishes a loopback endpoint that every
@@ -3265,6 +3570,7 @@ mod tests {
             servers: servers.into_iter().map(detected_mcp_server).collect(),
             plugin_servers: plugin_servers.into_iter().map(detected_mcp_server).collect(),
             gateway_installed: false,
+            entry_state: clients::GatewayEntryState::Absent,
             error: None,
         }
     }
@@ -3391,6 +3697,29 @@ mod tests {
         let picked = servers_to_import(&[client], &reg);
         assert_eq!(picked.len(), 1);
         assert_eq!(picked[0].name.to_lowercase(), "linear");
+    }
+
+    #[test]
+    fn migration_filter_skips_gateway_identities_before_reporting_moved() {
+        let mut client = detected_client("test-client", vec![], vec![]);
+        client.servers = vec![
+            // Name-based identity: the legacy gateway name is not the current
+            // GATEWAY_ENTRY_NAME and must not regress to a current-name-only check.
+            detected_mcp_server_with_command("conduit", "manual-wrapper"),
+            // Command-based identity: an arbitrary slot name still points at the
+            // gateway binary and would recurse if imported as a downstream server.
+            detected_mcp_server_with_command(
+                "stale",
+                r"C:\Users\x\AppData\Local\Toolport\toolport-gateway.exe",
+            ),
+        ];
+        let mut reg = Registry::default();
+
+        let (imported, moved) = import_client_servers_for_migration(&mut reg, &client);
+
+        assert_eq!(imported, 0);
+        assert!(moved.is_empty());
+        assert!(reg.servers.is_empty());
     }
 
     #[test]

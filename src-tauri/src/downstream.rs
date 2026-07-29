@@ -15,6 +15,11 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// Called from a downstream stdout drain when an armed server emits
+/// `notifications/resources/updated` (SOU-394). The gateway fans the URI out to
+/// subscribed upstream clients only.
+pub type ResourceUpdatedSink = Arc<dyn Fn(String) + Send + Sync>;
+
 use serde_json::{json, Value};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -37,7 +42,14 @@ const STDIO_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// still fails immediately because its stdout closing ends the wait. Batch
 /// connects run one thread per server, so several cold launchers install in
 /// parallel and a batch waits out this budget at most once, not per server.
-const LAUNCHER_CONNECT_TIMEOUT: Duration = Duration::from_secs(120);
+const LAUNCHER_CONNECT_TIMEOUT: Duration = LEADER_OPEN_BUDGET;
+
+/// The longest a single legitimate downstream open can take: the launcher budget
+/// above, which is the slowest path (it exceeds the ~110s of three
+/// [`STDIO_READ_TIMEOUT`] attempts plus backoff). Exported so anything that waits on
+/// another caller's open - `OPEN_GATE_WAIT` in the gateway - derives its deadline from
+/// this instead of hardcoding a number the two can drift apart on (SOU-434).
+pub const LEADER_OPEN_BUDGET: Duration = Duration::from_secs(120);
 /// Keep at most this many bytes of a child's stderr tail for error reporting.
 const STDERR_TAIL_CAP: usize = 4096;
 
@@ -45,6 +57,11 @@ const STDERR_TAIL_CAP: usize = 4096;
 /// or broken server can't stream gigabytes to exhaust gateway memory. Generous: real
 /// MCP responses are tiny.
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+/// Bound paginated MCP catalog traversal so a malicious server cannot keep the
+/// gateway in an infinite cursor chain or grow its in-memory catalog without limit.
+const MAX_LIST_PAGES: usize = 1_000;
+const MAX_LIST_ITEMS: usize = 100_000;
+const MAX_LIST_DURATION: Duration = Duration::from_secs(30);
 
 /// Retry budget for transient HTTP failures that are SAFE to repeat: a connection
 /// that never reached the server, or an explicit 429 rate-limit. We deliberately
@@ -643,20 +660,47 @@ fn is_list_changed(line: &str) -> bool {
     list_changed_kind(line) == change::TOOLS
 }
 
+/// Extract the resource URI from a `notifications/resources/updated` line, or
+/// `None` when the line is not that notification. Distinct from list_changed
+/// (SOU-394): resource content changed, not the catalog membership.
+fn resource_updated_uri(line: &str) -> Option<String> {
+    // Cheap gate: skip JSON parse for ordinary request/response lines.
+    if !line.contains("resources/updated") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("method").and_then(|m| m.as_str()) != Some("notifications/resources/updated") {
+        return None;
+    }
+    v.get("params")
+        .and_then(|p| p.get("uri"))
+        .and_then(|u| u.as_str())
+        .filter(|u| !u.is_empty())
+        .map(str::to_string)
+}
+
 /// Forward one drained stdout line to the request loop, first flagging `dirty` if
-/// the server (once `armed`) announced a tool-list change. Returns false when the
-/// receiver is gone (transport closed) so the drain loop can stop.
+/// the server (once `armed`) announced a tool-list change, and invoking the
+/// resource-updated sink for `notifications/resources/updated` (SOU-394).
+/// Returns false when the receiver is gone (transport closed) so the drain loop
+/// can stop.
 fn forward_line(
     line: String,
     tx: &Sender<String>,
     dirty: &Option<Arc<AtomicU8>>,
     armed: &Arc<AtomicBool>,
+    resource_updated: &Option<ResourceUpdatedSink>,
 ) -> bool {
-    if let Some(flag) = dirty {
-        if armed.load(Ordering::SeqCst) {
+    if armed.load(Ordering::SeqCst) {
+        if let Some(flag) = dirty {
             let kind = list_changed_kind(&line);
             if kind != 0 {
                 flag.fetch_or(kind, Ordering::SeqCst);
+            }
+        }
+        if let Some(sink) = resource_updated {
+            if let Some(uri) = resource_updated_uri(&line) {
+                sink(uri);
             }
         }
     }
@@ -1419,7 +1463,7 @@ impl StdioTransport {
         env: &[(String, String)],
         cwd: Option<&str>,
     ) -> Result<Self, String> {
-        Self::spawn_inner(command, args, env, cwd, None)
+        Self::spawn_inner(command, args, env, cwd, None, None)
     }
 
     /// Like [`spawn`], but sets a [`change`] bit in `dirty` whenever the downstream
@@ -1427,14 +1471,19 @@ impl StdioTransport {
     /// (after `arm_tools_watch`). The gateway watches that flag and re-queries the
     /// affected list, so a server changing its own catalog mid-session reaches the
     /// client instead of being silently dropped.
+    ///
+    /// When `resource_updated` is set, armed `notifications/resources/updated`
+    /// lines invoke that sink with the resource URI (SOU-394) so the gateway can
+    /// fan out only to subscribed upstream clients.
     pub fn spawn_watched(
         command: &str,
         args: &[String],
         env: &[(String, String)],
         cwd: Option<&str>,
         dirty: Arc<AtomicU8>,
+        resource_updated: Option<ResourceUpdatedSink>,
     ) -> Result<Self, String> {
-        Self::spawn_inner(command, args, env, cwd, Some(dirty))
+        Self::spawn_inner(command, args, env, cwd, Some(dirty), resource_updated)
     }
 
     fn spawn_inner(
@@ -1443,6 +1492,7 @@ impl StdioTransport {
         env: &[(String, String)],
         cwd: Option<&str>,
         dirty: Option<Arc<AtomicU8>>,
+        resource_updated: Option<ResourceUpdatedSink>,
     ) -> Result<Self, String> {
         // Split a command that packed its args into the `command` string, so a
         // mis-shaped config spawns correctly instead of erroring cryptically.
@@ -1534,7 +1584,7 @@ impl StdioTransport {
                             );
                             break;
                         }
-                        if !forward_line(line, &tx, &dirty, &drain_armed) {
+                        if !forward_line(line, &tx, &dirty, &drain_armed, &resource_updated) {
                             break;
                         }
                     }
@@ -1910,6 +1960,9 @@ pub struct HttpTransport {
     /// raw token or the authentication failure is surfaced.
     refresh: Option<RefreshFn>,
     server_handler: Option<ServerRequestHandler>,
+    /// Fan `notifications/resources/updated` seen mid-SSE to subscribed
+    /// upstream clients (SOU-394 follow-up for remote downstreams).
+    resource_updated: Option<ResourceUpdatedSink>,
 }
 
 impl HttpTransport {
@@ -1953,7 +2006,14 @@ impl HttpTransport {
             auth,
             refresh,
             server_handler: None,
+            resource_updated: None,
         }
+    }
+
+    /// Wire the gateway sink for `notifications/resources/updated` seen on SSE
+    /// response streams (SOU-394).
+    pub fn set_resource_updated_sink(&mut self, sink: Option<ResourceUpdatedSink>) {
+        self.resource_updated = sink;
     }
 
     /// Answer a server-initiated JSON-RPC request inline (SSE mid-stream or
@@ -2078,6 +2138,14 @@ impl HttpTransport {
                 let Ok(v) = serde_json::from_str::<Value>(data) else {
                     continue;
                 };
+                // Resource updates may arrive mid-stream alongside the response
+                // (SOU-394). Fan them out before treating the frame as a result.
+                if let Some(sink) = &self.resource_updated {
+                    if let Some(uri) = resource_updated_uri(data) {
+                        sink(uri);
+                        continue;
+                    }
+                }
                 if self.handle_inline_server_request(&v)? {
                     continue;
                 }
@@ -2209,17 +2277,23 @@ impl Transport for HttpTransport {
 }
 
 /// One connected downstream server: its id, its transport, and its cached
-/// tools, resources, and prompts.
+/// tools, resources, resource templates, and prompts.
 pub struct DownstreamServer {
     pub id: String,
     transport: Box<dyn Transport>,
     pub tools: Vec<Value>,
     pub resources: Vec<Value>,
+    /// Parameterized resource URI templates (`resources/templates/list`).
+    /// Refreshed with concrete resources on `resources/list_changed` because
+    /// MCP defines no separate templates list-change notification.
+    pub resource_templates: Vec<Value>,
     pub prompts: Vec<Value>,
     /// Whether the server's `initialize` advertised resources / prompts. The
     /// actual lists are fetched lazily via `load_resources_prompts`.
     caps_resources: bool,
     caps_prompts: bool,
+    /// Whether the server's `initialize` advertised the completions utility.
+    caps_completions: bool,
 }
 
 impl DownstreamServer {
@@ -2247,14 +2321,19 @@ impl DownstreamServer {
         let caps = init.get("capabilities");
         let caps_resources = caps.and_then(|c| c.get("resources")).is_some();
         let caps_prompts = caps.and_then(|c| c.get("prompts")).is_some();
+        let caps_completions = caps.and_then(|c| c.get("completions")).is_some();
         transport.notify("notifications/initialized", json!({})).map_err(|e| e.to_string())?;
 
         // `initialize` answered, so any launcher download is done: the rest of the
         // handshake goes back to the tight budget - a server that comes up but then
         // hangs on `tools/list` should still fail in seconds.
         transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        let result = transport.request("tools/list", json!({})).map_err(|e| e.to_string())?;
-        let tools = extract_array(&result, "tools");
+        let listed = fetch_paginated_list(&mut *transport, "tools/list", "tools")
+            .map_err(|e| e.to_string())?;
+        if let Some(warning) = &listed.warning {
+            eprintln!("toolport: server '{id}' returned a partial tool catalog: {warning}");
+        }
+        let tools = listed.items;
 
         // Restore the longer timeout: actual tool calls can legitimately be slow.
         transport.set_read_timeout(STDIO_READ_TIMEOUT);
@@ -2267,9 +2346,11 @@ impl DownstreamServer {
             transport,
             tools,
             resources: Vec::new(),
+            resource_templates: Vec::new(),
             prompts: Vec::new(),
             caps_resources,
             caps_prompts,
+            caps_completions,
         })
     }
 
@@ -2278,8 +2359,17 @@ impl DownstreamServer {
     /// hung server can't stall the refresh; on error the previous list is kept.
     pub fn refresh_tools(&mut self) {
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        if let Ok(result) = self.transport.request("tools/list", json!({})) {
-            self.tools = extract_array(&result, "tools");
+        match fetch_paginated_list(&mut *self.transport, "tools/list", "tools") {
+            Ok(listed) if listed.warning.is_none() => self.tools = listed.items,
+            Ok(listed) => eprintln!(
+                "toolport: keeping server '{}' previous tool catalog after an incomplete refresh: {}",
+                self.id,
+                listed.warning.unwrap_or_default()
+            ),
+            Err(error) => eprintln!(
+                "toolport: keeping server '{}' previous tool catalog after refresh failed: {error}",
+                self.id
+            ),
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -2288,13 +2378,44 @@ impl DownstreamServer {
     /// announced a `resources/list_changed`. Mirrors [`refresh_tools`]; best-effort
     /// (an error keeps the previous list), and a no-op if the server never
     /// advertised resources.
+    ///
+    /// Also re-fetches resource templates on the same notification. MCP has no
+    /// separate `resources/templates/list_changed`; template catalogs change
+    /// under the resources capability, so this is the protocol-aligned trigger.
     pub fn refresh_resources(&mut self) {
         if !self.caps_resources {
             return;
         }
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        if let Ok(r) = self.transport.request("resources/list", json!({})) {
-            self.resources = extract_array(&r, "resources");
+        match fetch_paginated_list(&mut *self.transport, "resources/list", "resources") {
+            Ok(listed) if listed.warning.is_none() => self.resources = listed.items,
+            Ok(listed) => eprintln!(
+                "toolport: keeping server '{}' previous resource catalog after an incomplete refresh: {}",
+                self.id,
+                listed.warning.unwrap_or_default()
+            ),
+            Err(error) => eprintln!(
+                "toolport: keeping server '{}' previous resource catalog after refresh failed: {error}",
+                self.id
+            ),
+        }
+        // Templates share the resources capability and list-change signal.
+        // Incomplete/failed traversal keeps the previous complete snapshot.
+        match fetch_paginated_list(
+            &mut *self.transport,
+            "resources/templates/list",
+            "resourceTemplates",
+        ) {
+            Ok(listed) if listed.warning.is_none() => self.resource_templates = listed.items,
+            Ok(listed) => eprintln!(
+                "toolport: keeping server '{}' previous resource-template catalog after an incomplete refresh: {}",
+                self.id,
+                listed.warning.unwrap_or_default()
+            ),
+            Err(error) => eprintln!(
+                "toolport: keeping server '{}' previous resource-template catalog after refresh failed: {error}",
+                self.id
+            ),
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
@@ -2307,24 +2428,65 @@ impl DownstreamServer {
             return;
         }
         self.transport.set_read_timeout(STDIO_CONNECT_TIMEOUT);
-        if let Ok(r) = self.transport.request("prompts/list", json!({})) {
-            self.prompts = extract_array(&r, "prompts");
+        match fetch_paginated_list(&mut *self.transport, "prompts/list", "prompts") {
+            Ok(listed) if listed.warning.is_none() => self.prompts = listed.items,
+            Ok(listed) => eprintln!(
+                "toolport: keeping server '{}' previous prompt catalog after an incomplete refresh: {}",
+                self.id,
+                listed.warning.unwrap_or_default()
+            ),
+            Err(error) => eprintln!(
+                "toolport: keeping server '{}' previous prompt catalog after refresh failed: {error}",
+                self.id
+            ),
         }
         self.transport.set_read_timeout(STDIO_READ_TIMEOUT);
     }
 
-    /// Fetch the resources and prompts the server advertised. Best-effort: an
-    /// error or empty response just leaves the list empty. Kept out of `connect`
-    /// so only the gateway (which actually proxies these) pays the cost.
+    /// Fetch the resources, resource templates, and prompts the server advertised.
+    /// Best-effort: an error or empty response just leaves the list empty. Kept
+    /// out of `connect` so only the gateway (which actually proxies these) pays
+    /// the cost. Templates are loaded whenever the server advertised resources;
+    /// a server that does not implement `resources/templates/list` simply leaves
+    /// the template catalog empty.
     pub fn load_resources_prompts(&mut self) {
         if self.caps_resources {
-            if let Ok(r) = self.transport.request("resources/list", json!({})) {
-                self.resources = extract_array(&r, "resources");
+            if let Ok(listed) =
+                fetch_paginated_list(&mut *self.transport, "resources/list", "resources")
+            {
+                if let Some(warning) = &listed.warning {
+                    eprintln!(
+                        "toolport: server '{}' returned a partial resource catalog: {warning}",
+                        self.id
+                    );
+                }
+                self.resources = listed.items;
+            }
+            if let Ok(listed) = fetch_paginated_list(
+                &mut *self.transport,
+                "resources/templates/list",
+                "resourceTemplates",
+            ) {
+                if let Some(warning) = &listed.warning {
+                    eprintln!(
+                        "toolport: server '{}' returned a partial resource-template catalog: {warning}",
+                        self.id
+                    );
+                }
+                self.resource_templates = listed.items;
             }
         }
         if self.caps_prompts {
-            if let Ok(r) = self.transport.request("prompts/list", json!({})) {
-                self.prompts = extract_array(&r, "prompts");
+            if let Ok(listed) =
+                fetch_paginated_list(&mut *self.transport, "prompts/list", "prompts")
+            {
+                if let Some(warning) = &listed.warning {
+                    eprintln!(
+                        "toolport: server '{}' returned a partial prompt catalog: {warning}",
+                        self.id
+                    );
+                }
+                self.prompts = listed.items;
             }
         }
     }
@@ -2360,6 +2522,20 @@ impl DownstreamServer {
             .request_with_cancel("resources/read", json!({ "uri": uri }), cancel)
     }
 
+    /// Subscribe to `notifications/resources/updated` for one resource URI on
+    /// this downstream (SOU-394). The gateway only calls this when at least one
+    /// upstream client is subscribed to the same URI.
+    pub fn subscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        self.transport
+            .request("resources/subscribe", json!({ "uri": uri }))
+    }
+
+    /// Drop a previously established downstream resource subscription.
+    pub fn unsubscribe_resource(&mut self, uri: &str) -> Result<Value, TransportError> {
+        self.transport
+            .request("resources/unsubscribe", json!({ "uri": uri }))
+    }
+
     /// Get one prompt by its (original, downstream) name.
     pub fn get_prompt(&mut self, name: &str, arguments: Value) -> Result<Value, TransportError> {
         self.get_prompt_with_cancel(name, arguments, None)
@@ -2378,6 +2554,26 @@ impl DownstreamServer {
         )
     }
 
+    /// Whether this server advertised the completions utility at initialize.
+    pub fn supports_completions(&self) -> bool {
+        self.caps_completions
+    }
+
+    /// Forward a `completion/complete` request. `params` must already use the
+    /// downstream's native reference names (prompt names un-namespaced).
+    pub fn complete(&mut self, params: Value) -> Result<Value, TransportError> {
+        self.complete_with_cancel(params, None)
+    }
+
+    pub fn complete_with_cancel(
+        &mut self,
+        params: Value,
+        cancel: Option<CancelContext>,
+    ) -> Result<Value, TransportError> {
+        self.transport
+            .request_with_cancel("completion/complete", params, cancel)
+    }
+
     /// Forward a JSON-RPC notification to this downstream server.
     pub fn notify_downstream(&mut self, method: &str, params: Value) -> Result<(), TransportError> {
         self.transport.notify(method, params)
@@ -2393,15 +2589,242 @@ fn extract_array(result: &Value, key: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+struct PaginatedList {
+    items: Vec<Value>,
+    /// Present when at least one page succeeded but traversal could not finish.
+    /// Initial discovery may expose that useful prefix; refreshes keep the prior
+    /// complete snapshot instead of replacing it with a partial catalog.
+    warning: Option<String>,
+}
+
+/// Traverse one MCP list operation using its opaque `nextCursor`. The first page
+/// remains mandatory. Once at least one page has succeeded, a later failure is
+/// returned as a partial result so a server stays usable during initial discovery.
+/// Cursor loops and excessive page/item counts are bounded defensively.
+fn fetch_paginated_list(
+    transport: &mut dyn Transport,
+    method: &str,
+    key: &str,
+) -> Result<PaginatedList, TransportError> {
+    let mut items = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = HashSet::new();
+    let started = Instant::now();
+
+    for page_index in 0..MAX_LIST_PAGES {
+        if page_index > 0 && started.elapsed() >= MAX_LIST_DURATION {
+            return Ok(PaginatedList {
+                items,
+                warning: Some(format!(
+                    "catalog traversal exceeded the {}-second safety cap",
+                    MAX_LIST_DURATION.as_secs()
+                )),
+            });
+        }
+        let params = cursor
+            .as_ref()
+            .map_or_else(|| json!({}), |value| json!({ "cursor": value }));
+        let result = match transport.request(method, params) {
+            Ok(result) => result,
+            Err(error) if page_index > 0 => {
+                return Ok(PaginatedList {
+                    items,
+                    warning: Some(format!("page {} failed: {error}", page_index + 1)),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+
+        let page = extract_array(&result, key);
+        let remaining = MAX_LIST_ITEMS.saturating_sub(items.len());
+        if page.len() > remaining {
+            items.extend(page.into_iter().take(remaining));
+            return Ok(PaginatedList {
+                items,
+                warning: Some(format!("catalog exceeded the {MAX_LIST_ITEMS}-item safety cap")),
+            });
+        }
+        items.extend(page);
+
+        let Some(next_cursor) = result
+            .get("nextCursor")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            return Ok(PaginatedList {
+                items,
+                warning: None,
+            });
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            return Ok(PaginatedList {
+                items,
+                warning: Some("server repeated a pagination cursor".to_string()),
+            });
+        }
+        cursor = Some(next_cursor);
+    }
+
+    Ok(PaginatedList {
+        items,
+        warning: Some(format!("catalog exceeded the {MAX_LIST_PAGES}-page safety cap")),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         cwd_validation_error, empty_cwd_variables, expand_cwd, file_uri_to_path, resolve_command,
         resolve_root_token, screen_resolved_addrs, screen_spawn_command, screen_spawn_env,
-        validate_cwd, CancelRegistry,
+        validate_cwd, CancelRegistry, DownstreamServer, Transport, TransportError,
+        fetch_paginated_list,
     };
-    use serde_json::json;
+    use serde_json::{json, Value};
+    use std::collections::VecDeque;
     use std::path::Path;
+
+    struct PaginationTransport {
+        responses: VecDeque<Result<Value, TransportError>>,
+        params: Vec<Value>,
+    }
+
+    impl PaginationTransport {
+        fn new(responses: Vec<Result<Value, TransportError>>) -> Self {
+            Self {
+                responses: responses.into(),
+                params: Vec::new(),
+            }
+        }
+    }
+
+    impl Transport for PaginationTransport {
+        fn request(&mut self, _method: &str, params: Value) -> Result<Value, TransportError> {
+            self.params.push(params);
+            self.responses
+                .pop_front()
+                .expect("pagination test supplied a response")
+        }
+
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn paginated_list_collects_every_page_and_treats_empty_cursor_as_opaque() {
+        let mut transport = PaginationTransport::new(vec![
+            Ok(json!({"tools":[{"name":"a"}],"nextCursor":""})),
+            Ok(json!({"tools":[{"name":"b"}],"nextCursor":"page-3"})),
+            Ok(json!({"tools":[{"name":"c"}]})),
+        ]);
+        let listed = fetch_paginated_list(&mut transport, "tools/list", "tools").unwrap();
+        assert!(listed.warning.is_none());
+        assert_eq!(
+            listed
+                .items
+                .iter()
+                .filter_map(|item| item["name"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["a", "b", "c"]
+        );
+        assert_eq!(
+            transport.params,
+            vec![json!({}), json!({"cursor":""}), json!({"cursor":"page-3"})]
+        );
+    }
+
+    #[test]
+    fn paginated_list_stops_on_a_repeated_cursor() {
+        let mut transport = PaginationTransport::new(vec![
+            Ok(json!({"resources":[{"uri":"one:"}],"nextCursor":"same"})),
+            Ok(json!({"resources":[{"uri":"two:"}],"nextCursor":"same"})),
+        ]);
+        let listed =
+            fetch_paginated_list(&mut transport, "resources/list", "resources").unwrap();
+        assert_eq!(listed.items.len(), 2);
+        assert_eq!(
+            listed.warning.as_deref(),
+            Some("server repeated a pagination cursor")
+        );
+    }
+
+    #[test]
+    fn downstream_server_loads_all_tool_resource_and_prompt_pages() {
+        let transport = PaginationTransport::new(vec![
+            Ok(json!({
+                "capabilities": { "resources": {}, "prompts": {}, "completions": {} }
+            })),
+            Ok(json!({"tools":[{"name":"one"}],"nextCursor":"tools-2"})),
+            Ok(json!({"tools":[{"name":"two"}]})),
+            Ok(json!({"resources":[{"uri":"one:"}],"nextCursor":"resources-2"})),
+            Ok(json!({"resources":[{"uri":"two:"}]})),
+            Ok(json!({"resourceTemplates":[{"uriTemplate":"one://{id}"}],"nextCursor":"templates-2"})),
+            Ok(json!({"resourceTemplates":[{"uriTemplate":"two://{id}"}]})),
+            Ok(json!({"prompts":[{"name":"one"}],"nextCursor":"prompts-2"})),
+            Ok(json!({"prompts":[{"name":"two"}]})),
+        ]);
+        let mut server =
+            DownstreamServer::connect("fixture".to_string(), Box::new(transport)).unwrap();
+        server.load_resources_prompts();
+        assert_eq!(server.tools.len(), 2);
+        assert_eq!(server.resources.len(), 2);
+        assert_eq!(server.resource_templates.len(), 2);
+        assert_eq!(server.prompts.len(), 2);
+        assert!(server.supports_completions());
+        assert_eq!(server.tools[1]["name"], "two");
+        assert_eq!(server.resources[1]["uri"], "two:");
+        assert_eq!(server.resource_templates[1]["uriTemplate"], "two://{id}");
+        assert_eq!(server.prompts[1]["name"], "two");
+    }
+
+    #[test]
+    fn incomplete_refresh_keeps_the_previous_complete_catalog() {
+        let transport = PaginationTransport::new(vec![
+            Ok(json!({"tools":[{"name":"partial"}],"nextCursor":"two"})),
+            Err(TransportError::Unavailable("page two timed out".to_string())),
+        ]);
+        let mut server = DownstreamServer {
+            id: "fixture".to_string(),
+            transport: Box::new(transport),
+            tools: vec![json!({"name":"stable"})],
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+            prompts: Vec::new(),
+            caps_resources: false,
+            caps_prompts: false,
+            caps_completions: false,
+        };
+        server.refresh_tools();
+        assert_eq!(server.tools, vec![json!({"name":"stable"})]);
+    }
+
+    #[test]
+    fn incomplete_template_refresh_keeps_the_previous_complete_catalog() {
+        // resources/list succeeds fully, but templates pagination is incomplete:
+        // keep the prior template snapshot rather than replacing it with a partial.
+        let transport = PaginationTransport::new(vec![
+            Ok(json!({"resources":[{"uri":"r:"}]})),
+            Ok(json!({"resourceTemplates":[{"uriTemplate":"partial://{id}"}],"nextCursor":"two"})),
+            Err(TransportError::Unavailable("page two timed out".to_string())),
+        ]);
+        let mut server = DownstreamServer {
+            id: "fixture".to_string(),
+            transport: Box::new(transport),
+            tools: Vec::new(),
+            resources: vec![json!({"uri":"stable-r:"})],
+            resource_templates: vec![json!({"uriTemplate":"stable://{id}"})],
+            prompts: Vec::new(),
+            caps_resources: true,
+            caps_prompts: false,
+            caps_completions: false,
+        };
+        server.refresh_resources();
+        assert_eq!(server.resources, vec![json!({"uri":"r:"})]);
+        assert_eq!(
+            server.resource_templates,
+            vec![json!({"uriTemplate":"stable://{id}"})]
+        );
+    }
 
     /// Minimal FFI for getpgrp (test-only, avoids adding libc as a dependency).
     #[cfg(unix)]
@@ -3471,23 +3894,24 @@ mod tests {
         let dirty = Some(Arc::new(AtomicU8::new(0)));
         let armed = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
+        let no_sink = None;
 
         // Unarmed (still in the handshake window): the line is forwarded but the
         // change is not acted on.
-        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed));
+        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink));
         assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), 0);
         assert_eq!(rx.recv().unwrap(), notif);
 
         // Armed: the same notification now sets the TOOLS bit.
         armed.store(true, Ordering::SeqCst);
-        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed));
+        assert!(forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink));
         assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), change::TOOLS);
         assert_eq!(rx.recv().unwrap(), notif);
 
         // A resources/list_changed sets the RESOURCES bit alongside it (OR, not
         // overwrite), so distinct changes between watcher ticks aren't lost.
         let res_notif = r#"{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}"#;
-        assert!(forward_line(res_notif.to_string(), &tx, &dirty, &armed));
+        assert!(forward_line(res_notif.to_string(), &tx, &dirty, &armed, &no_sink));
         assert_eq!(
             dirty.as_ref().unwrap().load(Ordering::SeqCst),
             change::TOOLS | change::RESOURCES
@@ -3497,13 +3921,64 @@ mod tests {
         // An ordinary line is always forwarded and never flags a change.
         let resp = r#"{"jsonrpc":"2.0","id":1,"result":{}}"#;
         let dirty2 = Some(Arc::new(AtomicU8::new(0)));
-        assert!(forward_line(resp.to_string(), &tx, &dirty2, &armed));
+        assert!(forward_line(resp.to_string(), &tx, &dirty2, &armed, &no_sink));
         assert_eq!(dirty2.as_ref().unwrap().load(Ordering::SeqCst), 0);
         assert_eq!(rx.recv().unwrap(), resp);
 
         // A closed receiver makes forward_line report "stop".
         drop(rx);
-        assert!(!forward_line(notif.to_string(), &tx, &dirty, &armed));
+        assert!(!forward_line(notif.to_string(), &tx, &dirty, &armed, &no_sink));
+    }
+
+    #[test]
+    fn resource_updated_uri_parses_only_updated_notifications() {
+        use super::resource_updated_uri;
+        assert_eq!(
+            resource_updated_uri(
+                r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"file://a"}}"#
+            )
+            .as_deref(),
+            Some("file://a")
+        );
+        // list_changed must not be treated as an updated notification.
+        assert_eq!(
+            resource_updated_uri(
+                r#"{"jsonrpc":"2.0","method":"notifications/resources/list_changed"}"#
+            ),
+            None
+        );
+        assert_eq!(resource_updated_uri(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#), None);
+        assert_eq!(resource_updated_uri("not json"), None);
+    }
+
+    #[test]
+    fn forward_line_invokes_resource_updated_sink_when_armed() {
+        use super::{forward_line, ResourceUpdatedSink};
+        use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_seen = Arc::clone(&seen);
+        let sink: ResourceUpdatedSink = Arc::new(move |uri| {
+            sink_seen.lock().unwrap().push(uri);
+        });
+        let dirty = Some(Arc::new(AtomicU8::new(0)));
+        let armed = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let sink_opt = Some(sink);
+        let line = r#"{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"fixture://r"}}"#;
+
+        // Unarmed: no sink call.
+        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &sink_opt));
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(rx.recv().unwrap(), line);
+
+        // Armed: sink receives the URI; dirty bits stay clear (not a list change).
+        armed.store(true, Ordering::SeqCst);
+        assert!(forward_line(line.to_string(), &tx, &dirty, &armed, &sink_opt));
+        assert_eq!(seen.lock().unwrap().as_slice(), &["fixture://r".to_string()]);
+        assert_eq!(dirty.as_ref().unwrap().load(Ordering::SeqCst), 0);
+        assert_eq!(rx.recv().unwrap(), line);
     }
 
     #[test]
