@@ -1703,9 +1703,15 @@ fn param_is_identifier(param: &str) -> bool {
     low == "id"
         || low.ends_with("_id")
         || param.ends_with("Id") // camelCase teamId / projectId
-        || low.contains("key")
-        || low.contains("token")
-        || low.contains("secret")
+        || low == "key"
+        || low.ends_with("_key")
+        || param.ends_with("Key")
+        || low == "token"
+        || low.ends_with("_token")
+        || param.ends_with("Token")
+        || low == "secret"
+        || low.ends_with("_secret")
+        || param.ends_with("Secret")
 }
 
 /// True if a string argument value looks like an LLM-invented placeholder rather
@@ -8702,6 +8708,8 @@ mod tests {
         // (this is the false-positive the guard used to trip on).
         for (param, val) in [
             ("query", "string"),
+            ("keyword", "string"), 
+            ("tokenizer", "string"), 
             ("title", "todo"),
             ("name", "example"),
             ("message", "xxx"),
