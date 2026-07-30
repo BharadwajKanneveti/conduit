@@ -1500,23 +1500,54 @@ fn parse_json_snippet(
         let mut malformed = Vec::new();
         let mut servers = Vec::new();
         for (name, definition) in obj {
-            let command_is_string = definition
-                .get("command")
-                .map(|c| c.is_string())
-                .unwrap_or(false);
+            let command = definition.get("command");
+            let type_hint = definition.get("type").and_then(|t| t.as_str());
+            // Both clients use a top-level `mcp` key, so the entry shape decides which
+            // one wrote it. OpenCode types entries `local`/`remote`; Crush uses
+            // `http`/`sse`. Those vocabularies do not overlap, which is what makes the
+            // branches below decidable.
+            let is_explicit_opencode_type = matches!(type_hint, Some("local") | Some("remote"));
 
-            if command_is_string {
-                // Crush: `command` is a string, args live separately.
+            if command.map(|c| c.is_string()).unwrap_or(false) {
+                if is_explicit_opencode_type {
+                    // Typed as OpenCode, but `command` is a string where OpenCode
+                    // requires an array. A malformed OpenCode entry, not a Crush one,
+                    // so say so rather than silently importing it as Crush.
+                    malformed.push(format!("{name} ('command' must be an array of strings)"));
+                    continue;
+                }
+                // Crush stdio: `command` is a string, args live separately.
                 servers.push(json_server_with_values(name, definition));
                 continue;
             }
 
-            // OpenCode: `command` is an argv array, or absent (remote/override-only).
-            match opencode_server_with_values(name, definition) {
-                Ok(Some(server)) => servers.push(server),
-                Ok(None) => {}
-                Err(error) => malformed.push(format!("{name} ({error})")),
+            let is_array = command.map(|c| c.is_array()).unwrap_or(false);
+            let is_absent = command.is_none();
+
+            if is_absent && matches!(type_hint, Some("http") | Some("sse")) {
+                // Crush remote: no `command`, transport comes from `type`, and env
+                // lives under `env`. Checked before the OpenCode branch below, which
+                // would otherwise claim it and hardcode http while reading
+                // `environment`. (Crush requires `type` on every entry, so a typeless
+                // remote is not a valid Crush config.)
+                servers.push(json_server_with_values(name, definition));
+                continue;
             }
+
+            if is_array || is_absent {
+                // OpenCode: `command` is an argv array, or absent for remote and
+                // override-only entries, which carry env under `environment`.
+                match opencode_server_with_values(name, definition) {
+                    Ok(Some(server)) => servers.push(server),
+                    Ok(None) => {}
+                    Err(error) => malformed.push(format!("{name} ({error})")),
+                }
+                continue;
+            }
+
+            // `command` is null, a number, or an object: not a shape either client
+            // writes. Skipped rather than reported, so the wrapper-key fallthrough
+            // below still runs when this was the only entry.
         }
         if !malformed.is_empty() {
             malformed.sort();
@@ -4614,7 +4645,32 @@ mod tests {
         let parsed = parse_json_snippet(crush, "").unwrap();
         assert_eq!(parsed[0].command.as_deref(), Some("npx"));
         assert_eq!(parsed[0].args, vec!["-y", "pkg"]);
-    } 
+    }
+
+    #[test]
+    fn parse_json_snippet_disambiguates_crush_sse_remote() {
+        let crush_remote = r#"{"mcp":{"remote":{"type":"sse","url":"https://example.com/mcp","env":{"TOKEN":"secret"}}}}"#;
+        let parsed = parse_json_snippet(crush_remote, "").unwrap();
+        assert_eq!(parsed[0].transport, "sse");
+        assert_eq!(parsed[0].url.as_deref(), Some("https://example.com/mcp"));
+        assert_eq!(parsed[0].env[0].key, "TOKEN");
+    }
+
+    #[test]
+    fn parse_json_snippet_unmatched_command_falls_through_to_wrapper_key() {
+        let mixed = r#"{"mcp":{"unmatched":{"command":null}},"mcpServers":{"fallback":{"command":"npx"}}}"#;
+        let parsed = parse_json_snippet(mixed, "").unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "fallback");
+    }
+
+    #[test]
+    fn parse_json_snippet_rejects_explicit_opencode_with_string_command() {
+        let malformed = r#"{"mcp":{"fs":{"type":"local","command":"npx"}}}"#;
+        let error = parse_json_snippet(malformed, "").unwrap_err();
+        assert!(error.contains("fs"), "got: {error}");
+        assert!(error.contains("array of strings"), "got: {error}");
+    }
 
     #[test]
     fn reads_windsurf_antigravity_server_url() {
