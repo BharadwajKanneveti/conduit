@@ -9,9 +9,10 @@
 //! the OS keychain; this file only records that a secret exists.
 
 use std::collections::{BTreeMap, HashMap};
-use crate::router::sanitize_segment;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::router::sanitize_segment;
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -2121,26 +2122,38 @@ mod tests {
     fn remove_server_cleans_up_server_state() {
         let mut r = Registry::default();
         let id = r.add_server(sample_server("Github MCP"));
+        // `tool_overrides` / `pinned_tools` are keyed by the RAW registry id, while
+        // `injection_block_exempt` / `result_budgets` / the allow-list are keyed by
+        // `sanitize_segment(id)` because that is what the gateway looks them up with
+        // (`toolport-gateway.rs`: `let srv_owned = sanitize_segment(server_id)`).
+        // Cleaning the wrong one of the two is a silent no-op, so keep both shapes
+        // exercised here.
         let sanitized_id = sanitize_segment(&id);
         r.set_tool_override(
-        id.clone(),
-        "search".to_string(),
-        ToolOverride {
-            name: Some("repo-search".to_string()),
-            description: None,
-          },
+            id.clone(),
+            "search".to_string(),
+            ToolOverride {
+                name: Some("repo-search".to_string()),
+                description: None,
+            },
         );
         r.set_tool_pinned(&id, "create_issue", true);
         let key = fingerprint_allow_key(&sanitized_id, "create_issue", "v2:testfp");
         r.allow_tool(key.clone());
         r.injection_block_exempt.insert(sanitized_id.clone(), true);
         r.result_budgets.insert(sanitized_id.clone(), 100);
+        // Block mode on, so `should_block_injection_for` reports the exemption
+        // instead of short-circuiting on the global flag.
+        r.block_on_injection = true;
 
-        // Assert setup 
+        // Assert setup
         assert!(r.tool_overrides.get(&id).is_some());
         assert!(r.is_tool_pinned(&id, "create_issue"));
         assert!(r.is_tool_allowed(&key));
-        assert!(r.injection_block_exempt.contains_key(&sanitized_id));
+        assert!(
+            !r.should_block_injection_for(&sanitized_id),
+            "an exempt server must not be blocked while it is registered"
+        );
         assert!(r.result_budgets.contains_key(&sanitized_id));
 
         // Act
@@ -2150,7 +2163,13 @@ mod tests {
         assert!(r.tool_overrides.get(&id).is_none());
         assert!(!r.is_tool_pinned(&id, "create_issue"));
         assert!(!r.is_tool_allowed(&key));
-        assert!(!r.injection_block_exempt.contains_key(&sanitized_id));
+        // Through the reader the gateway actually calls, not the raw map: a stale
+        // exemption surviving removal would silently disable injection blocking for
+        // whatever server next takes this id.
+        assert!(
+            r.should_block_injection_for(&sanitized_id),
+            "the injection exemption must not survive removing the server"
+        );
         assert!(!r.result_budgets.contains_key(&sanitized_id));
     }
 
