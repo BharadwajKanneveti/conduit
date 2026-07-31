@@ -1925,7 +1925,19 @@ fn release_quarantine(
     } else {
         Some(profile.as_str())
     };
-    integrity::release(prof, &tool);
+    if !integrity::release(prof, &tool) {
+        // Idempotent across app/gateway instances: another process may have released the
+        // same tool after this UI last polled. Only report failure when the persisted store
+        // still says it is blocked (or cannot be read), which also preserves the useful
+        // error for a tamper release whose accepted pin could not be saved.
+        let still_blocked = integrity::quarantined(prof)
+            .map_err(|e| format!("Could not verify re-approval for {tool}: {e}"))?;
+        if still_blocked.contains(&tool) {
+            return Err(format!(
+                "Could not re-approve {tool}; its quarantine record or integrity pin could not be updated"
+            ));
+        }
+    }
     // The quarantine release lives in the separate tool-pins file; the former blind re-save
     // here was only a gateway mtime-nudge (which the no-op guard usually swallowed anyway)
     // and it could revert a concurrent gateway/team write (SOU-23). Refresh the cache
