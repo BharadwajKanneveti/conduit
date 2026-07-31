@@ -51,13 +51,6 @@ pub fn parse_caps(team_cfg: &Value) -> Vec<Cap> {
             .get("maxCalls")
             .or_else(|| v.get("max_calls"))
             .and_then(Value::as_u64)
-            .or_else(|| {
-                v.get("maxCalls")
-                    .or_else(|| v.get("max_calls"))
-                    .and_then(Value::as_i64)
-                    .filter(|n| *n > 0)
-                    .map(|n| n as u64)
-            })
             .unwrap_or(0);
         if max == 0 {
             continue;
@@ -88,9 +81,8 @@ fn tool_matches(cap_tool: &str, server_id: &str, orig_tool: &str) -> bool {
         return true;
     }
     // `server/tool` or `server__tool` forms from admin authoring.
-    let slash = format!("{server_id}/{orig_tool}");
     let dunder = format!("{server_id}__{orig_tool}");
-    cap_tool == slash || cap_tool == dunder || cap_tool.ends_with(&format!("/{orig_tool}"))
+    cap_tool == dunder || cap_tool.strip_suffix(orig_tool).and_then(|s| s.strip_suffix("/")) == Some(server_id)
 }
 
 fn utc_ymd() -> (i64, u32, u32) {
@@ -607,6 +599,7 @@ mod tests {
     #[test]
     fn tool_matches_server_slash_form() {
         assert!(tool_matches("linear/list_issues", "linear", "list_issues"));
+        assert!(!tool_matches("github/list_issues", "linear", "list_issues"));
         assert!(tool_matches("list_issues", "linear", "list_issues"));
         assert!(!tool_matches("create_issue", "linear", "list_issues"));
     }
