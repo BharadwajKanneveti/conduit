@@ -28,7 +28,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 
-use conduit_lib::audit;
+use conduit_lib::{audit, usage_report};
 use conduit_lib::clients;
 use conduit_lib::codemode;
 use conduit_lib::downstream::{
@@ -2401,7 +2401,7 @@ fn savings_line() -> String {
     if saved > 0 {
         let loads = s.get("listLoads").and_then(Value::as_u64).unwrap_or(0);
         let peak = s.get("peakCatalog").and_then(Value::as_u64).unwrap_or(0);
-        let dollars = (saved as f64 / 1_000_000.0) * 3.0; // Claude Sonnet input $/M
+        let dollars = usage_report::est_cost(saved); // Claude Sonnet input $/M
         line.push_str(&format!(
             "Lazy discovery has kept ~{} tokens of tool definitions out of your agent's \
              context so far (about ${:.2} at Claude Sonnet input rates) across {loads} \
