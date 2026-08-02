@@ -91,6 +91,8 @@ enum Format {
     JsonQwenMcpServers,
     /// JSON with a top-level `servers` object (VS Code).
     JsonServers,
+    /// JSON with a top-level `mcp` object (Crush).
+    JsonMcp,
     /// JSON/JSONC with a top-level `mcp` object (OpenCode, Kilo Code). Local
     /// entries store the full argv in `command` and env vars in `environment`;
     /// remote entries use `type: "remote"` plus `url` and optional `headers`.
@@ -248,6 +250,7 @@ fn resolve_client_config_path(
     let path = match client_id {
         "claude-desktop" => config.join("Claude").join("claude_desktop_config.json"),
         "cursor" => home.join(".cursor").join("mcp.json"),
+        "crush" => home.join(".config").join("crush").join("crush.json"),
         "boltai" => home.join(".boltai").join("mcp.json"),
         "pi" => home.join(".pi").join("agent").join("mcp.json"),
         "omp" => home.join(".omp").join("agent").join("mcp.json"),
@@ -356,6 +359,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
     let path = match client_id {
         "claude-desktop" => config.join("Claude").join("claude_desktop_config.json"),
         "cursor" => home.join(".cursor").join("mcp.json"),
+        "crush" => config.join("crush").join("crush.json"),
         "boltai" => home.join(".boltai").join("mcp.json"),
         "pi" => home.join(".pi").join("agent").join("mcp.json"),
         "omp" => home.join(".omp").join("agent").join("mcp.json"),
@@ -457,7 +461,11 @@ fn resolve_rules_target(
                 .join("steering")
                 .join("toolport-team-rules.md"),
         ),
-        "roo-code" => owned(home.join(".roo").join("rules").join("toolport-team-rules.md")),
+        "roo-code" => owned(
+            home.join(".roo")
+                .join("rules")
+                .join("toolport-team-rules.md"),
+        ),
         "cline" => owned(
             home.join("Documents")
                 .join("Cline")
@@ -542,6 +550,51 @@ fn claude_desktop_path() -> Option<PathBuf> {
 
 fn cursor_path() -> Option<PathBuf> {
     client_config_path("cursor")
+}
+
+fn crush_override_path(config_dir: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    config_dir
+        .filter(|p| !p.is_empty())
+        .map(|dir| PathBuf::from(dir).join("crush.json"))
+}
+
+fn resolve_crush_path(
+    home: &Path,
+    config_override: Option<std::ffi::OsString>,
+    xdg_config_home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(path) = crush_override_path(config_override) {
+        return path;
+    }
+    xdg_config_home
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"))
+        .join("crush")
+        .join("crush.json")
+}
+
+/// Crush v0.88.0 resolves its global config through CRUSH_GLOBAL_CONFIG, then
+/// XDG_CONFIG_HOME, and finally ~/.config on every OS. Older Windows releases
+/// used LocalAppData, so retain that path only when it already contains a file.
+fn crush_path() -> Option<PathBuf> {
+    let home = home()?;
+    if let Some(path) = crush_override_path(std::env::var_os("CRUSH_GLOBAL_CONFIG")) {
+        return Some(path);
+    }
+    let current = resolve_crush_path(&home, None, std::env::var_os("XDG_CONFIG_HOME"));
+    #[cfg(windows)]
+    if !current.exists() {
+        if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA").filter(|p| !p.is_empty()) {
+            let legacy = PathBuf::from(local_app_data)
+                .join("crush")
+                .join("crush.json");
+            if legacy.exists() {
+                return Some(legacy);
+            }
+        }
+    }
+    Some(current)
 }
 
 fn anythingllm_path() -> Option<PathBuf> {
@@ -645,9 +698,12 @@ fn toolport_studio_install_marker() -> Option<PathBuf> {
             candidates.push(data.join("applications").join("toolport-studio.desktop"));
             candidates.push(data.join("toolport-studio"));
         }
-        candidates.push(home.join(".local").join("share").join("applications").join(
-            "toolport-studio.desktop",
-        ));
+        candidates.push(
+            home.join(".local")
+                .join("share")
+                .join("applications")
+                .join("toolport-studio.desktop"),
+        );
     }
 
     // Returning `None` would make `read_client` fall back to the config-parent
@@ -900,6 +956,14 @@ fn defs() -> Vec<ClientDef> {
             uses_connectors: false,
             path: cursor_path,
             plugin_scan: Some(scan_cursor_plugins),
+        },
+        ClientDef {
+            id: "crush",
+            name: "Crush",
+            format: Format::JsonMcp,
+            uses_connectors: false,
+            path: crush_path,
+            plugin_scan: None,
         },
         ClientDef {
             id: "anythingllm",
@@ -1224,11 +1288,7 @@ fn json_server_with_values(name: &str, def: &serde_json::Value) -> ParsedSnippet
     let args = def
         .get("args")
         .and_then(|a| a.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(json_value_to_string)
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(json_value_to_string).collect())
         .unwrap_or_default();
     // Merge `env` and `headers` keys (remote MCP stores credentials under headers;
     // ownership matching and import need both visible as env_keys).
@@ -1623,11 +1683,18 @@ fn parse_json_snippet(
             // is named after the package it runs, not the runner - otherwise every
             // `npx -y <pkg>` server collapses to the name (and id, and tool prefix)
             // "npx" and they all collide. See issue #251.
-            let command = value.get("command").and_then(|c| c.as_str()).unwrap_or_default();
+            let command = value
+                .get("command")
+                .and_then(|c| c.as_str())
+                .unwrap_or_default();
             let args: Vec<String> = value
                 .get("args")
                 .and_then(|a| a.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             name_from_invocation(command, &args)
         } else {
@@ -1638,10 +1705,7 @@ fn parse_json_snippet(
 
     if !unusable_mcp.is_empty() {
         unusable_mcp.sort();
-        return Err(format!(
-            "unusable 'mcp' entry: {}",
-            unusable_mcp.join(", ")
-        ));
+        return Err(format!("unusable 'mcp' entry: {}", unusable_mcp.join(", ")));
     }
 
     Err("JSON parsed but no server definition found (expected mcp, mcpServers, servers, context_servers, or a bare server object)".to_string())
@@ -1667,11 +1731,7 @@ fn parse_toml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
             let args = def
                 .get("args")
                 .and_then(|a| a.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(toml_value_to_string)
-                        .collect()
-                })
+                .map(|arr| arr.iter().filter_map(toml_value_to_string).collect())
                 .unwrap_or_default();
             let env = def
                 .get("env")
@@ -1746,11 +1806,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                 let args = def
                     .get("args")
                     .and_then(|v| v.as_sequence())
-                    .map(|seq| {
-                        seq.iter()
-                            .filter_map(yaml_value_to_string)
-                            .collect()
-                    })
+                    .map(|seq| seq.iter().filter_map(yaml_value_to_string).collect())
                     .unwrap_or_default();
                 let env = def
                     .get("env")
@@ -1796,11 +1852,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                 let args = def
                     .get("args")
                     .and_then(|v| v.as_sequence())
-                    .map(|seq| {
-                        seq.iter()
-                            .filter_map(yaml_value_to_string)
-                            .collect()
-                    })
+                    .map(|seq| seq.iter().filter_map(yaml_value_to_string).collect())
                     .unwrap_or_default();
                 let env = def
                     .get("envs")
@@ -1837,8 +1889,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
             .filter_map(|server| {
                 let def = server.as_mapping()?;
 
-                let str_of =
-                    |key: &str| def.get(key).and_then(|v| v.as_str()).map(String::from);
+                let str_of = |key: &str| def.get(key).and_then(|v| v.as_str()).map(String::from);
 
                 let name = str_of("name")?;
                 let command = str_of("command").filter(|s| !s.is_empty());
@@ -1851,11 +1902,7 @@ fn parse_yaml_snippet(content: &str) -> Result<Vec<ParsedSnippetServer>, String>
                 let args = def
                     .get("args")
                     .and_then(|v| v.as_sequence())
-                    .map(|seq| {
-                        seq.iter()
-                            .filter_map(yaml_value_to_string)
-                            .collect()
-                    })
+                    .map(|seq| seq.iter().filter_map(yaml_value_to_string).collect())
                     .unwrap_or_default();
 
                 let env = def
@@ -1926,9 +1973,8 @@ fn read_existing_toml(content: &str) -> Result<toml::Value, String> {
     if content.trim().is_empty() {
         return Ok(toml::Value::Table(toml::map::Map::new()));
     }
-    toml::from_str::<toml::Value>(content).map_err(|e| {
-        format!("Could not parse the existing config ({e}); leaving it untouched.")
-    })
+    toml::from_str::<toml::Value>(content)
+        .map_err(|e| format!("Could not parse the existing config ({e}); leaving it untouched."))
 }
 
 fn parse_json(content: &str, key: &str) -> Result<Vec<McpServer>, String> {
@@ -2098,7 +2144,9 @@ fn parse_opencode_json(content: &str) -> Result<Vec<McpServer>, String> {
     let obj = match value.get("mcp") {
         None => return Ok(Vec::new()),
         Some(value) if value.is_object() => value.as_object().unwrap(),
-        Some(_) => return Err("'mcp' must be an object mapping server names to definitions".into()),
+        Some(_) => {
+            return Err("'mcp' must be an object mapping server names to definitions".into())
+        }
     };
 
     let mut malformed = Vec::new();
@@ -2119,10 +2167,7 @@ fn parse_opencode_json(content: &str) -> Result<Vec<McpServer>, String> {
     }
     if !malformed.is_empty() {
         malformed.sort();
-        return Err(format!(
-            "malformed 'mcp' entry: {}",
-            malformed.join(", ")
-        ));
+        return Err(format!("malformed 'mcp' entry: {}", malformed.join(", ")));
     }
     servers.sort_by_key(|server| server.name.to_lowercase());
     Ok(servers)
@@ -2162,11 +2207,7 @@ fn parse_toml(content: &str) -> Result<Vec<McpServer>, String> {
             args: def
                 .get("args")
                 .and_then(|a| a.as_array())
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(toml_value_to_string)
-                        .collect()
-                })
+                .map(|arr| arr.iter().filter_map(toml_value_to_string).collect())
                 .unwrap_or_default(),
             env_keys: def
                 .get("env")
@@ -2276,11 +2317,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
                  servers: Vec<McpServer>,
                  error: Option<String>| {
         let gateway_installed = servers.iter().any(|server| {
-            gateway_identity_matches(
-                &server.name,
-                &server.name,
-                server.command.as_deref(),
-            )
+            gateway_identity_matches(&server.name, &server.name, server.command.as_deref())
         });
         // Ownership is filled in later via [`apply_entry_states`] once the registry
         // record is available. Until then: identity match → Managed (legacy), none → Absent.
@@ -2353,6 +2390,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         Format::JsonAmpMcpServers => parse_json(&content, "amp.mcpServers"),
         Format::JsonQwenMcpServers => parse_qwen_json(&content),
         Format::JsonServers => parse_json(&content, "servers"),
+        Format::JsonMcp => parse_json(&content, "mcp"),
         Format::JsonOpenCodeMcp => parse_opencode_json(&content),
         Format::JsonContextServers => parse_json(&content, "context_servers"),
         Format::TomlMcpServers => parse_toml(&content),
@@ -2422,9 +2460,9 @@ pub fn resolve_entry_state(
     servers: &[McpServer],
     record: Option<&ManagedEntry>,
 ) -> GatewayEntryState {
-    let entry = servers.iter().find(|s| {
-        gateway_identity_matches(&s.name, &s.name, s.command.as_deref())
-    });
+    let entry = servers
+        .iter()
+        .find(|s| gateway_identity_matches(&s.name, &s.name, s.command.as_deref()));
     let Some(entry) = entry else {
         return GatewayEntryState::Absent;
     };
@@ -2442,13 +2480,9 @@ pub fn resolve_entry_state(
 }
 
 /// Fill [`DetectedClient::entry_state`] from the registry ownership map.
-pub fn apply_entry_states(
-    clients: &mut [DetectedClient],
-    managed: &HashMap<String, ManagedEntry>,
-) {
+pub fn apply_entry_states(clients: &mut [DetectedClient], managed: &HashMap<String, ManagedEntry>) {
     for client in clients.iter_mut() {
-        client.entry_state =
-            resolve_entry_state(&client.servers, managed.get(&client.id));
+        client.entry_state = resolve_entry_state(&client.servers, managed.get(&client.id));
         // Keep gateway_installed aligned with identity presence (not ownership).
         client.gateway_installed = client.entry_state != GatewayEntryState::Absent;
     }
@@ -2644,10 +2678,7 @@ fn entry_to_json(entry: &ServerEntry) -> serde_json::Value {
             } else {
                 "http"
             };
-            map.insert(
-                "type".into(),
-                serde_json::Value::String(type_hint.into()),
-            );
+            map.insert("type".into(), serde_json::Value::String(type_hint.into()));
         }
     }
     let kv: serde_json::Map<String, serde_json::Value> = entry
@@ -2670,6 +2701,17 @@ fn entry_to_json(entry: &ServerEntry) -> serde_json::Value {
         map.insert(key.into(), serde_json::Value::Object(kv));
     }
     serde_json::Value::Object(map)
+}
+
+/// Crush uses the standard command/args/env fields but requires an explicit
+/// transport type on every entry.
+fn entry_to_crush_json(entry: &ServerEntry) -> serde_json::Value {
+    let mut value = entry_to_json(entry);
+    value.as_object_mut().unwrap().insert(
+        "type".into(),
+        serde_json::Value::String(entry.transport.clone()),
+    );
+    value
 }
 
 fn entry_to_qwen_json(entry: &ServerEntry) -> serde_json::Value {
@@ -2784,9 +2826,17 @@ fn validate_amp_settings_shape(root: &serde_json::Value) -> Result<(), String> {
         .get("amp.mcpServers")
         .is_some_and(|servers| !servers.is_object())
     {
-        return Err(
-            "'amp.mcpServers' must be an object; leaving Amp settings untouched.".into(),
-        );
+        return Err("'amp.mcpServers' must be an object; leaving Amp settings untouched.".into());
+    }
+    Ok(())
+}
+
+fn validate_crush_settings_shape(root: &serde_json::Value) -> Result<(), String> {
+    let object = root
+        .as_object()
+        .ok_or("Crush config root must be an object; leaving it untouched.")?;
+    if object.get("mcp").is_some_and(|servers| !servers.is_object()) {
+        return Err("'mcp' must be an object; leaving the Crush config untouched.".into());
     }
     Ok(())
 }
@@ -2797,18 +2847,24 @@ fn write_json(
     servers: &[ServerEntry],
     lenient: bool,
 ) -> Result<(), String> {
-    write_json_with_tools(path, key, servers, lenient, false)
+    write_json_with(path, key, servers, lenient, entry_to_json, false, false)
+}
+
+fn write_crush_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
+    write_json_with(path, "mcp", servers, true, entry_to_crush_json, true, false)
 }
 
 fn write_copilot_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    write_json_with_tools(path, "mcpServers", servers, false, true)
+    write_json_with(path, "mcpServers", servers, false, entry_to_json, false, true)
 }
 
-fn write_json_with_tools(
+fn write_json_with(
     path: &Path,
     key: &str,
     servers: &[ServerEntry],
     lenient: bool,
+    entry_to_value: fn(&ServerEntry) -> serde_json::Value,
+    validate_crush_shape: bool,
     include_tools: bool,
 ) -> Result<(), String> {
     let mut root = if path.exists() {
@@ -2817,7 +2873,9 @@ fn write_json_with_tools(
     } else {
         serde_json::Value::Object(serde_json::Map::new())
     };
-    if key == "amp.mcpServers" {
+    if validate_crush_shape {
+        validate_crush_settings_shape(&root)?;
+    } else if key == "amp.mcpServers" {
         validate_amp_settings_shape(&root)?;
     } else if !root.is_object() {
         root = serde_json::Value::Object(serde_json::Map::new());
@@ -2826,7 +2884,7 @@ fn write_json_with_tools(
     let servers_map: serde_json::Map<String, serde_json::Value> = servers
         .iter()
         .map(|server| {
-            let mut value = entry_to_json(server);
+            let mut value = entry_to_value(server);
             if include_tools {
                 value.as_object_mut().unwrap().insert(
                     "tools".into(),
@@ -2858,10 +2916,7 @@ fn write_qwen_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
         .iter()
         .map(|server| (server.name.clone(), entry_to_qwen_json(server)))
         .collect();
-    object.insert(
-        "mcpServers".into(),
-        serde_json::Value::Object(servers_map),
-    );
+    object.insert("mcpServers".into(), serde_json::Value::Object(servers_map));
 
     let output = serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?;
     atomic_write(path, &output)
@@ -2905,7 +2960,9 @@ fn opencode_entry_is_override_only(definition: &serde_json::Value) -> bool {
     object.get("type").is_none()
         && object.get("command").is_none()
         && object.get("url").is_none()
-        && object.get("enabled").is_some_and(|value| value.is_boolean())
+        && object
+            .get("enabled")
+            .is_some_and(|value| value.is_boolean())
 }
 
 fn write_opencode_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
@@ -2982,11 +3039,7 @@ fn parse_yaml_extensions(content: &str) -> Result<Vec<McpServer>, String> {
         let args = def
             .get("args")
             .and_then(|v| v.as_sequence())
-            .map(|seq| {
-                seq.iter()
-                    .filter_map(yaml_value_to_string)
-                    .collect()
-            })
+            .map(|seq| seq.iter().filter_map(yaml_value_to_string).collect())
             .unwrap_or_default();
         let env_keys = def
             .get("envs")
@@ -3155,11 +3208,7 @@ fn parse_continue_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> 
         let args = def
             .get(serde_yaml::Value::String("args".into()))
             .and_then(|v| v.as_sequence())
-            .map(|seq| {
-                seq.iter()
-                    .filter_map(yaml_value_to_string)
-                    .collect()
-            })
+            .map(|seq| seq.iter().filter_map(yaml_value_to_string).collect())
             .unwrap_or_default();
 
         // Stdio: Continue reads `env`. Remote: Continue sends
@@ -3365,11 +3414,7 @@ fn parse_hermes_yaml_servers(content: &str) -> Result<Vec<McpServer>, String> {
         let args = def
             .get("args")
             .and_then(|v| v.as_sequence())
-            .map(|seq| {
-                seq.iter()
-                    .filter_map(yaml_value_to_string)
-                    .collect()
-            })
+            .map(|seq| seq.iter().filter_map(yaml_value_to_string).collect())
             .unwrap_or_default();
         // Extract env/header keys from `headers` and `env` sub-maps.
         let mut env_keys: Vec<String> = Vec::new();
@@ -3521,6 +3566,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
         Format::JsonAmpMcpServers => write_json(&path, "amp.mcpServers", servers, true)?,
         Format::JsonQwenMcpServers => write_qwen_json(&path, servers)?,
         Format::JsonServers => write_json(&path, "servers", servers, lenient)?,
+        Format::JsonMcp => write_crush_json(&path, servers)?,
         Format::JsonOpenCodeMcp => write_opencode_json(&path, servers)?,
         Format::JsonContextServers => write_json(&path, "context_servers", servers, true)?,
         Format::TomlMcpServers => write_toml(&path, servers)?,
@@ -3720,6 +3766,7 @@ pub fn client_uses_mcp_remote_bridge(client_id: &str) -> bool {
     match def.format {
         // Native remote shapes already exist in our writers.
         Format::JsonQwenMcpServers
+        | Format::JsonMcp
         | Format::JsonCopilotMcpServers
         | Format::JsonOpenCodeMcp
         | Format::JsonServers
@@ -3804,18 +3851,32 @@ fn edit_json_gateway(
     entry: Option<&ServerEntry>,
     lenient: bool,
 ) -> Result<(), String> {
-    edit_json_gateway_with_tools(path, key, entry, lenient, false)
+    edit_json_gateway_with(path, key, entry, lenient, None, false, false)
+}
+
+fn edit_crush_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
+    edit_json_gateway_with(
+        path,
+        "mcp",
+        entry,
+        true,
+        Some(entry_to_crush_json),
+        true,
+        false,
+    )
 }
 
 fn edit_copilot_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    edit_json_gateway_with_tools(path, "mcpServers", entry, false, true)
+    edit_json_gateway_with(path, "mcpServers", entry, false, None, false, true)
 }
 
-fn edit_json_gateway_with_tools(
+fn edit_json_gateway_with(
     path: &Path,
     key: &str,
     entry: Option<&ServerEntry>,
     lenient: bool,
+    entry_formatter: Option<fn(&ServerEntry) -> serde_json::Value>,
+    validate_crush_shape: bool,
     include_tools: bool,
 ) -> Result<(), String> {
     let mut root = if path.exists() {
@@ -3824,7 +3885,9 @@ fn edit_json_gateway_with_tools(
     } else {
         serde_json::Value::Object(serde_json::Map::new())
     };
-    if key == "amp.mcpServers" {
+    if validate_crush_shape {
+        validate_crush_settings_shape(&root)?;
+    } else if key == "amp.mcpServers" {
         validate_amp_settings_shape(&root)?;
     } else if !root.is_object() {
         root = serde_json::Value::Object(serde_json::Map::new());
@@ -3842,11 +3905,13 @@ fn edit_json_gateway_with_tools(
         !gateway_identity_matches(name, name, command)
     });
     if let Some(entry) = entry {
-        // Remote-only entries: Qwen wants httpUrl+headers; VS Code "servers" keeps url.
-        // entry_to_qwen_json leaves url as-is for SSE and renames for streamable HTTP.
-        let mut value = if include_tools {
+        let mut value = if let Some(formatter) = entry_formatter {
+            formatter(entry)
+        } else if include_tools {
             entry_to_json(entry)
         } else if entry.command.is_none() && entry.url.is_some() {
+            // Remote-only entries: Qwen wants httpUrl+headers; VS Code "servers" keeps url.
+            // entry_to_qwen_json leaves url as-is for SSE and renames for streamable HTTP.
             if key == "servers" {
                 entry_to_json(entry)
             } else {
@@ -3880,10 +3945,7 @@ fn edit_opencode_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(),
         !gateway_identity_matches(name, name, command)
     });
     if let Some(entry) = entry {
-        mcp.insert(
-            GATEWAY_ENTRY_NAME.into(),
-            entry_to_opencode_json(entry),
-        );
+        mcp.insert(GATEWAY_ENTRY_NAME.into(), entry_to_opencode_json(entry));
     }
     let output = serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?;
     atomic_write(path, &output)
@@ -3941,14 +4003,11 @@ fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), Str
 fn config_is_whole_app_state(client_id: &str) -> bool {
     matches!(
         client_id,
-        "claude-code" | "gemini-cli" | "qwen-code" | "opencode" | "kilo-code" | "amp"
+        "claude-code" | "crush" | "gemini-cli" | "qwen-code" | "opencode" | "kilo-code" | "amp"
     )
 }
 
-fn install_or_remove(
-    client_id: &str,
-    entry: Option<&ServerEntry>,
-) -> Result<WriteOutcome, String> {
+fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
     let path = (def.path)().ok_or("Could not resolve a config path on this OS")?;
     let backup = backup_file(client_id, &path)?;
@@ -3966,10 +4025,9 @@ fn install_or_remove(
         }
         Format::JsonQwenMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
         Format::JsonServers => edit_json_gateway(&path, "servers", entry, lenient)?,
+        Format::JsonMcp => edit_crush_gateway(&path, entry)?,
         Format::JsonOpenCodeMcp => edit_opencode_gateway(&path, entry)?,
-        Format::JsonContextServers => {
-            edit_json_gateway(&path, "context_servers", entry, true)?
-        }
+        Format::JsonContextServers => edit_json_gateway(&path, "context_servers", entry, true)?,
         Format::TomlMcpServers => edit_toml_gateway(&path, entry)?,
         Format::YamlExtensions => edit_yaml_gateway(&path, entry)?,
         Format::YamlMcpServers => edit_hermes_yaml_gateway(&path, entry)?,
@@ -4285,8 +4343,6 @@ mod tests {
         }
     }
 
-
-
     #[test]
     fn gateway_command_stale_detection() {
         let current = "/opt/toolport/toolport-gateway";
@@ -4419,8 +4475,11 @@ mod tests {
 
         // 8 generations of config.yaml, oldest first by timestamp prefix.
         for stamp in 1000000000001u64..=1000000000008 {
-            std::fs::write(dir.join(format!("{stamp}-config.yaml")), "Authorization: Bearer x")
-                .unwrap();
+            std::fs::write(
+                dir.join(format!("{stamp}-config.yaml")),
+                "Authorization: Bearer x",
+            )
+            .unwrap();
         }
         // A different config whose name ENDS with the same suffix, plus unrelated files.
         std::fs::write(dir.join("1000000000001-other-config.yaml"), "x").unwrap();
@@ -4526,14 +4585,14 @@ mod tests {
         assert_eq!(parsed[0].env_keys, vec!["TOKEN".to_string()]);
     }
 
-
     #[test]
     fn amp_literal_dotted_key_round_trips_and_preserves_shared_settings() {
         let path = temp_path("amp-roundtrip");
         std::fs::write(
             &path,
             r#"{"amp.theme":"dark","telemetry":false,"amp.mcpServers":{"old":{"command":"x"}}}"#,
-        ).unwrap();
+        )
+        .unwrap();
 
         write_json(&path, "amp.mcpServers", &[stdio("filesystem")], true).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
@@ -4542,7 +4601,10 @@ mod tests {
 
         assert_eq!(root["amp.theme"], "dark");
         assert_eq!(root["telemetry"], false);
-        assert!(root.get("amp").is_none(), "the dotted key must stay literal");
+        assert!(
+            root.get("amp").is_none(),
+            "the dotted key must stay literal"
+        );
         assert!(root["amp.mcpServers"].get("old").is_none());
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "filesystem");
@@ -4559,14 +4621,21 @@ mod tests {
 
         let entry = sample_gateway(Some("Work"), "amp");
         edit_json_gateway(&path, "amp.mcpServers", Some(&entry), true).unwrap();
-        let installed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let installed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(installed["amp.notifications"], true);
-        assert_eq!(installed["amp.mcpServers"]["existing"]["env"]["SECRET"], "keepme");
+        assert_eq!(
+            installed["amp.mcpServers"]["existing"]["env"]["SECRET"],
+            "keepme"
+        );
         assert!(installed["amp.mcpServers"].get("conduit").is_none());
-        assert!(installed["amp.mcpServers"].get(GATEWAY_ENTRY_NAME).is_some());
+        assert!(installed["amp.mcpServers"]
+            .get(GATEWAY_ENTRY_NAME)
+            .is_some());
 
         edit_json_gateway(&path, "amp.mcpServers", None, true).unwrap();
-        let removed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let removed: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(removed["amp.notifications"], true);
         assert!(removed["amp.mcpServers"].get("existing").is_some());
         assert!(removed["amp.mcpServers"].get(GATEWAY_ENTRY_NAME).is_none());
@@ -4583,7 +4652,8 @@ mod tests {
             "amp.mcpServers",
             Some(&sample_gateway(None, "amp")),
             true,
-        ).unwrap_err();
+        )
+        .unwrap_err();
         assert!(error.contains("leaving it untouched"), "got: {error}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), malformed);
         std::fs::remove_file(&path).ok();
@@ -4772,7 +4842,8 @@ mod tests {
 
     #[test]
     fn parse_json_snippet_unmatched_command_falls_through_to_wrapper_key() {
-        let mixed = r#"{"mcp":{"unmatched":{"command":null}},"mcpServers":{"fallback":{"command":"npx"}}}"#;
+        let mixed =
+            r#"{"mcp":{"unmatched":{"command":null}},"mcpServers":{"fallback":{"command":"npx"}}}"#;
         let parsed = parse_json_snippet(mixed, "").unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "fallback");
@@ -4802,6 +4873,68 @@ mod tests {
         let error = parse_json_snippet(malformed, "").unwrap_err();
         assert!(error.contains("fs"), "got: {error}");
         assert!(error.contains("array of strings"), "got: {error}");
+    }
+
+    #[test]
+    fn crush_json_round_trips_without_wiping_app_settings() {
+        let path = temp_path("crush-json");
+        std::fs::write(&path, r#"{"theme":"dark","mcp":{"old":{"command":"x"}}}"#).unwrap();
+        write_crush_json(&path, &[stdio("fresh")]).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        let root: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let parsed = parse_json(&content, "mcp").unwrap();
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(root.get("theme").and_then(|v| v.as_str()), Some("dark"));
+        assert_eq!(
+            root.pointer("/mcp/fresh/type").and_then(|v| v.as_str()),
+            Some("stdio")
+        );
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "fresh");
+    }
+
+    #[test]
+    fn crush_gateway_install_includes_required_type() {
+        let path = temp_path("crush-gateway");
+        std::fs::write(&path, r#"{"theme":"dark","mcp":{}}"#).unwrap();
+        let entry = sample_gateway(None, "crush");
+
+        edit_crush_gateway(&path, Some(&entry)).unwrap();
+
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            root.get("theme").and_then(|value| value.as_str()),
+            Some("dark")
+        );
+        assert_eq!(
+            root["mcp"][GATEWAY_ENTRY_NAME]["type"].as_str(),
+            Some("stdio")
+        );
+    }
+
+    #[test]
+    fn crush_mutations_reject_unexpected_shapes_without_changing_the_file() {
+        let path = temp_path("crush-invalid-shape");
+        let gateway = sample_gateway(None, "crush");
+
+        for original in [r#"["valid","state"]"#, r#"{"theme":"dark","mcp":[]}"#] {
+            std::fs::write(&path, original).unwrap();
+            assert!(write_crush_json(&path, &[stdio("fresh")]).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+            std::fs::write(&path, original).unwrap();
+            assert!(edit_crush_gateway(&path, Some(&gateway)).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+
+            std::fs::write(&path, original).unwrap();
+            assert!(edit_crush_gateway(&path, None).is_err());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        }
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -4962,7 +5095,11 @@ bad = "not-a-table"
         )
         .unwrap();
 
-        { let _e = sample_gateway(Some("Billing"), "claude-code"); edit_json_gateway(&path, "mcpServers", Some(&_e), false) }.unwrap();
+        {
+            let _e = sample_gateway(Some("Billing"), "claude-code");
+            edit_json_gateway(&path, "mcpServers", Some(&_e), false)
+        }
+        .unwrap();
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let servers = root["mcpServers"].as_object().unwrap();
@@ -5001,7 +5138,10 @@ bad = "not-a-table"
         assert_eq!(entry.command.as_deref(), Some("npx"));
         assert!(entry.args.iter().any(|a| a == "mcp-remote"));
         assert!(entry.args.iter().any(|a| a.contains("8765/mcp")));
-        assert!(entry.args.iter().any(|a| a.contains("Authorization: Bearer secrettok")));
+        assert!(entry
+            .args
+            .iter()
+            .any(|a| a.contains("Authorization: Bearer secrettok")));
         // Ownership record must not retain the bearer.
         let rec = ManagedEntry::from_gateway_entry(&entry);
         assert_eq!(rec.transport, "sharedHttp");
@@ -5147,7 +5287,10 @@ bad = "not-a-table"
             let entry = gateway_entry_shared_http("hermes", None, &spec);
             edit_hermes_yaml_gateway(&path, Some(&entry)).unwrap();
             let content = std::fs::read_to_string(&path).unwrap();
-            assert!(content.contains(auth), "Hermes must contain bearer: {content}");
+            assert!(
+                content.contains(auth),
+                "Hermes must contain bearer: {content}"
+            );
             assert!(
                 content.contains("headers:"),
                 "Hermes remote auth under headers: {content}"
@@ -5198,11 +5341,9 @@ bad = "not-a-table"
         let rec = ManagedEntry {
             command: managed_cmd.to_string(),
             args: vec![],
-            env: [
-                (crate::brand::CLIENT_ID.to_string(), "claude-desktop".into()),
-            ]
-            .into_iter()
-            .collect(),
+            env: [(crate::brand::CLIENT_ID.to_string(), "claude-desktop".into())]
+                .into_iter()
+                .collect(),
             transport: "stdio".into(),
             url: None,
             updated_at: 1,
@@ -5244,10 +5385,7 @@ bad = "not-a-table"
             GatewayEntryState::Managed
         );
         // No identity entry → Absent.
-        assert_eq!(
-            resolve_entry_state(&[], None),
-            GatewayEntryState::Absent
-        );
+        assert_eq!(resolve_entry_state(&[], None), GatewayEntryState::Absent);
         assert_eq!(
             resolve_entry_state(
                 &[McpServer {
@@ -5406,7 +5544,11 @@ bad = "not-a-table"
             r#"{"mcpServers":{"conduit":{"command":"toolport-gateway","env":{"CONDUIT_CLIENT_ID":"claude-code","CONDUIT_PROFILE":"Billing"}},"existing":{"command":"node"}}}"#,
         )
         .unwrap();
-        { let _e = sample_gateway(Some("Billing"), "claude-code"); edit_json_gateway(&path, "mcpServers", Some(&_e), false) }.unwrap();
+        {
+            let _e = sample_gateway(Some("Billing"), "claude-code");
+            edit_json_gateway(&path, "mcpServers", Some(&_e), false)
+        }
+        .unwrap();
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let servers = root["mcpServers"].as_object().unwrap();
@@ -5442,7 +5584,11 @@ bad = "not-a-table"
             }"#,
         )
         .unwrap();
-        { let _e = sample_gateway(None, "claude-code"); edit_json_gateway(&json_path, "mcpServers", Some(&_e), false) }.unwrap();
+        {
+            let _e = sample_gateway(None, "claude-code");
+            edit_json_gateway(&json_path, "mcpServers", Some(&_e), false)
+        }
+        .unwrap();
         let json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&json_path).unwrap()).unwrap();
         let json_servers = json["mcpServers"].as_object().unwrap();
@@ -5475,7 +5621,11 @@ command = "npx"
 "#,
         )
         .unwrap();
-        { let _e = sample_gateway(None, "codex"); edit_toml_gateway(&toml_path, Some(&_e)) }.unwrap();
+        {
+            let _e = sample_gateway(None, "codex");
+            edit_toml_gateway(&toml_path, Some(&_e))
+        }
+        .unwrap();
         let toml: toml::Value =
             toml::from_str(&std::fs::read_to_string(&toml_path).unwrap()).unwrap();
         let toml_servers = toml["mcp_servers"].as_table().unwrap();
@@ -5494,7 +5644,11 @@ command = "npx"
             "extensions:\n  toolport:\n    cmd: manual-wrapper\n  stale:\n    cmd: C:\\Local\\Toolport\\toolport-gateway.exe\n  fetch:\n    cmd: uvx\n",
         )
         .unwrap();
-        { let _e = sample_gateway(None, "goose"); edit_yaml_gateway(&goose_path, Some(&_e)) }.unwrap();
+        {
+            let _e = sample_gateway(None, "goose");
+            edit_yaml_gateway(&goose_path, Some(&_e))
+        }
+        .unwrap();
         let goose: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&goose_path).unwrap()).unwrap();
         let goose_servers = goose["extensions"].as_mapping().unwrap();
@@ -5514,7 +5668,11 @@ command = "npx"
             "mcp_servers:\n  toolport:\n    command: manual-wrapper\n  stale:\n    command: C:\\Local\\Toolport\\conduit-gateway.exe\n  fetch:\n    command: uvx\n",
         )
         .unwrap();
-        { let _e = sample_gateway(None, "hermes"); edit_hermes_yaml_gateway(&hermes_path, Some(&_e)) }.unwrap();
+        {
+            let _e = sample_gateway(None, "hermes");
+            edit_hermes_yaml_gateway(&hermes_path, Some(&_e))
+        }
+        .unwrap();
         let hermes: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&hermes_path).unwrap()).unwrap();
         let hermes_servers = hermes["mcp_servers"].as_mapping().unwrap();
@@ -5534,7 +5692,11 @@ command = "npx"
             "mcpServers:\n  - name: toolport\n    command: manual-wrapper\n  - name: stale\n    command: C:\\Local\\Toolport\\toolport-gateway.exe\n  - name: fetch\n    command: uvx\n",
         )
         .unwrap();
-        { let _e = sample_gateway(None, "continue"); edit_continue_yaml_gateway(&continue_path, Some(&_e)) }.unwrap();
+        {
+            let _e = sample_gateway(None, "continue");
+            edit_continue_yaml_gateway(&continue_path, Some(&_e))
+        }
+        .unwrap();
         let continue_yaml: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&continue_path).unwrap()).unwrap();
         let continue_servers = continue_yaml["mcpServers"].as_sequence().unwrap();
@@ -5764,17 +5926,18 @@ command = "npx"
 
     #[test]
     fn toolport_studio_gateway_round_trip() {
-        let dir = std::env::temp_dir().join(format!(
-            "toolport-studio-client-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("toolport-studio-client-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("mcp.json");
 
         // Install writes mcpServers.toolport with TOOLPORT_CLIENT_ID=toolport-studio.
-        { let _e = sample_gateway(Some("Work"), "toolport-studio"); edit_json_gateway(&path, "mcpServers", Some(&_e), false) }
-            .unwrap();
+        {
+            let _e = sample_gateway(Some("Work"), "toolport-studio");
+            edit_json_gateway(&path, "mcpServers", Some(&_e), false)
+        }
+        .unwrap();
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         let entry = &root["mcpServers"][GATEWAY_ENTRY_NAME];
@@ -5817,7 +5980,11 @@ command = "npx"
         assert_eq!(parsed[0].name, "existing");
 
         // Installing preserves the unrelated key and the existing server.
-        { let _e = sample_gateway(None, "zed"); edit_json_gateway(&path, "context_servers", Some(&_e), true) }.unwrap();
+        {
+            let _e = sample_gateway(None, "zed");
+            edit_json_gateway(&path, "context_servers", Some(&_e), true)
+        }
+        .unwrap();
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(root["ui_font_size"], 16);
@@ -5833,7 +6000,11 @@ command = "npx"
         let garbage = "this is not json or json5 at all {{{";
         std::fs::write(&path, garbage).unwrap();
         // A lenient edit must ERROR, never replace the file with an empty object.
-        assert!({ let _e = sample_gateway(None, "zed"); edit_json_gateway(&path, "context_servers", Some(&_e), true) }.is_err());
+        assert!({
+            let _e = sample_gateway(None, "zed");
+            edit_json_gateway(&path, "context_servers", Some(&_e), true)
+        }
+        .is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
         std::fs::remove_file(&path).ok();
     }
@@ -5857,7 +6028,11 @@ command = "npx"
         let path = std::env::temp_dir().join(format!("conduit-claude-{}.json", std::process::id()));
         let garbage = "{ \"projects\": {}, \"oauthAccount\": broken not json";
         std::fs::write(&path, garbage).unwrap();
-        assert!({ let _e = sample_gateway(None, "claude-code"); edit_json_gateway(&path, "mcpServers", Some(&_e), true) }.is_err());
+        assert!({
+            let _e = sample_gateway(None, "claude-code");
+            edit_json_gateway(&path, "mcpServers", Some(&_e), true)
+        }
+        .is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
         std::fs::remove_file(&path).ok();
     }
@@ -5930,10 +6105,7 @@ command = "npx"
             .into_iter()
             .find(|definition| definition.id == "qwen-code")
             .unwrap();
-        assert!(matches!(
-            definition.format,
-            Format::JsonQwenMcpServers
-        ));
+        assert!(matches!(definition.format, Format::JsonQwenMcpServers));
         assert!((definition.path)().is_some());
     }
 
@@ -5966,7 +6138,11 @@ command = "npx"
         )
         .unwrap();
 
-        { let _e = sample_gateway(Some("Work"), "opencode"); edit_opencode_gateway(&path, Some(&_e)) }.unwrap();
+        {
+            let _e = sample_gateway(Some("Work"), "opencode");
+            edit_opencode_gateway(&path, Some(&_e))
+        }
+        .unwrap();
         let root: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -5987,10 +6163,7 @@ command = "npx"
         assert_eq!(mcp[GATEWAY_ENTRY_NAME]["enabled"], true);
         let command = mcp[GATEWAY_ENTRY_NAME]["command"].as_array().unwrap();
         assert_eq!(command.len(), 1);
-        assert!(command[0]
-            .as_str()
-            .unwrap()
-            .contains("toolport-gateway"));
+        assert!(command[0].as_str().unwrap().contains("toolport-gateway"));
         assert_eq!(
             mcp[GATEWAY_ENTRY_NAME]["environment"][crate::brand::CLIENT_ID],
             "opencode"
@@ -6057,12 +6230,20 @@ command = "npx"
         let path = temp_path("opencode-bad.json");
         let garbage = r#"{"model":"keep-me","mcp":{"broken": not-json"#;
         std::fs::write(&path, garbage).unwrap();
-        assert!({ let _e = sample_gateway(None, "opencode"); edit_opencode_gateway(&path, Some(&_e)) }.is_err());
+        assert!({
+            let _e = sample_gateway(None, "opencode");
+            edit_opencode_gateway(&path, Some(&_e))
+        }
+        .is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
 
         let wrong_shape = r#"{"model":"keep-me","mcp":"not-an-object"}"#;
         std::fs::write(&path, wrong_shape).unwrap();
-        assert!({ let _e = sample_gateway(None, "opencode"); edit_opencode_gateway(&path, Some(&_e)) }.is_err());
+        assert!({
+            let _e = sample_gateway(None, "opencode");
+            edit_opencode_gateway(&path, Some(&_e))
+        }
+        .is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), wrong_shape);
         assert!(write_opencode_json(&path, &[stdio("filesystem")]).is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), wrong_shape);
@@ -6172,8 +6353,16 @@ command = "npx"
         let path = std::env::temp_dir().join(format!("conduit-single-{}.json", std::process::id()));
         let garbage = "{ \"mcpServers\": { \"other\": broken not json";
         std::fs::write(&path, garbage).unwrap();
-        assert!({ let _e = sample_gateway(None, "claude-desktop"); edit_json_gateway(&path, "mcpServers", Some(&_e), false) }.is_err());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage, "unparseable file left untouched");
+        assert!({
+            let _e = sample_gateway(None, "claude-desktop");
+            edit_json_gateway(&path, "mcpServers", Some(&_e), false)
+        }
+        .is_err());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            garbage,
+            "unparseable file left untouched"
+        );
         std::fs::remove_file(&path).ok();
     }
 
@@ -6185,7 +6374,11 @@ command = "npx"
         let path = std::env::temp_dir().join(format!("conduit-bad-{}.toml", std::process::id()));
         let garbage = "model = \"o3\"\n[[[ this is not valid toml";
         std::fs::write(&path, garbage).unwrap();
-        assert!({ let _e = sample_gateway(None, "codex"); edit_toml_gateway(&path, Some(&_e)) }.is_err());
+        assert!({
+            let _e = sample_gateway(None, "codex");
+            edit_toml_gateway(&path, Some(&_e))
+        }
+        .is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
         std::fs::remove_file(&path).ok();
     }
@@ -6199,7 +6392,11 @@ command = "npx"
             "model = \"o3\"\napproval_policy = \"on-request\"\n\n[profiles.work]\nmodel = \"gpt-5\"\n",
         )
         .unwrap();
-        { let _e = sample_gateway(None, "codex"); edit_toml_gateway(&path, Some(&_e)) }.unwrap();
+        {
+            let _e = sample_gateway(None, "codex");
+            edit_toml_gateway(&path, Some(&_e))
+        }
+        .unwrap();
         let v: toml::Value = toml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(v.get("model").and_then(|x| x.as_str()), Some("o3"));
         assert_eq!(
@@ -6219,6 +6416,39 @@ command = "npx"
         let d = defs().into_iter().find(|d| d.id == "zed").unwrap();
         assert!(matches!(d.format, Format::JsonContextServers));
         assert!((d.path)().is_some());
+    }
+
+    #[test]
+    fn crush_is_registered_as_mcp_json() {
+        let d = defs().into_iter().find(|d| d.id == "crush").unwrap();
+        assert!(matches!(d.format, Format::JsonMcp));
+        assert!((d.path)().is_some());
+        assert!(config_is_whole_app_state("crush"));
+        assert_eq!(
+            crush_override_path(Some(std::ffi::OsString::from("custom-config"))),
+            Some(PathBuf::from("custom-config").join("crush.json"))
+        );
+        let home = Path::new("mock-home");
+        assert_eq!(
+            resolve_crush_path(home, None, None),
+            home.join(".config").join("crush").join("crush.json")
+        );
+        assert_eq!(
+            resolve_crush_path(
+                home,
+                None,
+                Some(std::ffi::OsString::from("xdg-config")),
+            ),
+            PathBuf::from("xdg-config").join("crush").join("crush.json")
+        );
+        assert_eq!(
+            resolve_crush_path(
+                home,
+                Some(std::ffi::OsString::from("custom-config")),
+                Some(std::ffi::OsString::from("xdg-config")),
+            ),
+            PathBuf::from("custom-config").join("crush.json")
+        );
     }
 
     #[test]
@@ -6383,7 +6613,11 @@ command = "npx"
         assert_eq!(parsed[0].transport, "stdio");
 
         // Installing the gateway preserves the model key and the existing extension.
-        { let _e = sample_gateway(None, "goose"); edit_yaml_gateway(&path, Some(&_e)) }.unwrap();
+        {
+            let _e = sample_gateway(None, "goose");
+            edit_yaml_gateway(&path, Some(&_e))
+        }
+        .unwrap();
         let v: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -6419,7 +6653,11 @@ command = "npx"
         let garbage = "key: value\n  - [unbalanced flow sequence\n:::not valid";
         std::fs::write(&path, garbage).unwrap();
         // A parse failure must error, never replace config.yaml (it holds model config).
-        assert!({ let _e = sample_gateway(None, "goose"); edit_yaml_gateway(&path, Some(&_e)) }.is_err());
+        assert!({
+            let _e = sample_gateway(None, "goose");
+            edit_yaml_gateway(&path, Some(&_e))
+        }
+        .is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
         std::fs::remove_file(&path).ok();
     }
@@ -6461,17 +6699,11 @@ command = "npx"
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed[0].name, "remote-http");
         assert_eq!(parsed[0].transport, "http");
-        assert_eq!(
-            parsed[0].url.as_deref(),
-            Some("https://example.com/mcp")
-        );
+        assert_eq!(parsed[0].url.as_deref(), Some("https://example.com/mcp"));
         assert!(parsed[0].command.is_none());
         assert_eq!(parsed[1].name, "remote-sse");
         assert_eq!(parsed[1].transport, "sse");
-        assert_eq!(
-            parsed[1].url.as_deref(),
-            Some("https://example.com/events")
-        );
+        assert_eq!(parsed[1].url.as_deref(), Some("https://example.com/events"));
         assert!(parsed[1].command.is_none());
     }
 
@@ -6636,7 +6868,11 @@ command = "npx"
         assert_eq!(parsed[0].env_keys, vec!["Authorization".to_string()]);
 
         // Installing the gateway preserves the model key and the existing server.
-        { let _e = sample_gateway(None, "hermes"); edit_hermes_yaml_gateway(&path, Some(&_e)) }.unwrap();
+        {
+            let _e = sample_gateway(None, "hermes");
+            edit_hermes_yaml_gateway(&path, Some(&_e))
+        }
+        .unwrap();
         let v: serde_yaml::Value =
             serde_yaml::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(
@@ -6672,7 +6908,11 @@ command = "npx"
         let garbage = "key: value\n  - [unbalanced flow sequence\n:::not valid";
         std::fs::write(&path, garbage).unwrap();
         // A parse failure must error, never replace config.yaml (it holds model config).
-        assert!({ let _e = sample_gateway(None, "hermes"); edit_hermes_yaml_gateway(&path, Some(&_e)) }.is_err());
+        assert!({
+            let _e = sample_gateway(None, "hermes");
+            edit_hermes_yaml_gateway(&path, Some(&_e))
+        }
+        .is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), garbage);
         std::fs::remove_file(&path).ok();
     }
@@ -6716,7 +6956,8 @@ command = "npx"
             let t = resolve_rules_target("claude-code", &mock_home(p), p).expect("supported");
             assert_eq!(t.strategy, Strategy::OwnedFile);
             assert!(
-                t.path.ends_with(PathBuf::from("rules").join("toolport-team-rules.md")),
+                t.path
+                    .ends_with(PathBuf::from("rules").join("toolport-team-rules.md")),
                 "unexpected claude-code rules path on {p:?}: {:?}",
                 t.path
             );
@@ -6752,7 +6993,9 @@ command = "npx"
         assert!(win.path.to_string_lossy().contains("Zed"));
         let mac = resolve_rules_target("zed", &mock_home(Platform::MacOs), Platform::MacOs)
             .expect("supported");
-        assert!(mac.path.ends_with(PathBuf::from(".config").join("zed").join("AGENTS.md")));
+        assert!(mac
+            .path
+            .ends_with(PathBuf::from(".config").join("zed").join("AGENTS.md")));
     }
 
     #[test]
@@ -6838,11 +7081,12 @@ command = "npx"
     fn amp_default_config_paths_match_each_platform() {
         for platform in Platform::ALL {
             let home = mock_home(platform);
-            let expected = home
-                .join(".config")
-                .join("amp")
-                .join("settings.json");
-            assert_eq!(resolve_client_config_path("amp", &home, platform), Some(expected), "Amp on {platform:?}");
+            let expected = home.join(".config").join("amp").join("settings.json");
+            assert_eq!(
+                resolve_client_config_path("amp", &home, platform),
+                Some(expected),
+                "Amp on {platform:?}"
+            );
         }
     }
 
@@ -6896,6 +7140,7 @@ command = "npx"
     fn client_config_paths_are_stable_across_platforms() {
         let cases: &[(&str, fn(&Path, Platform) -> PathBuf)] = &[
             ("cursor", |home, _| home.join(".cursor").join("mcp.json")),
+            ("crush", |home, _| home.join(".config").join("crush").join("crush.json")),
             ("grok", |home, _| home.join(".grok").join("config.toml")),
             ("github-copilot-cli", |home, _| {
                 home.join(".copilot").join("mcp-config.json")
@@ -7018,6 +7263,7 @@ command = "npx"
         let home = home().expect("home dir");
         let vscode = client_config_path("vscode").unwrap();
         let jan = client_config_path("jan").unwrap();
+        let crush = client_config_path("crush").unwrap();
         let opencode = client_config_path("opencode").unwrap();
         let kilo_code = client_config_path("kilo-code").unwrap();
 
@@ -7032,6 +7278,10 @@ command = "npx"
         assert_eq!(
             jan,
             xdg_data.join("Jan").join("data").join("mcp_config.json")
+        );
+        assert_eq!(
+            crush,
+            xdg_config.join("crush").join("crush.json")
         );
         assert_eq!(
             opencode,
@@ -7132,21 +7382,48 @@ OD_DATA_DIR = "/tmp/data"
         let vs = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         // The reporter's case and friends: name comes from the package, with the
         // scope, version, and MCP name affixes stripped (issue #251).
-        assert_eq!(name_from_invocation("npx", &vs(&["-y", "@verygoodplugins/mcp-automem"])), "automem");
-        assert_eq!(name_from_invocation("npx", &vs(&["-y", "@modelcontextprotocol/server-github"])), "github");
-        assert_eq!(name_from_invocation("uvx", &vs(&["mcp-server-fetch"])), "fetch");
-        assert_eq!(name_from_invocation("npx", &vs(&["@upstash/context7-mcp"])), "context7");
-        assert_eq!(name_from_invocation("npx", &vs(&["-y", "mcp-remote@latest"])), "remote");
-        assert_eq!(name_from_invocation("bunx", &vs(&["some-tool"])), "some-tool");
+        assert_eq!(
+            name_from_invocation("npx", &vs(&["-y", "@verygoodplugins/mcp-automem"])),
+            "automem"
+        );
+        assert_eq!(
+            name_from_invocation("npx", &vs(&["-y", "@modelcontextprotocol/server-github"])),
+            "github"
+        );
+        assert_eq!(
+            name_from_invocation("uvx", &vs(&["mcp-server-fetch"])),
+            "fetch"
+        );
+        assert_eq!(
+            name_from_invocation("npx", &vs(&["@upstash/context7-mcp"])),
+            "context7"
+        );
+        assert_eq!(
+            name_from_invocation("npx", &vs(&["-y", "mcp-remote@latest"])),
+            "remote"
+        );
+        assert_eq!(
+            name_from_invocation("bunx", &vs(&["some-tool"])),
+            "some-tool"
+        );
         // A Windows npx.cmd path is still recognized as the npx launcher.
         assert_eq!(
-            name_from_invocation("C:\\Program Files\\nodejs\\npx.cmd", &vs(&["-y", "@scope/mcp-thing"])),
+            name_from_invocation(
+                "C:\\Program Files\\nodejs\\npx.cmd",
+                &vs(&["-y", "@scope/mcp-thing"])
+            ),
             "thing"
         );
         // A packed "npx -y <pkg>" command with empty args is handled.
-        assert_eq!(name_from_invocation("npx -y @verygoodplugins/mcp-automem", &[]), "automem");
+        assert_eq!(
+            name_from_invocation("npx -y @verygoodplugins/mcp-automem", &[]),
+            "automem"
+        );
         // A non-runner keeps its own command file stem (unchanged behavior).
-        assert_eq!(name_from_invocation("/usr/local/bin/my-server", &[]), "my-server");
+        assert_eq!(
+            name_from_invocation("/usr/local/bin/my-server", &[]),
+            "my-server"
+        );
     }
 
     #[test]
@@ -7155,7 +7432,10 @@ OD_DATA_DIR = "/tmp/data"
         // An explicit --package=/--package/-p names the package, not the command
         // after `--` (which is what to run inside the package env), issue #251 f/u.
         assert_eq!(
-            name_from_invocation("npm", &vs(&["exec", "--package=@scope/mcp-weather", "--", "server"])),
+            name_from_invocation(
+                "npm",
+                &vs(&["exec", "--package=@scope/mcp-weather", "--", "server"])
+            ),
             "weather"
         );
         assert_eq!(
@@ -7166,14 +7446,20 @@ OD_DATA_DIR = "/tmp/data"
             name_from_invocation("npx", &vs(&["--package", "@scope/mcp-foo", "--", "cmd"])),
             "foo"
         );
-        assert_eq!(name_from_invocation("npx", &vs(&["-p", "@scope/mcp-foo", "cmd"])), "foo");
+        assert_eq!(
+            name_from_invocation("npx", &vs(&["-p", "@scope/mcp-foo", "cmd"])),
+            "foo"
+        );
         // A positional package before `--` still wins, and `--` stops the search.
         assert_eq!(
             name_from_invocation("npx", &vs(&["-y", "@scope/mcp-a", "--", "not-a-package"])),
             "a"
         );
         // Cross-platform: a Windows path resolves to its stem even on a Unix host.
-        assert_eq!(name_from_invocation("C:\\tools\\my-server.exe", &[]), "my-server");
+        assert_eq!(
+            name_from_invocation("C:\\tools\\my-server.exe", &[]),
+            "my-server"
+        );
     }
 
     #[test]
