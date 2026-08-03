@@ -2818,6 +2818,132 @@ fn atomic_write(path: &Path, contents: &str) -> Result<(), String> {
     crate::registry::atomic_write(path, contents)
 }
 
+/// Convert a `serde_json::Value` into a `jsonc-parser` CST input so we can splice
+/// a rewritten value into an existing JSONC document without losing comments.
+fn serde_to_cst_input(value: &serde_json::Value) -> jsonc_parser::cst::CstInputValue {
+    use jsonc_parser::cst::CstInputValue;
+    match value {
+        serde_json::Value::Null => CstInputValue::Null,
+        serde_json::Value::Bool(b) => CstInputValue::Bool(*b),
+        serde_json::Value::Number(n) => CstInputValue::Number(n.to_string()),
+        serde_json::Value::String(s) => CstInputValue::String(s.clone()),
+        serde_json::Value::Array(items) => {
+            CstInputValue::Array(items.iter().map(serde_to_cst_input).collect())
+        }
+        serde_json::Value::Object(map) => CstInputValue::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), serde_to_cst_input(v)))
+                .collect(),
+        ),
+    }
+}
+
+/// Count how many times `key` appears as a top-level property name in a JSONC object.
+fn count_top_level_key(obj: &jsonc_parser::cst::CstObject, key: &str) -> usize {
+    obj.properties()
+        .into_iter()
+        .filter(|prop| {
+            prop.name()
+                .and_then(|n| n.decoded_value().ok())
+                .map(|name| name == key)
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// Reject duplicate top-level occurrences of `key` in JSONC text.
+///
+/// Duplicate keys are ambiguous: `obj.get(key)` only rewrites the first, so a later
+/// effective entry can stay stale. Callers must not fall back to pretty JSON when this
+/// fails — the file must remain unchanged (#555 review).
+fn reject_duplicate_top_level_key(original: &str, key: &str) -> Result<(), String> {
+    use jsonc_parser::cst::CstRootNode;
+    use jsonc_parser::ParseOptions;
+
+    let root = CstRootNode::parse(original, &ParseOptions::default())
+        .map_err(|e| e.to_string())?;
+    let Some(obj) = root.object_value() else {
+        return Ok(());
+    };
+    let n = count_top_level_key(&obj, key);
+    if n > 1 {
+        return Err(format!(
+            "malformed config: top-level key '{key}' appears {n} times; refusing to write"
+        ));
+    }
+    Ok(())
+}
+
+/// Rewrite a single top-level object property in `original` JSON/JSONC text,
+/// preserving comments, trailing commas, and formatting of everything else.
+/// Used so gateway install/write no longer strips user annotations (#555).
+///
+/// Fails if `key` appears more than once at the top level (ambiguous rewrite).
+fn rewrite_json_key_preserving(
+    original: &str,
+    key: &str,
+    new_value: &serde_json::Value,
+) -> Result<String, String> {
+    use jsonc_parser::cst::CstRootNode;
+    use jsonc_parser::ParseOptions;
+
+    let root = CstRootNode::parse(original, &ParseOptions::default())
+        .map_err(|e| e.to_string())?;
+    // Client configs we edit are always root objects. Non-objects fall through
+    // to the pretty-print path via the caller.
+    let Some(obj) = root.object_value() else {
+        return Err("JSONC root is not an object".into());
+    };
+    let n = count_top_level_key(&obj, key);
+    if n > 1 {
+        return Err(format!(
+            "malformed config: top-level key '{key}' appears {n} times; refusing to write"
+        ));
+    }
+    let input = serde_to_cst_input(new_value);
+    if let Some(prop) = obj.get(key) {
+        prop.set_value(input);
+    } else {
+        obj.append(key, input);
+    }
+    Ok(root.to_string())
+}
+
+/// Serialize `root` for disk. When `original` is present, surgically rewrite
+/// only `changed_key` via a JSONC CST so comments outside that key survive.
+/// Falls back to `serde_json::to_string_pretty` for new/empty files or when the
+/// CST rewrite cannot apply (keeps prior behavior for pure JSON / edge cases).
+///
+/// Duplicate top-level keys for `changed_key` are a hard error (no pretty fallback)
+/// so the existing file is left untouched.
+fn atomic_write_json_config(
+    path: &Path,
+    original: Option<&str>,
+    root: &serde_json::Value,
+    changed_key: &str,
+) -> Result<(), String> {
+    let pretty = || {
+        serde_json::to_string_pretty(root).map_err(|e| e.to_string())
+    };
+
+    let out = match (original, root.get(changed_key)) {
+        (Some(src), Some(val)) if !src.trim().is_empty() => {
+            // Hard-fail on duplicate target keys before any rewrite/fallback so the
+            // file is never replaced with pretty JSON that drops one of the entries.
+            // Pre-check (not error-string matching) so jsonc-parser message rewords
+            // cannot silently re-enable the pretty fallback (#592 review).
+            reject_duplicate_top_level_key(src, changed_key)?;
+            match rewrite_json_key_preserving(src, changed_key, val) {
+                Ok(text) => text,
+                // rewrite may still fail for non-object roots / CST issues → pretty
+                Err(_) => pretty()?,
+            }
+        }
+        _ => pretty()?,
+    };
+    atomic_write(path, &out)
+}
+
 fn validate_amp_settings_shape(root: &serde_json::Value) -> Result<(), String> {
     let object = root
         .as_object()
@@ -2867,19 +2993,50 @@ fn write_json_with(
     validate_crush_shape: bool,
     include_tools: bool,
 ) -> Result<(), String> {
-    let mut root = if path.exists() {
+    let (mut root, original) = if path.exists() {
         let content = read_config_file(path)?;
-        read_existing_json(&content, lenient)?
+        let root = read_existing_json(&content, lenient)?;
+        (root, Some(content))
     } else {
-        serde_json::Value::Object(serde_json::Map::new())
+        (serde_json::Value::Object(serde_json::Map::new()), None)
     };
     if validate_crush_shape {
         validate_crush_settings_shape(&root)?;
     } else if key == "amp.mcpServers" {
         validate_amp_settings_shape(&root)?;
     } else if !root.is_object() {
+        // Non-object roots are replaced wholesale; skip comment-preserving rewrite.
         root = serde_json::Value::Object(serde_json::Map::new());
+        return write_json_with_body(
+            path,
+            None,
+            key,
+            &mut root,
+            servers,
+            entry_to_value,
+            include_tools,
+        );
     }
+    write_json_with_body(
+        path,
+        original.as_deref(),
+        key,
+        &mut root,
+        servers,
+        entry_to_value,
+        include_tools,
+    )
+}
+
+fn write_json_with_body(
+    path: &Path,
+    original: Option<&str>,
+    key: &str,
+    root: &mut serde_json::Value,
+    servers: &[ServerEntry],
+    entry_to_value: fn(&ServerEntry) -> serde_json::Value,
+    include_tools: bool,
+) -> Result<(), String> {
     let obj = root.as_object_mut().unwrap();
     let servers_map: serde_json::Map<String, serde_json::Value> = servers
         .iter()
@@ -2895,17 +3052,16 @@ fn write_json_with(
         })
         .collect();
     obj.insert(key.to_string(), serde_json::Value::Object(servers_map));
-
-    let json = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &json)
+    atomic_write_json_config(path, original, root, key)
 }
 
 fn write_qwen_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    let mut root = if path.exists() {
+    let (mut root, original) = if path.exists() {
         let content = read_config_file(path)?;
-        read_existing_json(&content, true)?
+        let root = read_existing_json(&content, true)?;
+        (root, Some(content))
     } else {
-        serde_json::Value::Object(serde_json::Map::new())
+        (serde_json::Value::Object(serde_json::Map::new()), None)
     };
     if !root.is_object() {
         return Err("Qwen Code config root must be an object; leaving it untouched.".into());
@@ -2918,8 +3074,7 @@ fn write_qwen_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
         .collect();
     object.insert("mcpServers".into(), serde_json::Value::Object(servers_map));
 
-    let output = serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?;
-    atomic_write(path, &output)
+    atomic_write_json_config(path, original.as_deref(), &root, "mcpServers")
 }
 
 fn opencode_mcp_mut(
@@ -2945,14 +3100,6 @@ fn opencode_mcp_mut(
     Ok(object.get_mut("mcp").unwrap().as_object_mut().unwrap())
 }
 
-fn read_existing_opencode_json(path: &Path) -> Result<serde_json::Value, String> {
-    if !path.exists() {
-        return Ok(serde_json::Value::Object(serde_json::Map::new()));
-    }
-    let content = read_config_file(path)?;
-    read_existing_json(&content, true)
-}
-
 fn opencode_entry_is_override_only(definition: &serde_json::Value) -> bool {
     let Some(object) = definition.as_object() else {
         return false;
@@ -2966,7 +3113,15 @@ fn opencode_entry_is_override_only(definition: &serde_json::Value) -> bool {
 }
 
 fn write_opencode_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
-    let mut root = read_existing_opencode_json(path)?;
+    let original = if path.exists() {
+        Some(read_config_file(path)?)
+    } else {
+        None
+    };
+    let mut root = match &original {
+        Some(content) => read_existing_json(content, true)?,
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    };
     let mcp = opencode_mcp_mut(&mut root)?;
     // Complete server definitions are replaced by Toolport's inventory, but an
     // `enabled`-only entry may override a server inherited from another OpenCode
@@ -2977,8 +3132,7 @@ fn write_opencode_json(path: &Path, servers: &[ServerEntry]) -> Result<(), Strin
             .iter()
             .map(|server| (server.name.clone(), entry_to_opencode_json(server))),
     );
-    let output = serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?;
-    atomic_write(path, &output)
+    atomic_write_json_config(path, original.as_deref(), &root, "mcp")
 }
 
 fn write_toml(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
@@ -3879,19 +4033,50 @@ fn edit_json_gateway_with(
     validate_crush_shape: bool,
     include_tools: bool,
 ) -> Result<(), String> {
-    let mut root = if path.exists() {
+    let (mut root, original) = if path.exists() {
         let content = read_config_file(path)?;
-        read_existing_json(&content, lenient)?
+        let root = read_existing_json(&content, lenient)?;
+        (root, Some(content))
     } else {
-        serde_json::Value::Object(serde_json::Map::new())
+        (serde_json::Value::Object(serde_json::Map::new()), None)
     };
     if validate_crush_shape {
         validate_crush_settings_shape(&root)?;
     } else if key == "amp.mcpServers" {
         validate_amp_settings_shape(&root)?;
     } else if !root.is_object() {
+        // Non-object roots are replaced wholesale; skip comment-preserving rewrite.
         root = serde_json::Value::Object(serde_json::Map::new());
+        return edit_json_gateway_body(
+            path,
+            None,
+            key,
+            &mut root,
+            entry,
+            entry_formatter,
+            include_tools,
+        );
     }
+    edit_json_gateway_body(
+        path,
+        original.as_deref(),
+        key,
+        &mut root,
+        entry,
+        entry_formatter,
+        include_tools,
+    )
+}
+
+fn edit_json_gateway_body(
+    path: &Path,
+    original: Option<&str>,
+    key: &str,
+    root: &mut serde_json::Value,
+    entry: Option<&ServerEntry>,
+    entry_formatter: Option<fn(&ServerEntry) -> serde_json::Value>,
+    include_tools: bool,
+) -> Result<(), String> {
     let obj = root.as_object_mut().unwrap();
     if !obj.get(key).map(|v| v.is_object()).unwrap_or(false) {
         obj.insert(
@@ -3929,12 +4114,19 @@ fn edit_json_gateway_with(
         servers.insert(GATEWAY_ENTRY_NAME.to_string(), value);
     }
 
-    let out = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    atomic_write(path, &out)
+    atomic_write_json_config(path, original, root, key)
 }
 
 fn edit_opencode_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
-    let mut root = read_existing_opencode_json(path)?;
+    let original = if path.exists() {
+        Some(read_config_file(path)?)
+    } else {
+        None
+    };
+    let mut root = match &original {
+        Some(content) => read_existing_json(content, true)?,
+        None => serde_json::Value::Object(serde_json::Map::new()),
+    };
     let mcp = opencode_mcp_mut(&mut root)?;
     mcp.retain(|name, definition| {
         let command = definition
@@ -3947,8 +4139,7 @@ fn edit_opencode_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(),
     if let Some(entry) = entry {
         mcp.insert(GATEWAY_ENTRY_NAME.into(), entry_to_opencode_json(entry));
     }
-    let output = serde_json::to_string_pretty(&root).map_err(|error| error.to_string())?;
-    atomic_write(path, &output)
+    atomic_write_json_config(path, original.as_deref(), &root, "mcp")
 }
 
 fn edit_toml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
@@ -5969,7 +6160,7 @@ command = "npx"
         // JSONC: line comment, trailing comma, an unrelated user setting.
         std::fs::write(
             &path,
-            "// my zed settings\n{\n  \"ui_font_size\": 16,\n  \"context_servers\": {\n    \"existing\": { \"command\": \"x\", \"args\": [] },\n  },\n}\n",
+            "// my zed settings\n{\n  \"ui_font_size\": 16, // keep font note\n  \"context_servers\": {\n    \"existing\": { \"command\": \"x\", \"args\": [] },\n  },\n}\n",
         )
         .unwrap();
 
@@ -5979,18 +6170,65 @@ command = "npx"
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "existing");
 
-        // Installing preserves the unrelated key and the existing server.
+        // Installing preserves the unrelated key, the existing server, and comments.
         {
             let _e = sample_gateway(None, "zed");
             edit_json_gateway(&path, "context_servers", Some(&_e), true)
         }
         .unwrap();
-        let root: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("// my zed settings"),
+            "file-level comment must survive install: {content}"
+        );
+        assert!(
+            content.contains("// keep font note"),
+            "inline comment on an unrelated key must survive: {content}"
+        );
+        let root = parse_json_value(&content).unwrap();
         assert_eq!(root["ui_font_size"], 16);
         let cs = root["context_servers"].as_object().unwrap();
         assert!(cs.contains_key(GATEWAY_ENTRY_NAME));
         assert!(cs.contains_key("existing"));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn vscode_mcp_json_jsonc_preserves_comments_on_write() {
+        // VS Code's mcp.json is JSONC; writing servers must not strip user comments (#555).
+        let path = temp_path("vscode-mcp-jsonc");
+        std::fs::write(
+            &path,
+            r#"// VS Code MCP servers
+{
+  // prefer the local catalog
+  "servers": {
+    "existing": { "command": "npx", "args": ["-y", "x"] },
+  },
+}
+"#,
+        )
+        .unwrap();
+
+        write_json(
+            &path,
+            "servers",
+            &[stdio("filesystem"), stdio("github")],
+            false,
+        )
+        .unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("// VS Code MCP servers"),
+            "top comment must survive write_json: {content}"
+        );
+        assert!(
+            content.contains("// prefer the local catalog"),
+            "comment above servers must survive: {content}"
+        );
+        let parsed = parse_json(&content, "servers").unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "filesystem");
         std::fs::remove_file(&path).ok();
     }
 
@@ -6268,6 +6506,7 @@ command = "npx"
             r#"// Kilo settings
             {
                 "$schema": "https://app.kilo.ai/config.json",
+                // preferred model for day-to-day work
                 "model": "anthropic/claude-sonnet-4-5",
                 "mcp": {
                     "existing": {
@@ -6291,8 +6530,17 @@ command = "npx"
             edit_opencode_gateway(&path, Some(&entry))
         }
         .unwrap();
-        let root: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            content.contains("// Kilo settings"),
+            "file-level comment must survive gateway install: {content}"
+        );
+        assert!(
+            content.contains("// preferred model for day-to-day work"),
+            "comment on unrelated key must survive: {content}"
+        );
+        // Still JSONC after write — parse with the lenient path, not strict serde_json.
+        let root = parse_json_value(&content).unwrap();
         assert_eq!(
             root.get("$schema").and_then(|value| value.as_str()),
             Some("https://app.kilo.ai/config.json")
@@ -6309,12 +6557,82 @@ command = "npx"
         );
 
         edit_opencode_gateway(&path, None).unwrap();
-        let after: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let after_content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            after_content.contains("// Kilo settings"),
+            "comments must also survive uninstall: {after_content}"
+        );
+        let after = parse_json_value(&after_content).unwrap();
         assert!(after["mcp"].get(GATEWAY_ENTRY_NAME).is_none());
         assert!(after["mcp"].get("existing").is_some());
         assert_eq!(after["model"], "anthropic/claude-sonnet-4-5");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rewrite_json_key_preserving_keeps_unrelated_text() {
+        let original = r#"// header
+{
+  "ui_font_size": 16, // note
+  "context_servers": {
+    "old": { "command": "x" },
+  },
+}
+"#;
+        let new_servers = serde_json::json!({
+            "old": { "command": "x" },
+            "Toolport": { "command": "toolport-gateway", "args": [] }
+        });
+        let rewritten =
+            rewrite_json_key_preserving(original, "context_servers", &new_servers).unwrap();
+        assert!(rewritten.contains("// header"));
+        assert!(rewritten.contains("// note"));
+        assert!(rewritten.contains("\"Toolport\""));
+        assert!(rewritten.contains("\"ui_font_size\""));
+        let root = parse_json_value(&rewritten).unwrap();
+        assert_eq!(root["ui_font_size"], 16);
+        assert!(root["context_servers"].get("Toolport").is_some());
+    }
+
+    #[test]
+    fn atomic_write_json_config_rejects_duplicate_top_level_keys() {
+        // Duplicate top-level mcpServers: rewriting only the first would leave a stale second.
+        let path = temp_path("dup-mcpServers.json");
+        let original = r#"{
+  // keep me
+  "mcpServers": { "a": { "command": "old-a" } },
+  "other": 1,
+  "mcpServers": { "b": { "command": "old-b" } }
+}
+"#;
+        std::fs::write(&path, original).unwrap();
+        let root = serde_json::json!({
+            "mcpServers": { "Toolport": { "command": "toolport-gateway" } },
+            "other": 1
+        });
+        let err = atomic_write_json_config(&path, Some(original), &root, "mcpServers").unwrap_err();
+        assert!(
+            err.contains("malformed") && err.contains("mcpServers"),
+            "expected malformed duplicate-key error, got: {err}"
+        );
+        // File must stay unchanged (no pretty-JSON fallback).
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn rewrite_json_key_preserving_rejects_duplicate_top_level_keys() {
+        let original = r#"{
+  "context_servers": { "a": {} },
+  "context_servers": { "b": {} }
+}"#;
+        let err = rewrite_json_key_preserving(
+            original,
+            "context_servers",
+            &serde_json::json!({ "Toolport": {} }),
+        )
+        .unwrap_err();
+        assert!(err.contains("appears") && err.contains("2"), "got: {err}");
     }
 
     #[test]
