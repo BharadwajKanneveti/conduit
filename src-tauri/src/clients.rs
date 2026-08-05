@@ -82,6 +82,9 @@ enum Format {
     /// GitHub Copilot CLI's `mcpServers` object. Entries use the standard JSON
     /// shape but require a `tools` allowlist; Toolport enables every gateway tool.
     JsonCopilotMcpServers,
+    /// Factory Droid's `mcpServers` object. Standard JSON shape, but every
+    /// entry requires a `"type"` field ("stdio" for local servers).
+    JsonDroidMcpServers,
     /// Amp's shared settings file stores servers under the literal dotted
     /// top-level key `amp.mcpServers` (not a nested `amp` object).
     JsonAmpMcpServers,
@@ -250,6 +253,7 @@ fn resolve_client_config_path(
     let path = match client_id {
         "claude-desktop" => config.join("Claude").join("claude_desktop_config.json"),
         "cursor" => home.join(".cursor").join("mcp.json"),
+        "droid" => home.join(".factory").join("mcp.json"),
         "crush" => home.join(".config").join("crush").join("crush.json"),
         "boltai" => home.join(".boltai").join("mcp.json"),
         "pi" => home.join(".pi").join("agent").join("mcp.json"),
@@ -359,6 +363,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
     let path = match client_id {
         "claude-desktop" => config.join("Claude").join("claude_desktop_config.json"),
         "cursor" => home.join(".cursor").join("mcp.json"),
+        "droid" => home.join(".factory").join("mcp.json"),
         "crush" => config.join("crush").join("crush.json"),
         "boltai" => home.join(".boltai").join("mcp.json"),
         "pi" => home.join(".pi").join("agent").join("mcp.json"),
@@ -550,6 +555,10 @@ fn claude_desktop_path() -> Option<PathBuf> {
 
 fn cursor_path() -> Option<PathBuf> {
     client_config_path("cursor")
+}
+
+fn droid_path() -> Option<PathBuf> {
+    client_config_path("droid")
 }
 
 fn crush_override_path(config_dir: Option<std::ffi::OsString>) -> Option<PathBuf> {
@@ -956,6 +965,14 @@ fn defs() -> Vec<ClientDef> {
             uses_connectors: false,
             path: cursor_path,
             plugin_scan: Some(scan_cursor_plugins),
+        },
+        ClientDef {
+            id: "droid",
+            name: "Factory Droid",
+            format: Format::JsonDroidMcpServers,
+            uses_connectors: false,
+            path: droid_path,
+            plugin_scan: None,
         },
         ClientDef {
             id: "crush",
@@ -2387,6 +2404,7 @@ fn read_client(def: &ClientDef) -> DetectedClient {
     let parsed = match def.format {
         Format::JsonMcpServers => parse_json(&content, "mcpServers"),
         Format::JsonCopilotMcpServers => parse_json(&content, "mcpServers"),
+        Format::JsonDroidMcpServers => parse_json(&content, "mcpServers"),
         Format::JsonAmpMcpServers => parse_json(&content, "amp.mcpServers"),
         Format::JsonQwenMcpServers => parse_qwen_json(&content),
         Format::JsonServers => parse_json(&content, "servers"),
@@ -2714,6 +2732,15 @@ fn entry_to_crush_json(entry: &ServerEntry) -> serde_json::Value {
     value
 }
 
+fn entry_to_droid_json(entry: &ServerEntry) -> serde_json::Value {
+    let mut value = entry_to_json(entry);
+    value.as_object_mut().unwrap().insert(
+        "type".into(),
+        serde_json::Value::String(entry.transport.clone()),
+    );
+    value
+}
+
 fn entry_to_qwen_json(entry: &ServerEntry) -> serde_json::Value {
     let mut value = entry_to_json(entry);
     if entry.command.is_none() {
@@ -2982,6 +3009,10 @@ fn write_crush_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> 
 
 fn write_copilot_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
     write_json_with(path, "mcpServers", servers, false, entry_to_json, false, true)
+}
+
+fn write_droid_json(path: &Path, servers: &[ServerEntry]) -> Result<(), String> {
+    write_json_with(path, "mcpServers", servers, false, entry_to_droid_json, false, false)
 }
 
 fn write_json_with(
@@ -3717,6 +3748,7 @@ pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOu
     match def.format {
         Format::JsonMcpServers => write_json(&path, "mcpServers", servers, lenient)?,
         Format::JsonCopilotMcpServers => write_copilot_json(&path, servers)?,
+        Format::JsonDroidMcpServers => write_droid_json(&path, servers)?,
         Format::JsonAmpMcpServers => write_json(&path, "amp.mcpServers", servers, true)?,
         Format::JsonQwenMcpServers => write_qwen_json(&path, servers)?,
         Format::JsonServers => write_json(&path, "servers", servers, lenient)?,
@@ -3922,6 +3954,7 @@ pub fn client_uses_mcp_remote_bridge(client_id: &str) -> bool {
         Format::JsonQwenMcpServers
         | Format::JsonMcp
         | Format::JsonCopilotMcpServers
+        | Format::JsonDroidMcpServers
         | Format::JsonOpenCodeMcp
         | Format::JsonServers
         | Format::YamlMcpServers
@@ -4022,6 +4055,10 @@ fn edit_crush_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), St
 
 fn edit_copilot_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
     edit_json_gateway_with(path, "mcpServers", entry, false, None, false, true)
+}
+
+fn edit_droid_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
+    edit_json_gateway_with(path, "mcpServers", entry, false, Some(entry_to_droid_json), false, false)
 }
 
 fn edit_json_gateway_with(
@@ -4211,6 +4248,7 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
             edit_json_gateway(&path, "mcpServers", entry, lenient)?
         }
         Format::JsonCopilotMcpServers => edit_copilot_json_gateway(&path, entry)?,
+        Format::JsonDroidMcpServers => edit_droid_json_gateway(&path, entry)?,
         Format::JsonAmpMcpServers => {
             edit_json_gateway(&path, "amp.mcpServers", entry, true)?
         }
@@ -5316,6 +5354,72 @@ bad = "not-a-table"
         assert!(!servers2.contains_key(GATEWAY_ENTRY_NAME));
         assert!(servers2.contains_key("existing"));
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn droid_install_preserves_existing_factory_server() {
+        let path = temp_path("droid-install-json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"filesystem":{"command":"npx","args":["-y","@modelcontextprotocol/server-filesystem"],"env":{"HOME":"/home/user"}}}}"#,
+        )
+        .unwrap();
+
+        // Install: gateway entry added, existing Factory server untouched.
+        {
+            let entry = sample_gateway(Some("Work"), "droid");
+            edit_droid_json_gateway(&path, Some(&entry))
+        }
+        .unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let servers = root["mcpServers"].as_object().unwrap();
+        assert!(servers.contains_key(GATEWAY_ENTRY_NAME));
+        assert!(servers.contains_key("filesystem"));
+        assert_eq!(
+            servers["filesystem"]["env"]["HOME"],
+            "/home/user"
+        );
+        assert_eq!(
+            servers[GATEWAY_ENTRY_NAME]["env"][crate::brand::PROFILE],
+            "Work"
+        );
+
+        // Uninstall: gateway entry removed, existing Factory server still untouched.
+        edit_droid_json_gateway(&path, None).unwrap();
+        let root2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let servers2 = root2["mcpServers"].as_object().unwrap();
+        assert!(!servers2.contains_key(GATEWAY_ENTRY_NAME));
+        assert!(servers2.contains_key("filesystem"));
+        assert_eq!(
+            servers2["filesystem"]["args"],
+            serde_json::json!(["-y", "@modelcontextprotocol/server-filesystem"])
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn droid_gateway_install_includes_required_type() {
+        let path = temp_path("droid-gateway");
+        std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
+        let entry = sample_gateway(None, "droid");
+        edit_droid_json_gateway(&path, Some(&entry)).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            root["mcpServers"][GATEWAY_ENTRY_NAME]["type"].as_str(),
+            Some("stdio")
+        );
+        edit_droid_json_gateway(&path, None).unwrap();
+        let root2: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert!(!root2["mcpServers"]
+            .as_object()
+            .unwrap()
+            .contains_key(GATEWAY_ENTRY_NAME));
     }
 
     #[test]
@@ -7458,6 +7562,7 @@ command = "npx"
     fn client_config_paths_are_stable_across_platforms() {
         let cases: &[(&str, fn(&Path, Platform) -> PathBuf)] = &[
             ("cursor", |home, _| home.join(".cursor").join("mcp.json")),
+            ("droid", |home, _| home.join(".factory").join("mcp.json")),
             ("crush", |home, _| home.join(".config").join("crush").join("crush.json")),
             ("grok", |home, _| home.join(".grok").join("config.toml")),
             ("github-copilot-cli", |home, _| {
