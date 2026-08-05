@@ -1271,6 +1271,31 @@ pub fn augmented_path() -> &'static str {
     })
 }
 
+/// The PATH a downstream child would receive with no launcher rewrite in play.
+///
+/// Exists so prepending a resolved `node_modules/.bin` cannot change PATH
+/// precedence as a side effect: the two platforms already disagree about whether a
+/// server's own `env` PATH wins, and that disagreement must not additionally depend
+/// on whether the rewrite happened to succeed.
+#[cfg(windows)]
+fn base_child_path(env: &[(String, String)]) -> String {
+    // Windows children inherit the gateway's PATH, and a configured PATH overrides
+    // it through `.envs()`. There is no augmented_path() equivalent because .cmd
+    // shims and node installs are already on the inherited PATH.
+    env.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| std::env::var("PATH").unwrap_or_default())
+}
+
+#[cfg(not(windows))]
+fn base_child_path(_env: &[(String, String)]) -> String {
+    // Non-Windows overwrites PATH with augmented_path() unconditionally, configured
+    // or not, so building on anything else here would silently drop the augmented
+    // entries (nvm/asdf/homebrew) for exactly the servers that got rewritten.
+    augmented_path().to_string()
+}
+
 #[cfg(not(windows))]
 pub fn resolve_command(command: &str) -> String {
     if command.contains('/') {
@@ -2424,9 +2449,35 @@ impl StdioTransport {
         // never reaches a process.
         screen_spawn_command(command, args)?;
         screen_spawn_env(env)?;
-        let resolved = resolve_command(command);
+        // Collapse an `npx`/`.cmd`-shim chain to the `node <entry>` it would have
+        // ended at. On Windows that is 4 processes down to 1 per server; the shims
+        // do no work beyond holding pipes open. Anything not provably equivalent
+        // resolves to None and spawns unchanged. Re-screen the rewrite: the guard
+        // must judge what actually runs, not only what was configured, and a refusal
+        // falls back to the original rather than failing the spawn.
+        //
+        // Classify the CONFIGURED invocation before the rewrite shadows it. The
+        // `launcher` field decides the connect budget (120s vs 10s), and
+        // `stdio_connect_timeout` computes that from the original command at other
+        // call sites; reading it off the rewritten pair would say `node`, i.e. not a
+        // launcher, and quietly cut a slow-starting server's handshake budget to a
+        // tenth for the ones the rewrite happened to succeed on.
+        let launcher = is_download_launcher(command, args);
+        let direct = crate::launcher::resolve_direct(command, args)
+            .filter(|d| screen_spawn_command(&d.command, &d.args).is_ok());
+        // Bind the rewrite to NEW names rather than shadowing `command`/`args`.
+        // Shadowing left every later read silently referring to `node <abs script>`,
+        // which is right for the spawn and wrong for everything that describes the
+        // server: the connect-budget classification below, and the spawn error
+        // message. Keeping both pairs addressable makes each read state which one it
+        // means instead of depending on where it sits in the function.
+        let (spawn_command, spawn_args) = match &direct {
+            Some(d) => (d.command.as_str(), d.args.as_slice()),
+            None => (command, args),
+        };
+        let resolved = resolve_command(spawn_command);
         let mut cmd = Command::new(&resolved);
-        cmd.args(args)
+        cmd.args(spawn_args)
             .envs(env.iter().cloned())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -2447,6 +2498,20 @@ impl StdioTransport {
         // Give the child the augmented PATH too, so e.g. `npx` can find `node`.
         #[cfg(not(windows))]
         cmd.env("PATH", augmented_path());
+        // Replacing the launcher means also replacing the PATH it set up: the
+        // package's own `node_modules/.bin`. Servers that shell out to a sibling
+        // binary would otherwise stop finding it. Prepend to whatever PATH the child
+        // would have received anyway, so a rewrite only ever ADDS an entry and never
+        // changes which PATH wins.
+        if let Some(dir) = direct.as_ref().and_then(|d| d.bin_dir.as_ref()) {
+            let base = base_child_path(env);
+            let mut merged = dir.to_string_lossy().into_owned();
+            if !base.is_empty() {
+                merged.push(if cfg!(windows) { ';' } else { ':' });
+                merged.push_str(&base);
+            }
+            cmd.env("PATH", merged);
+        }
         // Isolate each downstream server in its own process group so terminal
         // job-control signals (SIGTTIN/SIGTTOU) generated during the child's
         // startup or runtime cannot propagate to the gateway's own process
@@ -2554,7 +2619,7 @@ impl StdioTransport {
             next_id: 1,
             read_timeout: STDIO_READ_TIMEOUT,
             armed,
-            launcher: is_download_launcher(command, args),
+            launcher,
             server_handler: None,
             pending_mrtr: None,
             progress,
@@ -5535,6 +5600,137 @@ mod tests {
         std::env::remove_var(&secret);
         std::env::remove_var(&secret_new);
         std::env::remove_var(&keep);
+    }
+
+    /// The connect budget must be decided by the CONFIGURED command, never by the
+    /// launcher rewrite's output.
+    ///
+    /// `spawn_inner` keeps the rewrite in separate `spawn_command`/`spawn_args`
+    /// bindings and classifies the configured pair before it. Reading
+    /// `is_download_launcher` off the rewritten pair instead would see
+    /// `node <abs script>` rather than `npx -y pkg`. The two disagree, which is the
+    /// hazard: a server whose rewrite succeeded would silently drop from the 120s
+    /// launcher budget to the 10s one, while `stdio_connect_timeout` kept reporting
+    /// 120s for the same server at other call sites.
+    #[test]
+    fn a_rewritten_command_must_not_decide_the_connect_budget() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let configured = ("npx", a(&["-y", "toolport-mcp-servers", "vercel"]));
+        // What resolve_direct turns the above into.
+        let rewritten = (
+            r"C:\Program Files\nodejs\node.exe",
+            a(&[r"C:\cache\_npx\h\node_modules\toolport-mcp-servers\bin\cli.js", "vercel"]),
+        );
+
+        assert!(
+            super::is_download_launcher(configured.0, &configured.1),
+            "the configured invocation is a download launcher"
+        );
+        assert!(
+            !super::is_download_launcher(rewritten.0, &rewritten.1),
+            "the rewritten invocation is not, which is why the classification has to \
+             be captured before the rewrite shadows the original"
+        );
+        assert_eq!(
+            super::stdio_connect_timeout(configured.0, &configured.1),
+            super::LAUNCHER_CONNECT_TIMEOUT,
+            "callers still compute the long budget from the configured command, so \
+             the transport must agree with them"
+        );
+    }
+
+    /// The capture point itself, driven through `spawn_inner` with a rewrite that
+    /// actually succeeds.
+    ///
+    /// The assertion above proves the two classifications differ; it does not prove
+    /// `spawn_inner` reads the configured one, and moving the capture back after the
+    /// rewrite leaves it green. Verified by exactly that mutation. Needs the rewrite
+    /// to succeed to discriminate at all: on a fallback both pairs are the same
+    /// command, so the wrong capture point still yields the right answer.
+    #[test]
+    fn spawn_inner_takes_the_connect_budget_from_the_configured_command() {
+        let tag = format!("toolport-spawnfix-{}", std::process::id());
+        let root = std::env::temp_dir().join(&tag);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // A fixture npx cache holding one package whose entry just holds stdin open,
+        // so the spawned child survives long enough to inspect the transport.
+        let pkg = root.join("_npx").join("hash").join("node_modules").join("srv");
+        std::fs::create_dir_all(pkg.join("bin")).expect("fixture package");
+        std::fs::write(
+            pkg.join("package.json"),
+            r#"{"name":"srv","version":"1.0.0","bin":{"srv":"bin/cli.js"}}"#,
+        )
+        .expect("manifest");
+        std::fs::write(pkg.join("bin").join("cli.js"), "process.stdin.resume();\n")
+            .expect("stub entry");
+        std::env::set_var("npm_config_cache", &root);
+
+        // Unique args so the process-wide resolution memo cannot serve a stale miss.
+        let args: Vec<String> = ["-y", "srv", &tag].iter().map(|s| s.to_string()).collect();
+        let resolved = crate::launcher::resolve_direct("npx", &args);
+        std::env::remove_var("npm_config_cache");
+
+        // If node is missing the rewrite cannot happen and the test would assert
+        // nothing, so say so rather than passing vacuously.
+        let Some(direct) = resolved else {
+            let _ = std::fs::remove_dir_all(&root);
+            panic!("fixture package must resolve, or this test discriminates nothing");
+        };
+        assert!(
+            !super::is_download_launcher(&direct.command, &direct.args),
+            "the rewritten pair must classify as a non-launcher for this to bite"
+        );
+
+        std::env::set_var("npm_config_cache", &root);
+        let transport = super::StdioTransport::spawn_inner("npx", &args, &[], None, None, None);
+        std::env::remove_var("npm_config_cache");
+        let transport = transport.expect("the stub server must spawn");
+
+        assert!(
+            transport.launcher,
+            "the connect budget must come from the configured `npx`, not the `node` \
+             the rewrite produced"
+        );
+        assert_eq!(
+            transport.connect_timeout(),
+            super::LAUNCHER_CONNECT_TIMEOUT,
+            "and it must reach connect_timeout as the long budget"
+        );
+
+        drop(transport);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Prepending a launcher's `node_modules/.bin` must not also decide whether a
+    /// server's configured PATH wins.
+    ///
+    /// The two platforms already disagree: Windows lets a configured PATH through
+    /// via `.envs()`, while `spawn_inner` overwrites PATH with `augmented_path()`
+    /// unconditionally on everything else. An earlier version of the rewrite always
+    /// preferred the configured PATH, so on non-Windows a server that set PATH
+    /// silently lost the augmented nvm/asdf/homebrew entries - but only when the
+    /// rewrite happened to succeed, which is the worst kind of conditional.
+    #[test]
+    fn a_launcher_rewrite_does_not_change_which_path_wins() {
+        let configured = vec![("PATH".to_string(), "/configured/only".to_string())];
+        let base = super::base_child_path(&configured);
+        // `augmented_path` only exists off Windows, so this splits at compile time
+        // rather than with a runtime `cfg!`.
+        #[cfg(windows)]
+        assert_eq!(
+            base, "/configured/only",
+            "Windows passes a configured PATH to the child, so it is the base"
+        );
+        #[cfg(not(windows))]
+        assert_eq!(
+            base,
+            super::augmented_path(),
+            "non-Windows overwrites PATH regardless, so the rewrite must build on that"
+        );
+        // With nothing configured, both platforms land on the same PATH the child
+        // would have received with no rewrite at all.
+        assert!(!super::base_child_path(&[]).is_empty());
     }
 
     /// Verify that a downstream server spawned with process-group isolation lands
