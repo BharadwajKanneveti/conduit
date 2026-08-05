@@ -2791,12 +2791,141 @@ fn stop_spawned_gateways() -> u32 {
     crate::gateway_publish::stop_spawned_gateways()
 }
 
+/// Apps still launching an obsolete gateway, accumulated across reaper passes.
+///
+/// Held rather than recomputed on demand because the advice is only knowable from
+/// a pre-kill process table: once a pass has stopped the obsolete gateways, a fresh
+/// query reads a table with the evidence already removed.
+///
+/// The merge is a **union keyed by client pid**, never a replace. #542 shipped an
+/// unconditional write and the failure was immediate: the launch pass correctly
+/// recorded "restart Claude" and killed the process, the user opened Settings and
+/// clicked **Run** (the obvious next action), Claude had not made a tool call yet so
+/// the new snapshot was empty, and the empty snapshot overwrote the good advice. The
+/// panel vanished and the UI claimed "No old gateway processes found" while Claude
+/// was still pinned to an obsolete binary, for the rest of the session.
+///
+/// Entries expire on their own terms: a pid that is no longer running means the user
+/// restarted that app, which is the only evidence of compliance that actually exists.
+/// Absence of a respawned gateway is not evidence, because a client that simply has
+/// not made a tool call yet looks identical.
+#[derive(Default)]
+struct RestartAdvice(Mutex<Vec<crate::gateway_publish::ClientNeedingRestart>>);
+
+impl RestartAdvice {
+    /// Fold one pass's pre-kill findings into the stored set and return the result.
+    fn merge(
+        &self,
+        fresh: Vec<crate::gateway_publish::ClientNeedingRestart>,
+    ) -> Vec<crate::gateway_publish::ClientNeedingRestart> {
+        let mut stored = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for entry in fresh {
+            // One row per app to act on. A client that respawned two different
+            // obsolete gateways is still one restart.
+            if !stored.iter().any(|e| e.client_pid == entry.client_pid) {
+                stored.push(entry);
+            }
+        }
+        stored.retain(|e| crate::gateway_publish::pid_is_running(e.client_pid));
+        stored.clone()
+    }
+
+    fn current(&self) -> Vec<crate::gateway_publish::ClientNeedingRestart> {
+        let mut stored = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        stored.retain(|e| crate::gateway_publish::pid_is_running(e.client_pid));
+        stored.clone()
+    }
+}
+
+/// What a reaper run did and what the user still has to do about it.
+///
+/// One payload rather than a killed-list plus a separate advice query, so the two
+/// cannot describe different moments: any second call necessarily observes a table
+/// the first one already changed.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReapOutcome {
+    killed: Vec<String>,
+    /// Processes that matched but could not be stopped. Previously dropped, which
+    /// made "found nothing stale" and "found something and failed to kill it"
+    /// indistinguishable in the UI (#542 review).
+    failed: Vec<String>,
+    needs_restart: Vec<crate::gateway_publish::ClientNeedingRestart>,
+}
+
 /// Stop obsolete gateway processes (older versions / stale paths), keeping the
 /// current resolved binary. Safe to run any time; used from Settings and launch.
-/// Returns labels of processes that were stopped.
 #[tauri::command]
-fn stop_stale_gateways(bridge: State<HttpBridgeState>) -> Vec<String> {
-    reap_stale_and_restore_bridge(bridge.inner())
+fn stop_stale_gateways(bridge: State<HttpBridgeState>, advice: State<RestartAdvice>) -> ReapOutcome {
+    reap_stale_and_restore_bridge(bridge.inner(), advice.inner())
+}
+
+/// Apps that need restarting, without running a reaper pass.
+#[tauri::command]
+fn clients_needing_restart(
+    advice: State<RestartAdvice>,
+) -> Vec<crate::gateway_publish::ClientNeedingRestart> {
+    advice.current()
+}
+
+/// Log a reaper pass. `failed` is logged separately from `killed` so "found nothing"
+/// and "found something and could not stop it" are distinguishable in a support log.
+fn log_reap_outcome(kind: &str, outcome: &ReapOutcome) {
+    if !outcome.killed.is_empty() {
+        eprintln!(
+            "toolport: {kind} stopped {} stale gateway process(es): {}",
+            outcome.killed.len(),
+            outcome.killed.join("; ")
+        );
+    }
+    if !outcome.failed.is_empty() {
+        eprintln!(
+            "toolport: {kind} could not stop {} gateway process(es): {}",
+            outcome.failed.len(),
+            outcome.failed.join("; ")
+        );
+    }
+    if !outcome.needs_restart.is_empty() {
+        eprintln!(
+            "toolport: {} app(s) are still launching an obsolete gateway and need restarting: {}",
+            outcome.needs_restart.len(),
+            outcome
+                .needs_restart
+                .iter()
+                .map(|c| format!("{} (pid {}) -> {}", c.client, c.client_pid, c.gateway))
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+    }
+}
+
+/// Entries whose client has not already been announced.
+///
+/// A later pass reads the merged advice, which by design still holds everything an
+/// earlier pass found, so it must be filtered before it becomes a second toast for
+/// the same app. Pure so the "only new clients interrupt the user" rule is pinned by
+/// a test rather than by the shape of a closure.
+fn unannounced(
+    already: &[u32],
+    current: Vec<crate::gateway_publish::ClientNeedingRestart>,
+) -> Vec<crate::gateway_publish::ClientNeedingRestart> {
+    current
+        .into_iter()
+        .filter(|c| !already.contains(&c.client_pid))
+        .collect()
+}
+
+/// Tell the frontend which apps need restarting, if any.
+fn announce_restart_needed(
+    handle: &tauri::AppHandle,
+    needs_restart: &[crate::gateway_publish::ClientNeedingRestart],
+) {
+    if needs_restart.is_empty() {
+        return;
+    }
+    if let Err(e) = handle.emit("gateway-restart-needed", needs_restart) {
+        eprintln!("toolport: could not emit gateway-restart-needed: {e}");
+    }
 }
 
 /// Run the stale reaper, then bring the supervised HTTP bridge back if the reaper
@@ -2811,7 +2940,10 @@ fn stop_stale_gateways(bridge: State<HttpBridgeState>) -> Vec<String> {
 ///
 /// Connected clients are unaffected by the new process: they authenticate with the
 /// per-client bearers in `http_clients`, not the bridge's own env token.
-fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState) -> Vec<String> {
+fn reap_stale_and_restore_bridge(
+    bridge: &HttpBridgeState,
+    advice: &RestartAdvice,
+) -> ReapOutcome {
     let mut extra_keep = Vec::new();
     if let Some(p) = clients::resolve_gateway_path() {
         extra_keep.push(p);
@@ -2822,7 +2954,14 @@ fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState) -> Vec<String> {
         let mut b = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         http_bridge_alive(&mut b).then(|| b.port).flatten()
     };
-    let killed = crate::gateway_publish::stop_stale_gateways_with_keep(&extra_keep);
+    let report = crate::gateway_publish::reap_stale(&extra_keep);
+    // Merged from this pass's pre-kill snapshot, which is the only moment it can be
+    // known. Union, not replace: see `RestartAdvice`.
+    let outcome = ReapOutcome {
+        killed: report.killed.clone(),
+        failed: report.failed.clone(),
+        needs_restart: advice.merge(report.needs_restart),
+    };
     if let Some(port) = was_serving {
         let still_serving = {
             let mut b = bridge.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2842,7 +2981,7 @@ fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState) -> Vec<String> {
                             "toolport: restarted the HTTP endpoint on port {port} after the stale \
                              reaper stopped its previous (replaced) binary"
                         );
-                        return killed;
+                        return outcome;
                     }
                     Err(e) => last = e,
                 }
@@ -2856,7 +2995,7 @@ fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState) -> Vec<String> {
             );
         }
     }
-    killed
+    outcome
 }
 
 /// Start `toolport-gateway --http <port>` as a supervised child so HTTP/OpenAPI
@@ -3182,6 +3321,7 @@ pub fn run() {
         .manage(Mutex::new(registry))
         .manage(Mutex::new(HttpBridge::default()))
         .manage(PendingShare::default())
+        .manage(RestartAdvice::default())
         .invoke_handler(tauri::generate_handler![
             detect_clients,
             get_registry,
@@ -3279,6 +3419,7 @@ pub fn run() {
             http_bridge_status,
             stop_spawned_gateways,
             stop_stale_gateways,
+            clients_needing_restart,
         ])
         // Close-to-tray: the window's X hides it instead of quitting, so the gateway and
         // approval broker keep running (HITL only works while the app is alive). Quit is
@@ -3407,26 +3548,35 @@ pub fn run() {
                 // Both passes go through `reap_stale_and_restore_bridge` so a supervised
                 // HTTP bridge the reaper stops (correctly, when its binary was replaced)
                 // comes back instead of leaving HTTP/OpenAPI clients dark (SOU-418).
-                let stale = reap_stale_and_restore_bridge(migrate_handle.state::<HttpBridgeState>().inner());
-                if !stale.is_empty() {
-                    eprintln!(
-                        "toolport: stopped {} stale gateway process(es): {}",
-                        stale.len(),
-                        stale.join("; ")
-                    );
-                }
+                //
+                // The FIRST pass is the one that can see the restart advice: it runs
+                // before anything has been killed, so its snapshot still holds the
+                // obsolete gateways their clients spawned. The delayed pass contributes
+                // whatever raced in after it, which the union in `RestartAdvice`
+                // folds together rather than overwriting.
+                let advice_state = migrate_handle.state::<RestartAdvice>();
+                let stale = reap_stale_and_restore_bridge(
+                    migrate_handle.state::<HttpBridgeState>().inner(),
+                    advice_state.inner(),
+                );
+                log_reap_outcome("stale reaper", &stale);
+                announce_restart_needed(&migrate_handle, &stale.needs_restart);
+                // What the user has already been told about. The delayed pass reads
+                // the MERGED list, which by design still contains everything the
+                // first pass found, so announcing it wholesale would toast the same
+                // apps twice three seconds apart. Only genuinely new clients are
+                // worth interrupting for; the Settings panel is the durable view.
+                let already_announced: Vec<u32> =
+                    stale.needs_restart.iter().map(|c| c.client_pid).collect();
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_secs(3));
                     let again = reap_stale_and_restore_bridge(
                         migrate_handle.state::<HttpBridgeState>().inner(),
+                        migrate_handle.state::<RestartAdvice>().inner(),
                     );
-                    if !again.is_empty() {
-                        eprintln!(
-                            "toolport: delayed reaper stopped {} more stale gateway process(es): {}",
-                            again.len(),
-                            again.join("; ")
-                        );
-                    }
+                    log_reap_outcome("delayed reaper", &again);
+                    let newly_found = unannounced(&already_announced, again.needs_restart);
+                    announce_restart_needed(&migrate_handle, &newly_found);
                 });
             });
 
@@ -4236,5 +4386,171 @@ mod tests {
         assert!(!s.contains("sk-live-xyz"), "secret token leaked: {s}");
         assert!(s.contains("<redacted>"), "missing redaction marker: {s}");
         assert!(s.contains("https://api.example.com/path"), "safe URL was over-redacted: {s}");
+    }
+
+    // ----- SOU-435: restart advice survives later passes ----------------------
+
+    fn advice_entry(pid: u32, client: &str) -> crate::gateway_publish::ClientNeedingRestart {
+        crate::gateway_publish::ClientNeedingRestart {
+            client: client.into(),
+            client_pid: pid,
+            gateway: "toolport-gateway-1.9.4.exe".into(),
+        }
+    }
+
+    /// A pid guaranteed to be running for the length of the test.
+    fn live_pid() -> u32 {
+        std::process::id()
+    }
+
+    /// A pid guaranteed not to be running. Near the top of the numeric range, so it
+    /// is not a pid any real process on the machine would have been assigned.
+    fn dead_pid() -> u32 {
+        u32::MAX - 1
+    }
+
+    /// The exact #542 failure, as a test.
+    ///
+    /// Launch pass finds "restart Claude" and kills the process. The user opens
+    /// Settings and clicks Run. Claude has not made a tool call yet, so that pass
+    /// finds nothing. The old code wrote unconditionally, so the empty result erased
+    /// the advice and the UI then claimed nothing was stale while Claude was still
+    /// pinned to an obsolete binary.
+    #[test]
+    fn an_empty_later_pass_does_not_erase_earlier_advice() {
+        let advice = RestartAdvice::default();
+        let pid = live_pid();
+
+        let after_launch = advice.merge(vec![advice_entry(pid, "claude.exe")]);
+        assert_eq!(after_launch.len(), 1, "launch pass records the advice");
+
+        // The Settings button: a second pass whose snapshot is empty.
+        let after_button = advice.merge(Vec::new());
+        assert_eq!(
+            after_button,
+            after_launch,
+            "an empty pass must not erase advice the user has not acted on yet"
+        );
+        assert_eq!(
+            advice.current().len(),
+            1,
+            "and the panel must still have something to show"
+        );
+    }
+
+    /// A second live pid, for union cases that need two distinct surviving entries.
+    /// Killed by the caller; the merge only ever asks whether the pid is running.
+    fn spawn_live_child() -> std::process::Child {
+        let mut cmd = if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/c", "ping", "-n", "30", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sleep");
+            c.arg("30");
+            c
+        };
+        cmd.stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a short-lived helper process")
+    }
+
+    /// Union across SEPARATE passes is the behaviour `RestartAdvice` exists for:
+    /// the delayed launch pass must add what it finds without discarding what the
+    /// first pass already recorded.
+    #[test]
+    fn merge_unions_apps_found_by_different_passes() {
+        let advice = RestartAdvice::default();
+        let mut child = spawn_live_child();
+        let other_pid = child.id();
+
+        let first = advice.merge(vec![advice_entry(live_pid(), "claude.exe")]);
+        assert_eq!(first.len(), 1);
+
+        // A later pass finds a genuinely different app. Both must survive.
+        let merged = advice.merge(vec![advice_entry(other_pid, "grok.exe")]);
+        let mut names: Vec<&str> = merged.iter().map(|c| c.client.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            vec!["claude.exe", "grok.exe"],
+            "a later pass adds to the advice instead of replacing it"
+        );
+
+        child.kill().ok();
+        child.wait().ok();
+    }
+
+    #[test]
+    fn merge_keeps_one_row_per_app() {
+        let advice = RestartAdvice::default();
+        let pid = live_pid();
+
+        advice.merge(vec![advice_entry(pid, "claude.exe")]);
+        // The same app seen by a later pass is still one restart to perform.
+        let merged = advice.merge(vec![advice_entry(pid, "claude.exe")]);
+        assert_eq!(merged.len(), 1);
+
+        // Same app, second obsolete gateway: still one thing for the user to do.
+        let mut second_gateway = advice_entry(pid, "claude.exe");
+        second_gateway.gateway = "toolport-gateway-1.9.5.exe".into();
+        let merged = advice.merge(vec![second_gateway]);
+        assert_eq!(
+            merged.len(),
+            1,
+            "advice is keyed by client pid, so one row per app regardless of gateway count"
+        );
+    }
+
+    /// Compliance is only observable through the pid disappearing. Absence of a
+    /// respawned gateway is not evidence: a client that has not made a tool call yet
+    /// looks exactly the same.
+    #[test]
+    fn advice_expires_once_the_user_restarts_the_app() {
+        let advice = RestartAdvice::default();
+        let stored = advice.merge(vec![advice_entry(dead_pid(), "claude.exe")]);
+        assert!(
+            stored.is_empty(),
+            "a client pid that is no longer running means the app was restarted"
+        );
+        assert!(advice.current().is_empty());
+    }
+
+    #[test]
+    fn expiry_is_per_entry_not_all_or_nothing() {
+        let advice = RestartAdvice::default();
+        let merged = advice.merge(vec![
+            advice_entry(live_pid(), "claude.exe"),
+            advice_entry(dead_pid(), "grok.exe"),
+        ]);
+        assert_eq!(merged.len(), 1, "only the restarted app drops out");
+        assert_eq!(merged[0].client, "claude.exe");
+    }
+
+    /// The delayed launch pass reads the merged advice, so without this filter the
+    /// same app would toast twice three seconds apart (Copilot review, PR #622).
+    #[test]
+    fn only_newly_seen_clients_are_announced_again() {
+        let first = advice_entry(101, "claude.exe");
+        let second = advice_entry(202, "grok.exe");
+        let already = vec![first.client_pid];
+
+        // The delayed pass sees the merged list: the first app plus a new one.
+        let merged = vec![first.clone(), second.clone()];
+        assert_eq!(
+            unannounced(&already, merged),
+            vec![second],
+            "only the app the user has not been told about interrupts them again"
+        );
+
+        // Nothing new raced in: the merged list is entirely old news.
+        assert!(
+            unannounced(&already, vec![first]).is_empty(),
+            "re-announcing stored advice would double-toast the same app"
+        );
+
+        // Nothing announced yet (an empty first pass): everything is new.
+        assert_eq!(unannounced(&[], vec![advice_entry(303, "cursor.exe")]).len(), 1);
     }
 }
