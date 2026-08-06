@@ -3386,12 +3386,16 @@ fn content_binding_decision(
     }
 }
 
-/// Post-HITL revalidation against the *live* router (SOU-321 / SOU-322).
+/// Post-HITL revalidation against the *live* router (SOU-321 / SOU-322 / SOU-478).
 ///
 /// After a human approves, the world may have changed during the hold: quarantine may have
-/// forked a new `Arc<Router>` via `Arc::make_mut`, or the tool definition may have drifted.
+/// forked a new `Arc<Router>` via `Arc::make_mut`, the tool definition may have drifted, or
+/// a rebuild may have re-homed the exposed name onto a different owning server.
 /// The request-scoped snapshot used for the gate is intentionally kept for pre-HITL
 /// consistency, but execution must fail closed if:
+/// - the live route maps the exposed name to a different server than the human approved
+///   against (SOU-478: `integrity::fingerprint` does not hash the owner, so an identical
+///   tool definition on another server would otherwise pass),
 /// - the live definition fingerprint no longer matches what was approved (or is gone), or
 /// - the live router now blocks the exposed tool (quarantine / policy).
 ///
@@ -3404,8 +3408,20 @@ fn content_binding_decision(
 fn post_hitl_revalidation(
     approved_fingerprint: Option<&str>,
     name: &str,
+    gate_server_id: &str,
     live: &Router,
 ) -> Option<approval::ApprovalDecision> {
+    // SOU-478: owner identity is not in the definition fingerprint. Two server ids that
+    // sanitize to the same prefix (`gh-api` / `gh_api`) can flip who owns the bare exposed
+    // name after a mid-hold rebuild; refuse rather than run under the wrong policy/audit.
+    match live.route_of(name) {
+        Some((live_srv, _)) if live_srv == gate_server_id => {}
+        Some(_) => return Some(approval::ApprovalDecision::StaleState),
+        None if !gate_server_id.is_empty() => {
+            return Some(approval::ApprovalDecision::StaleState);
+        }
+        None => {}
+    }
     let live_fp = live
         .aggregated_tools()
         .iter()
@@ -3688,6 +3704,9 @@ fn execute_call(
     let mut exec_router_owned: Option<Arc<Router>> = None;
     let mut active_modern_hitl: Option<String> = None;
     let mut routed_mrtr: Option<MrtrRequest> = None;
+    // Defer the "approved" audit line until after the exec-route rebind so it names
+    // the same (server, tool) as route_call / defense / inspect (CodeRabbit on SOU-478).
+    let mut pending_approval_audit: Option<(&'static str, u64)> = None;
 
     // Human-in-the-loop approval: gate a destructive or untrusted call until a
     // person approves it in the Toolport app. Legacy clients hold this request;
@@ -3883,13 +3902,17 @@ fn execute_call(
                 );
                 return refused_call_result(name, stale, reason_str);
             }
-            // Rebind to the live router and re-check fingerprint + quarantine
-            // (SOU-321 / SOU-322). The request snapshot may predate a mid-hold
-            // `requarantine` that forked a new Arc via `make_mut`.
+            // Rebind to the live router and re-check owner + fingerprint + quarantine
+            // (SOU-321 / SOU-322 / SOU-478). The request snapshot may predate a mid-hold
+            // `requarantine` that forked a new Arc via `make_mut`, or a rebuild that
+            // re-homed the exposed name onto a different server.
             if let Some(live) = clone_live_router(live_router) {
-                if let Some(stale) =
-                    post_hitl_revalidation(approved_fp.as_deref(), name, &live)
-                {
+                if let Some(stale) = post_hitl_revalidation(
+                    approved_fp.as_deref(),
+                    name,
+                    server_id,
+                    &live,
+                ) {
                     finish_modern_hitl(active_modern_hitl.as_deref());
                     audit::record_decision(
                         srv,
@@ -3904,18 +3927,9 @@ fn execute_call(
                 }
                 exec_router_owned = Some(live);
             }
-            // Approved calls are audited too, so the trail shows what actually ran,
-            // not only what was blocked.
+            // Defer the approval audit until after the exec-route rebind below.
             if audit_approval {
-                audit::record_decision(
-                    srv,
-                    tool,
-                    client,
-                    reason_str,
-                    "approved",
-                    &arguments,
-                    Some(held_ms),
-                );
+                pending_approval_audit = Some((reason_str, held_ms));
             }
             // Skip the agent-confirm step and route the call.
             confirmed = true;
@@ -3933,6 +3947,31 @@ fn execute_call(
     }
 
     let exec_router: &Router = exec_router_owned.as_deref().unwrap_or(router);
+
+    // SOU-478: bind every post-gate consumer (confirm, progress, audit, content
+    // defense, inspect) to the route identity on the router that will execute.
+    // After HITL, that is the live Arc revalidated above; otherwise it is the
+    // request snapshot and this rebind is a no-op. Owner flips during a hold are
+    // already refused by post_hitl_revalidation; rebinding still keeps audit and
+    // per-server defense policy aligned with the executing route if the original
+    // tool name changes under a rename/override rebuild.
+    let (server_id, tool) = exec_router.route_of(name).unwrap_or((server_id, tool));
+    let srv_owned = sanitize_segment(server_id);
+    let srv = srv_owned.as_str();
+
+    // Approval decision audit uses the rebound identity so the trail matches
+    // the server/tool that will actually run (and that content defense uses).
+    if let Some((reason_str, held_ms)) = pending_approval_audit {
+        audit::record_decision(
+            srv,
+            tool,
+            client,
+            reason_str,
+            "approved",
+            &arguments,
+            Some(held_ms),
+        );
+    }
 
     // Per-call confirmation for destructive tools: intercept the first
     // call with these arguments, store it, and return a preview. The
@@ -4007,13 +4046,9 @@ fn execute_call(
     // spoof check compares like with like. Held in a named binding so the RAII
     // guard lives across the call rather than dropping immediately.
     //
-    // The producer must come from the router that will actually execute the call,
-    // not the request snapshot `server_id` was resolved from. A rebuild during a
-    // HITL hold can re-route the tool to a different server, and a route
-    // registered against the pre-hold producer fails the spoof check on every
-    // notification the new one sends - silently dropping the whole stream (SOU-474).
-    let exec_server_id = exec_router.route_of(name).map_or(server_id, |(srv, _)| srv);
-    let (_progress_route, relay_owned) = prepare_progress(client_meta, exec_server_id);
+    // Identity already comes from `exec_router` via the SOU-478 rebind above
+    // (SOU-474 originally fixed only this progress path).
+    let (_progress_route, relay_owned) = prepare_progress(client_meta, server_id);
     let client_meta = relay_owned.as_ref().or(client_meta);
 
     let started = Instant::now();
@@ -6863,6 +6898,8 @@ fn watch_registry(
     resource_updated: Option<ResourceUpdatedDispatch>,
     // Subscription table so rebuilds re-issue resources/subscribe.
     resource_subs: Option<Arc<Mutex<ResourceSubscriptionTable>>>,
+    // Single-flight with startup self-heal and ${ROOT} rebuilds (SOU-337).
+    rebuild_lock: Arc<Mutex<()>>,
 ) {
     eprintln!("toolport: watching registry at {}", path.display());
     let mut state = WatchLoopState {
@@ -6893,6 +6930,7 @@ fn watch_registry(
             Some(&mcp_sessions),
             resource_updated.as_ref(),
             resource_subs.as_ref(),
+            &rebuild_lock,
             &mut state,
         );
     }
@@ -6921,6 +6959,9 @@ fn watch_tick(
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
     resource_updated: Option<&ResourceUpdatedDispatch>,
     resource_subs: Option<&Arc<Mutex<ResourceSubscriptionTable>>>,
+    // Serializes full rebuilds with self-heal / ${ROOT} (SOU-337). Unused on the
+    // in-place list_changed refresh branch, which does not spawn.
+    rebuild_lock: &Arc<Mutex<()>>,
     state: &mut WatchLoopState,
 ) -> TickOutcome {
     // Re-approving a tool rewrites quarantine.json, which is NOT the registry file
@@ -7024,7 +7065,13 @@ fn watch_tick(
             *guard = resolved.clone();
             prev
         };
-        // Build the new router (spawns processes) before taking locks.
+        // Full rebuild spawns stdio children. Single-flight with startup self-heal
+        // and ${ROOT} rebuild so two concurrent build_router+swap paths cannot
+        // double-spawn and kill the loser's children on Drop (SOU-337).
+        let _rebuild = rebuild_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Build the new router (spawns processes) before taking the router lock.
         let new_router = build_router(
             &new_reg,
             resolved.as_deref(),
@@ -7188,10 +7235,11 @@ struct GatewayState {
     stdout: Arc<Mutex<std::io::Stdout>>,
     ready: Arc<AtomicBool>,
     downstream_dirty: Arc<AtomicU8>,
-    /// Serializes the self-heal rebuild so a startup burst of concurrent tools/call
-    /// workers that all observe an empty router don't each spawn the full server set
-    /// (single-flight). The winner rebuilds; the others block here, then re-check
-    /// server_count under the router lock and skip.
+    /// Serializes every full `build_router` + router swap: startup background build,
+    /// empty-router self-heal, `${ROOT}` rebuild, and registry-watcher full rebuild
+    /// (SOU-337). Without this, overlapping builds double-spawn stdio children and
+    /// the loser's Drop kills mid-flight work. In-place tools/list_changed refresh
+    /// does not take it (no spawn).
     rebuild_lock: Arc<Mutex<()>>,
     lazy: bool,
     /// Live-updated: the registry watcher keeps this in sync with
@@ -11322,6 +11370,7 @@ fn main() {
         let mcp_sessions = Arc::clone(&mcp_sessions);
         let resource_updated = resource_updated_sink.clone();
         let resource_subs_watch = Arc::clone(&resource_subs);
+        let rebuild_lock = Arc::clone(&rebuild_lock);
         std::thread::spawn(move || {
             watch_registry(
                 path,
@@ -11339,6 +11388,7 @@ fn main() {
                 mcp_sessions,
                 resource_updated,
                 Some(resource_subs_watch),
+                rebuild_lock,
             )
         });
     }
@@ -12225,6 +12275,7 @@ mod tests {
             post_hitl_revalidation(
                 approved_fp.as_deref(),
                 "s__wipe",
+                "s",
                 live.lock().unwrap().as_ref(),
             ),
             Some(approval::ApprovalDecision::StaleState),
@@ -12232,7 +12283,7 @@ mod tests {
         );
         // Control: revalidating the stale snapshot alone would wrongly pass.
         assert!(
-            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &snapshot).is_none(),
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", "s", &snapshot).is_none(),
             "snapshot-only check would miss the bug this test guards"
         );
     }
@@ -12277,11 +12328,11 @@ mod tests {
             tool_fingerprint_for("s__wipe", &[], &after_drift).as_deref(),
         );
         assert_eq!(
-            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &after_drift),
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", "s", &after_drift),
             Some(approval::ApprovalDecision::StaleState),
         );
         assert!(
-            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &at_gate).is_none(),
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", "s", &at_gate).is_none(),
             "unchanged definition must still pass"
         );
     }
@@ -12296,6 +12347,7 @@ mod tests {
         assert!(post_hitl_revalidation(
             approved_fp.as_deref(),
             "s__wipe",
+            "s",
             live.lock().unwrap().as_ref(),
         )
         .is_none());
@@ -12314,7 +12366,7 @@ mod tests {
         // not use it — missing live definition is StaleState.
         let _stale_cache = snapshot.aggregated_tools();
         assert_eq!(
-            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &live),
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", "s", &live),
             Some(approval::ApprovalDecision::StaleState),
         );
     }
@@ -12354,15 +12406,82 @@ mod tests {
             post_hitl_revalidation(
                 approved_fp.as_deref(),
                 "s__wipe",
+                "s",
                 live.lock().unwrap().as_ref(),
             )
             .is_none(),
             "a mid-hold release on the live Arc must clear the post-HITL block"
         );
         assert_eq!(
-            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", &snapshot),
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", "s", &snapshot),
             Some(approval::ApprovalDecision::StaleState),
             "the pre-hold snapshot would still wrongly block"
+        );
+    }
+
+    /// SOU-478: a mid-hold rebuild can re-home an exposed name onto a different owning
+    /// server when two ids sanitize to the same prefix (`gh-api` / `gh_api`). Definition
+    /// fingerprints match (identical tools), so only the owner check fails closed.
+    ///
+    /// Mutation check: drop the `gate_server_id` comparison in `post_hitl_revalidation`
+    /// and this test must fail (fingerprint alone would allow execute).
+    #[test]
+    fn post_hitl_revalidation_rejects_server_owner_flip() {
+        let tool_def = json!({ "name": "wipe", "description": "delete rows" });
+        let with_order = |first: &str, second: &str| {
+            let mut r = Router::new();
+            for id in [first, second] {
+                let ds = DownstreamServer::connect(
+                    id.into(),
+                    Box::new(MockRoute {
+                        tools: vec![tool_def.clone()],
+                    }),
+                )
+                .unwrap();
+                r.add(ds);
+            }
+            r
+        };
+        // First writer owns the bare `gh_api__wipe` name; second takes `_2`.
+        let at_gate = with_order("gh-api", "gh_api");
+        let after_flip = with_order("gh_api", "gh-api");
+        let exposed = "gh_api__wipe";
+        assert_eq!(at_gate.route_of(exposed), Some(("gh-api", "wipe")));
+        assert_eq!(after_flip.route_of(exposed), Some(("gh_api", "wipe")));
+        assert_ne!(
+            at_gate.route_of(exposed).map(|(s, _)| s),
+            after_flip.route_of(exposed).map(|(s, _)| s),
+            "fixture must actually flip the owner"
+        );
+
+        let approved_fp = tool_fingerprint_for(exposed, &[], &at_gate);
+        assert!(approved_fp.is_some());
+        assert_eq!(
+            approved_fp.as_deref(),
+            tool_fingerprint_for(exposed, &[], &after_flip).as_deref(),
+            "identical definitions: fingerprint alone cannot catch the owner flip"
+        );
+
+        assert_eq!(
+            post_hitl_revalidation(approved_fp.as_deref(), exposed, "gh-api", &after_flip),
+            Some(approval::ApprovalDecision::StaleState),
+            "owner flip must StaleState even when fingerprints match"
+        );
+        assert!(
+            post_hitl_revalidation(approved_fp.as_deref(), exposed, "gh-api", &at_gate).is_none(),
+            "unchanged owner must still pass"
+        );
+    }
+
+    /// SOU-478: missing live route for a tool that had a known owner at gate is StaleState.
+    #[test]
+    fn post_hitl_revalidation_rejects_missing_live_owner() {
+        let at_gate = routed_router("s", "wipe");
+        let approved_fp = tool_fingerprint_for("s__wipe", &[], &at_gate);
+        let live = Router::new();
+        assert_eq!(
+            post_hitl_revalidation(approved_fp.as_deref(), "s__wipe", "s", &live),
+            Some(approval::ApprovalDecision::StaleState),
         );
     }
 
@@ -17791,6 +17910,7 @@ mod tests {
         };
 
         // First tick: pick up the quarantined tool from disk.
+        let rebuild_lock = Arc::new(Mutex::new(()));
         let load = watch_tick(
             &reg_path,
             &registry,
@@ -17807,6 +17927,7 @@ mod tests {
             None,
             None,
             None,
+            &rebuild_lock,
             &mut state,
         );
         assert!(
@@ -17836,6 +17957,7 @@ mod tests {
             None,
             None,
             None,
+            &rebuild_lock,
             &mut state,
         );
         assert!(steady.idle_after_quarantine);
@@ -17859,6 +17981,7 @@ mod tests {
             None,
             None,
             None,
+            &rebuild_lock,
             &mut state,
         );
         assert!(
