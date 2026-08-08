@@ -124,11 +124,64 @@ pub struct ServerEntry {
     /// an empty list means every tool the server advertises is exposed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_tools: Vec<String>,
+    /// Headless outbound OAuth for an HTTP server (SBS-524). Presence of this
+    /// block is what selects the client-credentials flow; absence leaves
+    /// interactive OAuth and pasted-token behaviour exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_credentials: Option<ClientCredentials>,
     /// Per-server fields written by a newer build that this binary doesn't know
     /// about. Captured on load and re-emitted on save so a mixed-version binary
     /// never strips them (same contract as `Registry::unknown_fields`).
     #[serde(flatten)]
     pub unknown_fields: serde_json::Map<String, serde_json::Value>,
+}
+
+/// Non-secret configuration for the OAuth client-credentials flow (SBS-524).
+///
+/// Deliberately holds no secret. The client secret lives in the OS vault under
+/// [`crate::secrets::CLIENT_SECRET_KEY`], because this struct is written to
+/// `registry.json`, copied into config backups, and included in exports. The
+/// client id, scopes and auth method are not credentials and are useful to see
+/// in the file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientCredentials {
+    /// OAuth client identifier issued by the authorization server.
+    pub client_id: String,
+    /// `client_secret_basic` | `client_secret_post` | `private_key_jwt`.
+    /// Unset means negotiate from the server's advertised methods.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_endpoint_auth_method: Option<String>,
+    /// Space-delimited scopes to request. Unset means use what discovery
+    /// advertises for the protected resource.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    /// Forward-compat, same contract as `ServerEntry::unknown_fields`.
+    ///
+    /// Sanitized by [`Self::strip_secret_fields`] wherever this crosses a trust
+    /// boundary: forward-compat must not become a smuggling channel for a
+    /// credential this type is specifically designed never to hold.
+    #[serde(flatten)]
+    pub unknown_fields: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ClientCredentials {
+    /// Drop any forward-compat field whose name looks like a credential.
+    ///
+    /// `unknown_fields` exists so a newer build's additions survive a round trip
+    /// through an older one. That is the right default for configuration, and the
+    /// wrong one for secrets: a `clientSecret` key written by hand into
+    /// registry.json, or present in a team payload, would otherwise be preserved
+    /// and then pushed to the org control plane and every teammate by
+    /// `team_server_export` -- the exact leak this struct's shape is meant to make
+    /// impossible.
+    ///
+    /// Name-based and deliberately broad. A real forward-compat field is free to
+    /// avoid the word; a credential that slips through is not recoverable.
+    pub fn strip_secret_fields(&mut self) {
+        self.unknown_fields
+            .retain(|k, _| !k.to_ascii_lowercase().contains("secret"));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -2035,6 +2088,7 @@ mod tests {
             source: Some("manual".to_string()),
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -3064,6 +3118,7 @@ mod tests {
             source: None,
             disabled_tools: vec![],
             cwd: None,
+            client_credentials: None,
             unknown_fields: serde_json::Map::new(),
         });
         // Inject a per-server field this binary's ServerEntry doesn't define.
