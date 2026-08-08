@@ -23,7 +23,7 @@ use std::io::{BufRead, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
@@ -31,6 +31,7 @@ use serde_json::{json, Value};
 use conduit_lib::{audit, usage_report};
 use conduit_lib::clients;
 use conduit_lib::codemode;
+use conduit_lib::pii;
 use conduit_lib::downstream::{
     self, CacheHint, DownstreamServer, MrtrRequest, ResourceUpdatedSink, ServerRequestAction,
     ServerRequestHandler, StdioTransport, Transport,
@@ -3616,6 +3617,22 @@ fn execute_call(
     // `None` only in test wrappers that lack `GatewayState`.
     live_router: Option<&Arc<Mutex<Arc<Router>>>>,
 ) -> Value {
+    // Turn pseudonyms back into real values BEFORE anything inspects the arguments
+    // (SBS-346).
+    //
+    // Every gate downstream of here reads them: the human-approval prompt, the
+    // destructive-call confirmation preview, the content-binding hash, and the
+    // audit record. An approver asked to authorize a send to `⟦EMAIL_1⟧` cannot
+    // make an informed decision, and a hash taken over pseudonyms would not
+    // describe the call actually dispatched. Re-hydrating once, up front, keeps
+    // all of them consistent with what the downstream server receives.
+    //
+    // A no-op when the feature is off or nothing was ever tokenized.
+    let mut arguments = arguments;
+    if reg.pii_redaction_effective() {
+        with_pii_session(client, |map| pii::rehydrate_args(map, &mut arguments));
+    }
+
     let mut confirmed = opts.confirmed;
     let shape = opts.shape;
     if !opts.allow_app_only && !named_tool_is_model_visible(name, cached, router) {
@@ -4185,6 +4202,66 @@ struct CallOpts {
 /// When opt-in block-on-injection is effective for `srv` (SOU-345) and the scanner hits
 /// high confidence, the labeled body is withheld and replaced with an `isError` security
 /// message so the agent never sees the payload as a successful result.
+/// PII token maps, one per client (SBS-346).
+///
+/// Keyed by client, NOT process-global. One gateway process serves several
+/// clients over the HTTP bridge, each with its own bearer token, so a single
+/// shared map would let a token minted from client A's result be re-hydrated into
+/// client B's outgoing call -- handing A's real PII to B's downstream server.
+/// That is the exact leak this feature exists to prevent, so isolation is
+/// enforced here rather than assumed from "one process per stdio client".
+///
+/// `None` (the local stdio client, and Toolport's own internal calls) gets its own
+/// reserved key rather than sharing with the first HTTP client to connect.
+///
+/// Ephemeral by construction: these live in memory and die with the process, so
+/// no PII reaches disk. Never serialized, never travels in a result.
+fn pii_sessions() -> &'static Mutex<HashMap<String, pii::SessionMap>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<String, pii::SessionMap>>> = OnceLock::new();
+    SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Reserved key for the local stdio client, which has no bearer identity. Carries a
+/// NUL so it cannot collide with a real client id.
+const PII_LOCAL_SESSION: &str = "\0local";
+
+/// Run `f` against one client's map.
+///
+/// A poisoned lock is recovered rather than propagated: the map is a cache, and
+/// failing every tool call because one thread panicked mid-pass would be a worse
+/// outcome than continuing with whatever it already holds.
+fn with_pii_session<T>(client: Option<&str>, f: impl FnOnce(&mut pii::SessionMap) -> T) -> T {
+    let mut sessions = pii_sessions()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let map = sessions
+        .entry(client.unwrap_or(PII_LOCAL_SESSION).to_string())
+        .or_insert_with(pii::SessionMap::new);
+    f(map)
+}
+
+/// Pseudonymize a result's text blocks in place, returning how many values were
+/// replaced. Zero when the feature is off.
+///
+/// Runs BEFORE content-defense so the injection wrapper, which is Toolport's own
+/// text rather than untrusted content, is not scanned as if it were PII.
+///
+/// An incomplete pass is logged. This path fails OPEN -- a full map or an over-cap
+/// result leaves values in the clear -- and the whole point of returning
+/// `complete` was so that could be noticed rather than assumed away.
+fn pseudonymize_if_enabled(reg: &Registry, client: Option<&str>, result: &mut Value) -> usize {
+    if !reg.pii_redaction_effective() {
+        return 0;
+    }
+    let out = with_pii_session(client, |map| pii::pseudonymize_result(map, result));
+    if !out.complete {
+        eprintln!(
+            "toolport: PII pseudonymization was incomplete for this result - some values              reached the model in the clear (the session map is full, or the result exceeded              the scan cap)."
+        );
+    }
+    out.replaced
+}
+
 fn defend_and_shape(
     reg: &Registry,
     srv: &str,
@@ -4198,6 +4275,9 @@ fn defend_and_shape(
     // Block mode alone must still run the scanner: an org forceBlockOnInjection (or a
     // local blockOnInjection) with contentDefense off would otherwise silently do
     // nothing (SOU-345).
+    // PII first, then injection defense: the wrap must go around already-
+    // pseudonymized text, not the other way round.
+    pseudonymize_if_enabled(reg, client, &mut result);
     if reg.content_defense_effective() || reg.block_on_injection_effective() {
         let block = reg.should_block_injection_for(srv);
         if let Some(msg) = integrity::defend_content(srv, tool, &mut result, block) {
@@ -5309,6 +5389,12 @@ fn handle_request_with_cancel(
                     // result, so scan it for injection and label any flagged text as data.
                     // Block mode (SOU-345) uses the owning server id for the exempt map
                     // and still runs when contentDefense is off but block is on.
+                    // Independent of content defense: PII redaction is its own
+                    // setting, and nesting it under the injection guard would make
+                    // it silently do nothing whenever content defense was off.
+                    if !preserve_mcp_app {
+                        pseudonymize_if_enabled(reg, client, &mut result);
+                    }
                     if !preserve_mcp_app
                         && (reg.content_defense_effective()
                             || reg.block_on_injection_effective())
@@ -5402,6 +5488,8 @@ fn handle_request_with_cancel(
                     // scan for injection and label any flagged text as data.
                     // Block mode (SOU-345) uses the owning server id for the exempt map
                     // and still runs when contentDefense is off but block is on.
+                    // Independent of content defense, same reasoning as resources.
+                    pseudonymize_if_enabled(reg, client, &mut result);
                     if reg.content_defense_effective() || reg.block_on_injection_effective() {
                         let srv = router.prompt_server(name).unwrap_or(name);
                         let block = reg.should_block_injection_for(srv);
