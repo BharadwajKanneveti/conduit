@@ -6,6 +6,19 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [1.12.0] - 2026-08-09
 
+Two features ship for the first time here. Toolport can now replace personal data in
+tool results with pseudonyms before the model sees them, putting the real values back
+only for the server that provided them; and headless MCP servers can authenticate
+with OAuth client credentials, so a server nobody can click through a browser sign-in
+for still gets a real token. Both are off or opt-in by default.
+
+Alongside them, several things that were only safe within one process are now safe
+across processes: rate-limit counters, OAuth token refresh, and the pseudonym map.
+Each client spawns its own gateway, so "one process" was never the real shape.
+
+**Upgrading a Teams deployment:** the instructions receipt hash changes once in this
+release. See the Changed section below before you roll it out.
+
 ### Added
 
 - Old gateway binaries are now cleaned up instead of accumulating forever. Every
@@ -76,6 +89,14 @@ Entries before the rename below shipped under the project's former name, Conduit
   already committed. (SBS-646, SBS-647)
 - The gateway binary now supports `--help` and `--version` and rejects unknown flags
   instead of silently ignoring them.
+
+### Changed
+
+- The team-instructions receipt hash now uses SHA-256 instead of Rust's default
+  hasher, whose algorithm carries no guarantee across compiler releases. **This
+  changes every member's reported hash once.** The Teams coverage dashboard will show
+  one round of drift that is not real drift; it reconverges as members report in on
+  this version. The hash is the same width and format as before. (SBS-460)
 
 ### Security
 
@@ -157,17 +178,9 @@ Entries before the rename below shipped under the project's former name, Conduit
   identity. Only `.exe`, `.cmd` and `.ps1` were recognized as package runners, so two
   servers running different packages under one display name collapsed into a single
   import and a pasted config was named "npx". (SBS-664)
-- Toolport for Teams links now come from one place, and the onboarding "What is
-  Toolport for Teams?" link deliberately points at the explainer page rather than the
-  app sign-in. (SBS-461)
-
-### Changed
-
-- The team-instructions receipt hash now uses SHA-256 instead of Rust's default
-  hasher, whose algorithm carries no guarantee across compiler releases. **This
-  changes every member's reported hash once.** The Teams coverage dashboard will show
-  one round of drift that is not real drift; it reconverges as members report in on
-  this version. The hash is the same width and format as before. (SBS-460)
+- The onboarding "What is Toolport for Teams?" link now deliberately opens the
+  explainer page rather than the app sign-in, which is the right destination for
+  someone who has no team and no invite code yet. (SBS-461)
 
 ### Maintenance
 
@@ -181,33 +194,42 @@ Entries before the rename below shipped under the project's former name, Conduit
 - Regression tests now pin that pseudonyms are resolved as the last step before a call
   leaves the machine. That ordering had regressed once before without any test
   noticing. (SBS-614)
-- CodeRev now reviews pull requests as an advisory shadow reviewer, once per PR.
-- Client configs written by Toolport keep their JSONC comments, and all text files
-  check out with LF endings on every platform.
+- The three Toolport for Teams URLs now come from one place instead of being declared
+  separately in two components, with a third hardcoded alongside them. (SBS-461)
+- CodeRev now reviews pull requests as an advisory shadow reviewer, once per PR
+  rather than on every push.
+- All text files check out with LF endings on every platform, and the reaper test
+  fixtures share one scratch-directory guard instead of serializing on a mutex.
 
 ### Thanks
 
-Patches this cycle came from:
+Ten people sent patches this cycle. Two new clients, a config-corruption fix that
+protects anyone hand-editing their MCP files, and the CI job that now guards the
+gateway's security suite all came from outside the core:
 
-- **[alexgaribay](https://github.com/alexgaribay)** - Kimi CLI support and a fix for
+- **[Vermitrude](https://github.com/Vermitrude)** - Factory Droid CLI support, and
+  `--help` / `--version` on the gateway binary, which previously accepted unknown
+  flags silently (#579, #627).
+- **[slegarraga](https://github.com/slegarraga)** - removed a dead data-directory
+  shim and corrected three pieces of CONTRIBUTING that had drifted from the code
+  (#638, #639, #642).
+- **[rohankumardubey](https://github.com/rohankumardubey)** - put the headless
+  gateway security smoke suite into CI, where it had never run, and exposed sidebar
+  and toggle state to screen readers (#580, #621).
+- **[syf2211](https://github.com/syf2211)** - turned raw stack traces into readable
+  headlines for DNS, TLS, 429 and 5xx connection failures, and made catalog search
+  include the category so searching a visible heading actually matches (#611, #614).
+- **[alexgaribay](https://github.com/alexgaribay)** - Kimi CLI support, and a fix for
   duplicate Tauri context creation across startup paths (#658, #662).
-- **[slegarraga](https://github.com/slegarraga)** - dead data-dir shim removal and
-  CONTRIBUTING accuracy fixes (#638, #639, #642).
-- **[Vermitrude](https://github.com/Vermitrude)** - Factory Droid CLI support and
-  gateway `--help`/`--version` handling (#369, #627).
-- **[rohankumardubey](https://github.com/rohankumardubey)** - headless security smoke
-  suite in CI and sidebar accessibility state (#580, #609).
-- **[syf2211](https://github.com/syf2211)** - readable connection-failure headlines
-  and catalog search that includes categories (#611, #614).
+- **[arimu1](https://github.com/arimu1)** - installing the gateway no longer strips
+  comments out of JSONC client configs (Zed, VS Code, Kilo Code) (#592).
 - **[adity982](https://github.com/adity982)** - Crush MCP client support (#407).
-- **[arimu1](https://github.com/arimu1)** - JSONC comment preservation when writing
-  client configs (#592).
 - **[georgeatparallel](https://github.com/georgeatparallel)** - Parallel Search in the
   curated catalog (#615).
 - **[aryansk](https://github.com/aryansk)** - documented the gateway's public
   environment overrides (#640).
-- **[AshSgDe29071999](https://github.com/AshSgDe29071999)** - curated stacks
-  documentation and a less brittle stack test (#616).
+- **[AshSgDe29071999](https://github.com/AshSgDe29071999)** - documented curated
+  stacks and replaced a hardcoded count that broke whenever one was added (#616).
 
 ## [1.11.0] - 2026-08-01
 
