@@ -1329,11 +1329,17 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
                     parts.length > 0
                       ? parts.join(". ")
                       : outcome.needsRestart.length > 0
-                        ? // Saying "found nothing" while the panel below names an
-                          // app still launching an old gateway would be the same
-                          // self-contradiction this panel exists to prevent. None
-                          // are running *now*; the panel explains they come back.
-                          "No old gateway processes are running right now."
+                        ? // Saying "found nothing" while the panel below names an app
+                          // still launching an old gateway would be the same
+                          // self-contradiction this panel exists to prevent. Naming
+                          // only the moment ("none right now") was not enough either:
+                          // read directly above "5 apps are still launching an old
+                          // gateway" it still lands as a contradiction. State the
+                          // reason, because that is what makes both true at once — a
+                          // client spawns the gateway on its next tool call, not
+                          // continuously.
+                          "Nothing to stop: these apps spawn the old gateway on their " +
+                          "next tool call, so there is no process running between calls."
                         : "No old gateway processes found.",
                   );
                 } catch (e) {
@@ -1358,15 +1364,24 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
               <ul className="mt-1.5 space-y-1">
                 {needsRestart.map((c) => (
                   <li key={c.clientPid} className="text-xs text-muted-foreground">
-                    <span className="font-medium text-foreground">{c.client}</span> keeps
-                    starting <code className="font-mono">{c.gateway}</code>
+                    <span className="font-medium text-foreground">{c.client}</span>
+                    {/* The pid is the only thing separating two rows for the same app.
+                        Without it, several copies of one editor render as identical
+                        lines that read as a duplicate-row bug, and "restart each one"
+                        cannot be followed when a dozen are running. */}
+                    <span className="ml-1 font-mono text-muted-foreground/70">
+                      (pid {c.clientPid})
+                    </span>{" "}
+                    keeps starting <code className="font-mono">{c.gateway}</code>
                   </li>
                 ))}
               </ul>
               <p className="mt-2 text-xs text-muted-foreground">
                 These apps cached the old gateway path when they started, so stopping the
-                process only makes them launch it again. Restart each one to pick up the
-                current gateway. This list clears itself as you do.
+                process only makes them launch it again — and they only launch it when
+                they next use a tool, which is why none may be running this moment.
+                Restart each one to pick up the current gateway. This list clears itself
+                as you do.
               </p>
             </div>
           )}
