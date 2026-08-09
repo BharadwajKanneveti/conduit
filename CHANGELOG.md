@@ -178,6 +178,13 @@ release. See the Changed section below before you roll it out.
   identity. Only `.exe`, `.cmd` and `.ps1` were recognized as package runners, so two
   servers running different packages under one display name collapsed into a single
   import and a pasted config was named "npx". (SBS-664)
+- The "Stop old gateways" panel no longer reads as though it contradicts itself.
+  Running it could report that no old gateway processes were running directly above a
+  list of apps still launching one. Both were true — a client spawns the gateway on
+  its next tool call, not continuously, so between calls there is nothing to stop —
+  but the panel never said so. It now does, and each row shows the process id, so
+  several copies of one editor are no longer three identical-looking lines you cannot
+  act on.
 - The onboarding "What is Toolport for Teams?" link now deliberately opens the
   explainer page rather than the app sign-in, which is the right destination for
   someone who has no team and no invite code yet. (SBS-461)
