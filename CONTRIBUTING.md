@@ -403,21 +403,6 @@ npm run tauri dev   # check the client appears in the sidebar
 **Reference PR:** [#18](https://github.com/tsouth89/toolport/pull/18) (BoltAI
 client — a path resolver, one `ClientDef`, and a registration test).
 
-## Sign your commits (DCO)
-
-Toolport uses the [Developer Certificate of Origin](https://developercertificate.org/)
-(DCO): a lightweight way to state that you wrote the contribution and have the
-right to submit it. There is **no copyright assignment**, you keep ownership of
-your work.
-
-Just add a `Signed-off-by` line to each commit with `git commit -s`:
-
-```
-Signed-off-by: Your Name <your@email.com>
-```
-
-That line means you agree to the DCO. That's all there is to it.
-
 ## Reporting issues
 
 Bugs and ideas are welcome in [Issues](https://github.com/tsouth89/toolport/issues).
