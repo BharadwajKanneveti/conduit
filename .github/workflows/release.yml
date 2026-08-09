@@ -259,6 +259,9 @@ jobs:
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           draft: true
+          # Without this the release is titled with the bare tag. Every release since
+          # 1.10.0 has been "Toolport vX.Y.Z", set by hand each time.
+          name: Toolport ${{ github.ref_name }}
           body_path: ${{ steps.notes.outputs.have_notes == 'true' && 'release-notes.md' || '' }}
           generate_release_notes: ${{ steps.notes.outputs.have_notes != 'true' }}
           files: |
