@@ -223,11 +223,44 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
+      # Use the changelog entry we actually wrote. `generate_release_notes` produces a
+      # flat list of every PR title with no grouping and no explanation, which for a
+      # release like 1.12.0 buried a privacy feature and a migration note under 48
+      # lines of "fix(oauth): ... by @tsouth89". Falls back to the generated notes only
+      # if the tag has no matching section, so a tag cut before the changelog is
+      # written still gets something rather than an empty release.
+      - name: Extract this version's changelog entry
+        id: notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # index() rather than a regex: the version is full of dots and the heading is
+          # full of brackets, and building that into a pattern turns "[1.12.0]" into a
+          # character class that matches nothing.
+          awk -v v="$version" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            found && index($0, "## [") == 1 { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          # Decide BEFORE appending the footer: with it, the file always has content and
+          # the fallback below could never fire.
+          if grep -q '[^[:space:]]' release-notes.md; then
+            # Links to the file at this tag rather than a tag-to-tag compare: the build
+            # checks out shallow, so `git describe` cannot see the previous tag here.
+            printf '\n---\n\n**Full changelog:** https://github.com/%s/blob/%s/CHANGELOG.md\n' \
+              "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> release-notes.md
+            echo "have_notes=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_notes=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::No CHANGELOG section for $version; falling back to generated notes."
+          fi
+
       - name: Draft release with the installers
         uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
           draft: true
-          generate_release_notes: true
+          body_path: ${{ steps.notes.outputs.have_notes == 'true' && 'release-notes.md' || '' }}
+          generate_release_notes: ${{ steps.notes.outputs.have_notes != 'true' }}
           files: |
             src-tauri/target/release/bundle/nsis/*-setup.exe
             src-tauri/target/release/bundle/nsis/*-setup.exe.sig
