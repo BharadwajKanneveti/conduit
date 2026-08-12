@@ -7459,13 +7459,16 @@ fn cleanup_resource_subs_for_session(state: &GatewayState, session: &str) {
 /// security log inside `integrity::check`; here we also surface it in the gateway
 /// log so it's visible in "Copy diagnostics". Ordinary drift blocks only when its
 /// policy is enabled; baseline loss always blocks because the trust root is gone.
-/// Returns true if tools were just quarantined (so the caller should re-filter the
-/// router this cycle).
+/// Returns the newly quarantined names when the caller must re-filter the router this cycle.
+/// Store/lock failures stay distinct so the caller can keep the router's currently enforced
+/// catalog rather than publishing a stale unfiltered list.
+type IntegrityCheckFailure = (String, BTreeSet<String>);
+
 fn maybe_check_integrity(
     registry: &Arc<Mutex<Registry>>,
     tools: &[Value],
     profile: Option<&str>,
-) -> bool {
+) -> Result<Option<BTreeSet<String>>, IntegrityCheckFailure> {
     let (enabled, quarantine_on) = {
         let r = registry
             .lock()
@@ -7473,9 +7476,26 @@ fn maybe_check_integrity(
         (r.integrity_check, r.quarantine_on_drift_effective())
     };
     if !enabled {
-        return false;
+        return Ok(None);
     }
-    let events = integrity::check(profile, tools);
+    let events = integrity::check_staged(profile, tools).map_err(|e| {
+        // Without a trustworthy pin-store update we cannot identify which definitions are
+        // safely baselined. Keep the whole live catalog behind the integrity gate until a
+        // later rebuild can acquire/persist the store.
+        let all = tools
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        (e, all)
+    })?;
+    // A previous cycle may have persisted quarantine and then failed (or exited) before
+    // advancing the corresponding pins. Recover from those durable records without depending on
+    // the filtered catalog. Do this after `check_staged` so a corrupt pin store still takes the
+    // mandatory baseline-tamper path instead of returning early from ordinary recovery.
+    if !integrity::baseline_tamper_detected(&events) {
+        let pending = integrity::quarantine_candidates(tools, &events);
+        integrity::accept_quarantined_pins(profile).map_err(|e| (e, pending))?;
+    }
     for d in &events {
         let server = d.get("server").and_then(Value::as_str).unwrap_or("?");
         let tool = d.get("tool").and_then(Value::as_str).unwrap_or("?");
@@ -7487,8 +7507,23 @@ fn maybe_check_integrity(
     }
     // Ordinary high-risk drift follows the user's setting. A lost baseline is mandatory:
     // no setting may turn destruction of the trust root into a fail-open catalog.
-    (quarantine_on || integrity::baseline_tamper_detected(&events))
-        && integrity::apply_quarantine(profile, tools, &events)
+    if quarantine_on || integrity::baseline_tamper_detected(&events) {
+        let pending = integrity::quarantine_candidates(tools, &events);
+        integrity::apply_quarantine(profile, tools, &events)
+            .map_err(|e| (e, pending.clone()))?;
+        // `check_staged` deliberately kept these old pins until the quarantine write was
+        // durable. Accept from that durable record so a failed pin write or process exit can
+        // recover even after the router filters the quarantined tool from its next catalog.
+        integrity::accept_quarantined_pins(profile)
+            .map_err(|e| (e, pending.clone()))?;
+        Ok((!pending.is_empty()).then_some(pending))
+    } else {
+        // Optional quarantine is off, so accept the observed high-risk definitions after
+        // recording them; only the mandatory lost-baseline case above blocks independently.
+        integrity::accept_staged_pins(profile, tools, &events)
+            .map_err(|e| (e, BTreeSet::new()))?;
+        Ok(None)
+    }
 }
 
 /// Run integrity detection on a freshly built catalog; if a high-risk drift was just
@@ -7500,29 +7535,74 @@ fn requarantine_if_needed(
     tools: Vec<Value>,
     profile: Option<&str>,
 ) -> Vec<Value> {
-    if maybe_check_integrity(registry, &tools, profile) {
-        let mut guard = router
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // make_mut clones the Router (sharing its Arc<ServerSlot> connections) only if
-        // an in-flight request still holds the old Arc, then re-filters in place and
-        // publishes the result; the old snapshot keeps serving until that request ends.
-        let r = Arc::make_mut(&mut guard);
-        // Fail closed: if the store is corrupt/unreadable, keep the live blocked set
-        // rather than installing empty (SOU-320).
-        match integrity::quarantined(profile) {
-            Ok(set) => r.requarantine(set),
-            Err(e) => {
-                glog(&format!(
-                    "SECURITY: {e}; keeping the live quarantine set rather than un-blocking"
-                ));
-                eprintln!("toolport: {e}; keeping the live quarantine set");
-            }
+    match maybe_check_integrity(registry, &tools, profile) {
+        Ok(Some(pending)) => requarantine_after_integrity_change(
+            router,
+            pending,
+            integrity::quarantined(profile),
+        ),
+        Ok(None) => tools,
+        Err((e, pending)) => {
+            glog(&format!(
+                "SECURITY: integrity store update failed: {e}; keeping the live blocked set"
+            ));
+            eprintln!(
+                "toolport: integrity store update failed: {e}; keeping the live blocked set"
+            );
+            fail_closed_integrity_catalog(router, profile, pending)
         }
-        r.aggregated_tools()
-    } else {
-        tools
     }
+}
+
+fn requarantine_after_integrity_change(
+    router: &Arc<Mutex<Arc<Router>>>,
+    pending: BTreeSet<String>,
+    persisted: Result<BTreeSet<String>, String>,
+) -> Vec<Value> {
+    let mut guard = router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut enforce = match persisted {
+        Ok(set) => set,
+        Err(e) => {
+            glog(&format!(
+                "SECURITY: {e}; keeping the live quarantine set plus newly quarantined tools"
+            ));
+            eprintln!(
+                "toolport: {e}; keeping the live quarantine set plus newly quarantined tools"
+            );
+            guard.quarantined().clone()
+        }
+    };
+    // Even after a successful quarantine write, a post-write read may fail or race. The names
+    // that triggered that write are already known and must never wait for a later watcher tick.
+    enforce.extend(pending);
+    // make_mut clones the Router (sharing its Arc<ServerSlot> connections) only if an in-flight
+    // request still holds the old Arc; the old snapshot keeps serving until that request ends.
+    let r = Arc::make_mut(&mut guard);
+    r.requarantine(enforce);
+    r.aggregated_tools()
+}
+
+fn fail_closed_integrity_catalog(
+    router: &Arc<Mutex<Arc<Router>>>,
+    profile: Option<&str>,
+    pending: BTreeSet<String>,
+) -> Vec<Value> {
+    let mut guard = router
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut fail_closed = guard.quarantined().clone();
+    fail_closed.extend(pending);
+    // If the quarantine write succeeded but the subsequent pin write failed, the durable
+    // store contains the new block. If the store itself is unreadable, retain the current set
+    // plus the candidates above rather than weakening either one.
+    if let Ok(persisted) = integrity::quarantined(profile) {
+        fail_closed.extend(persisted);
+    }
+    let r = Arc::make_mut(&mut guard);
+    r.requarantine(fail_closed);
+    r.aggregated_tools()
 }
 
 /// The quarantine set the router SHOULD be enforcing right now, mirroring how the
@@ -20739,6 +20819,57 @@ mod tests {
     }
 
     #[test]
+    fn integrity_failure_unions_pending_and_live_blocks_instead_of_installing_stale_state() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-integrity-fail-closed-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let (router, _stdout) = reconcile_harness();
+        {
+            let mut guard = router.lock().unwrap();
+            Arc::make_mut(&mut guard).requarantine(set_of(&["srv__already_blocked"]));
+        }
+
+        fail_closed_integrity_catalog(
+            &router,
+            Some("sbs714-gateway"),
+            set_of(&["srv__new_drift"]),
+        );
+
+        assert_eq!(
+            router.lock().unwrap().quarantined(),
+            &set_of(&["srv__already_blocked", "srv__new_drift"]),
+            "a failed persistence step must preserve live blocks and add the new candidate"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn post_write_quarantine_read_failure_still_blocks_the_new_candidate() {
+        let (router, _stdout) = reconcile_harness();
+        {
+            let mut guard = router.lock().unwrap();
+            Arc::make_mut(&mut guard).requarantine(set_of(&["srv__already_blocked"]));
+        }
+
+        requarantine_after_integrity_change(
+            &router,
+            set_of(&["srv__new_drift"]),
+            Err("injected post-write read failure".to_string()),
+        );
+
+        assert_eq!(
+            router.lock().unwrap().quarantined(),
+            &set_of(&["srv__already_blocked", "srv__new_drift"]),
+            "a post-write read error must preserve live blocks and enforce the new candidate"
+        );
+    }
+
+    #[test]
     fn effective_quarantine_is_empty_without_mandatory_entries_while_feature_is_off() {
         // Ordinary drift entries stay dormant while quarantine-on-drift is off. With no
         // baseline-tamper entries persisted, the effective set is still known-empty.
@@ -20760,6 +20891,46 @@ mod tests {
             Some(BTreeSet::new()),
             "feature off is a known-empty set, not an unknown one"
         );
+    }
+
+    #[test]
+    fn corrupt_pin_root_keeps_live_fail_closed_set_while_optional_quarantine_is_off() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-corrupt-pins-live-q-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+        let profile = Some("corrupt-pins-live-q");
+        std::fs::write(
+            dir.join("tool-pins-corrupt-pins-live-q.json"),
+            "{ corrupt trust root",
+        )
+        .unwrap();
+
+        let mut reg = Registry::default();
+        reg.quarantine_on_drift = false;
+        let registry = Arc::new(Mutex::new(reg));
+        let (router, stdout) = reconcile_harness();
+        {
+            let mut guard = router.lock().unwrap();
+            // Simulate fail_closed_integrity_catalog after the mandatory tamper quarantine write
+            // failed. The watcher must not clear this live set from an empty durable ordinary set.
+            Arc::make_mut(&mut guard).requarantine(set_of(&["srv__wipe"]));
+        }
+
+        assert_eq!(effective_quarantine(&registry, profile), None);
+        assert!(!reconcile_quarantine(
+            &registry, &router, &stdout, profile, None
+        ));
+        assert_eq!(
+            router.lock().unwrap().quarantined(),
+            &set_of(&["srv__wipe"]),
+            "the watcher must retain live blocks until the corrupt trust root is repaired"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -20787,13 +20958,20 @@ mod tests {
         reg.quarantine_on_drift = false;
         let registry = Arc::new(Mutex::new(reg));
         assert!(
-            maybe_check_integrity(&registry, &tools, profile),
+            maybe_check_integrity(&registry, &tools, profile)
+                .unwrap()
+                .is_some(),
             "lost baseline must create a quarantine even with optional drift blocking off"
         );
         assert_eq!(
+            integrity::mandatory_quarantined(profile).unwrap(),
+            BTreeSet::from(["srv__read".to_string()]),
+            "the baseline-tamper quarantine is durable and mandatory"
+        );
+        assert_eq!(
             effective_quarantine(&registry, profile),
-            Some(BTreeSet::from(["srv__read".to_string()])),
-            "baseline-tamper quarantine is mandatory"
+            None,
+            "while the trust root remains corrupt, watcher reconciliation must retain the live set"
         );
     }
 
@@ -20812,9 +20990,9 @@ mod tests {
         let events = vec![json!({
             "server": "srv", "tool": "srv__wipe", "change": "poison", "severity": "high"
         })];
-        assert!(conduit_lib::integrity::apply_quarantine(
-            profile, &current, &events
-        ));
+        assert!(
+            conduit_lib::integrity::apply_quarantine(profile, &current, &events).unwrap()
+        );
 
         let mut reg = Registry::default();
         reg.quarantine_on_drift = true;
@@ -20874,9 +21052,9 @@ mod tests {
         let events = vec![json!({
             "server": "srv", "tool": "srv__wipe", "change": "poison", "severity": "high"
         })];
-        assert!(conduit_lib::integrity::apply_quarantine(
-            profile, &current, &events
-        ));
+        assert!(
+            conduit_lib::integrity::apply_quarantine(profile, &current, &events).unwrap()
+        );
 
         let mut reg = Registry::default();
         reg.quarantine_on_drift = true;
@@ -20952,7 +21130,7 @@ mod tests {
         assert!(!steady.quarantine_changed);
 
         // Release on disk only (registry mtime + downstream flag untouched).
-        assert!(conduit_lib::integrity::release(profile, "srv__wipe"));
+        assert!(conduit_lib::integrity::release(profile, "srv__wipe").unwrap());
         let after = watch_tick(
             &reg_path,
             &registry,
@@ -21011,7 +21189,7 @@ mod tests {
             "server": "srv", "tool": "srv__wipe", "change": "poison", "severity": "high"
         })];
         assert!(
-            conduit_lib::integrity::apply_quarantine(profile, &current, &events),
+            conduit_lib::integrity::apply_quarantine(profile, &current, &events).unwrap(),
             "fixture should have quarantined the tool"
         );
 
@@ -21033,7 +21211,7 @@ mod tests {
         ));
 
         // The user re-approves. This is the SOU-292 regression, end to end.
-        assert!(conduit_lib::integrity::release(profile, "srv__wipe"));
+        assert!(conduit_lib::integrity::release(profile, "srv__wipe").unwrap());
         assert!(reconcile_quarantine(
             &registry, &router, &stdout, profile, None
         ));
