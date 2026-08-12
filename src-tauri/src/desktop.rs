@@ -35,6 +35,10 @@ use crate::vendors;
 
 type RegistryState = Mutex<Registry>;
 
+struct TrayMenuState {
+    pending_approvals: MenuItem<tauri::Wry>,
+}
+
 const OAUTH_LOCK_LEASE_SECS: u64 = 180;
 const OAUTH_LOCK_WAIT_SECS: u64 = 30;
 const OAUTH_LOCK_POLL_MS: u64 = 250;
@@ -2829,6 +2833,40 @@ async fn share_stack(setup_json: String) -> Result<String, String> {
 /// that arrived before the UI was ready (cold start). The frontend claims it on mount.
 type PendingShare = Mutex<Option<String>>;
 
+/// Remembers an approvals tray request that arrived before the frontend listener.
+#[derive(Default)]
+struct PendingTrayApprovals(Mutex<TrayApprovalsDelivery>);
+
+#[derive(Default)]
+struct TrayApprovalsDelivery {
+    frontend_ready: bool,
+    pending: bool,
+}
+
+/// Queue a request until the frontend is ready, or tell the caller it is safe
+/// to emit live. The decision and state change are atomic with the readiness claim.
+fn should_emit_tray_approvals(state: &PendingTrayApprovals) -> bool {
+    let mut delivery = state
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if delivery.frontend_ready {
+        true
+    } else {
+        delivery.pending = true;
+        false
+    }
+}
+
+fn claim_pending_tray_approvals(state: &PendingTrayApprovals) -> bool {
+    let mut delivery = state
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    delivery.frontend_ready = true;
+    std::mem::take(&mut delivery.pending)
+}
+
 /// Parse a `toolport://import?s=<id>` (or legacy `conduit://…`) deep link into its
 /// share id. Tolerates an optional trailing slash after the host; the id must look
 /// like a share id.
@@ -2883,16 +2921,21 @@ fn take_pending_shared(state: State<PendingShare>) -> Option<String> {
         .take()
 }
 
+/// Claim an approvals tray request captured before the UI was listening.
+#[tauri::command]
+fn take_pending_tray_approvals(state: State<PendingTrayApprovals>) -> bool {
+    claim_pending_tray_approvals(state.inner())
+}
+
 /// Deliver a shared-stack id from a deep link to the UI: stash it so a cold start
-/// can claim it on mount, focus the window, and emit the live event for a running
-/// app. Idempotent enough that delivering the same id twice just re-opens it.
+/// can claim it on mount, reveal the window from every tray/minimized state, and
+/// emit the live event for a running app. Idempotent enough that delivering the
+/// same id twice just re-opens it.
 fn deliver_shared_import(handle: &tauri::AppHandle, id: String) {
     if let Some(st) = handle.try_state::<PendingShare>() {
         *st.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(id.clone());
     }
-    if let Some(w) = handle.get_webview_window("main") {
-        let _ = w.set_focus();
-    }
+    show_main_window(handle);
     let _ = handle.emit("import-shared", id);
 }
 
@@ -3504,6 +3547,11 @@ fn update_tray_tooltip(app: &AppHandle) {
         .try_state::<approval_broker::ApprovalBroker>()
         .map(|b| b.list().len())
         .unwrap_or(0);
+    if let Some(menu) = app.try_state::<TrayMenuState>() {
+        let _ = menu
+            .pending_approvals
+            .set_text(format!("Pending approvals ({pending})"));
+    }
     if let Some(tray) = app.tray_by_id("main") {
         let tip = if pending > 0 {
             format!(
@@ -3540,15 +3588,36 @@ fn maybe_show_tray_hint(app: &AppHandle) {
         .show();
 }
 
-/// Build the system-tray (Windows) / menu-bar (macOS) icon: left-click opens the app,
-/// right-click shows an Open/Quit menu. Quit fully exits (the run-loop's Exit handler
-/// tears down the HTTP bridge); closing the window only hides it (see the window-event
+/// Build the system-tray (Windows) / menu-bar (macOS) icon. The menu exposes the two
+/// background actions users need without hunting through a hidden window: pending
+/// approvals and update checks. Quit fully exits (the run-loop's Exit handler tears
+/// down the HTTP bridge); closing the window only hides it (see the window-event
 /// handler), so the gateway/broker keep running and HITL stays live.
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
     let open = MenuItem::with_id(app, "tray_open", "Open Toolport", true, None::<&str>)?;
+    let approvals = MenuItem::with_id(
+        app,
+        "tray_approvals",
+        "Pending approvals (0)",
+        true,
+        None::<&str>,
+    )?;
+    let check_updates = MenuItem::with_id(
+        app,
+        "tray_check_updates",
+        "Check for updates",
+        true,
+        None::<&str>,
+    )?;
     let sep = PredefinedMenuItem::separator(app)?;
     let quit = MenuItem::with_id(app, "tray_quit", "Quit Toolport", true, None::<&str>)?;
-    let menu = Menu::with_items(app, &[&open, &sep, &quit])?;
+    let menu = Menu::with_items(
+        app,
+        &[&open, &approvals, &check_updates, &sep, &quit],
+    )?;
+    app.manage(TrayMenuState {
+        pending_approvals: approvals,
+    });
 
     let mut builder = TrayIconBuilder::with_id("main")
         .tooltip("Toolport")
@@ -3556,6 +3625,19 @@ fn build_tray(app: &AppHandle) -> tauri::Result<()> {
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "tray_open" => show_main_window(app),
+            "tray_approvals" => {
+                let should_emit = app
+                    .try_state::<PendingTrayApprovals>()
+                    .is_none_or(|state| should_emit_tray_approvals(state.inner()));
+                show_main_window(app);
+                if should_emit {
+                    let _ = app.emit("tray-open-approvals", ());
+                }
+            }
+            "tray_check_updates" => {
+                show_main_window(app);
+                let _ = app.emit("tray-check-updates", ());
+            }
             "tray_quit" => app.exit(0),
             _ => {}
         })
@@ -3689,6 +3771,7 @@ pub fn run() {
         .manage(Mutex::new(registry))
         .manage(Mutex::new(HttpBridge::default()))
         .manage(PendingShare::default())
+        .manage(PendingTrayApprovals::default())
         .manage(RestartAdvice::default())
         .invoke_handler(tauri::generate_handler![
             detect_clients,
@@ -3783,6 +3866,7 @@ pub fn run() {
             share_stack,
             fetch_shared_setup,
             take_pending_shared,
+            take_pending_tray_approvals,
             import_config,
             read_setup_file,
             preview_import,
@@ -4080,6 +4164,20 @@ mod tests {
     use super::*;
     use crate::{arg_looks_secret, redact_url_userinfo};
     use registry::EnvVar;
+
+    #[test]
+    fn tray_approvals_requests_choose_exactly_one_delivery_mode() {
+        let pending = PendingTrayApprovals::default();
+
+        // Before the frontend claims readiness, queue without emitting.
+        assert!(!should_emit_tray_approvals(&pending));
+        assert!(claim_pending_tray_approvals(&pending));
+        assert!(!claim_pending_tray_approvals(&pending));
+
+        // Once ready, deliver live without leaving a queued duplicate.
+        assert!(should_emit_tray_approvals(&pending));
+        assert!(!claim_pending_tray_approvals(&pending));
+    }
 
     #[test]
     fn registry_startup_failure_is_blocking_and_preserves_the_real_path_and_error() {
