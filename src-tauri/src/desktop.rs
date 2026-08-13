@@ -1294,7 +1294,7 @@ fn set_client_credentials(
     // require re-entering the credential. Resolve it here but do not write yet.
     let secret_to_store = supplied_secret(client_secret);
     if secret_to_store.is_none()
-        && secrets::get_secret(&server_id, secrets::CLIENT_SECRET_KEY).is_none()
+        && secrets::get_secret_result(&server_id, secrets::CLIENT_SECRET_KEY)?.is_none()
     {
         return Err("no client secret is stored for this server yet; enter one".into());
     }
@@ -1367,8 +1367,8 @@ fn clear_client_credentials(
 /// Whether a client secret is vaulted for this server, so the UI can show
 /// "configured" without ever reading the value back.
 #[tauri::command]
-fn has_client_secret(server_id: String) -> bool {
-    secrets::get_secret(&server_id, secrets::CLIENT_SECRET_KEY).is_some()
+fn has_client_secret(server_id: String) -> Result<bool, String> {
+    Ok(secrets::get_secret_result(&server_id, secrets::CLIENT_SECRET_KEY)?.is_some())
 }
 
 /// The most recent tool-call audit entries (newest first).
@@ -4610,6 +4610,21 @@ mod tests {
         assert!(message.contains(r"C:\Toolport\registry.json"));
         assert!(message.contains("Corrupt registry: bad json"));
         assert!(message.contains("Your registry was not replaced"));
+    }
+
+    /// A failed keychain read must surface as an error, never as "no secret
+    /// stored": `Ok(false)` sends the UI down the first-time path and blocks a
+    /// user whose secret really is vaulted (SBS-722). The reserved internal
+    /// namespace is the one deterministic way to make `get_secret_result` fail
+    /// on every platform, and `secrets::get_secret` swallows exactly that error
+    /// into `None` -- which is the regression this pins against.
+    #[test]
+    fn has_client_secret_reports_a_failed_read_as_an_error_not_missing() {
+        let result = has_client_secret("__toolport_internal__".to_string());
+        assert!(
+            result.is_err(),
+            "a failed secret read must propagate, not resolve to a boolean: {result:?}"
+        );
     }
 
     fn github_with_secret() -> ServerEntry {
