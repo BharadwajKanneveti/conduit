@@ -654,29 +654,31 @@ export function openDataDir(): Promise<void> {
 /** Serialize the user's servers into a shareable setup (no secret values),
  * optionally labelled with a name + description. */
 export function exportConfig(
-  name?: string,
-  description?: string,
-  serverNames?: string[],
+  name: string | undefined,
+  description: string | undefined,
+  // Required snapshot. `[]` means share nothing; never omit this or default it
+  // to empty, or a caller would silently export zero servers.
+  serverIds: string[],
 ): Promise<string> {
   return invoke<string>("export_config", {
     name: name ?? null,
     description: description ?? null,
-    serverNames: serverNames ?? null,
+    serverIds,
   });
 }
 
 /** Write the shareable setup to a file on disk (path from a save dialog). */
 export function exportConfigToPath(
   path: string,
-  name?: string,
-  description?: string,
-  serverNames?: string[],
+  name: string | undefined,
+  description: string | undefined,
+  serverIds: string[],
 ): Promise<void> {
   return invoke<void>("export_config_to_path", {
     path,
     name: name ?? null,
     description: description ?? null,
-    serverNames: serverNames ?? null,
+    serverIds,
   });
 }
 

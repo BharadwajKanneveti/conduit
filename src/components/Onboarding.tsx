@@ -805,6 +805,7 @@ function Done({
   // servers healthy": swallowing it to health=[] would show a confident "you're
   // set up" over servers we never actually checked, so track it separately.
   const [probeFailed, setProbeFailed] = useState(false);
+  const [probeAttempt, setProbeAttempt] = useState(0);
   useEffect(() => {
     if (serverCount === 0) {
       setHealth([]);
@@ -812,6 +813,8 @@ function Done({
       return;
     }
     let alive = true;
+    setHealth(null);
+    setProbeFailed(false);
     onProbe()
       .then((r) => {
         if (!alive) return;
@@ -820,18 +823,23 @@ function Done({
       })
       .catch(() => {
         if (!alive) return;
-        setHealth([]);
         setProbeFailed(true);
       });
     return () => {
       alive = false;
     };
-  }, [serverCount, onProbe]);
+  }, [serverCount, onProbe, probeAttempt]);
 
   const nameFor = (id: string) => registry.servers.find((s) => s.id === id)?.name ?? id;
   const broken = (health ?? []).filter((r) => !r.ok && !r.authRequired);
 
-  const ready = serverCount > 0 && connectedCount > 0;
+  const configured = serverCount > 0 && connectedCount > 0;
+  // Verification states only apply once setup is actually complete: with no client
+  // connected the step reports what's missing, and must not dress the finish button
+  // or the status blocks in "Checking…" / "couldn't verify" language.
+  const checkingHealth = configured && health === null && !probeFailed;
+  const verificationFailed = configured && probeFailed;
+  const ready = configured && health !== null && !probeFailed;
   // The client to verify against: the first one Toolport is actually wired into.
   const verifyClient = clients.find((c) => c.gatewayInstalled) ?? null;
   const missing = [
@@ -844,7 +852,15 @@ function Done({
     <>
       <StepHeader
         icon={<Check className="size-5" />}
-        title={ready ? "You're set up" : "Setup started"}
+        title={
+          ready
+            ? "You're set up"
+            : configured && checkingHealth
+              ? "Checking your setup"
+              : configured && probeFailed
+                ? "Setup couldn't be verified"
+                : "Setup started"
+        }
       >
         {ready ? (
           <>
@@ -856,6 +872,15 @@ function Done({
             success. And Toolport watches every server for tampering and prompt injection,
             see Activity.
           </>
+        ) : configured && checkingHealth ? (
+          <>
+            Toolport is checking that your servers can start before marking setup ready.
+          </>
+        ) : configured && probeFailed ? (
+          <>
+            Your servers and client are connected, but Toolport could not verify server
+            health. Retry the check below or continue without verification.
+          </>
         ) : (
           <>
             You haven't {missing} yet. You can do both any time from the main screen: add
@@ -863,6 +888,16 @@ function Done({
           </>
         )}
       </StepHeader>
+
+      {checkingHealth && (
+        <div
+          role="status"
+          className="flex items-center gap-2 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground"
+        >
+          <Loader2 className="size-3.5 animate-spin" aria-hidden="true" />
+          Checking server health…
+        </div>
+      )}
 
       {broken.length > 0 && (
         <div className="flex flex-col gap-2 rounded-md bg-warning/10 px-3 py-2 text-sm">
@@ -891,10 +926,19 @@ function Done({
         </div>
       )}
 
-      {probeFailed && (
-        <div className="rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
-          Couldn&apos;t verify your servers started, the health check didn&apos;t run.
-          Open the main screen to see each server&apos;s live status.
+      {verificationFailed && (
+        <div className="flex items-center gap-2 rounded-md bg-muted/40 px-3 py-2 text-xs text-muted-foreground">
+          <span>
+            Couldn&apos;t verify your servers started, the health check didn&apos;t run.
+          </span>
+          <Button
+            type="button"
+            size="sm"
+            variant="outline"
+            onClick={() => setProbeAttempt((attempt) => attempt + 1)}
+          >
+            Retry
+          </Button>
         </div>
       )}
 
@@ -903,7 +947,11 @@ function Done({
       )}
 
       <Button onClick={onFinish} className="self-start">
-        {ready ? "Start using Toolport" : "Got it"}
+        {checkingHealth || verificationFailed
+          ? "Continue without verification"
+          : ready
+            ? "Start using Toolport"
+            : "Got it"}
         <ArrowRight className="size-4" />
       </Button>
     </>
