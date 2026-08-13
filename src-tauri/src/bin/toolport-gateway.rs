@@ -7888,24 +7888,14 @@ fn gtrace(msg: &str) {
     }
 }
 
-/// Cache file for a given profile. Scoped clients get their own file
-/// (`tool-cache-<profile>.json`) so a billing-scoped client never reads a
+/// Cache file for a given stable profile id. Scoped clients get their own file
+/// (`tool-cache-v2-<profile-id>.json`) so a billing-scoped client never reads a
 /// coding-scoped client's catalog - which would defeat the scoping.
 fn tool_cache_path(profile: Option<&str>) -> Option<PathBuf> {
     let dir = registry::conduit_dir()?;
     let file = match profile {
         Some(p) if !p.is_empty() => {
-            let slug: String = p
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() {
-                        c.to_ascii_lowercase()
-                    } else {
-                        '-'
-                    }
-                })
-                .collect();
-            format!("tool-cache-{slug}.json")
+            format!("tool-cache-v2-{}.json", registry::profile_store_key(p))
         }
         _ => "tool-cache.json".to_string(),
     };
@@ -7943,9 +7933,9 @@ fn save_tool_cache(tools: &[Value], profile: Option<&str>) {
 
 /// Resolve this client's live profile from `registry.client_scopes[client_id]`
 /// (kept current by `watch_registry` on every reload). Three cases:
-/// - a non-empty entry: this client is scoped to that named profile;
+/// - a non-empty entry: this client is scoped to that stable profile id;
 /// - an empty-string entry: this client is *explicitly* unscoped (follow the
-///   active profile now), so return `None` and do NOT fall back to the boot env
+///   active profile now), so return its id and do NOT fall back to the boot env
 ///   var - that's what makes a live re-scope to "all servers" take effect
 ///   without restarting the client (see `Registry::set_client_unscoped`);
 /// - no entry at all: fall back to the `CONDUIT_PROFILE` this process started
@@ -7959,11 +7949,16 @@ fn resolve_live_profile(
     client_id: Option<&str>,
     env_profile: &Option<String>,
 ) -> Option<String> {
-    match client_id.and_then(|id| reg.client_scopes.get(id)) {
-        Some(p) if p.trim().is_empty() => None,
-        Some(p) => Some(p.clone()),
-        None => env_profile.clone(),
-    }
+    let profile_ref = match client_id.and_then(|id| reg.client_scopes.get(id)) {
+        Some(p) if p.trim().is_empty() => return Some(reg.active_profile_id()),
+        Some(p) => Some(p.as_str()),
+        None => env_profile.as_deref(),
+    };
+    Some(
+        profile_ref
+            .map(|profile| reg.resolve_profile_id(profile))
+            .unwrap_or_else(|| reg.active_profile_id()),
+    )
 }
 
 /// The profile that actually governs a client's scope right now: a folder-scoped override
@@ -8197,7 +8192,13 @@ fn watch_tick(
         // client's configured profile. So editing folder_profiles (a registry change)
         // re-applies routing live for a client already sitting in a mapped folder.
         let env_owned = env_profile.map(|s| s.to_string());
-        let resolved = effective_profile(&new_reg, client_id, &env_owned, root.as_deref());
+        // HTTP serves a union catalog. Never persist that into a profile namespace
+        // after a later registry reload (SBS-715).
+        let resolved = if http_mode {
+            None
+        } else {
+            effective_profile(&new_reg, client_id, &env_owned, root.as_deref())
+        };
         // Capture the profile we were serving before this reload so the log can
         // show the transition - the single most useful line when diagnosing
         // "why can't this client see server X": it pins down which profile is
@@ -12626,7 +12627,13 @@ fn main() {
     // Resolve the live profile immediately from what's already on disk, rather than
     // waiting for the watcher's first tick: a scoped client re-launched after being
     // re-scoped should see the new profile from its very first request.
-    let resolved_profile = resolve_live_profile(&loaded, client_id.as_deref(), &env_profile);
+    // The HTTP bridge serves a union of several profiles and must never persist
+    // that union under the active profile's cache/pins/quarantine namespace.
+    let resolved_profile = if http_mode {
+        None
+    } else {
+        resolve_live_profile(&loaded, client_id.as_deref(), &env_profile)
+    };
     let registry = Arc::new(Mutex::new(loaded));
     // Empty router + cached catalog: the handshake and tools/list answer instantly
     // (from cache), while downstream servers connect in the background for the
@@ -14094,39 +14101,41 @@ mod tests {
         // client, it must win - that's what makes a profile switch apply without
         // restarting the client.
         let mut reg = Registry::default();
+        let billing = reg.add_profile("Billing");
         reg.set_client_scope("cursor", Some("Billing"));
         let env_profile = Some("Default".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some("Billing".to_string())
+            Some(billing)
         );
     }
 
     #[test]
     fn resolve_live_profile_falls_back_to_env_var_when_scope_unset() {
         // A client_id with no client_scopes entry yet (e.g. installed before
-        // CONDUIT_CLIENT_ID existed, or never re-scoped) keeps the bootstrap value.
+        // CONDUIT_CLIENT_ID existed, or never re-scoped) keeps the bootstrap value,
+        // resolved to the stable profile id so cache/pins/quarantine stay isolated.
         let reg = Registry::default();
         let env_profile = Some("Default".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some("Default".to_string())
+            Some(reg.active_profile_id())
         );
     }
 
     #[test]
     fn resolve_live_profile_explicit_unscope_overrides_frozen_env_var() {
         // Re-scoping a client to "all servers" records an explicit-unscoped marker
-        // (empty string), which must resolve to None (follow the active profile)
-        // rather than falling back to the CONDUIT_PROFILE this process booted with.
-        // Without this, switching from a named profile to unscoped wouldn't apply
-        // until the client restarted.
+        // (empty string), which must follow the live active profile rather than the
+        // CONDUIT_PROFILE this process booted with. Returning that id (not None)
+        // keeps the client's cache/pins on the active profile's isolated store
+        // instead of the shared HTTP-union fallback files.
         let mut reg = Registry::default();
         reg.set_client_unscoped("cursor");
         let env_profile = Some("Billing".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            None
+            Some(reg.active_profile_id())
         );
     }
 
@@ -14137,18 +14146,21 @@ mod tests {
         let env_profile = Some("Default".to_string());
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &env_profile),
-            Some("Default".to_string())
+            Some(reg.active_profile_id())
         );
     }
 
     #[test]
     fn resolve_live_profile_unscoped_client_always_uses_env_profile() {
         // No client_id at all (unscoped install): never consult client_scopes.
-        // This path already resolves the active profile live elsewhere, via
-        // Registry::enabled_servers().
+        // Without a boot profile, isolate onto the active profile rather than
+        // the shared fallback files the HTTP union uses.
         let mut reg = Registry::default();
         reg.set_client_scope("cursor", Some("Billing"));
-        assert_eq!(resolve_live_profile(&reg, None, &None), None);
+        assert_eq!(
+            resolve_live_profile(&reg, None, &None),
+            Some(reg.active_profile_id())
+        );
     }
 
     #[test]
@@ -14156,15 +14168,17 @@ mod tests {
         // Simulates a profile switch mid-session: same client_id, registry
         // mutated in place (as the watcher would see across two poll ticks).
         let mut reg = Registry::default();
+        let billing = reg.add_profile("Billing");
+        let engineering = reg.add_profile("Engineering");
         reg.set_client_scope("cursor", Some("Billing"));
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &None),
-            Some("Billing".to_string())
+            Some(billing)
         );
         reg.set_client_scope("cursor", Some("Engineering"));
         assert_eq!(
             resolve_live_profile(&reg, Some("cursor"), &None),
-            Some("Engineering".to_string())
+            Some(engineering)
         );
     }
 
@@ -21111,7 +21125,10 @@ mod tests {
         let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
         let profile = Some("corrupt-pins-live-q");
         std::fs::write(
-            dir.join("tool-pins-corrupt-pins-live-q.json"),
+            dir.join(format!(
+                "tool-pins-v2-{}.json",
+                conduit_lib::registry::profile_store_key("corrupt-pins-live-q")
+            )),
             "{ corrupt trust root",
         )
         .unwrap();
@@ -21149,7 +21166,10 @@ mod tests {
 
         let profile = Some("baseline-tamper");
         std::fs::write(
-            dir.join("tool-pins-baseline-tamper.json"),
+            dir.join(format!(
+                "tool-pins-v2-{}.json",
+                conduit_lib::registry::profile_store_key("baseline-tamper")
+            )),
             "{ corrupt baseline",
         )
         .unwrap();
@@ -21212,7 +21232,10 @@ mod tests {
         assert!(router.lock().unwrap().quarantined().contains("srv__wipe"));
 
         // Corrupt the store underneath the running gateway.
-        let path = dir.join("quarantine-corrupt-q.json");
+        let path = dir.join(format!(
+            "quarantine-v2-{}.json",
+            conduit_lib::registry::profile_store_key("corrupt-q")
+        ));
         assert!(path.exists(), "fixture wrote where expected: {path:?}");
         std::fs::write(&path, "{ not json at all").unwrap();
 
@@ -21239,6 +21262,58 @@ mod tests {
 
         drop(_data_dir);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn watch_tick_http_mode_keeps_profile_none_after_registry_reload() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-http-profile-none-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let registry = Arc::new(Mutex::new(Registry::default()));
+        let router = Arc::new(Mutex::new(Arc::new(Router::new())));
+        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        let cached_tools = Arc::new(Mutex::new(Arc::new(CatalogSnapshot::default())));
+        let profile_slot = Arc::new(Mutex::new(None));
+        let downstream_dirty = Arc::new(AtomicU8::new(0));
+        let client_root = Arc::new(Mutex::new(None));
+        let server_handler: ServerRequestHandler = Arc::new(|_| None);
+        let rebuild_lock = Arc::new(Mutex::new(()));
+        let reg_path = dir.join("registry.json");
+        conduit_lib::registry::save_to(&reg_path, &Registry::default()).unwrap();
+        let mut state = WatchLoopState {
+            last_mtime: None,
+            last_relevant: json!({}),
+        };
+
+        let _ = watch_tick(
+            &reg_path,
+            &registry,
+            &router,
+            &stdout,
+            &cached_tools,
+            &profile_slot,
+            None,
+            Some("Default"),
+            true,
+            &downstream_dirty,
+            &server_handler,
+            &client_root,
+            None,
+            None,
+            None,
+            &rebuild_lock,
+            &mut state,
+        );
+        assert!(
+            profile_slot.lock().unwrap().is_none(),
+            "HTTP mode must not adopt the active profile after a registry reload"
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]

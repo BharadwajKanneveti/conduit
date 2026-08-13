@@ -245,25 +245,20 @@ fn server_of(namespaced: &str) -> &str {
 }
 
 fn pins_path(profile: Option<&str>) -> Option<PathBuf> {
-    profile_file(profile, "tool-pins-", "tool-pins.json")
+    profile_file(profile, "tool-pins-v2-", "tool-pins.json")
 }
 
 fn quarantine_path(profile: Option<&str>) -> Option<PathBuf> {
-    profile_file(profile, "quarantine-", "quarantine.json")
+    profile_file(profile, "quarantine-v2-", "quarantine.json")
 }
 
-/// Per-profile store file in the conduit dir. The profile name is slugged to
-/// `[a-z0-9-]` so it can't escape the directory; the no-profile case uses `fallback`.
+/// Per-profile store file in the conduit dir. Profile references are canonical
+/// stable ids before they reach this module; imported non-canonical ids receive a
+/// collision-resistant key. The no-profile case uses `fallback`.
 fn profile_file(profile: Option<&str>, prefix: &str, fallback: &str) -> Option<PathBuf> {
     let dir = crate::registry::conduit_dir()?;
     let file = match profile {
-        Some(p) if !p.is_empty() => {
-            let slug: String = p
-                .chars()
-                .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
-                .collect();
-            format!("{prefix}{slug}.json")
-        }
+        Some(p) if !p.is_empty() => format!("{prefix}{}.json", crate::registry::profile_store_key(p)),
         _ => fallback.to_string(),
     };
     Some(dir.join(file))
@@ -285,6 +280,9 @@ fn load_pins(profile: Option<&str>) -> PinsLoad {
         return PinsLoad::Fresh;
     };
     if !path.exists() {
+        if profile.is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, true)) {
+            return PinsLoad::Corrupt;
+        }
         return PinsLoad::Fresh;
     }
     // Every connected client spawns its own gateway, and they all share this one pins file.
@@ -711,27 +709,22 @@ pub fn baselines(profile: Option<&str>) -> BTreeMap<String, ToolBaseline> {
     }
 }
 
-/// Aggregate baselines across ALL profile pin files (`tool-pins.json` +
-/// `tool-pins-<slug>.json`), merged by tool name. The gateway keys pins by the
-/// `CONDUIT_PROFILE` it ran under (often None -> `tool-pins.json`), so the identity view
+/// Aggregate baselines across current stable-id pin files, merged by tool name.
+/// The legacy fallback is also included for the distinct HTTP-union namespace, but retained
+/// pre-v2 name-derived files are migration evidence and must not affect live identity state.
 /// must union every profile's pins rather than guess a single one. For a tool seen in
 /// several profiles: earliest first_seen, latest last_changed, and the fingerprint from
 /// the most recent change.
-pub fn all_baselines() -> BTreeMap<String, ToolBaseline> {
+pub fn all_baselines() -> Result<BTreeMap<String, ToolBaseline>, String> {
     let mut merged: BTreeMap<String, ToolBaseline> = BTreeMap::new();
     let Some(dir) = crate::registry::conduit_dir() else {
-        return merged;
+        return Ok(merged);
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return merged;
-    };
-    for entry in entries.flatten() {
-        let fname = entry.file_name();
-        let Some(name) = fname.to_str() else { continue };
-        if !(name.starts_with("tool-pins") && name.ends_with(".json")) {
-            continue;
-        }
-        let Ok(s) = std::fs::read_to_string(entry.path()) else {
+    let registry = crate::registry::load_resolved()?;
+    let mut paths = vec![dir.join("tool-pins.json")];
+    paths.extend(registry.profiles.iter().filter_map(|profile| pins_path(Some(&profile.id))));
+    for path in paths {
+        let Ok(s) = std::fs::read_to_string(path) else {
             continue;
         };
         let Ok(pins) = serde_json::from_str::<BTreeMap<String, PinRepr>>(&s) else {
@@ -760,7 +753,7 @@ pub fn all_baselines() -> BTreeMap<String, ToolBaseline> {
                 .or_insert(base);
         }
     }
-    merged
+    Ok(merged)
 }
 
 /// The set of quarantined tool names across ALL profiles, for the identity view's badge.
@@ -774,25 +767,16 @@ fn is_legacy_added(rec: &Value) -> bool {
     rec.get("change").and_then(Value::as_str) == Some("added")
 }
 
-pub fn all_quarantined_names() -> BTreeSet<String> {
+pub fn all_quarantined_names() -> Result<BTreeSet<String>, String> {
     let mut out = BTreeSet::new();
     let Some(dir) = crate::registry::conduit_dir() else {
-        return out;
+        return Ok(out);
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let fname = entry.file_name();
-        let Some(name) = fname.to_str() else { continue };
-        let is_q = name
-            .strip_prefix("quarantine")
-            .and_then(|r| r.strip_suffix(".json"))
-            .is_some();
-        if !is_q {
-            continue;
-        }
-        if let Ok(s) = std::fs::read_to_string(entry.path()) {
+    let registry = crate::registry::load_resolved()?;
+    let mut paths = vec![dir.join("quarantine.json")];
+    paths.extend(registry.profiles.iter().filter_map(|profile| quarantine_path(Some(&profile.id))));
+    for path in paths {
+        if let Ok(s) = std::fs::read_to_string(path) {
             if let Ok(q) = serde_json::from_str::<Quarantine>(&s) {
                 for (name, rec) in q {
                     if !is_legacy_added(&rec) {
@@ -802,7 +786,7 @@ pub fn all_quarantined_names() -> BTreeSet<String> {
             }
         }
     }
-    out
+    Ok(out)
 }
 
 // ===== Quarantine: block high-risk tools after a drift until re-approved =====
@@ -828,7 +812,16 @@ fn load_quarantine(profile: Option<&str>) -> Result<Quarantine, String> {
     };
     let raw = match std::fs::read_to_string(&path) {
         Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Quarantine::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if profile
+                .is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, false))
+            {
+                return Err(format!(
+                    "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
+                ));
+            }
+            return Ok(Quarantine::new());
+        }
         Err(e) => {
             return Err(format!("quarantine store at {path:?} is unreadable: {e}"))
         }
@@ -896,6 +889,14 @@ pub fn quarantined_checked(profile: Option<&str>) -> Result<BTreeSet<String>, St
         // place, so an empty set is the truth here rather than a failure.
         return Ok(BTreeSet::new());
     };
+    // A missing v2 store with a leftover legacy slug file means migration failed;
+    // reporting "empty" would let the watcher reconcile the live set down to nothing
+    // and re-expose previously quarantined tools (SBS-715).
+    if profile.is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, false)) {
+        return Err(format!(
+            "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
+        ));
+    }
     quarantined_checked_at(&path)
 }
 
@@ -920,6 +921,13 @@ pub fn mandatory_quarantined_checked(profile: Option<&str>) -> Result<BTreeSet<S
     let Some(path) = quarantine_path(profile) else {
         return Ok(BTreeSet::new());
     };
+    // Same unmigrated-legacy guard as `quarantined_checked`: a failed migration must
+    // not read as "no mandatory quarantine" (SBS-715).
+    if profile.is_some_and(|id| crate::registry::unmigrated_legacy_profile_store(id, false)) {
+        return Err(format!(
+            "quarantine store at {path:?} was not migrated from a legacy file; refusing to treat that as empty"
+        ));
+    }
     Ok(quarantined_sets_checked_at(&path)?.1)
 }
 
@@ -1021,41 +1029,33 @@ pub fn quarantine_list(profile: Option<&str>) -> Vec<Value> {
     }
 }
 
-/// Every quarantined tool across all profiles, each record tagged with its profile
-/// slug (`""` for the no-profile store), for the app UI which spans profiles. The
+/// Every quarantined tool across all current stable-id profiles, each record tagged with its
+/// exact profile id (`""` for the distinct HTTP-union store), for the app UI. The
 /// `profile` tag is what `release` takes back to clear the right store.
-pub fn all_quarantined() -> Vec<Value> {
+pub fn all_quarantined() -> Result<Vec<Value>, String> {
     let Some(dir) = crate::registry::conduit_dir() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut out = Vec::new();
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return out;
-    };
-    for entry in entries.flatten() {
-        let fname = entry.file_name();
-        let Some(name) = fname.to_str() else { continue };
-        // "quarantine.json" -> slug ""; "quarantine-<slug>.json" -> "<slug>".
-        let Some(rest) = name
-            .strip_prefix("quarantine")
-            .and_then(|r| r.strip_suffix(".json"))
-        else {
-            continue;
-        };
-        let slug = rest.strip_prefix('-').unwrap_or("");
-        if let Ok(s) = std::fs::read_to_string(entry.path()) {
+    let registry = crate::registry::load_resolved()?;
+    let mut stores = vec![(String::new(), dir.join("quarantine.json"))];
+    stores.extend(registry.profiles.iter().filter_map(|profile| {
+        quarantine_path(Some(&profile.id)).map(|path| (profile.id.clone(), path))
+    }));
+    for (profile, path) in stores {
+        if let Ok(s) = std::fs::read_to_string(path) {
             if let Ok(q) = serde_json::from_str::<Quarantine>(&s) {
                 for mut rec in q.into_values() {
                     if is_legacy_added(&rec) {
                         continue;
                     }
-                    rec["profile"] = json!(slug);
+                    rec["profile"] = json!(profile);
                     out.push(rec);
                 }
             }
         }
     }
-    out
+    Ok(out)
 }
 
 /// Re-approve a quarantined tool: drop it so the gateway re-exposes it on the next
@@ -2816,11 +2816,12 @@ mod tests {
         // filter or the UI keeps showing tools the gateway no longer blocks (the bug the
         // user hit: dozens of first-sight destructive tools still listed as quarantined).
         assert!(
-            !all_quarantined_names().contains(probe),
+            !all_quarantined_names().unwrap().contains(probe),
             "legacy added entry is dropped from the cross-profile enforcement set"
         );
         assert!(
             !all_quarantined()
+                .unwrap()
                 .iter()
                 .any(|r| r.get("tool").and_then(Value::as_str) == Some(probe)),
             "legacy added entry is dropped from the cross-profile display list"
@@ -2999,6 +3000,50 @@ mod tests {
         let still_blocked = mandatory_quarantined(profile).unwrap();
         assert!(!still_blocked.contains("alpha__read"));
         assert!(still_blocked.contains("beta__write"));
+    }
+
+    #[test]
+    fn load_pins_fails_closed_when_a_legacy_file_was_not_migrated() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data_dir = TestDataDir::new("legacy-pins-unmigrated");
+        std::fs::write(data_dir.path.join("tool-pins-billing.json"), r#"{"x":{}}"#)
+            .unwrap();
+        assert!(
+            matches!(load_pins(Some("billing")), PinsLoad::Corrupt),
+            "a leftover name-slug pin file is not a first run"
+        );
+    }
+
+    #[test]
+    fn quarantine_reads_fail_closed_when_a_legacy_file_was_not_migrated() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data_dir = TestDataDir::new("legacy-quarantine-unmigrated");
+        let record = r#"{"srv__wipe":{"server":"srv","tool":"wipe","change":"tamper"}}"#;
+        std::fs::write(data_dir.path.join("quarantine-billing.json"), record).unwrap();
+        assert!(
+            load_quarantine(Some("billing")).is_err(),
+            "a leftover name-slug quarantine file is not a first run"
+        );
+        // The watcher's cached reads must also refuse: `Ok(empty)` would reconcile
+        // the router's live quarantine set down to nothing.
+        assert!(quarantined_checked(Some("billing")).is_err());
+        assert!(mandatory_quarantined_checked(Some("billing")).is_err());
+        // Once the v2 store exists the same reads recover.
+        let v2 = quarantine_path(Some("billing")).expect("data dir override is set");
+        std::fs::write(&v2, record).unwrap();
+        assert_eq!(quarantined_checked(Some("billing")).unwrap().len(), 1);
+        assert_eq!(mandatory_quarantined_checked(Some("billing")).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn cross_profile_quarantine_view_surfaces_a_registry_load_failure() {
+        let _data_dir_lock = crate::registry::data_dir_test_lock();
+        let data_dir = TestDataDir::new("aggregate-corrupt-registry");
+        std::fs::write(data_dir.path.join("registry.json"), "{ corrupt registry").unwrap();
+        assert!(
+            all_quarantined().is_err(),
+            "a corrupt registry must not become an authoritative empty cross-profile view"
+        );
     }
 
     #[test]
