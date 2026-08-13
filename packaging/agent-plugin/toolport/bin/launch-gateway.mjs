@@ -57,11 +57,16 @@ function newestPublished(binDir, fsOps, pathImpl, exe) {
     return null;
   }
   for (const name of entries) {
-    if (
-      ![GATEWAY, LEGACY_GATEWAY].some((prefix) => name.startsWith(`${prefix}-`)) ||
-      !name.endsWith(exe || ".exe")
-    )
-      continue;
+    const prefix = [GATEWAY, LEGACY_GATEWAY].find((p) => name.startsWith(`${p}-`));
+    if (!prefix || !name.endsWith(exe)) continue;
+    // Mirror the publisher's own rule (gateway_publish.rs::looks_like_version_suffix)
+    // rather than a looser one: leading digit, contains a dot, version-ish chars
+    // only. A copy Explorer made ("...-1.12.0 - Copy.exe", "...-1.12.0 (1).exe")
+    // can never be something we published, and would otherwise win on mtime and
+    // hide the real newest binary, since only one scanned path is returned.
+    // `exe` is a plain suffix here: it is "" off Windows, not ".exe".
+    const version = name.slice(prefix.length + 1, name.length - exe.length);
+    if (!/^\d[A-Za-z0-9._+-]*$/.test(version) || !version.includes(".")) continue;
     const full = pathImpl.join(binDir, name);
     try {
       const mtime = fsOps.statSync(full).mtimeMs;
@@ -108,8 +113,17 @@ export function gatewayCandidates({
       const binDir = pathImpl.join(roaming, leaf, "bin");
       const fromManifest = manifestPath(binDir, fsOps, pathImpl);
       if (fromManifest) found.push(fromManifest);
-      // The normal published filename can be constructed from this plugin's
-      // lockstep version even when MSIX hides the directory and manifest.
+      // Scan before guessing. This plugin is installed from a release zip and is
+      // never auto-updated, so its version pins to whatever shipped, while the
+      // desktop app updates underneath it. The app's prune keeps recent and
+      // still-referenced old images (gateway_publish.rs::decide_prune), so
+      // guessing first would spawn a stale gateway with the newer one sitting in
+      // the same directory.
+      const published = newestPublished(binDir, fsOps, pathImpl, exe);
+      if (published) found.push(published);
+      // Tried only after the scanned path fails to spawn: the normal published
+      // filename can still be constructed from this plugin's lockstep version
+      // when MSIX hides the directory and the manifest from readdir/read.
       const candidateVersion = version ?? pluginVersion(fsOps);
       if (candidateVersion) {
         found.push(
@@ -117,8 +131,6 @@ export function gatewayCandidates({
           pathImpl.join(binDir, `${LEGACY_GATEWAY}-${candidateVersion}${exe}`),
         );
       }
-      const published = newestPublished(binDir, fsOps, pathImpl, exe);
-      if (published) found.push(published);
     }
     for (const leaf of ["Toolport", "Conduit"]) {
       for (const name of [GATEWAY, LEGACY_GATEWAY]) {

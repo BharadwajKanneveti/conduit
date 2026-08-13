@@ -237,6 +237,95 @@ describe("agent plugin gateway launcher", () => {
     ).toContain(win32.join(legacyBin, "conduit-gateway-1.11.0.exe"));
   });
 
+  it("prefers the newest published gateway over its own pinned version", () => {
+    // The zip is never auto-updated, so an installed plugin's version goes stale
+    // while the app publishes newer gateways. Guessing the pinned filename ahead
+    // of a real directory scan would spawn old gateway code that the app's prune
+    // deliberately kept (referenced by another client, or recent enough).
+    const binDir = win32.join("R:\\Roaming", "Toolport", "bin");
+    const newer = win32.join(binDir, "toolport-gateway-1.13.0.exe");
+    const pinned = win32.join(binDir, "toolport-gateway-1.12.0.exe");
+    const candidates = gatewayCandidates({
+      platform: "win32",
+      home: "C:\\Users\\me",
+      env: { APPDATA: "R:\\Roaming", LOCALAPPDATA: "L:\\Local" },
+      fsOps: {
+        // No manifest, so the fallbacks are all that is left to order.
+        readFileSync: () => {
+          throw new Error("unreadable manifest");
+        },
+        readdirSync: (path: string) =>
+          path === binDir
+            ? ["toolport-gateway-1.12.0.exe", "toolport-gateway-1.13.0.exe"]
+            : [],
+        statSync: (path: string) => ({ mtimeMs: path === newer ? 2 : 1 }),
+      },
+      version: "1.12.0",
+    });
+    expect(candidates).toContain(newer);
+    expect(candidates.indexOf(newer)).toBeLessThan(candidates.indexOf(pinned));
+  });
+
+  it("only scans versioned gateway images, not lookalike neighbours", () => {
+    // Explorer's duplicate names and hand-made backups sit in the same directory
+    // and usually have the newest mtime. Only one scanned path is returned, so
+    // letting one of these win would hide the real newest binary entirely. The
+    // publisher cannot produce these names (gateway_publish.rs's version suffix
+    // is digit-led, dotted, and `[A-Za-z0-9._+-]` only).
+    const binDir = win32.join("R:\\Roaming", "Toolport", "bin");
+    const impostors = [
+      "toolport-gateway-1.12.0 - Copy.exe",
+      "toolport-gateway-1.12.0 (1).exe",
+      "toolport-gateway-backup.exe",
+      "toolport-gateway-1.13.0.exe.sig",
+    ];
+    const candidates = gatewayCandidates({
+      platform: "win32",
+      home: "C:\\Users\\me",
+      env: { APPDATA: "R:\\Roaming", LOCALAPPDATA: "L:\\Local" },
+      fsOps: {
+        readFileSync: () => {
+          throw new Error("unreadable manifest");
+        },
+        readdirSync: (path: string) =>
+          path === binDir ? [...impostors, "toolport-gateway-1.13.0.exe"] : [],
+        // Every impostor is newer than the real image.
+        statSync: (path: string) => ({
+          mtimeMs: path.endsWith("toolport-gateway-1.13.0.exe") ? 1 : 9,
+        }),
+      },
+      version: "1.12.0",
+    });
+    for (const impostor of impostors) {
+      expect(candidates, impostor).not.toContain(win32.join(binDir, impostor));
+    }
+    // The real image still beats this plugin's own pinned guess.
+    expect(
+      candidates.indexOf(win32.join(binDir, "toolport-gateway-1.13.0.exe")),
+    ).toBeLessThan(candidates.indexOf(win32.join(binDir, "toolport-gateway-1.12.0.exe")));
+  });
+
+  it("still accepts content-addressed published names", () => {
+    // `<gateway>-<version>-<digest><exe>` is a real publisher output and must
+    // survive the stricter scan.
+    const binDir = win32.join("R:\\Roaming", "Toolport", "bin");
+    const addressed = "toolport-gateway-1.13.0-a1b2c3d4e5f6.exe";
+    const candidates = gatewayCandidates({
+      platform: "win32",
+      home: "C:\\Users\\me",
+      env: { APPDATA: "R:\\Roaming", LOCALAPPDATA: "L:\\Local" },
+      fsOps: {
+        readFileSync: () => {
+          throw new Error("unreadable manifest");
+        },
+        readdirSync: (path: string) => (path === binDir ? [addressed] : []),
+        statSync: () => ({ mtimeMs: 1 }),
+      },
+      version: "1.12.0",
+    });
+    expect(candidates).toContain(win32.join(binDir, addressed));
+  });
+
   it("falls through an unspawnable candidate to a working binary", async () => {
     await expect(
       spawnFirst([join(repoRoot, "missing-gateway"), process.execPath], {
