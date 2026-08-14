@@ -1659,20 +1659,24 @@ pub fn screen_url_elicitation_request(
 }
 
 fn screen_input_required(result: &mut Value) -> Result<(), TransportError> {
-    let Some(requests) = result.get_mut("inputRequests").and_then(Value::as_object_mut) else {
+    let Some(requests) = result
+        .get_mut("inputRequests")
+        .and_then(Value::as_object_mut)
+    else {
         return Ok(());
     };
     for request in requests.values_mut() {
         screen_url_elicitation_request(request).map_err(|message| {
-            TransportError::Fatal(format!("Toolport refused unsafe URL elicitation: {message}"))
+            TransportError::Fatal(format!(
+                "Toolport refused unsafe URL elicitation: {message}"
+            ))
         })?;
     }
     Ok(())
 }
 
 fn modern_client_supports_input_request(meta: Option<&Value>, request: &Value) -> bool {
-    let capabilities = meta
-        .and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"));
+    let capabilities = meta.and_then(|meta| meta.get("io.modelcontextprotocol/clientCapabilities"));
     match request.get("method").and_then(Value::as_str) {
         Some("roots/list") => capabilities.and_then(|caps| caps.get("roots")).is_some(),
         Some("sampling/createMessage") => {
@@ -2163,6 +2167,12 @@ pub fn screen_spawn_command(command: &str, args: &[String]) -> Result<(), String
         // host-namespace sharing escalate past a normal host process (a plain `-v`
         // mount does not, and stays allowed; see container_escape_flag).
         "docker" | "podman" | "nerdctl" => container_escape_flag(args),
+        // Package launchers look like `npx -y @scope/pkg`, which is allowed, but
+        // `-c`/`--call` run a shell string and `--node-arg`/`-n` are `node -e`
+        // by another name. The rewriter documents these and falls through to
+        // spawn-as-is (SBS-783).
+        "npx" => npx_dangerous(args),
+        "npm" => npm_dangerous(args),
         _ => None,
     };
     match dangerous {
@@ -2477,6 +2487,93 @@ fn pwsh_dangerous(args: &[String]) -> Option<&str> {
         .map(|a| a.as_str())
 }
 
+/// npx flags that run attacker-supplied code instead of a cached package.
+/// `-c`/`--call` execute a shell string; `--node-arg`/`-n` are extra node
+/// argv (so `--node-arg=-e` is the `node -e` case this guard already blocks);
+/// `--shell` picks the shell `-c` runs in.
+fn npx_dangerous(args: &[String]) -> Option<&str> {
+    let launcher_args = npx_launcher_args(args);
+    first_flag(
+        launcher_args,
+        &["-c", "--call", "-n", "--node-arg", "--shell"],
+    )
+    // `-yc '<shell>'` is `-y -c '<shell>'`: the same getopt clustering this file
+    // already closes for `sh -ec` and `node -pe`, and the same threat, since a
+    // team-pushed config can swap `-c` for `-yc`. `y`/`q` are npx's booleans; `n`
+    // takes a value, so it bails the walk rather than reading as an eval.
+    .or_else(|| clustered_eval(launcher_args, NPX_EVAL, NPX_BOOL))
+    .or_else(|| npx_launched_dangerous(args))
+}
+
+/// The part of argv parsed by npx itself. Package arguments after the first positional
+/// or `--` may legitimately be named `-c`, `--call`, or `--shell`; treating those as
+/// launcher flags breaks otherwise safe servers. `-p/--package` is the one supported
+/// launcher option whose value is positional-looking, so skip it before finding the
+/// command boundary.
+fn npx_launcher_args(args: &[String]) -> &[String] {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" || !arg.starts_with('-') {
+            break;
+        }
+        if matches!(arg, "-p" | "--package") {
+            i = (i + 2).min(args.len());
+        } else {
+            i += 1;
+        }
+    }
+    &args[..i]
+}
+
+/// npx short flags that take no value, so an eval flag can cluster behind them.
+const NPX_BOOL: &[char] = &['y', 'q'];
+/// npx short flags that run an attacker-supplied string instead of a cached package.
+const NPX_EVAL: &[char] = &['c'];
+
+/// Screen the program `npx`/`npm exec` will actually execute.
+///
+/// `--` separates npx's own options from the command's arguments; it does NOT introduce
+/// the command. In `npm exec node -- -e <code>` the executable is the positional `node`
+/// BEFORE the separator and `-e <code>` are its arguments, so taking the first token
+/// after `--` as the program screened `-e` - not an interpreter, allowed - and let the
+/// real `node -e` straight through the guard.
+///
+/// So screen every positional as a candidate command with the tokens that follow it,
+/// which covers all three spellings without a table of npx's value-taking options:
+/// `npx node -e …`, `npx -- node -e …`, `npm exec node -- -e …`, and `-p pkg node -e …`
+/// where the executable trails a flag's value. Over-screening a package name is
+/// harmless: a name that is not an interpreter basename passes immediately, and a
+/// package literally named `node` followed by `-e` is the case we mean to stop.
+fn npx_launched_dangerous(args: &[String]) -> Option<&str> {
+    for (i, arg) in args.iter().enumerate() {
+        if arg == "--" || arg.starts_with('-') {
+            continue;
+        }
+        let rest = args.get(i + 1..).unwrap_or(&[]);
+        if screen_spawn_command(arg, rest).is_err() {
+            // Name the offending token where we can, so the error points at the eval
+            // flag rather than at the interpreter that merely hosts it.
+            return rest
+                .iter()
+                .find(|a| a.starts_with('-') && *a != "--")
+                .map(|a| a.as_str())
+                .or(Some(arg.as_str()));
+        }
+    }
+    None
+}
+
+/// `npm exec` / `npm x` is npx. Other npm subcommands are not MCP launchers; still
+/// screen them for the same eval flags so `npm -c` cannot slip through.
+fn npm_dangerous(args: &[String]) -> Option<&str> {
+    let rest = match args.first().map(String::as_str) {
+        Some("exec") | Some("x") => args.get(1..).unwrap_or(&[]),
+        _ => args,
+    };
+    npx_dangerous(rest)
+}
+
 fn first_flag<'a>(args: &'a [String], flags: &[&str]) -> Option<&'a str> {
     args.iter()
         .find(|a| {
@@ -2583,6 +2680,85 @@ fn container_escape_flag(args: &[String]) -> Option<&str> {
         }
     }
     None
+}
+
+/// For docker/podman/nerdctl, `-e KEY` (no value) copies KEY from the CLI process
+/// env into the container. Vaulted secrets already ride on the CLI via `.envs()`;
+/// without `-e` they stay on the host docker process and the container starts
+/// with empty credentials (SBS-785). Values stay off argv so `ps` cannot leak them.
+fn inject_container_env(command: &str, args: &[String], env: &[(String, String)]) -> Vec<String> {
+    let base = command_basename(command);
+    let family = interpreter_family(&base);
+    if !matches!(family, "docker" | "podman" | "nerdctl") || env.is_empty() {
+        return args.to_vec();
+    }
+    let Some(at) = args
+        .iter()
+        .position(|a| a.eq_ignore_ascii_case("run") || a.eq_ignore_ascii_case("create"))
+    else {
+        // No subcommand that accepts `-e` (e.g. `docker build`). There is nowhere
+        // correct to put it, so leave argv untouched rather than corrupt it.
+        return args.to_vec();
+    };
+    // Only inspect the option prefix after run/create. Once the first non-option
+    // operand appears it may be the image (or an option value); stopping early can
+    // cause a harmless duplicate, while scanning farther can mistake an application's
+    // own `-e KEY` argument for a container option and omit the vaulted secret.
+    let option_tail = &args[at + 1..];
+    let prefix_end = option_tail
+        .iter()
+        .position(|a| !a.starts_with('-'))
+        .unwrap_or(option_tail.len());
+    let already: std::collections::HashSet<String> = {
+        let mut set = std::collections::HashSet::new();
+        let mut i = 0;
+        while i < prefix_end {
+            let a = option_tail[i].as_str();
+            let al = a.to_ascii_lowercase();
+            if al == "-e" || al == "--env" {
+                if let Some(val) = option_tail.get(i + 1) {
+                    set.insert(val.split('=').next().unwrap_or(val).to_string());
+                    i += 2;
+                    continue;
+                }
+            } else if al.starts_with("--env=") || al.starts_with("-e=") {
+                if let Some((_, rest)) = a.split_once('=') {
+                    set.insert(rest.split('=').next().unwrap_or(rest).to_string());
+                }
+            } else if al.starts_with("-e") && al.len() > 2 {
+                let rest = &a[2..];
+                set.insert(rest.split('=').next().unwrap_or(rest).to_string());
+            }
+            i += 1;
+        }
+        set
+    };
+    let mut extras: Vec<String> = Vec::new();
+    for (key, _) in env {
+        if key.is_empty() || key.starts_with('-') {
+            continue;
+        }
+        if already.contains(key) {
+            continue;
+        }
+        extras.push("-e".to_string());
+        extras.push(key.clone());
+    }
+    if extras.is_empty() {
+        return args.to_vec();
+    }
+    // `-e` is a `run`/`create` option, not a docker/podman/nerdctl GLOBAL one, so it
+    // has to follow that subcommand rather than lead argv. `docker compose run`,
+    // `docker container run`, and a global like `docker --context x run` all put the
+    // subcommand later than argv[0], where prepending produced
+    // `docker -e KEY compose run …` and the CLI refused it with
+    // "unknown shorthand flag: 'e'" - so a server that used to start stopped starting
+    // the moment it was given a vaulted secret.
+    let mut out = Vec::with_capacity(args.len() + extras.len());
+    out.extend(args[..=at].iter().cloned());
+    out.extend(extras);
+    out.extend(args[at + 1..].iter().cloned());
+    out
 }
 
 /// Talks to a downstream MCP server over its stdio (a spawned child process).
@@ -2966,6 +3142,8 @@ impl StdioTransport {
             Some(d) => (d.command.as_str(), d.args.as_slice()),
             None => (command, args),
         };
+        let container_args = inject_container_env(spawn_command, spawn_args, env);
+        let spawn_args = container_args.as_slice();
         let resolved = resolve_command(spawn_command);
         let mut cmd = Command::new(&resolved);
         cmd.args(spawn_args)
@@ -3166,9 +3344,7 @@ impl Transport for StdioTransport {
         params: Value,
         cancel: Option<CancelContext>,
     ) -> Result<Value, TransportError> {
-        if self.pending_mrtr.is_some()
-            && cancel.as_ref().is_some_and(CancelContext::is_cancelled)
-        {
+        if self.pending_mrtr.is_some() && cancel.as_ref().is_some_and(CancelContext::is_cancelled) {
             if let Some(cancel) = cancel.as_ref() {
                 self.cancel_matching_pending_request(method, &params, cancel);
             }
@@ -3338,7 +3514,10 @@ impl Transport for StdioTransport {
         if pending.response_for_retry(method, params).is_err() {
             return false;
         }
-        let pending = self.pending_mrtr.take().expect("matching pending request exists");
+        let pending = self
+            .pending_mrtr
+            .take()
+            .expect("matching pending request exists");
         CancelEntry {
             stdin: Arc::clone(&self.stdin),
             downstream_id: pending.downstream_request_id,
@@ -4665,7 +4844,10 @@ impl Transport for HttpTransport {
         if pending.common.response_for_retry(method, params).is_err() {
             return false;
         }
-        let pending = self.pending_mrtr.take().expect("matching pending request exists");
+        let pending = self
+            .pending_mrtr
+            .take()
+            .expect("matching pending request exists");
         self.forward_cancel_async(pending.common.downstream_request_id, cancel);
         true
     }
@@ -5317,9 +5499,7 @@ impl DownstreamServer {
                 });
                 let response = match handler(&request) {
                     Some(ServerRequestAction::Respond(response)) => response,
-                    Some(ServerRequestAction::InputRequired) => {
-                        return Ok(None)
-                    }
+                    Some(ServerRequestAction::InputRequired) => return Ok(None),
                     None => {
                         return Err(TransportError::Fatal(format!(
                             "upstream client did not handle input request '{key}' ({method})"
@@ -6079,11 +6259,11 @@ fn fetch_paginated_list(
 #[cfg(test)]
 mod tests {
     use super::{
-        cwd_validation_error, empty_cwd_variables, expand_cwd, fetch_paginated_list,
-        file_uri_to_path, protocol_meta_for, resolve_command, resolve_project_root,
-        resolve_root_token, screen_resolved_addrs, screen_spawn_command, screen_spawn_env,
-        validate_cwd, CacheHint, CancelRegistry, DownstreamServer, HttpTransport, MrtrRequest,
-        apply_catalog_refresh, is_implausible_shrink, RootSource, ServerRequestAction,
+        apply_catalog_refresh, cwd_validation_error, empty_cwd_variables, expand_cwd,
+        fetch_paginated_list, file_uri_to_path, is_implausible_shrink, protocol_meta_for,
+        resolve_command, resolve_project_root, resolve_root_token, screen_resolved_addrs,
+        screen_spawn_command, screen_spawn_env, validate_cwd, CacheHint, CancelRegistry,
+        DownstreamServer, HttpTransport, MrtrRequest, RootSource, ServerRequestAction,
         ServerRequestHandler, Transport, TransportError, Truncation, MODERN_PROTOCOL_VERSION,
         OAUTH_CLIENT_CREDENTIALS_EXTENSION,
     };
@@ -6324,7 +6504,9 @@ mod tests {
             let mut hint = CacheHint::default();
             apply_catalog_refresh(
                 &mut tools,
-                (0..new_len).map(|i| json!({"name": format!("t{i}")})).collect(),
+                (0..new_len)
+                    .map(|i| json!({"name": format!("t{i}")}))
+                    .collect(),
                 &mut streak,
                 &mut hint,
                 CacheHint::default(),
@@ -7632,9 +7814,7 @@ mod tests {
             }
         }))]);
         let mut server = DownstreamServer::connect("modern".into(), Box::new(transport)).unwrap();
-        server.set_server_request_handler(Arc::new(|_| {
-            Some(ServerRequestAction::InputRequired)
-        }));
+        server.set_server_request_handler(Arc::new(|_| Some(ServerRequestAction::InputRequired)));
         let meta = json!({
             "io.modelcontextprotocol/protocolVersion": MODERN_PROTOCOL_VERSION,
             "io.modelcontextprotocol/clientCapabilities": { "elicitation": { "url": {} } }
@@ -8383,6 +8563,158 @@ mod tests {
         );
         // A plain binary server.
         assert!(screen_spawn_command("/usr/local/bin/my-mcp", &argv(&["--stdio"])).is_ok());
+        assert!(screen_spawn_command("npm", &argv(&["exec", "-y", "@some/mcp-server"])).is_ok());
+    }
+
+    #[test]
+    fn spawn_guard_blocks_npx_eval_flags() {
+        // SBS-783: npx/npm eval flags were falling through to allow.
+        assert!(screen_spawn_command("npx", &argv(&["-c", "calc"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["--call", "x"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["-ccalc"])).is_err());
+        assert!(screen_spawn_command(
+            "npx",
+            &argv(&["--node-arg=-e", "require('fs')", "-y", "pkg"])
+        )
+        .is_err());
+        assert!(screen_spawn_command("npx", &argv(&["-n", "-e", "-y", "pkg"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["--shell", "bash", "-c", "x"])).is_err());
+        assert!(screen_spawn_command("npm", &argv(&["exec", "-c", "x"])).is_err());
+        assert!(screen_spawn_command("npm", &argv(&["x", "--call=x"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["--", "node", "-e", "x"])).is_err());
+        assert!(screen_spawn_command("npm", &argv(&["exec", "--", "node", "-e", "x"])).is_err());
+        // Normal package install is still the allow-path.
+        assert!(screen_spawn_command("npx", &argv(&["-y", "@scope/mcp"])).is_ok());
+    }
+
+    /// `--` separates npx's own options from the command's arguments; it does not
+    /// introduce the command. Reading the token after it as the program screened `-e`
+    /// (not an interpreter, allowed) while npm actually ran `node -e <code>`.
+    #[test]
+    fn spawn_guard_screens_the_program_npx_actually_runs() {
+        // The reported bypass: the executable is the positional BEFORE `--`.
+        assert!(screen_spawn_command("npm", &argv(&["exec", "node", "--", "-e", "x"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["node", "--", "-e", "x"])).is_err());
+        // Same shape without a separator, and with the executable trailing a flag's
+        // value, where a `--`-anchored parse never looks.
+        assert!(screen_spawn_command("npx", &argv(&["node", "-e", "x"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["-p", "pkg", "node", "-e", "x"])).is_err());
+        assert!(
+            screen_spawn_command("npm", &argv(&["exec", "sh", "--", "-c", "curl|sh"])).is_err()
+        );
+        // A package name is not an interpreter, so over-screening positionals costs
+        // nothing: these must still install and run.
+        assert!(screen_spawn_command("npx", &argv(&["-y", "@scope/mcp", "--port", "1"])).is_ok());
+        assert!(screen_spawn_command("npx", &argv(&["-p", "pkg", "server", "--flag"])).is_ok());
+        assert!(screen_spawn_command("npm", &argv(&["exec", "--", "mcp-server", "--x"])).is_ok());
+        // These are arguments to the launched package, not npx's own eval flags.
+        assert!(screen_spawn_command("npx", &argv(&["-y", "pkg", "-c", "config.yaml"])).is_ok());
+        assert!(screen_spawn_command("npx", &argv(&["-y", "pkg", "--", "--call", "safe"])).is_ok());
+        assert!(
+            screen_spawn_command("npm", &argv(&["exec", "pkg", "--", "--shell", "safe"])).is_ok()
+        );
+    }
+
+    /// `-yc '<shell>'` is `-y -c '<shell>'`. Same getopt clustering this file already
+    /// closes for `sh -ec` and `node -pe`, and the same threat: a team-pushed config
+    /// swaps `-c` for `-yc` and the operand runs.
+    #[test]
+    fn spawn_guard_blocks_clustered_npx_call() {
+        assert!(screen_spawn_command("npx", &argv(&["-yc", "calc"])).is_err());
+        assert!(screen_spawn_command("npx", &argv(&["-qyc", "calc"])).is_err());
+        assert!(screen_spawn_command("npm", &argv(&["exec", "-yc", "calc"])).is_err());
+        // `n` takes a value, so the walk bails there rather than reading a later
+        // character as an eval flag.
+        assert!(screen_spawn_command("npx", &argv(&["-y", "@scope/mcp"])).is_ok());
+        assert!(screen_spawn_command("npx", &argv(&["-qy", "@scope/mcp"])).is_ok());
+    }
+
+    #[test]
+    fn inject_container_env_adds_dash_e_before_the_image() {
+        let env = vec![("ACME_API_KEY".to_string(), "secret".to_string())];
+        assert_eq!(
+            super::inject_container_env(
+                "docker",
+                &argv(&["run", "-i", "--rm", "ghcr.io/acme/boxed-mcp:1.2.3"]),
+                &env,
+            ),
+            argv(&[
+                "run",
+                "-e",
+                "ACME_API_KEY",
+                "-i",
+                "--rm",
+                "ghcr.io/acme/boxed-mcp:1.2.3"
+            ])
+        );
+        // Value stays off argv; npx is unchanged.
+        assert_eq!(
+            super::inject_container_env("npx", &argv(&["-y", "pkg"]), &env),
+            argv(&["-y", "pkg"])
+        );
+        // Already-present -e is not duplicated.
+        assert_eq!(
+            super::inject_container_env(
+                "docker",
+                &argv(&["run", "-e", "ACME_API_KEY", "img"]),
+                &env,
+            ),
+            argv(&["run", "-e", "ACME_API_KEY", "img"])
+        );
+        // Docker's compact spelling is recognized too.
+        assert_eq!(
+            super::inject_container_env(
+                "docker",
+                &argv(&["run", "-eACME_API_KEY=old", "img"]),
+                &env,
+            ),
+            argv(&["run", "-eACME_API_KEY=old", "img"])
+        );
+    }
+
+    /// `-e` is a run/create option, not a docker global. Leading argv with it produced
+    /// `docker -e KEY compose run …`, which the CLI rejects with
+    /// "unknown shorthand flag: 'e'", so a server that started fine stopped starting
+    /// as soon as it had a vaulted secret.
+    #[test]
+    fn inject_container_env_follows_the_subcommand_not_argv0() {
+        let env = vec![("ACME_API_KEY".to_string(), "secret".to_string())];
+        let inject = |args: &[&str]| super::inject_container_env("docker", &argv(args), &env);
+
+        assert_eq!(
+            inject(&["compose", "run", "--rm", "svc"]),
+            argv(&["compose", "run", "-e", "ACME_API_KEY", "--rm", "svc"])
+        );
+        assert_eq!(
+            inject(&["container", "run", "img"]),
+            argv(&["container", "run", "-e", "ACME_API_KEY", "img"])
+        );
+        // A global option before the subcommand is the same shape.
+        assert_eq!(
+            inject(&["--context", "remote", "run", "img"]),
+            argv(&["--context", "remote", "run", "-e", "ACME_API_KEY", "img"])
+        );
+        assert_eq!(
+            inject(&["create", "--name", "x", "img"]),
+            argv(&["create", "-e", "ACME_API_KEY", "--name", "x", "img"])
+        );
+        // An application argument after the image is not a Docker env option. It
+        // must not suppress propagation of the vaulted value into the container.
+        assert_eq!(
+            inject(&["run", "img", "server", "-e", "ACME_API_KEY"]),
+            argv(&[
+                "run",
+                "-e",
+                "ACME_API_KEY",
+                "img",
+                "server",
+                "-e",
+                "ACME_API_KEY"
+            ])
+        );
+        // Nothing here accepts `-e`, so argv is left alone rather than corrupted.
+        assert_eq!(inject(&["build", "."]), argv(&["build", "."]));
+        assert_eq!(inject(&["ps"]), argv(&["ps"]));
     }
 
     #[test]
@@ -8955,7 +9287,10 @@ mod tests {
     fn bearer_header_adds_scheme_once() {
         assert_eq!(super::bearer_header("sk-123"), "Bearer sk-123");
         assert_eq!(super::bearer_header("Bearer sk-123"), "Bearer sk-123");
-        assert_eq!(super::bearer_header("Basic ZW1haWw6dG9rZW4="), "Basic ZW1haWw6dG9rZW4=");
+        assert_eq!(
+            super::bearer_header("Basic ZW1haWw6dG9rZW4="),
+            "Basic ZW1haWw6dG9rZW4="
+        );
         assert_eq!(super::bearer_header("bearer sk-123"), "bearer sk-123");
     }
 
@@ -10980,11 +11315,9 @@ mod tests {
                 "id": body["id"],
                 "result": { "recovered": true }
             });
-            let content_type = tiny_http::Header::from_bytes(
-                &b"Content-Type"[..],
-                &b"application/json"[..],
-            )
-            .unwrap();
+            let content_type =
+                tiny_http::Header::from_bytes(&b"Content-Type"[..], &b"application/json"[..])
+                    .unwrap();
             request
                 .respond(
                     tiny_http::Response::from_string(response.to_string())
@@ -11036,7 +11369,10 @@ mod tests {
 
             let mut cancellation = server.recv().expect("receive MRTR cancellation");
             let mut cancel_body = String::new();
-            cancellation.as_reader().read_to_string(&mut cancel_body).unwrap();
+            cancellation
+                .as_reader()
+                .read_to_string(&mut cancel_body)
+                .unwrap();
             cancel_tx
                 .send(serde_json::from_str::<Value>(&cancel_body).unwrap())
                 .unwrap();
@@ -11140,7 +11476,10 @@ mod tests {
             assert_eq!(value["method"], "notifications/cancelled");
             assert_eq!(value["params"]["requestId"], 41);
             assert!(
-                server.recv_timeout(Duration::from_millis(150)).unwrap().is_none(),
+                server
+                    .recv_timeout(Duration::from_millis(150))
+                    .unwrap()
+                    .is_none(),
                 "pre-cancellation must not send the inline continuation POST"
             );
         });

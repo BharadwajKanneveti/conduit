@@ -511,7 +511,19 @@ fn map_server(server: &Value) -> Option<CatalogEntry> {
         }
         let version = pkg.get("version").and_then(|v| v.as_str());
         let spec = match version {
-            Some(v) if !v.is_empty() && v != "latest" => format!("{identifier}@{v}"),
+            Some(v) if !v.is_empty() && v != "latest" => {
+                // npm/PyPI pin with `@`. Docker treats `@` as a content digest
+                // (`image@sha256:…`), so OCI tags must use `identifier:version` (SBS-784).
+                if matches!(registry_type, "oci" | "docker") {
+                    if v.contains(':') {
+                        format!("{identifier}@{v}")
+                    } else {
+                        format!("{identifier}:{v}")
+                    }
+                } else {
+                    format!("{identifier}@{v}")
+                }
+            }
             _ => identifier.to_string(),
         };
         // SECURITY: this spec becomes an argument to npx/uvx/docker for a one-click
@@ -833,7 +845,7 @@ mod tests {
             // so `-i --rm` must precede the image spec.
             assert_eq!(
                 e.args,
-                vec!["run", "-i", "--rm", "ghcr.io/acme/boxed-mcp@1.2.3"],
+                vec!["run", "-i", "--rm", "ghcr.io/acme/boxed-mcp:1.2.3"],
                 "{registry_type}"
             );
             assert_eq!(e.env_keys, vec!["ACME_API_KEY"], "{registry_type}");
@@ -845,6 +857,23 @@ mod tests {
         assert_eq!(
             map_server(&bare).unwrap().args,
             vec!["run", "-i", "--rm", "ghcr.io/acme/boxed-mcp"]
+        );
+
+        // OCI digests use @; a colon is only the separator for a tag.
+        let digest = json!({ "name": "io.github.acme/boxed", "title": "Boxed",
+            "packages": [{
+                "registryType": "oci",
+                "identifier": "ghcr.io/acme/boxed-mcp",
+                "version": "sha256:abcdef0123456789"
+            }] });
+        assert_eq!(
+            map_server(&digest).unwrap().args,
+            vec![
+                "run",
+                "-i",
+                "--rm",
+                "ghcr.io/acme/boxed-mcp@sha256:abcdef0123456789"
+            ]
         );
     }
 
