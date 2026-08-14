@@ -60,7 +60,11 @@ import { PendingApprovals } from "@/components/PendingApprovals";
 import { QuarantineAlert } from "@/components/QuarantineAlert";
 import { RegistryServerRow } from "@/components/RegistryServerRow";
 import { ServerDialog } from "@/components/ServerDialog";
-import { ImportReviewDialog } from "@/components/ImportReviewDialog";
+import {
+  ImportReviewDialog,
+  needsTeamEnableReview,
+  sameReviewedDefinition,
+} from "@/components/ImportReviewDialog";
 
 // Secondary destinations are code-split so the initial bundle only carries the
 // default Servers view and the app chrome. Each mounts behind a Suspense
@@ -118,6 +122,7 @@ function App() {
   // Gates the "Disable all" bulk action behind a confirm when it turns off more
   // than a couple of servers, so one menu click can't silently kill a big set.
   const [confirmDisableAll, setConfirmDisableAll] = useState(false);
+  const [confirmEnableTeam, setConfirmEnableTeam] = useState<ServerEntry | null>(null);
   const [selectedClientId, setSelectedClientId] = useState<string | null>(null);
   const [view, setView] = useState<View>("servers");
   const [activityKey, setActivityKey] = useState(0);
@@ -635,11 +640,11 @@ function App() {
     setOnboardingStep(0);
   }
 
-  async function handleToggle(serverId: string, enabled: boolean) {
+  async function applyToggle(serverId: string, enabled: boolean, reviewed = false) {
     if (!profileId) return;
     setBusyId(serverId);
     try {
-      setRegistry(await setServerEnabled(profileId, serverId, enabled));
+      setRegistry(await setServerEnabled(profileId, serverId, enabled, reviewed));
       // Enabling adds a server with no health entry yet, so its card would sit on
       // "Checking…" until a manual refresh. Probe now to resolve it. (Disabling
       // moves it to the disabled group, no probe needed.)
@@ -649,6 +654,17 @@ function App() {
     } finally {
       setBusyId(null);
     }
+  }
+
+  async function handleToggle(serverId: string, enabled: boolean) {
+    if (enabled) {
+      const server = servers.find((s) => s.id === serverId);
+      if (server && needsTeamEnableReview(server)) {
+        setConfirmEnableTeam(server);
+        return;
+      }
+    }
+    await applyToggle(serverId, enabled);
   }
 
   async function handleRemove(serverId: string, name: string) {
@@ -666,11 +682,31 @@ function App() {
   async function handleToggleAll() {
     if (!profileId || togglingAll) return;
     const enable = enabledCount < servers.length;
+    const pendingReview =
+      enable && registry
+        ? servers.filter((s) => needsTeamEnableReview(s) && !isEnabled(registry, s.id))
+            .length
+        : 0;
+    if (enable && pendingReview > 0 && pendingReview === servers.length - enabledCount) {
+      toast.message(
+        pendingReview === 1
+          ? "That team server still needs review in Teams."
+          : `${pendingReview} team servers still need review in Teams.`,
+      );
+      return;
+    }
     setTogglingAll(true);
     try {
       setRegistry(await setAllEnabled(profileId, enable));
       if (enable) void reprobeAfterMutation().catch(() => {});
-      toast.success(enable ? "Enabled all servers" : "Disabled all servers");
+      let message = enable ? "Enabled all servers" : "Disabled all servers";
+      if (enable && pendingReview > 0) {
+        message =
+          pendingReview === 1
+            ? "Enabled servers. 1 team server still needs review."
+            : `Enabled servers. ${pendingReview} team servers still need review.`;
+      }
+      toast.success(message);
     } catch (e) {
       toastError(`Couldn't update servers: ${e}`);
     } finally {
@@ -1053,6 +1089,48 @@ function App() {
         confirmLabel="Disable all"
         destructive
         onConfirm={handleToggleAll}
+      />
+      <ConfirmDialog
+        open={confirmEnableTeam !== null}
+        onOpenChange={(open) => {
+          if (!open) setConfirmEnableTeam(null);
+        }}
+        title={
+          confirmEnableTeam ? `Enable "${confirmEnableTeam.name}"?` : "Enable server?"
+        }
+        description={
+          confirmEnableTeam
+            ? confirmEnableTeam.transport === "stdio" || confirmEnableTeam.command
+              ? `This runs a local command on your machine: ${[confirmEnableTeam.command, ...(confirmEnableTeam.args ?? [])].join(" ")}. Only enable it if you trust your team and recognize this command.`
+              : `This connects Toolport to ${confirmEnableTeam.url ?? ""}, a private/LAN address. Only enable it if you trust your team.`
+            : undefined
+        }
+        confirmLabel="Enable"
+        onConfirm={() => {
+          if (!confirmEnableTeam) return;
+          // Re-check the definition against the one that was reviewed. Team sync runs
+          // on a timer, so a push landing while this dialog is open would otherwise
+          // enable a command or URL the member never saw - the confirmation carried
+          // only the id. If it changed under them, re-open review on the new one
+          // instead of enabling it.
+          const live = registry?.servers.find((s) => s.id === confirmEnableTeam.id);
+          if (!live) {
+            setConfirmEnableTeam(null);
+            toastError("That server is no longer in your registry.");
+            return;
+          }
+          if (!sameReviewedDefinition(confirmEnableTeam, live)) {
+            setConfirmEnableTeam(live);
+            toastError(
+              "This server changed while you were reviewing it. Check it again.",
+            );
+            // Reject so ConfirmDialog skips its setOpen(false) - a normal return
+            // would close the dialog and onOpenChange(false) would null out the
+            // `live` entry we just swapped in, so the re-review never appears.
+            throw new Error("definition changed");
+          }
+          return applyToggle(confirmEnableTeam.id, true, true);
+        }}
       />
       {/* Ctrl+N. Mounted only while open so `autoOpen` fires each time, and unmounted
           on close so the next press starts from a clean form. */}

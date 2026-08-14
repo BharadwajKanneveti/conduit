@@ -697,6 +697,9 @@ fn add_server(state: State<RegistryState>, entry: ServerEntry) -> Result<Registr
 /// then the package is already in the launcher's cache, which is the whole point.
 /// The connect result is deliberately ignored; the real probe reports health.
 fn prewarm_launcher(server: &ServerEntry) {
+    if server.needs_team_enable_review() {
+        return;
+    }
     let Some(command) = server.command.clone() else {
         return;
     };
@@ -737,17 +740,54 @@ fn remove_server(state: State<RegistryState>, id: String) -> Result<Registry, St
     Ok(reg)
 }
 
+/// `reviewed` is the caller asserting the member saw the Teams review dialog for
+/// THIS definition. It defaults to false, which is the point: `set_all_enabled`
+/// already filters these out (`Registry::set_all_enabled`), but this single-server
+/// path had no gate at all, so the renderer's `needsTeamEnableReview` was the only
+/// thing standing between a team-pushed local command and a running process. That
+/// check cannot resolve DNS, so it missed a LAN URL written as a hostname, and any
+/// future caller of this command would have inherited the same hole. Deciding it
+/// here means the frontend heuristic is now an affordance rather than the boundary.
 #[tauri::command]
 fn set_server_enabled(
     state: State<RegistryState>,
     profile_id: String,
     server_id: String,
     enabled: bool,
+    reviewed: Option<bool>,
 ) -> Result<Registry, String> {
+    let reviewed = reviewed.unwrap_or(false);
     let (reg, _) = write_registry(state.inner(), |reg| {
+        // Checked inside the write closure so it sees the registry that will be
+        // persisted: a team_sync_wait replace landing between a pre-lock check and
+        // this write could swap the entry for one that needs review.
+        refuse_unreviewed_team_enable(reg, &server_id, enabled, reviewed)?;
         reg.set_server_enabled(&profile_id, &server_id, enabled)
     })?;
     Ok(reg)
+}
+
+/// The gate half of `set_server_enabled`, split out so the write-closure behavior
+/// is unit-testable without a Tauri `State`.
+fn refuse_unreviewed_team_enable(
+    reg: &Registry,
+    server_id: &str,
+    enabled: bool,
+    reviewed: bool,
+) -> Result<(), String> {
+    if enabled
+        && !reviewed
+        && reg
+            .servers
+            .iter()
+            .any(|s| s.id == server_id && s.needs_team_enable_review())
+    {
+        return Err(
+            "this team server runs a local command or private address; enable it from Teams after review"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -1583,13 +1623,26 @@ async fn probe_servers(
 }
 
 /// Snapshot one server out of the registry by id (dropping the lock before I/O).
-fn server_by_id(state: &RegistryState, server_id: &str) -> Result<ServerEntry, String> {
+/// Playground connects must not spawn a team-review server the member has not
+/// enabled — the Teams confirm is otherwise frontend-only.
+fn playground_server(state: &RegistryState, server_id: &str) -> Result<ServerEntry, String> {
     let reg = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    reg.servers
+    let server = reg
+        .servers
         .iter()
         .find(|s| s.id == server_id)
         .cloned()
-        .ok_or_else(|| format!("server '{server_id}' not found"))
+        .ok_or_else(|| format!("server '{server_id}' not found"))?;
+    if server.needs_team_enable_review() {
+        let pid = reg.active_profile_id();
+        if !reg.is_enabled(&pid, &server.id) {
+            return Err(
+                "this team server runs a local command or private address; enable it from Teams after review"
+                    .into(),
+            );
+        }
+    }
+    Ok(server)
 }
 
 /// List the tools one server exposes (raw MCP tool objects: name, description,
@@ -1600,7 +1653,7 @@ async fn list_server_tools(
     state: State<'_, RegistryState>,
     server_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let server = server_by_id(state.inner(), &server_id)?;
+    let server = playground_server(state.inner(), &server_id)?;
     tauri::async_runtime::spawn_blocking(move || connect_server(&server).map(|ds| ds.tools))
         .await
         .map_err(|e| e.to_string())?
@@ -1616,7 +1669,7 @@ async fn call_tool(
     tool: String,
     arguments: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let server = server_by_id(state.inner(), &server_id)?;
+    let server = playground_server(state.inner(), &server_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut ds = connect_server(&server)?;
         let started = std::time::Instant::now();
@@ -1648,7 +1701,7 @@ async fn list_server_resources(
     state: State<'_, RegistryState>,
     server_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let server = server_by_id(state.inner(), &server_id)?;
+    let server = playground_server(state.inner(), &server_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         connect_server(&server).map(|mut ds| {
             ds.load_resources_prompts();
@@ -1667,7 +1720,7 @@ async fn list_server_prompts(
     state: State<'_, RegistryState>,
     server_id: String,
 ) -> Result<Vec<serde_json::Value>, String> {
-    let server = server_by_id(state.inner(), &server_id)?;
+    let server = playground_server(state.inner(), &server_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         connect_server(&server).map(|mut ds| {
             ds.load_resources_prompts();
@@ -1686,7 +1739,7 @@ async fn read_resource(
     server_id: String,
     uri: String,
 ) -> Result<serde_json::Value, String> {
-    let server = server_by_id(state.inner(), &server_id)?;
+    let server = playground_server(state.inner(), &server_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut ds = connect_server(&server)?;
         ds.read_resource(&uri).map_err(|e| e.to_string())
@@ -1704,7 +1757,7 @@ async fn get_prompt(
     name: String,
     arguments: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let server = server_by_id(state.inner(), &server_id)?;
+    let server = playground_server(state.inner(), &server_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let mut ds = connect_server(&server)?;
         ds.get_prompt(&name, arguments).map_err(|e| e.to_string())
@@ -4663,6 +4716,23 @@ mod tests {
         );
         assert!(!r.ok);
         assert_eq!(r.server_id, "bogus");
+    }
+
+    #[test]
+    fn unreviewed_team_stdio_enable_is_refused_in_write_closure() {
+        let mut reg = Registry::default();
+        let mut s = plain_server("team-tool", "Team tool");
+        s.source = Some("team:acme".into());
+        reg.servers.push(s);
+
+        let err = refuse_unreviewed_team_enable(&reg, "team-tool", true, false)
+            .expect_err("stdio team server must not enable without review");
+        assert!(err.contains("enable it from Teams after review"), "{err}");
+        // The consent path (reviewed=true), disabling, and non-team servers pass.
+        assert!(refuse_unreviewed_team_enable(&reg, "team-tool", true, true).is_ok());
+        assert!(refuse_unreviewed_team_enable(&reg, "team-tool", false, false).is_ok());
+        reg.servers[0].source = None;
+        assert!(refuse_unreviewed_team_enable(&reg, "team-tool", true, false).is_ok());
     }
 
     fn plain_server(id: &str, name: &str) -> ServerEntry {
