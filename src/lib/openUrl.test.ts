@@ -20,6 +20,23 @@ describe("openExternal", () => {
     expect(openUrl).toHaveBeenCalledTimes(2);
   });
 
+  it("keeps loopback and private-LAN docs reachable", async () => {
+    await openExternal("http://127.0.0.1:8080/docs");
+    await openExternal("http://192.168.1.10/manual");
+    expect(openUrl).toHaveBeenCalledTimes(2);
+  });
+
+  it("refuses link-local and cloud-metadata hosts", async () => {
+    await openExternal("http://169.254.169.254/latest/meta-data/");
+    await openExternal("http://169.254.169.254./latest/meta-data/");
+    await openExternal("http://100.100.100.200/latest/meta-data/");
+    await openExternal("http://0.0.0.0:8080/");
+    await openExternal("http://[fe80::1]/");
+    await openExternal("http://[::ffff:169.254.169.254]/");
+    await openExternal("http://[::]/");
+    expect(openUrl).not.toHaveBeenCalled();
+  });
+
   it("refuses file:, javascript:, malformed, and empty inputs", async () => {
     await openExternal("file:///etc/passwd");
     await openExternal("javascript:alert(1)");

@@ -894,8 +894,13 @@ pub fn connect_remote_with_handler(
             .expect("uses_client_credentials checked it");
         acquire_client_credentials(server_id, url, config)?;
     }
-    let stored_auth = secrets::get_secret(server_id, secrets::HTTP_AUTH_KEY)
-        .or_else(|| first_vaulted_secret(server));
+    // A vault read failure is not "no token" (SBS-789): connecting anonymous on a
+    // locked keychain would surface as a bogus 401/"needs sign-in" and can hand an
+    // unauthenticated session to a server the user believes is authenticated.
+    let stored_auth = match secrets::get_secret_result(server_id, secrets::HTTP_AUTH_KEY) {
+        Ok(v) => v.or_else(|| first_vaulted_secret(server)),
+        Err(e) => return Err(format!("could not read the vaulted auth token: {e}")),
+    };
     let auth = match refresh_token_if_needed(server_id)? {
         Some(fresh) => Some(fresh),
         None => stored_auth,

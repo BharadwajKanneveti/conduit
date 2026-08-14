@@ -456,11 +456,15 @@ struct ProbeResult {
 }
 
 /// True if this server declares secret env vars that don't yet have a vaulted value.
+/// A failed vault read is NOT "missing" (SBS-789): a locked keychain must not flip
+/// the UI to "Needs sign-in" and invite the user to re-enter a credential that is
+/// in fact stored — only a confirmed `Ok(None)` counts.
 fn missing_secret(server: &ServerEntry) -> bool {
-    server
-        .env
-        .iter()
-        .any(|e| e.secret && e.value.is_none() && secrets::get_secret(&server.id, &e.key).is_none())
+    server.env.iter().any(|e| {
+        e.secret
+            && e.value.is_none()
+            && matches!(secrets::get_secret_result(&server.id, &e.key), Ok(None))
+    })
 }
 
 /// Connect to one server (stdio or remote), injecting any vaulted secrets, and
@@ -719,16 +723,21 @@ fn prewarm_launcher(server: &ServerEntry) {
     }
     let server = server.clone();
     std::thread::spawn(move || {
-        let env: Vec<(String, String)> = server
-            .env
-            .iter()
-            .filter_map(|e| {
-                e.value
-                    .clone()
-                    .or_else(|| secrets::get_secret(&server.id, &e.key))
-                    .map(|v| (e.key.clone(), v))
-            })
-            .collect();
+        let mut env: Vec<(String, String)> = Vec::new();
+        for e in &server.env {
+            match e.value.clone() {
+                Some(v) => env.push((e.key.clone(), v)),
+                None => match secrets::get_secret_result(&server.id, &e.key) {
+                    Ok(Some(v)) => env.push((e.key.clone(), v)),
+                    // Unset stays lenient (the point is warming the download
+                    // cache), but a failed vault read aborts (SBS-789): don't
+                    // hand the child a half-real environment while the keychain
+                    // is locked — the real probe will retry with the truth.
+                    Ok(None) => {}
+                    Err(_) => return,
+                },
+            }
+        }
         let cwd = server.cwd.as_deref().and_then(|c| resolve_root_token(c, None));
         if let Ok(t) = StdioTransport::spawn(&command, &server.args, &env, cwd.as_deref()) {
             // Attempting the handshake keeps the child alive until the download
@@ -2878,9 +2887,11 @@ fn clear_auth_token(state: State<RegistryState>, server_id: String) -> Result<()
     Ok(())
 }
 
+/// Errs on a failed vault read instead of reporting `false` (SBS-789): a locked
+/// keychain must not make a vaulted token look like "never authenticated".
 #[tauri::command]
-fn has_auth_token(server_id: String) -> bool {
-    secrets::get_secret(&server_id, secrets::HTTP_AUTH_KEY).is_some()
+fn has_auth_token(server_id: String) -> Result<bool, String> {
+    Ok(secrets::get_secret_result(&server_id, secrets::HTTP_AUTH_KEY)?.is_some())
 }
 
 /// Figure out what a remote server needs to connect (none / oauth / token) and

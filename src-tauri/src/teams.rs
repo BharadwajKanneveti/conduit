@@ -23,8 +23,10 @@ pub const TEAM_TOKEN_KEY: &str = "member_token";
 pub fn save_token(token: &str) -> Result<(), String> {
     crate::secrets::set_secret(TEAM_TOKEN_SERVER, TEAM_TOKEN_KEY, token)
 }
-pub fn load_token() -> Option<String> {
-    crate::secrets::get_secret(TEAM_TOKEN_SERVER, TEAM_TOKEN_KEY)
+/// Distinguishes "no token stored" (`Ok(None)`) from a failed vault read
+/// (`Err`) so a locked keychain reads as an error, not as signed-out (SBS-789).
+pub fn load_token() -> Result<Option<String>, String> {
+    crate::secrets::get_secret_result(TEAM_TOKEN_SERVER, TEAM_TOKEN_KEY)
 }
 pub fn clear_token() -> Result<(), String> {
     crate::secrets::delete_secret(TEAM_TOKEN_SERVER, TEAM_TOKEN_KEY)
@@ -660,7 +662,7 @@ fn sync_inner(wait_secs: u64) -> Result<SyncResult, String> {
         let reg = crate::registry::load()?;
         reg.team.clone().ok_or("not connected to a team")?
     };
-    let token = load_token().ok_or("team token is missing from the keychain")?;
+    let token = load_token()?.ok_or("team token is missing from the keychain")?;
 
     // Membership heartbeat first. This catches two things a config pull can't: removal
     // (a config pull would just error on the now-invalid token, indistinguishable from a
@@ -1321,7 +1323,7 @@ pub fn preview_push_current() -> Result<PushPreview, String> {
     if conn.role != "admin" {
         return Err("only a team admin can push the shared config".into());
     }
-    let token = load_token().ok_or("team token is missing from the keychain")?;
+    let token = load_token()?.ok_or("team token is missing from the keychain")?;
     let local_servers = team_server_export(&reg);
     let (base_version, remote_config) =
         fetch_config_for_update(&conn.server_url, &conn.team_id, &token)?;
@@ -1346,7 +1348,7 @@ pub fn push_current(
     if conn.role != "admin" {
         return Err("only a team admin can push the shared config".into());
     }
-    let token = load_token().ok_or("team token is missing from the keychain")?;
+    let token = load_token()?.ok_or("team token is missing from the keychain")?;
     let servers = team_server_export(&reg);
     if crate::audit::args_hash(&servers) != expected_local_fingerprint {
         return Err(

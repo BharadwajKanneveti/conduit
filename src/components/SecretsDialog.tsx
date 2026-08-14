@@ -92,6 +92,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
   const [newValue, setNewValue] = useState("");
   const [busyKey, setBusyKey] = useState<string | null>(null);
   const [authSet, setAuthSet] = useState(false);
+  const [authProbeError, setAuthProbeError] = useState(false);
   const [authInput, setAuthInput] = useState("");
   const [oauthBusy, setOauthBusy] = useState(false);
   // Headless (client-credentials) auth. `ccSecretSet` tracks only whether a
@@ -138,8 +139,16 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     }
     if (isRemote && server.url) {
       hasAuthToken(server.id)
-        .then((v) => fresh() && setAuthSet(v))
-        .catch(() => {});
+        .then((v) => {
+          if (!fresh()) return;
+          setAuthSet(v);
+          setAuthProbeError(false);
+        })
+        .catch(() => {
+          // Unknown ≠ absent (SBS-789): keep the badge off but say the check
+          // failed rather than implying no token is vaulted.
+          if (fresh()) setAuthProbeError(true);
+        });
       // Seed the headless form from the registry. The secret is deliberately not
       // fetched: only whether one exists, so it can never be read back out.
       const cc = server.clientCredentials ?? null;
@@ -419,6 +428,11 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
                         <span className="inline-flex items-center gap-1 text-xs text-success">
                           <Check className="size-3" />
                           vaulted
+                        </span>
+                      )}
+                      {authProbeError && (
+                        <span className="text-xs text-warning">
+                          couldn't check the keychain
                         </span>
                       )}
                     </div>

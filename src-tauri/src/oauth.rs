@@ -1078,8 +1078,11 @@ pub fn build_authorize_url(
     scope: Option<&str>,
 ) -> String {
     let enc = |s: &str| urlencoding::encode(s).into_owned();
+    // RFC 6749 §3.1: the metadata's authorization_endpoint may already carry a
+    // query component (some enterprise/B2C providers); join with `&` then.
+    let sep = if authorization_endpoint.contains('?') { '&' } else { '?' };
     let mut url = format!(
-        "{authorization_endpoint}?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}&resource={}",
+        "{authorization_endpoint}{sep}response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}&resource={}",
         enc(client_id),
         enc(redirect_uri),
         enc(challenge),
@@ -1817,6 +1820,21 @@ mod tests {
         assert!(url.contains("code_challenge_method=S256"));
         assert!(url.contains("redirect_uri=http%3A%2F%2F127.0.0.1%3A41789%2Fcallback"));
         assert!(url.contains("scope=mcp"));
+    }
+
+    #[test]
+    fn authorize_url_joins_with_ampersand_when_endpoint_has_a_query() {
+        let url = build_authorize_url(
+            "https://as/auth?p=b2c_signin",
+            "cid",
+            "http://127.0.0.1:41789/callback",
+            "chal",
+            "st",
+            "https://mcp/x",
+            None,
+        );
+        assert!(url.starts_with("https://as/auth?p=b2c_signin&response_type=code"));
+        assert_eq!(url.matches('?').count(), 1);
     }
 
     #[test]

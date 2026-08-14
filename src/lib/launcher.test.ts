@@ -11,6 +11,7 @@ describe("isDownloadLauncher", () => {
   it("matches launchers behind absolute paths and Windows shims", () => {
     expect(isDownloadLauncher("/usr/local/bin/npx", ["-y", "pkg"])).toBe(true);
     expect(isDownloadLauncher("C:\\Program Files\\nodejs\\npx.cmd", ["pkg"])).toBe(true);
+    expect(isDownloadLauncher("C:\\Program Files\\nodejs\\npx.bat", ["pkg"])).toBe(true);
     expect(isDownloadLauncher("NPX.EXE", ["pkg"])).toBe(true);
   });
 

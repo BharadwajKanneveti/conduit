@@ -10,21 +10,67 @@ import { openUrl } from "@tauri-apps/plugin-opener";
  * backend also validates at the source (see `catalog.rs`); this is the matching
  * frontend guard so every `openUrl` call site is covered.
  *
- * Silently no-ops on a missing or non-web URL rather than throwing, since these
+ * Link-local and metadata-range hosts are refused too: clicking "docs" on an
+ * untrusted registry entry must not reach `http://169.254.169.254/…` (IMDSv1)
+ * from a cloud desktop. Loopback stays allowed for locally served docs; other
+ * private LAN ranges are ordinary browsing and stay allowed as well.
+ *
+ * Silently no-ops on a missing or refused URL rather than throwing, since these
  * are all fire-and-forget click handlers.
  */
 export function openExternal(url: string | null | undefined): Promise<void> {
   if (!url) return Promise.resolve();
-  let protocol: string;
+  let parsed: URL;
   try {
-    protocol = new URL(url).protocol;
+    parsed = new URL(url);
   } catch {
     console.warn(`openExternal: refusing to open unparseable URL: ${url}`);
     return Promise.resolve();
   }
-  if (protocol !== "http:" && protocol !== "https:") {
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     console.warn(`openExternal: refusing to open non-web URL: ${url}`);
     return Promise.resolve();
   }
+  if (isLinkLocalHost(parsed.hostname)) {
+    console.warn(`openExternal: refusing to open link-local/metadata URL: ${url}`);
+    return Promise.resolve();
+  }
   return openUrl(url);
+}
+
+/** Link-local and metadata address ranges only — deliberately narrower than
+ * `isPrivateHostUrl` (ImportReviewDialog): loopback and RFC1918 LAN hosts are
+ * legitimate browser targets, the metadata ranges never are. */
+function isLinkLocalHost(hostname: string): boolean {
+  // WHATWG keeps a trailing dot on named hosts and brackets on IPv6 literals.
+  const host = hostname
+    .toLowerCase()
+    .replace(/^\[|\]$/g, "")
+    .replace(/\.$/, "");
+  const v4 = (dotted: string): boolean => {
+    const match = dotted.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (!match) return false;
+    const [a, b, c, d] = match.slice(1).map(Number);
+    if ([a, b, c, d].some((n) => n > 255)) return false;
+    return (
+      (a === 169 && b === 254) || // link-local, incl. 169.254.169.254 (IMDS)
+      (a === 100 && (b & 0xc0) === 64) || // CGNAT 100.64/10 (Alibaba/OCI metadata)
+      a === 0 || // "this network" — 0.0.0.0 reaches loopback/IMDS on some stacks
+      (a === 255 && b === 255 && c === 255 && d === 255) // broadcast
+    );
+  };
+  if (!host.includes(":")) return v4(host);
+  // IPv4-mapped IPv6 — WHATWG may emit dotted or hex form.
+  const mappedDotted = host.match(/^::ffff:(\d{1,3}(?:\.\d{1,3}){3})$/i);
+  if (mappedDotted) return v4(mappedDotted[1]);
+  const mappedHex = host.match(/^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/i);
+  if (mappedHex) {
+    const hi = parseInt(mappedHex[1], 16);
+    const lo = parseInt(mappedHex[2], 16);
+    return v4(`${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`);
+  }
+  if (host === "::" || host === "0:0:0:0:0:0:0:0") return true; // unspecified
+  const first = parseInt(host.split(":")[0] || "0", 16);
+  if (Number.isNaN(first)) return false;
+  return (first & 0xffc0) === 0xfe80; // fe80::/10 link-local
 }

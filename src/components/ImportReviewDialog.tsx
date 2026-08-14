@@ -114,7 +114,7 @@ function ImportReviewContent({
 export function ImportRow({ item, selected }: { item: ImportItem; selected?: boolean }) {
   const runs =
     item.command != null ? [item.command, ...item.args].join(" ") : (item.url ?? "");
-  const shell = runsShell(item.command);
+  const shell = runsShell(item.command, item.args);
   const privateHost = isPrivateHostUrl(item.url);
   return (
     <div className="rounded-md border px-3 py-2">
@@ -156,15 +156,33 @@ export function ImportRow({ item, selected }: { item: ImportItem; selected?: boo
 
 // Exported for unit tests: security-relevant classifier behind the
 // "Runs a shell command" warning above.
-export function runsShell(command: string | null): boolean {
+export function runsShell(command: string | null, args: string[] = []): boolean {
   if (!command) return false;
-  const base = command
+  let cmd = command;
+  let argv = args;
+  // Backend `normalize_invocation`: a packed `"bash -c '…'"` with empty args is
+  // split, but only when the first token is a bare program name (no path) — the
+  // same rule `isDownloadLauncher` mirrors, so a path with spaces stays intact.
+  if (args.length === 0) {
+    const parts = command.split(/\s+/).filter(Boolean);
+    const first = parts[0] ?? "";
+    if (parts.length > 1 && !first.includes("/") && !first.includes("\\")) {
+      cmd = first;
+      argv = parts.slice(1);
+    }
+  }
+  const base = cmd
     .replace(/\\/g, "/")
     .split("/")
     .pop()!
     .toLowerCase()
-    .replace(/\.exe$/, "");
-  return ["cmd", "sh", "bash", "zsh", "powershell", "pwsh"].includes(base);
+    .replace(/\.(exe|cmd|bat)$/, "");
+  // `env` just launches its first non-flag argument; classify that instead.
+  if (base === "env") {
+    const target = argv.find((a) => !a.startsWith("-") && !a.includes("="));
+    return target != null && runsShell(target, argv.slice(argv.indexOf(target) + 1));
+  }
+  return ["cmd", "sh", "bash", "zsh", "fish", "powershell", "pwsh"].includes(base);
 }
 
 // Exported for unit tests: security-relevant classifier behind the

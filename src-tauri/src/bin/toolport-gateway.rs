@@ -8704,6 +8704,10 @@ fn connect_one(
         .map(|d| bind_progress_sink(d, &server.id));
     let result = if let Some(command) = &server.command {
         let mut env: Vec<(String, String)> = Vec::new();
+        // A failed vault read is NOT "no secret stored" (SBS-789): a locked
+        // Credential Manager or torn chunk read must fail the connect, not spawn
+        // the child without its token and make it look never-authenticated.
+        let mut vault_error: Option<String> = None;
         for e in &server.env {
             if let Some(v) = &e.value {
                 env.push((e.key.clone(), v.clone()));
@@ -8718,12 +8722,21 @@ fn connect_one(
                         format_args!("TOOLPORT_SECRET_{}", e.key),
                         e.key
                     ),
-                    Err(err) => eprintln!(
-                        "toolport: '{}' could not read secret '{}': {err}",
-                        server.id, e.key
-                    ),
+                    Err(err) => {
+                        vault_error = Some(format!(
+                            "could not read secret '{}' from the vault: {err}",
+                            e.key
+                        ));
+                        break;
+                    }
                 }
             }
+        }
+        if let Some(err) = vault_error {
+            let msg = format!("'{}' failed: {err}", server.id);
+            eprintln!("toolport: {msg}");
+            glog(&msg);
+            return None;
         }
         // Resolve the ${ROOT} token against the client's project root (issue #239)
         // before spawning. `None` (no ${ROOT}, or ${ROOT} with no known root) means

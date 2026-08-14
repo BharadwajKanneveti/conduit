@@ -21,7 +21,7 @@ export function isDownloadLauncher(command: string | null, args: string[]): bool
   }
   const base = (cmd.split(/[\\/]/).pop() ?? cmd)
     .toLowerCase()
-    .replace(/\.(exe|cmd|ps1)$/, "");
+    .replace(/\.(exe|cmd|bat|ps1)$/, "");
   if (base === "npx" || base === "uvx" || base === "bunx") return true;
   const sub = argv[0];
   if ((base === "pnpm" || base === "yarn") && sub === "dlx") return true;
