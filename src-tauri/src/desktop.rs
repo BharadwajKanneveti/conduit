@@ -1238,51 +1238,70 @@ async fn migrate_client(
 /// Store a secret env value in the OS keychain and mark it on the server entry
 /// (the value itself never enters the registry file).
 #[tauri::command]
-fn set_secret(
-    state: State<RegistryState>,
+async fn set_secret(
+    app: AppHandle,
     server_id: String,
     key: String,
     value: String,
 ) -> Result<Registry, String> {
-    // Keychain write first (external to the registry, so outside the lock), then record
-    // that the secret exists + bump the generation on the FRESH value under the lock.
-    secrets::set_secret(&server_id, &key, &value)?;
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
-            match server.env.iter_mut().find(|e| e.key == key) {
-                Some(ev) => {
-                    ev.secret = true;
-                    ev.value = None;
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        // Serialize the whole keychain+registry pair, not just the registry half.
+        // These commands used to be synchronous and therefore ran one at a time on
+        // the GTK main loop; on the blocking pool they are genuinely concurrent, so
+        // a `delete_secret` landing between this keychain write and the registry
+        // write below would leave the registry advertising a secret the keychain no
+        // longer holds. Same keyed lock `set_auth_token` already uses.
+        let _mutation = acquire_auth_mutation_lock(&server_id)?;
+        // Keychain write first (external to the registry, so outside the lock), then record
+        // that the secret exists + bump the generation on the FRESH value under the lock.
+        secrets::set_secret(&server_id, &key, &value)?;
+        let (reg, _) = write_registry(state.inner(), |reg| {
+            if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
+                match server.env.iter_mut().find(|e| e.key == key) {
+                    Some(ev) => {
+                        ev.secret = true;
+                        ev.value = None;
+                    }
+                    None => server.env.push(registry::EnvVar {
+                        key,
+                        value: None,
+                        secret: true,
+                    }),
                 }
-                None => server.env.push(registry::EnvVar {
-                    key,
-                    value: None,
-                    secret: true,
-                }),
             }
-        }
-        reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
-        Ok(())
-    })?;
-    Ok(reg)
+            reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
+            Ok(())
+        })?;
+        Ok(reg)
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 /// Remove a secret from the keychain and drop the env var from the server entry.
 #[tauri::command]
-fn delete_secret(
-    state: State<RegistryState>,
+async fn delete_secret(
+    app: AppHandle,
     server_id: String,
     key: String,
 ) -> Result<Registry, String> {
-    secrets::delete_secret(&server_id, &key)?;
-    let (reg, _) = write_registry(state.inner(), |reg| {
-        if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
-            server.env.retain(|e| e.key != key);
-        }
-        reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
-        Ok(())
-    })?;
-    Ok(reg)
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        // Held across both halves: see the note in `set_secret`.
+        let _mutation = acquire_auth_mutation_lock(&server_id)?;
+        secrets::delete_secret(&server_id, &key)?;
+        let (reg, _) = write_registry(state.inner(), |reg| {
+            if let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) {
+                server.env.retain(|e| e.key != key);
+            }
+            reg.secrets_generation = reg.secrets_generation.wrapping_add(1);
+            Ok(())
+        })?;
+        Ok(reg)
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 /// Did the user supply a new client secret, and what exactly should be stored?
@@ -1304,14 +1323,36 @@ fn supplied_secret(input: Option<String>) -> Option<String> {
 /// [`set_secret`], which records an env var: this credential is not an env var,
 /// and surfacing it as one would put it in the server's environment listing.
 #[tauri::command]
-fn set_client_credentials(
-    state: State<RegistryState>,
+async fn set_client_credentials(
+    app: AppHandle,
     server_id: String,
     client_id: String,
     client_secret: Option<String>,
     token_endpoint_auth_method: Option<String>,
     scope: Option<String>,
 ) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        set_client_credentials_blocking(&state, server_id, client_id, client_secret, token_endpoint_auth_method, scope)
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
+}
+
+fn set_client_credentials_blocking(
+    state: &RegistryState,
+    server_id: String,
+    client_id: String,
+    client_secret: Option<String>,
+    token_endpoint_auth_method: Option<String>,
+    scope: Option<String>,
+) -> Result<Registry, String> {
+    // The reset/registry/keychain ordering below is deliberate, and on the
+    // blocking pool a concurrent `clear_client_credentials` can interleave with
+    // it -- clearing the registry entry before this call's final keychain write,
+    // which would strand a client secret with nothing pointing at it. Taken here
+    // rather than in the command so a direct caller cannot skip it.
+    let _mutation = acquire_auth_mutation_lock(&server_id)?;
     let client_id = client_id.trim().to_string();
     if client_id.is_empty() {
         return Err("a client id is required for client-credentials auth".into());
@@ -1361,7 +1402,7 @@ fn set_client_credentials(
     // Any config change invalidates a token minted under the old settings.
     remote::reset_client_credentials(&server_id)?;
 
-    let (reg, _) = write_registry(state.inner(), |reg| {
+    let (reg, _) = write_registry(state, |reg| {
         // Fail loudly on an unknown id. The keychain write above already happened,
         // so silently skipping the registry half would leave a stored secret with
         // no configuration pointing at it, and report success.
@@ -1396,10 +1437,24 @@ fn set_client_credentials(
 /// Remove client-credentials auth from a server: the vaulted secret, the minted
 /// access token, and the registry config.
 #[tauri::command]
-fn clear_client_credentials(
-    state: State<RegistryState>,
+async fn clear_client_credentials(
+    app: AppHandle,
     server_id: String,
 ) -> Result<Registry, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<RegistryState>();
+        clear_client_credentials_blocking(&state, server_id)
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
+}
+
+fn clear_client_credentials_blocking(
+    state: &RegistryState,
+    server_id: String,
+) -> Result<Registry, String> {
+    // Paired with `set_client_credentials_blocking`: see the note there.
+    let _mutation = acquire_auth_mutation_lock(&server_id)?;
     // Reset first, so a failure here preserves the credential and the removal can
     // be retried.
     remote::reset_client_credentials(&server_id)?;
@@ -1412,7 +1467,7 @@ fn clear_client_credentials(
     // stale keychain entry with nothing pointing at it, and Remove can be run
     // again; that is strictly better than losing a credential the user cannot get
     // back.
-    let (reg, _) = write_registry(state.inner(), |reg| {
+    let (reg, _) = write_registry(state, |reg| {
         let Some(server) = reg.servers.iter_mut().find(|s| s.id == server_id) else {
             return Err(format!("no server with id {server_id:?}"));
         };
@@ -1427,36 +1482,53 @@ fn clear_client_credentials(
 /// Whether a client secret is vaulted for this server, so the UI can show
 /// "configured" without ever reading the value back.
 #[tauri::command]
-fn has_client_secret(server_id: String) -> Result<bool, String> {
-    Ok(secrets::get_secret_result(&server_id, secrets::CLIENT_SECRET_KEY)?.is_some())
+async fn has_client_secret(server_id: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(secrets::get_secret_result(&server_id, secrets::CLIENT_SECRET_KEY)?.is_some())
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 /// The most recent tool-call audit entries (newest first).
 #[tauri::command]
-fn get_audit_log(limit: usize) -> Vec<serde_json::Value> {
-    audit::read_recent(limit)
+async fn get_audit_log(limit: usize) -> Vec<serde_json::Value> {
+    // Async, like every polled reader here: Activity invokes these every few
+    // seconds, and as sync commands the file reads ran on the GTK main loop,
+    // where a large log made window controls intermittently dead on Linux
+    // (SBS-813). A join failure only means the worker panicked; return the
+    // benign empty shape rather than poisoning the poll loop.
+    tauri::async_runtime::spawn_blocking(move || audit::read_recent(limit))
+        .await
+        .unwrap_or_default()
 }
 
 /// Aggregate the full retained audit log into per-server call/error/latency stats for
 /// the observability dashboard. Bounded by the log's byte cap, so totals are real.
 #[tauri::command]
-fn audit_stats() -> serde_json::Value {
-    audit::stats()
+async fn audit_stats() -> serde_json::Value {
+    tauri::async_runtime::spawn_blocking(audit::stats)
+        .await
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// Recent tool-definition integrity events (newest first): a previously-approved
 /// tool whose definition changed (rug-pull signal) or a known server that added a
 /// tool. Powers the in-app security notices.
 #[tauri::command]
-fn get_security_events(limit: usize) -> Vec<serde_json::Value> {
-    integrity::read_recent(limit)
+async fn get_security_events(limit: usize) -> Vec<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || integrity::read_recent(limit))
+        .await
+        .unwrap_or_default()
 }
 
 /// Cumulative tool-definition tokens that lazy discovery has kept out of clients'
 /// context, summed from the local savings log for the in-app counter.
 #[tauri::command]
-fn savings_summary() -> serde_json::Value {
-    savings::summary()
+async fn savings_summary() -> serde_json::Value {
+    tauri::async_runtime::spawn_blocking(savings::summary)
+        .await
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// How many trailing gateway-log lines the diagnostics bundle includes.
@@ -1467,7 +1539,13 @@ const DIAG_LOG_LINES: usize = 200;
 /// Safe to paste into a public issue, secret values live in the OS keychain and
 /// are never included; env vars are listed by key name only.
 #[tauri::command]
-fn gather_diagnostics() -> String {
+async fn gather_diagnostics() -> String {
+    tauri::async_runtime::spawn_blocking(gather_diagnostics_blocking)
+        .await
+        .unwrap_or_else(|e| format!("diagnostics task join failed: {e}"))
+}
+
+fn gather_diagnostics_blocking() -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
     let _ = writeln!(out, "Toolport diagnostics");
@@ -2103,8 +2181,10 @@ fn set_live_inspect(state: State<RegistryState>, enabled: bool) -> Result<Regist
 /// The most recent live-inspection captures (newest first): each tool call's args and
 /// result, only present while live inspection has been on. Empty when off/unused.
 #[tauri::command]
-fn get_inspect_log(limit: usize) -> Vec<serde_json::Value> {
-    inspect::read_recent(limit)
+async fn get_inspect_log(limit: usize) -> Vec<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || inspect::read_recent(limit))
+        .await
+        .unwrap_or_default()
 }
 
 /// Clear the live-inspection ring (delete `inspect.jsonl`), so no captured args/results
@@ -2120,8 +2200,10 @@ fn clear_inspect_log() -> Result<(), String> {
 /// the whole catalog. The in-path proof that lazy discovery is working. Empty when
 /// nothing has searched yet.
 #[tauri::command]
-fn get_search_traces(limit: usize) -> Vec<serde_json::Value> {
-    searchtrace::read_recent(limit)
+async fn get_search_traces(limit: usize) -> Vec<serde_json::Value> {
+    tauri::async_runtime::spawn_blocking(move || searchtrace::read_recent(limit))
+        .await
+        .unwrap_or_default()
 }
 
 /// Clear the search-trace log (delete `search-trace.jsonl`).
@@ -2308,10 +2390,14 @@ fn set_pii_redaction(state: State<RegistryState>, on: bool) -> Result<Registry, 
 /// running" path. First call only seeds the seen-set so restarting the app with an
 /// already-quarantined tool does not re-notify.
 #[tauri::command]
-fn list_quarantined(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
-    let list = integrity::all_quarantined()?;
-    notify_new_quarantines(&app, &list);
-    Ok(list)
+async fn list_quarantined(app: AppHandle) -> Result<Vec<serde_json::Value>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let list = integrity::all_quarantined()?;
+        notify_new_quarantines(&app, &list);
+        Ok(list)
+    })
+    .await
+    .map_err(|e| format!("quarantine read task join failed: {e}"))?
 }
 
 /// Keys of quarantine entries we have already observed this process. `None` = not
@@ -2865,36 +2951,44 @@ fn take_registry_recovery_notice() -> Option<registry::RegistryRecoveryNotice> {
 
 /// Store a bearer token for an http server (used as `Authorization: Bearer ...`).
 #[tauri::command]
-fn set_auth_token(
-    state: State<RegistryState>,
-    server_id: String,
-    token: String,
-) -> Result<(), String> {
-    let _mutation = acquire_auth_mutation_lock(&server_id)?;
-    // A manually pasted bearer replaces any prior OAuth session. Keeping stale
-    // refresh metadata could otherwise overwrite the user's token later.
-    remote::clear_oauth_state(&server_id)?;
-    secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &token)?;
-    bump_secrets_generation(state.inner());
-    Ok(())
+async fn set_auth_token(app: AppHandle, server_id: String, token: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation = acquire_auth_mutation_lock(&server_id)?;
+        // A manually pasted bearer replaces any prior OAuth session. Keeping stale
+        // refresh metadata could otherwise overwrite the user's token later.
+        remote::clear_oauth_state(&server_id)?;
+        secrets::set_secret(&server_id, secrets::HTTP_AUTH_KEY, &token)?;
+        bump_secrets_generation(app.state::<RegistryState>().inner());
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 #[tauri::command]
-fn clear_auth_token(state: State<RegistryState>, server_id: String) -> Result<(), String> {
-    let _mutation = acquire_auth_mutation_lock(&server_id)?;
-    // Remove refresh metadata first so a second-write failure cannot leave state
-    // that silently recreates the bearer token the user asked to delete.
-    remote::clear_oauth_state(&server_id)?;
-    secrets::delete_secret(&server_id, secrets::HTTP_AUTH_KEY)?;
-    bump_secrets_generation(state.inner());
-    Ok(())
+async fn clear_auth_token(app: AppHandle, server_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _mutation = acquire_auth_mutation_lock(&server_id)?;
+        // Remove refresh metadata first so a second-write failure cannot leave state
+        // that silently recreates the bearer token the user asked to delete.
+        remote::clear_oauth_state(&server_id)?;
+        secrets::delete_secret(&server_id, secrets::HTTP_AUTH_KEY)?;
+        bump_secrets_generation(app.state::<RegistryState>().inner());
+        Ok(())
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 /// Errs on a failed vault read instead of reporting `false` (SBS-789): a locked
 /// keychain must not make a vaulted token look like "never authenticated".
 #[tauri::command]
-fn has_auth_token(server_id: String) -> Result<bool, String> {
-    Ok(secrets::get_secret_result(&server_id, secrets::HTTP_AUTH_KEY)?.is_some())
+async fn has_auth_token(server_id: String) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        Ok(secrets::get_secret_result(&server_id, secrets::HTTP_AUTH_KEY)?.is_some())
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))?
 }
 
 /// Figure out what a remote server needs to connect (none / oauth / token) and
@@ -2967,13 +3061,27 @@ async fn search_catalog(query: String) -> Result<Vec<catalog::CatalogEntry>, Str
 
 /// Which of a server's env keys currently have a value stored in the keychain.
 #[tauri::command]
-fn secret_status(server_id: String, keys: Vec<String>) -> Vec<(String, bool)> {
-    keys.into_iter()
-        .map(|k| {
-            let present = secrets::get_secret(&server_id, &k).is_some();
-            (k, present)
-        })
-        .collect()
+async fn secret_status(server_id: String, keys: Vec<String>) -> Result<Vec<(String, bool)>, String> {
+    // Async, like every keychain command here: a Secret Service read is a
+    // synchronous D-Bus round trip that can stall for seconds on a locked or
+    // slow keyring, and as sync commands they ran on the GTK main loop,
+    // freezing window controls while a dialog probed the vault (SBS-813).
+    //
+    // Errs rather than returning an empty list on a worker failure, for the same
+    // reason `has_auth_token` errs (SBS-789): the dialog treats a resolved list
+    // as authoritative and would mark every key unvaulted, while its `catch`
+    // leaves the badges alone. The polled readers below can absorb a panic as an
+    // empty result because they run again in seconds; this is a one-shot probe.
+    tauri::async_runtime::spawn_blocking(move || {
+        keys.into_iter()
+            .map(|k| {
+                let present = secrets::get_secret(&server_id, &k).is_some();
+                (k, present)
+            })
+            .collect()
+    })
+    .await
+    .map_err(|e| format!("keychain task join failed: {e}"))
 }
 
 /// Open Toolport's data directory (registry, logs, audit) in the OS file manager,
@@ -4030,6 +4138,125 @@ fn set_dock_icon_visible(app: &AppHandle, visible: bool) {
 #[cfg(not(target_os = "macos"))]
 fn set_dock_icon_visible(_app: &AppHandle, _visible: bool) {}
 
+/// Wayland workaround (SBS-813): a window created hidden and shown later has a
+/// stale input region under tao 0.35, so the native titlebar buttons ignore
+/// clicks until something forces a surface reconfigure (the user's repro:
+/// maximize + restore heals it). Nudge the size by one pixel and back to force
+/// that reconfigure invisibly. Fixed upstream in tao 0.36 (tauri-apps/tao#1218,
+/// ships with Tauri 2.12) — remove this when the dependency bump lands.
+#[cfg(target_os = "linux")]
+static WAYLAND_NUDGE_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(target_os = "linux")]
+fn nudge_wayland_input_region(w: &tauri::WebviewWindow) {
+    use std::sync::atomic::Ordering;
+
+    if std::env::var("WAYLAND_DISPLAY").is_err() {
+        return; // X11 sessions are unaffected.
+    }
+    // One nudge at a time. `show_main_window` runs on every tray click, second
+    // instance, and approval reveal, and each nudge drives the window through
+    // maximize -> unmaximize -> set_size over about a second. Overlapping runs
+    // would fight each other: one reads `prior` while another has the window
+    // maximized, then restores that maximized size as the "real" one. A window
+    // already visible enough to be re-shown does not need a second heal anyway.
+    if WAYLAND_NUDGE_RUNNING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    // The reconfigure only heals a MAPPED surface, and `show()` has not mapped
+    // it yet when this runs — an immediate resize is a no-op for the bug. Give
+    // the compositor a beat to map the window first, off the main thread so a
+    // slow map never delays the reveal itself.
+    let w = w.clone();
+    std::thread::spawn(move || {
+        // Cleared however this thread leaves, including the early returns below.
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                WAYLAND_NUDGE_RUNNING
+                    .store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _done = Done;
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // A maximized window already has a fresh configure (that's why the
+        // manual maximize/restore workaround heals the buttons) — and it's
+        // also the state we must not disturb. Fullscreen is the same story with
+        // a worse failure: maximize/unmaximize on a fullscreen surface drops
+        // fullscreen and leaves the user in a windowed frame they never asked
+        // for. Both states are already configured, so there is nothing to heal.
+        if w.is_maximized().unwrap_or(false) || w.is_fullscreen().unwrap_or(false) {
+            return;
+        }
+        // A plain 1px resize was tested and does NOT heal the input region;
+        // only the maximize state change does. The flick can be briefly
+        // visible — the lesser evil next to dead window controls.
+        //
+        // Unmaximize restores broken geometry on this compositor (oversized,
+        // titlebar off-screen), so remember the real size and put it back
+        // explicitly, then re-center (a no-op where the compositor owns
+        // placement, correct everywhere else).
+        let prior = w.inner_size().ok();
+        let _ = w.maximize();
+        std::thread::sleep(std::time::Duration::from_millis(80));
+        let _ = w.unmaximize();
+        // Unmaximize completes asynchronously (a compositor configure
+        // round-trip), and its restore geometry lands AFTER any set_size
+        // issued immediately — overwriting it with a broken oversized frame.
+        // Wait for the state to actually flip before enforcing a size.
+        let mut settled = false;
+        for attempt in 0..20 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if !w.is_maximized().unwrap_or(true) {
+                settled = true;
+                break;
+            }
+            // Re-issue periodically: the maximize has already happened, so
+            // giving up here would leave the user staring at a maximized window
+            // they never asked for. A dropped request is the likely cause, and
+            // unmaximize on an already-restored window is a no-op.
+            if attempt % 5 == 4 {
+                let _ = w.unmaximize();
+            }
+        }
+        if !settled {
+            // Out of retries. Restoring the size is unsafe now (the window is
+            // still maximized, so the geometry would be wrong), but leaving it
+            // maximized is not an option either: one last request, then stop.
+            let _ = w.unmaximize();
+            return;
+        }
+        // Clamp the remembered size to the current monitor's usable area. The
+        // window-state plugin can hold a size that no longer fits (a broken
+        // restore geometry persisted on quit, or a saved state from a larger
+        // monitor); restoring it verbatim opens the window below the fold.
+        // Clamping here also heals the persisted state: the plugin saves the
+        // clamped size on the next quit.
+        let target = prior.map(|mut s| {
+            if let Ok(Some(mon)) = w.current_monitor() {
+                let m = mon.size();
+                s.width = s.width.min(m.width * 95 / 100);
+                s.height = s.height.min(m.height * 85 / 100);
+            }
+            s
+        });
+        if let Some(size) = target {
+            for _ in 0..10 {
+                let _ = w.set_size(size);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                if w.inner_size().map(|s| s == size).unwrap_or(false) {
+                    break;
+                }
+            }
+        }
+        let _ = w.center();
+    });
+}
+
+#[cfg(not(target_os = "linux"))]
+fn nudge_wayland_input_region(_w: &tauri::WebviewWindow) {}
+
 /// Bring the main window back to the foreground (from the tray, a re-launch, or an
 /// approval). Un-hides, un-minimizes, and focuses so it works from every hidden state.
 fn show_main_window(app: &AppHandle) {
@@ -4039,6 +4266,7 @@ fn show_main_window(app: &AppHandle) {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
+        nudge_wayland_input_region(&w);
         // Tell the frontend the window is visible again so the team-sync loop resumes and does
         // an immediate catch-up poll. The webview's Page Visibility API doesn't report Tauri
         // tray show/hide on Windows, so this event is the authoritative signal (see the
@@ -4813,7 +5041,10 @@ mod tests {
     /// into `None` -- which is the regression this pins against.
     #[test]
     fn has_client_secret_reports_a_failed_read_as_an_error_not_missing() {
-        let result = has_client_secret("__toolport_internal__".to_string());
+        // The command went async (SBS-813); the probe semantics under test are
+        // unchanged, so drive the future to completion on the runtime.
+        let result =
+            tauri::async_runtime::block_on(has_client_secret("__toolport_internal__".to_string()));
         assert!(
             result.is_err(),
             "a failed secret read must propagate, not resolve to a boolean: {result:?}"
