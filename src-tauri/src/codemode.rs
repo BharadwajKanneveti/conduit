@@ -58,9 +58,7 @@ use boa_engine::builtins::promise::{PromiseState, ResolvingFunctions};
 use boa_engine::job::{GenericJob, Job, JobExecutor, PromiseJob};
 use boa_engine::object::builtins::JsPromise;
 use boa_engine::property::Attribute;
-use boa_engine::{
-    js_string, Context, JsError, JsNativeError, JsValue, NativeFunction, Source,
-};
+use boa_engine::{js_string, Context, JsError, JsNativeError, JsValue, NativeFunction, Source};
 use boa_gc::{Finalize, Trace};
 use serde_json::{json, Value};
 
@@ -81,6 +79,15 @@ pub struct FetchArgs {
 
 /// Host binding for paging a shaped result by cursor (same cache as `toolport_fetch_result`).
 pub type FetchBinding = Arc<dyn Fn(FetchArgs) -> Value + Send + Sync>;
+
+/// The JSON payload exposed to a script. Ordinary Code Mode keeps its historical mutable
+/// `data` global. Persisted routines get a distinct, deeply frozen `input` global so a saved
+/// definition cannot mutate the arguments it was invoked with or observe a writable alias.
+#[derive(Debug, Clone)]
+pub enum ScriptInput {
+    Data(Value),
+    ImmutableInput(Value),
+}
 
 /// Resource limits for one script run. All are fail-closed: exceeding any of them aborts
 /// the script with an error result the agent can read and recover from.
@@ -248,6 +255,8 @@ pub struct CallRecord {
     /// False when the downstream result carried `isError: true`. A recorded call
     /// ran either way — `ok` says how it ended, not whether it happened.
     pub ok: bool,
+    /// Serialized result size only. The ledger never retains a downstream result body.
+    pub result_bytes: usize,
 }
 
 /// The outcome of running a script.
@@ -281,6 +290,9 @@ pub struct ScriptOutcome {
     /// script whose call sequence depends on data returned mid-run, even that
     /// holds only if the re-run takes the same branches.
     pub progress: Vec<CallRecord>,
+    /// Serialized size of the final aggregate. The outcome already owns `value`; callers
+    /// can use this aggregate without retaining another copy of the result.
+    pub final_result_bytes: usize,
     /// Last value the script passed to `toolport.checkpoint()`, if any. Author-chosen,
     /// so unlike `progress` this can safely carry script-relevant state — the script
     /// decides what's safe to surface. `None` if the script never called it. See #663.
@@ -530,7 +542,9 @@ pub fn build_servers_prelude(catalog: &[String]) -> String {
     out.push_str("  var servers = Object.create(null);\n");
     out.push_str("  function stub(fullName) {\n");
     out.push_str("    var f = function (args) {\n");
-    out.push_str("      return toolport.call(fullName, args === undefined || args === null ? {} : args);\n");
+    out.push_str(
+        "      return toolport.call(fullName, args === undefined || args === null ? {} : args);\n",
+    );
     out.push_str("    };\n");
     out.push_str("    f.async = function (args) {\n");
     out.push_str("      return toolport.callAsync(fullName, args === undefined || args === null ? {} : args);\n");
@@ -677,6 +691,26 @@ pub fn run_script(
     limits: Limits,
     catalog: &[String],
 ) -> ScriptOutcome {
+    run_script_with_input(
+        script,
+        ScriptInput::Data(data),
+        call,
+        fetch,
+        limits,
+        catalog,
+    )
+}
+
+/// Run a script with an explicitly selected input surface. This is separate from
+/// [`run_script`] so existing callers keep the writable `data` contract unchanged.
+pub fn run_script_with_input(
+    script: &str,
+    input: ScriptInput,
+    call: CallBinding,
+    fetch: Option<FetchBinding>,
+    limits: Limits,
+    catalog: &[String],
+) -> ScriptOutcome {
     let calls_made = Rc::new(Cell::new(0usize));
     let executed = Rc::new(RefCell::new(Vec::new()));
     let checkpoint = Rc::new(RefCell::new(None::<Value>));
@@ -692,6 +726,7 @@ pub fn run_script(
                 value: json!(null),
                 calls: 0,
                 progress: Vec::new(),
+                final_result_bytes: 0,
                 checkpoint: None,
                 error: Some(format!("toolport code mode: failed to create JS context: {e}")),
             };
@@ -733,6 +768,7 @@ pub fn run_script(
                     index,
                     name,
                     ok: result_ok(&result),
+                    result_bytes: serialized_len(&result),
                 });
             }
             let result_str = serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string());
@@ -821,9 +857,10 @@ pub fn run_script(
                 .unwrap_or("")
                 .to_string();
             if cursor.is_empty() {
-                return Err(JsError::from_native(JsNativeError::error().with_message(
-                    "toolport.fetchResult requires a non-empty cursor",
-                )));
+                return Err(JsError::from_native(
+                    JsNativeError::error()
+                        .with_message("toolport.fetchResult requires a non-empty cursor"),
+                ));
             }
             let offset = spec
                 .get("offset")
@@ -852,16 +889,39 @@ pub fn run_script(
         return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
     }
 
-    // Inject `data` as a global before the prelude/script run.
-    match JsValue::from_json(&data, &mut context) {
+    let (global_name, value, attributes, freeze) = match input {
+        ScriptInput::Data(value) => ("data", value, Attribute::all(), false),
+        ScriptInput::ImmutableInput(value) => ("input", value, Attribute::empty(), true),
+    };
+    match JsValue::from_json(&value, &mut context) {
         Ok(v) => {
-            if let Err(e) =
-                context.register_global_property(js_string!("data"), v, Attribute::all())
-            {
+            if let Err(e) = context.register_global_property(
+                boa_engine::JsString::from(global_name),
+                v,
+                attributes,
+            ) {
                 return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
             }
         }
         Err(e) => return fail(calls_made.get(), executed.take(), checkpoint.take(), e),
+    }
+
+    if freeze {
+        const DEEP_FREEZE_INPUT: &str = r#"
+            (function (root) {
+                const seen = new WeakSet();
+                function freeze(value) {
+                    if (value === null || typeof value !== "object" || seen.has(value)) return value;
+                    seen.add(value);
+                    for (const key of Object.keys(value)) freeze(value[key]);
+                    return Object.freeze(value);
+                }
+                freeze(root);
+            })(input);
+        "#;
+        if let Err(e) = context.eval(Source::from_bytes(DEEP_FREEZE_INPUT)) {
+            return fail(calls_made.get(), executed.take(), checkpoint.take(), e);
+        }
     }
 
     if let Err(e) = context.eval(Source::from_bytes(PRELUDE)) {
@@ -883,6 +943,7 @@ pub fn run_script(
 
     match drive_to_completion(&mut context, &state, top) {
         Ok(value) => ScriptOutcome {
+            final_result_bytes: serialized_len(&value),
             value,
             calls: calls_made.get(),
             progress: executed.take(),
@@ -1062,6 +1123,7 @@ fn flush_pending_host_calls(context: &mut Context, state: &HostState) -> Result<
                     index,
                     name: pending_call.name.clone(),
                     ok: result_ok(result),
+                    result_bytes: serialized_len(result),
                 });
             }
         }
@@ -1070,11 +1132,10 @@ fn flush_pending_host_calls(context: &mut Context, state: &HostState) -> Result<
             let result_str =
                 serde_json::to_string(&result).unwrap_or_else(|_| "null".to_string());
             let js_result = JsValue::from(js_string!(result_str));
-            pending_call.resolvers.resolve.call(
-                &JsValue::undefined(),
-                &[js_result],
-                context,
-            )?;
+            pending_call
+                .resolvers
+                .resolve
+                .call(&JsValue::undefined(), &[js_result], context)?;
         }
 
         // More may still be queued; keep draining this wave before returning to the
@@ -1143,9 +1204,16 @@ fn fail(calls: usize, progress: Vec<CallRecord>, checkpoint: Option<Value>, err:
         value: json!(null),
         calls,
         progress,
+        final_result_bytes: 0,
         checkpoint,
         error: Some(err.to_string()),
     }
+}
+
+fn serialized_len(value: &Value) -> usize {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -1156,9 +1224,7 @@ mod tests {
     use std::time::Duration as StdDuration;
 
     /// A call binding that records the calls it saw and echoes a canned reply per tool.
-    fn recording_call(
-        log: Arc<Mutex<Vec<(String, Value)>>>,
-    ) -> CallBinding {
+    fn recording_call(log: Arc<Mutex<Vec<(String, Value)>>>) -> CallBinding {
         Arc::new(move |name: &str, args: Value| {
             log.lock().unwrap().push((name.to_string(), args.clone()));
             json!({ "echo": name, "args": args })
@@ -1199,6 +1265,64 @@ mod tests {
 
     fn returns(script: &str) -> ScriptOutcome {
         run(script, json!({}), no_calls(), Limits::default())
+    }
+
+    fn returns_with_immutable_input(script: &str, input: Value) -> ScriptOutcome {
+        run_script_with_input(
+            script,
+            ScriptInput::ImmutableInput(input),
+            no_calls(),
+            None,
+            Limits::default(),
+            &[],
+        )
+    }
+
+    #[test]
+    fn routine_input_is_deeply_immutable_and_has_no_data_alias() {
+        let out = returns_with_immutable_input(
+            r#"
+                try { input.owner = "changed"; } catch (_) {}
+                try { input.nested.value = 2; } catch (_) {}
+                try { input.items.push("new"); } catch (_) {}
+                return {
+                    owner: input.owner,
+                    nested: input.nested.value,
+                    items: input.items,
+                    inputFrozen: Object.isFrozen(input),
+                    nestedFrozen: Object.isFrozen(input.nested),
+                    arrayFrozen: Object.isFrozen(input.items),
+                    dataType: typeof data,
+                };
+            "#,
+            json!({ "owner": "original", "nested": { "value": 1 }, "items": ["old"] }),
+        );
+
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(
+            out.value,
+            json!({
+                "owner": "original",
+                "nested": 1,
+                "items": ["old"],
+                "inputFrozen": true,
+                "nestedFrozen": true,
+                "arrayFrozen": true,
+                "dataType": "undefined",
+            })
+        );
+    }
+
+    #[test]
+    fn ordinary_code_mode_data_remains_mutable() {
+        let out = run(
+            "data.value = 2; return data.value;",
+            json!({ "value": 1 }),
+            no_calls(),
+            Limits::default(),
+        );
+        assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
+        assert_eq!(out.value, json!(2));
     }
 
     #[test]
@@ -1390,7 +1514,12 @@ mod tests {
     #[test]
     fn a_script_that_never_compiles_reports_no_progress() {
         let call = recording_call(Arc::new(Mutex::new(Vec::new())));
-        let out = run("this is not ( valid javascript", json!({}), call, Limits::default());
+        let out = run(
+            "this is not ( valid javascript",
+            json!({}),
+            call,
+            Limits::default(),
+        );
         assert!(out.error.is_some());
         assert!(out.progress.is_empty());
         assert_eq!(out.calls, 0);
@@ -1451,7 +1580,12 @@ mod tests {
             }
             return out;
         "#;
-        let out = run(script, json!({ "ids": [10, 20, 30] }), call, Limits::default());
+        let out = run(
+            script,
+            json!({ "ids": [10, 20, 30] }),
+            call,
+            Limits::default(),
+        );
         assert_eq!(out.error, None, "unexpected error: {:?}", out.error);
         assert_eq!(out.value, json!([10, 20, 30]));
         assert_eq!(out.calls, 3);
@@ -1554,7 +1688,12 @@ mod tests {
     #[test]
     fn a_thrown_error_is_reported_not_panicked() {
         let call = Arc::new(|_: &str, _: Value| Value::Null);
-        let out = run("throw new Error('boom');", json!({}), call, Limits::default());
+        let out = run(
+            "throw new Error('boom');",
+            json!({}),
+            call,
+            Limits::default(),
+        );
         assert!(out.error.unwrap().contains("boom"));
     }
 
@@ -1605,9 +1744,7 @@ mod tests {
 
     #[test]
     fn call_all_sugar_matches_promise_all() {
-        let call = Arc::new(|name: &str, args: Value| {
-            json!({ "echo": name, "args": args })
-        });
+        let call = Arc::new(|name: &str, args: Value| json!({ "echo": name, "args": args }));
         let script = r#"
             const results = await toolport.callAll([
                 { name: "x", args: { i: 1 } },
@@ -1937,9 +2074,9 @@ mod tests {
     /// invalid specs against a live binding cannot spin past its wall clock.
     #[test]
     fn fetch_result_charges_the_budget_before_validating_the_spec() {
-        let fetch: FetchBinding = Arc::new(|_: FetchArgs| {
-            json!({ "content": [{ "type": "text", "text": "x" }], "isError": false })
-        });
+        let fetch: FetchBinding = Arc::new(
+            |_: FetchArgs| json!({ "content": [{ "type": "text", "text": "x" }], "isError": false }),
+        );
         let call = Arc::new(|_: &str, _: Value| Value::Null);
         let out = run_script(
             // Empty cursor is invalid; the budget must be refused first.
@@ -1963,9 +2100,9 @@ mod tests {
     /// WS2-2: fetchResult must share the call budget with toolport.call.
     #[test]
     fn fetch_result_counts_against_call_budget() {
-        let fetch: FetchBinding = Arc::new(|_: FetchArgs| {
-            json!({ "content": [{ "type": "text", "text": "x" }], "isError": false })
-        });
+        let fetch: FetchBinding = Arc::new(
+            |_: FetchArgs| json!({ "content": [{ "type": "text", "text": "x" }], "isError": false }),
+        );
         let call = Arc::new(|_: &str, _: Value| Value::Null);
         let limits = Limits {
             max_calls: 2,

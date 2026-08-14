@@ -31,10 +31,14 @@ import {
   isEnabled as isAutostartEnabled,
 } from "@tauri-apps/plugin-autostart";
 import { open as openFolderDialog } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import { toastError } from "@/lib/toast";
 import { Button } from "@/components/ui/button";
 import {
   addHttpClient,
+  approveRoutineSuggestion,
+  dismissRoutineSuggestion,
+  listRoutineSuggestions,
   clearInspectLog,
   httpBridgeStatus,
   listAllowedTools,
@@ -45,6 +49,7 @@ import {
   revokeAllowedTool,
   removeHttpClient,
   setAllowAgentControl,
+  setAllowRoutineWrites,
   setConfirmDestructive,
   setDenyDestructive,
   setCodeMode,
@@ -64,7 +69,13 @@ import {
   type HttpBridgeStatus,
   type QuarantinedTool,
 } from "@/lib/api";
-import type { AllowedTool, FolderProfile, Profile, Registry } from "@/lib/types";
+import type {
+  AllowedTool,
+  FolderProfile,
+  Profile,
+  Registry,
+  RoutineSuggestion,
+} from "@/lib/types";
 import { isGatewayServer } from "@/lib/types";
 import { useTheme, type Theme } from "@/lib/theme";
 import { Switch } from "@/components/ui/switch";
@@ -75,6 +86,152 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+
+/** Strong, repeated orchestration patterns the gateway queued for saving. Passive by
+ * design: injection-hardened models measurably ignore save directives placed in tool
+ * results (0/7 conversions, 2026-08-13), so the human converts here instead. One click
+ * persists - the card carries the same disclosure the approval prompt would, so the
+ * click IS the persistence authorization and no second prompt fires. */
+function RoutineSuggestions() {
+  const [suggestions, setSuggestions] = useState<RoutineSuggestion[]>([]);
+  const [names, setNames] = useState<Record<string, string>>({});
+  const [busy, setBusy] = useState<string | null>(null);
+
+  const refresh = useCallback(async () => {
+    try {
+      setSuggestions(await listRoutineSuggestions());
+    } catch {
+      // An unreachable backend renders as an empty queue; the section hides itself.
+      setSuggestions([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+    // Event bridge may be absent (tests, plain-browser dev); polling refresh on
+    // mount already covered the initial state, so a failed subscribe is benign.
+    const unlisten = listen("routine-suggestion", () => void refresh()).catch(
+      () => () => {},
+    );
+    return () => {
+      void unlisten.then((stop) => stop());
+    };
+  }, [refresh]);
+
+  async function save(suggestion: RoutineSuggestion) {
+    const fingerprint = suggestion.definitionFingerprint;
+    setBusy(fingerprint);
+    try {
+      await approveRoutineSuggestion(
+        fingerprint,
+        names[fingerprint]?.trim() || suggestion.suggestedName,
+      );
+      await refresh();
+    } catch (e) {
+      toastError(`Couldn't save the routine: ${e}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function dismiss(fingerprint: string) {
+    setBusy(fingerprint);
+    try {
+      await dismissRoutineSuggestion(fingerprint);
+      await refresh();
+    } catch (e) {
+      toastError(`Couldn't dismiss the suggestion: ${e}`);
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  if (suggestions.length === 0) return null;
+  return (
+    <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
+      <div className="flex items-center gap-2 text-xs">
+        <Braces className="size-3.5 shrink-0 text-warning" />
+        <span className="font-medium">Suggested routines</span>
+        <span className="rounded-full bg-muted px-1.5 py-0.5 text-muted-foreground">
+          {suggestions.length}
+        </span>
+        <span className="ml-auto text-muted-foreground">
+          repeated patterns Toolport verified; saving advertises them to every client
+        </span>
+      </div>
+      <ul className="mt-2 space-y-2">
+        {suggestions.map((suggestion) => {
+          const fingerprint = suggestion.definitionFingerprint;
+          const synthesized =
+            suggestion.evidence.provenance === "synthesized_from_observed_calls";
+          return (
+            <li
+              key={fingerprint}
+              className="space-y-2 rounded-md border border-border/60 bg-background/60 p-2.5 text-sm"
+            >
+              <input
+                aria-label="Routine name"
+                className="w-full rounded border border-border/60 bg-background px-2 py-1 text-sm font-medium"
+                value={names[fingerprint] ?? suggestion.suggestedName}
+                onChange={(e) =>
+                  setNames((prev) => ({ ...prev, [fingerprint]: e.target.value }))
+                }
+              />
+              {synthesized && (
+                <div className="rounded border border-warning/40 bg-warning/10 px-2 py-1 text-xs leading-relaxed text-warning">
+                  Synthesized by Toolport from observed direct calls: every listed call
+                  really ran, but the surrounding script was generated and statically
+                  validated, not yet executed.
+                </div>
+              )}
+              <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                <span>Risk: {suggestion.evidence.riskClass}</span>
+                <span>Calls: {suggestion.evidence.calls}</span>
+                <span>
+                  Dependencies:{" "}
+                  {suggestion.evidence.observedDependencies
+                    .map((dependency) => dependency.name)
+                    .join(", ")}
+                </span>
+                <span>
+                  ~{Math.max(1, Math.round(suggestion.intermediateBytes / 1024))} KB/run
+                  kept out of context
+                </span>
+              </div>
+              <details>
+                <summary className="cursor-pointer text-xs font-medium text-muted-foreground hover:text-foreground">
+                  Source and schema
+                </summary>
+                <pre className="mt-2 max-h-36 overflow-auto rounded border border-border/60 bg-background/60 p-2 font-mono text-[0.7rem] leading-relaxed">
+                  {suggestion.source}
+                  {"\n\n"}
+                  {JSON.stringify(suggestion.inputSchema, null, 2)}
+                </pre>
+              </details>
+              <div className="flex justify-end gap-2">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  disabled={busy === fingerprint}
+                  onClick={() => void dismiss(fingerprint)}
+                >
+                  Dismiss
+                </Button>
+                <Button
+                  size="sm"
+                  disabled={busy === fingerprint}
+                  onClick={() => void save(suggestion)}
+                >
+                  Save routine
+                </Button>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
+  );
+}
 
 /** The set of tools pinned as lazy-discovery prerequisites, with one-click unpin.
  * Pinning happens contextually (a tool's card in Playground); this is where you see
@@ -302,6 +459,36 @@ interface Props {
   registry: Registry | null;
   onRegistryChange: (registry: Registry) => void;
 }
+
+type SettingKey =
+  | "autostart"
+  | "lazy-discovery"
+  | "code-mode"
+  | "allow-routine-writes"
+  | "deny-destructive"
+  | "confirm-destructive"
+  | "human-approval"
+  | "quarantine-on-drift"
+  | "block-on-injection"
+  | "pii-redaction"
+  | "allow-agent-control"
+  | "live-inspect";
+
+type RegistrySettingKey = Exclude<SettingKey, "autostart">;
+
+const REGISTRY_FIELD_BY_SETTING = {
+  "lazy-discovery": "lazyDiscovery",
+  "code-mode": "codeMode",
+  "allow-routine-writes": "allowRoutineWrites",
+  "deny-destructive": "denyDestructive",
+  "confirm-destructive": "confirmDestructive",
+  "human-approval": "humanApproval",
+  "quarantine-on-drift": "quarantineOnDrift",
+  "block-on-injection": "blockOnInjection",
+  "pii-redaction": "piiRedaction",
+  "allow-agent-control": "allowAgentControl",
+  "live-inspect": "liveInspect",
+} as const satisfies Record<RegistrySettingKey, keyof Registry>;
 
 /** A one-line security posture readout at the top of the Security section, so the user can
  * tell at a glance whether they're protected instead of mentally AND-ing every toggle. */
@@ -547,6 +734,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   // On by default (SOU-397); only treat explicit false as off when the field is missing
   // during a partial load, match the registry serde default.
   const codeMode = registry?.codeMode ?? true;
+  const allowRoutineWrites = registry?.allowRoutineWrites ?? false;
   const denyDestructive = registry?.denyDestructive ?? false;
   const confirmDestructive = registry?.confirmDestructive ?? false;
   const humanApproval = registry?.humanApproval ?? false;
@@ -555,7 +743,13 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   const blockOnInjection = registry?.blockOnInjection ?? false;
   const piiRedaction = registry?.piiRedaction ?? false;
   const liveInspect = registry?.liveInspect ?? false;
-  const [busy, setBusy] = useState(false);
+  const [busySettings, setBusySettings] = useState<ReadonlySet<SettingKey>>(
+    () => new Set(),
+  );
+  const latestRegistry = useRef(registry);
+  useEffect(() => {
+    latestRegistry.current = registry;
+  }, [registry]);
   // Profile cards collapse so a big Default profile doesn't dump every server (and its
   // per-server tool rows) onto the page. Collapsed by default; the comma summary still shows.
   const [openProfiles, setOpenProfiles] = useState<Set<string>>(new Set());
@@ -604,7 +798,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
   }, []);
 
   const toggleAutostart = async (on: boolean) => {
-    setBusy(true);
+    setBusySettings((current) => new Set(current).add("autostart"));
     try {
       if (on) await enableAutostart();
       else await disableAutostart();
@@ -612,7 +806,11 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     } catch (e) {
       toastError(`Couldn't ${on ? "enable" : "disable"} launch at login: ${e}`);
     } finally {
-      setBusy(false);
+      setBusySettings((current) => {
+        const next = new Set(current);
+        next.delete("autostart");
+        return next;
+      });
     }
   };
 
@@ -725,29 +923,48 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     );
   };
 
-  const apply = (fn: (v: boolean) => Promise<Registry>) => async (v: boolean) => {
-    setBusy(true);
-    try {
-      onRegistryChange(await fn(v));
-    } catch (e) {
-      toastError(`Couldn't update the setting: ${e}`);
-    } finally {
-      setBusy(false);
-    }
+  const publishRegistrySetting = (key: RegistrySettingKey, updated: Registry) => {
+    const field = REGISTRY_FIELD_BY_SETTING[key];
+    const reconciled: Registry = latestRegistry.current
+      ? { ...latestRegistry.current, [field]: updated[field] }
+      : updated;
+    latestRegistry.current = reconciled;
+    onRegistryChange(reconciled);
   };
+
+  const apply =
+    (key: RegistrySettingKey, fn: (v: boolean) => Promise<Registry>) =>
+    async (v: boolean) => {
+      setBusySettings((current) => new Set(current).add(key));
+      try {
+        publishRegistrySetting(key, await fn(v));
+      } catch (e) {
+        toastError(`Couldn't update the setting: ${e}`);
+      } finally {
+        setBusySettings((current) => {
+          const next = new Set(current);
+          next.delete(key);
+          return next;
+        });
+      }
+    };
 
   // Live inspection needs a step the plain `apply` helper doesn't: when turned OFF,
   // clear the ephemeral capture ring so nothing lingers on disk.
   const applyLiveInspect = async (on: boolean) => {
-    setBusy(true);
+    setBusySettings((current) => new Set(current).add("live-inspect"));
     try {
       const reg = await setLiveInspect(on);
       if (!on) await clearInspectLog();
-      onRegistryChange(reg);
+      publishRegistrySetting("live-inspect", reg);
     } catch (e) {
       toastError(`Couldn't update the setting: ${e}`);
     } finally {
-      setBusy(false);
+      setBusySettings((current) => {
+        const next = new Set(current);
+        next.delete("live-inspect");
+        return next;
+      });
     }
   };
 
@@ -758,6 +975,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
     title: string,
     desc: string,
     onChange: (v: boolean) => void,
+    settingKey: SettingKey,
   ) => (
     <label className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
       <Icon className={`size-4 shrink-0 ${on ? accent : "text-muted-foreground"}`} />
@@ -765,7 +983,11 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
         <span className="font-medium">{title}</span>
         <span className="text-xs text-muted-foreground">{desc}</span>
       </span>
-      <Switch checked={on} onCheckedChange={onChange} disabled={busy} />
+      <Switch
+        checked={on}
+        onCheckedChange={onChange}
+        disabled={busySettings.has(settingKey)}
+      />
     </label>
   );
 
@@ -782,6 +1004,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "Launch at login",
           "Start Toolport in the tray when you sign in, so it can hold tool calls for approval even before you open it",
           toggleAutostart,
+          "autostart",
         )}
         <div className="flex items-center gap-2.5 rounded-md border px-3 py-2.5 text-sm">
           <Sun className="size-4 shrink-0 text-info" />
@@ -902,7 +1125,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-info",
           "Lazy discovery",
           "Expose 4 meta-tools, not the full catalog (all clients)",
-          apply(setLazyDiscovery),
+          apply("lazy-discovery", setLazyDiscovery),
+          "lazy-discovery",
         )}
         {/* Pinned prerequisites is a refinement of lazy discovery (the tools it must never
             hide), not a peer feature, so nest it under the Lazy discovery toggle with an
@@ -923,8 +1147,24 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-info",
           "Code mode",
           "On by default: agents can run one server-side script that calls many tools in a single round-trip. Sandboxed JS; each call still respects profile scope and human approval. Not a security boundary; turn off to hide toolport_run_script.",
-          apply(setCodeMode),
+          apply("code-mode", setCodeMode),
+          "code-mode",
         )}
+        {codeMode
+          ? toggle(
+              Braces,
+              allowRoutineWrites,
+              "text-warning",
+              "Allow routine writes",
+              "Allow agents to request saving persistent routines. Every save still requires your approval.",
+              apply("allow-routine-writes", setAllowRoutineWrites),
+              "allow-routine-writes",
+            )
+          : null}
+        {/* Rendered independently of the writes toggle: a suggestion queued while
+            writes were on stays actionable (the user is the authority here), and the
+            section hides itself entirely when the queue is empty. */}
+        <RoutineSuggestions />
       </section>
       <section className="flex flex-col gap-2">
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
@@ -943,7 +1183,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-warning",
           "Block destructive tools",
           "Hide any tool the server marks as able to delete or change data, from every client",
-          apply(setDenyDestructive),
+          apply("deny-destructive", setDenyDestructive),
+          "deny-destructive",
         )}
         {toggle(
           ShieldCheck,
@@ -951,7 +1192,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-info",
           "Confirm destructive tools",
           "Hold each destructive call for the agent to confirm before it runs",
-          apply(setConfirmDestructive),
+          apply("confirm-destructive", setConfirmDestructive),
+          "confirm-destructive",
         )}
         {toggle(
           UserCheck,
@@ -959,7 +1201,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-info",
           "Require human approval",
           "Hold destructive or untrusted-server calls until you approve them in the app",
-          apply(setHumanApproval),
+          apply("human-approval", setHumanApproval),
+          "human-approval",
         )}
         {toggle(
           ShieldX,
@@ -967,7 +1210,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-destructive",
           "Quarantine changed high-risk tools",
           "Block a destructive or poisoned tool that changes from its approved version, until you re-approve it",
-          apply(setQuarantineOnDrift),
+          apply("quarantine-on-drift", setQuarantineOnDrift),
+          "quarantine-on-drift",
         )}
         {toggle(
           ShieldAlert,
@@ -975,7 +1219,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-destructive",
           "Block high-confidence injection",
           "Fail a tool call when content defense finds a high-confidence prompt-injection hit, instead of only labeling the text. Off by default; medium-confidence hits still label only",
-          apply(setBlockOnInjection),
+          apply("block-on-injection", setBlockOnInjection),
+          "block-on-injection",
         )}
         {toggle(
           EyeOff,
@@ -983,7 +1228,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-info",
           "Hide personal data from the model",
           "Replace emails, phone numbers, card numbers and API keys in tool results with placeholders before the model sees them, then put the real values back when it calls a tool. A value only goes back to the server it came from, so a call that would send one server's data to another is refused. Real data stays on this machine and is forgotten when the conversation ends. Off by default; a value no detector recognises still passes through, so this reduces what reaches the model rather than guaranteeing it",
-          apply(setPiiRedaction),
+          apply("pii-redaction", setPiiRedaction),
+          "pii-redaction",
         )}
         {toggle(
           Bot,
@@ -991,7 +1237,8 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "text-success",
           "Allow agent control",
           "Let an agent turn servers on/off; your destructive-tool block always stays yours",
-          apply(setAllowAgentControl),
+          apply("allow-agent-control", setAllowAgentControl),
+          "allow-agent-control",
         )}
         {toggle(
           Activity,
@@ -1000,6 +1247,7 @@ export function SettingsView({ registry, onRegistryChange }: Props) {
           "Live request/response inspection",
           "Off by default. While on, Toolport captures each tool call's arguments and results to a small local, ephemeral buffer (the last 50 calls) so you can inspect them in Activity. This is separate from the audit log, never leaves your machine, and is cleared when you turn it off or restart the gateway.",
           applyLiveInspect,
+          "live-inspect",
         )}
         {quarantined.length === 0 && quarantineError && (
           <div className="flex items-center gap-2 rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-muted-foreground">

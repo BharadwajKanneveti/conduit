@@ -43,6 +43,9 @@ pub enum ApprovalReason {
     UntrustedSource,
     /// Both of the above.
     DestructiveAndUntrusted,
+    /// Persisting an immutable Code Mode routine. This is always one-shot and binds to
+    /// the exact source, schema, limits, and content hash shown in the request.
+    PersistentCodeWrite,
     /// The call carries a pseudonym minted by a DIFFERENT server, so dispatching it would
     /// hand one server's data to another (SBS-696). Never produced by [`gate_reason`]: this
     /// gate is not about the tool at all, it is about a specific value's destination, and it
@@ -297,7 +300,10 @@ mod tests {
 
     #[test]
     fn endpoint_descriptor_round_trips() {
-        let d = EndpointDescriptor { endpoint: "127.0.0.1:8790".into(), token: "s3cret".into() };
+        let d = EndpointDescriptor {
+            endpoint: "127.0.0.1:8790".into(),
+            token: "s3cret".into(),
+        };
         let round: EndpointDescriptor =
             serde_json::from_str(&serde_json::to_string(&d).unwrap()).unwrap();
         assert_eq!(round.endpoint, "127.0.0.1:8790");

@@ -4,15 +4,15 @@ use std::io::ErrorKind;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use sha2::{Digest, Sha256};
 use tauri::menu::{Menu, MenuItem, PredefinedMenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{AppHandle, Emitter, Listener, Manager, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons, MessageDialogKind};
 use tauri_plugin_notification::NotificationExt;
-use sha2::{Digest, Sha256};
 
-use crate::approval_broker;
 use crate::approval;
+use crate::approval_broker;
 use crate::audit;
 use crate::catalog;
 use crate::clients;
@@ -25,6 +25,7 @@ use crate::registry::{
 };
 use crate::remote;
 use crate::router;
+use crate::routines;
 use crate::savings;
 use crate::searchtrace;
 use crate::secrets;
@@ -125,9 +126,11 @@ lease_secs={}
 }
 
 fn parse_lock_attempt_id(content: &str) -> Option<String> {
-    content
-        .lines()
-        .find_map(|line| line.strip_prefix("attempt_id=").or_else(|| line.strip_prefix("nonce=")).map(ToOwned::to_owned))
+    content.lines().find_map(|line| {
+        line.strip_prefix("attempt_id=")
+            .or_else(|| line.strip_prefix("nonce="))
+            .map(ToOwned::to_owned)
+    })
 }
 
 fn read_oauth_lock_snapshot(path: &std::path::Path) -> Result<Option<OAuthLockSnapshot>, String> {
@@ -306,7 +309,10 @@ fn try_acquire_oauth_lock(path: &std::path::Path) -> Result<Option<OAuthFlowLock
     }
 }
 
-fn acquire_or_wait_oauth_lock(_server_id: &str, url: &str) -> Result<Option<OAuthFlowLock>, String> {
+fn acquire_or_wait_oauth_lock(
+    _server_id: &str,
+    url: &str,
+) -> Result<Option<OAuthFlowLock>, String> {
     let path = oauth_lock_path(_server_id, url)?;
     let mut observed_attempt_id: Option<String> = None;
     let deadline = std::time::Instant::now() + Duration::from_secs(OAUTH_LOCK_WAIT_SECS);
@@ -595,12 +601,17 @@ fn server_from_detected(server: &clients::McpServer, client_id: &str) -> ServerE
 /// The onboarding banner promises a count across both server sources (see
 /// `importableServers` in `src/lib/types.ts`), so this must actually cover
 /// both or it silently under-imports relative to what was promised.
-fn servers_to_import(detected: &[clients::DetectedClient], existing: &Registry) -> Vec<ServerEntry> {
+fn servers_to_import(
+    detected: &[clients::DetectedClient],
+    existing: &Registry,
+) -> Vec<ServerEntry> {
     let mut picked: Vec<ServerEntry> = Vec::new();
     let mut import_keys: std::collections::HashSet<String> = existing
         .servers
         .iter()
-        .map(|server| clients::import_dedupe_key(&server.name, server.command.as_deref(), &server.args))
+        .map(|server| {
+            clients::import_dedupe_key(&server.name, server.command.as_deref(), &server.args)
+        })
         .collect();
     for client in detected {
         for server in client.servers.iter().chain(client.plugin_servers.iter()) {
@@ -796,7 +807,9 @@ fn set_all_enabled(
     profile_id: String,
     enabled: bool,
 ) -> Result<Registry, String> {
-    let (reg, _) = write_registry(state.inner(), |reg| reg.set_all_enabled(&profile_id, enabled))?;
+    let (reg, _) = write_registry(state.inner(), |reg| {
+        reg.set_all_enabled(&profile_id, enabled)
+    })?;
     Ok(reg)
 }
 
@@ -863,11 +876,7 @@ fn write_to_client(
 }
 
 /// Refuse to overwrite a hand-edited gateway entry unless `force` is true (SOU-406).
-fn refuse_if_customized(
-    state: &RegistryState,
-    client_id: &str,
-    force: bool,
-) -> Result<(), String> {
+fn refuse_if_customized(state: &RegistryState, client_id: &str, force: bool) -> Result<(), String> {
     if force {
         return Ok(());
     }
@@ -1299,9 +1308,8 @@ fn set_client_credentials(
     // before matching, so an untrimmed method would validate here and then be
     // persisted with the whitespace still on it; scope is sent to the token
     // endpoint verbatim, where padding can be rejected.
-    let blank_to_none = |v: Option<String>| {
-        v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
-    };
+    let blank_to_none =
+        |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
     let token_endpoint_auth_method = blank_to_none(token_endpoint_auth_method);
     let scope = blank_to_none(scope);
     // Reject an unknown method here rather than at connect time, so a typo is a
@@ -1481,7 +1489,13 @@ fn registry_summary(reg: &Registry) -> String {
         .discovery_mode
         .as_deref()
         .map(str::to_string)
-        .unwrap_or_else(|| if reg.lazy_discovery { "lazy".into() } else { "full".into() });
+        .unwrap_or_else(|| {
+            if reg.lazy_discovery {
+                "lazy".into()
+            } else {
+                "full".into()
+            }
+        });
     let _ = writeln!(out, "  discovery mode: {global_mode} (global)");
     if !reg.client_discovery.is_empty() {
         let mut overrides: Vec<String> = reg
@@ -1508,7 +1522,13 @@ fn registry_summary(reg: &Registry) -> String {
             let keys: Vec<String> = s
                 .env
                 .iter()
-                .map(|e| if e.secret { format!("{} (secret)", e.key) } else { e.key.clone() })
+                .map(|e| {
+                    if e.secret {
+                        format!("{} (secret)", e.key)
+                    } else {
+                        e.key.clone()
+                    }
+                })
                 .collect();
             let _ = writeln!(out, "        env: {}", keys.join(", "));
         }
@@ -1877,6 +1897,66 @@ fn decide_approval(
     Ok(())
 }
 
+/// Strong routine candidates the gateway queued for the passive Settings area.
+/// Polled by the frontend; the `routine-suggestion` event prompts a refresh.
+#[tauri::command]
+fn list_routine_suggestions(
+    broker: State<approval_broker::ApprovalBroker>,
+) -> Vec<routines::RoutineSuggestion> {
+    broker.list_suggestions()
+}
+
+/// Persist a queued suggestion. The user's click IS the persistence authorization:
+/// the card showed the same disclosure the approval prompt would (name, dependencies,
+/// risk, provenance, collapsible source), so no second prompt fires. Everything still
+/// passes the store's own validation and the equivalence dedupe, and the routine
+/// watcher advertises the result to every client.
+#[tauri::command]
+fn approve_routine_suggestion(
+    broker: State<approval_broker::ApprovalBroker>,
+    fingerprint: String,
+    name: String,
+    description: Option<String>,
+) -> Result<routines::RoutineDefinition, String> {
+    let suggestion = broker
+        .suggestion(&fingerprint)
+        .ok_or_else(|| "no queued suggestion with that fingerprint".to_string())?;
+    suggestion.validate()?;
+    let started = std::time::Instant::now();
+    // Equivalent-definition dedupe: an agent-initiated save may have landed the same
+    // definition already; treat that as success rather than a duplicate.
+    if let Some(existing) = routines::find_by_definition_fingerprint(&fingerprint)? {
+        broker.remove_suggestion(&fingerprint);
+        return Ok(existing);
+    }
+    let definition = routines::new_promoted_definition(
+        name,
+        description.filter(|text| !text.trim().is_empty()),
+        suggestion.source,
+        suggestion.input_schema,
+        suggestion.limits,
+        suggestion.evidence,
+    )?;
+    let saved = routines::append_immutable(definition)?;
+    audit::record_routine(
+        "save",
+        saved.id(),
+        saved.content_hash(),
+        true,
+        Some(started.elapsed().as_millis().min(u64::MAX as u128) as u64),
+        Some("app_suggestion"),
+        None,
+    );
+    broker.remove_suggestion(&fingerprint);
+    Ok(saved)
+}
+
+/// Drop a queued suggestion and keep the same definition out for this app run.
+#[tauri::command]
+fn dismiss_routine_suggestion(broker: State<approval_broker::ApprovalBroker>, fingerprint: String) {
+    broker.dismiss_suggestion(&fingerprint);
+}
+
 /// A tool allowed to skip human approval, for the Settings "Allowed tools" list.
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1913,13 +1993,23 @@ fn list_allowed_tools(
         .iter()
         .filter_map(|k| {
             let (server, tool) = parse(k)?;
-            Some(AllowedTool { key: k.clone(), server, tool, persistent: true })
+            Some(AllowedTool {
+                key: k.clone(),
+                server,
+                tool,
+                persistent: true,
+            })
         })
         .collect();
     for k in broker.session_allowed() {
         if !persistent.contains(&k) {
             if let Some((server, tool)) = parse(&k) {
-                out.push(AllowedTool { key: k, server, tool, persistent: false });
+                out.push(AllowedTool {
+                    key: k,
+                    server,
+                    tool,
+                    persistent: false,
+                });
             }
         }
     }
@@ -1960,7 +2050,10 @@ fn set_tool_override(
         reg.set_tool_override(
             server,
             tool,
-            registry::ToolOverride { name: norm(name), description: norm(description) },
+            registry::ToolOverride {
+                name: norm(name),
+                description: norm(description),
+            },
         );
         Ok(())
     })?;
@@ -2238,7 +2331,9 @@ fn notify_new_quarantines(app: &AppHandle, list: &[serde_json::Value]) {
                 .collect();
             if !newcomers.is_empty() {
                 // Newest first for the body when several land in one poll.
-                newcomers.sort_by_key(|r| std::cmp::Reverse(r.get("ts").and_then(|v| v.as_u64()).unwrap_or(0)));
+                newcomers.sort_by_key(|r| {
+                    std::cmp::Reverse(r.get("ts").and_then(|v| v.as_u64()).unwrap_or(0))
+                });
                 let title = if newcomers.len() == 1 {
                     "Toolport: tool quarantined".to_string()
                 } else {
@@ -2329,6 +2424,17 @@ fn set_lazy_discovery(state: State<RegistryState>, lazy: bool) -> Result<Registr
 fn set_code_mode(state: State<RegistryState>, enabled: bool) -> Result<Registry, String> {
     let (reg, _) = write_registry(state.inner(), |reg| {
         reg.code_mode = enabled;
+        Ok(())
+    })?;
+    Ok(reg)
+}
+
+/// Opt into agent-requested Routine persistence. The gateway refreshes this setting live,
+/// but every save remains separately gated by content-bound human approval.
+#[tauri::command]
+fn set_allow_routine_writes(state: State<RegistryState>, allow: bool) -> Result<Registry, String> {
+    let (reg, _) = write_registry(state.inner(), |reg| {
+        reg.allow_routine_writes = allow;
         Ok(())
     })?;
     Ok(reg)
@@ -2532,7 +2638,11 @@ async fn team_connect(
             // Team config adds local/stdio + LAN servers OFF (the member reviews + enables them)
             // and refuses link-local/metadata URLs. Surface both so the state is never a mystery.
             emit_team_review(&app, review);
-            Ok(TeamConnectResult { status: "connected", registry: Some(fresh), request_token: None })
+            Ok(TeamConnectResult {
+                status: "connected",
+                registry: Some(fresh),
+                request_token: None,
+            })
         }
         teams::ConnectOutcome::Pending { request_token } => Ok(TeamConnectResult {
             status: "pending",
@@ -2564,17 +2674,27 @@ async fn team_join_poll(
             let fresh = reload_into_state(state.inner())?;
             nudge_gateway(state.inner());
             emit_team_review(&app, review);
-            Ok(TeamConnectResult { status: "connected", registry: Some(fresh), request_token: None })
+            Ok(TeamConnectResult {
+                status: "connected",
+                registry: Some(fresh),
+                request_token: None,
+            })
         }
-        teams::JoinPoll::Pending => {
-            Ok(TeamConnectResult { status: "pending", registry: None, request_token: None })
-        }
-        teams::JoinPoll::Denied => {
-            Ok(TeamConnectResult { status: "denied", registry: None, request_token: None })
-        }
-        teams::JoinPoll::Unknown => {
-            Ok(TeamConnectResult { status: "unknown", registry: None, request_token: None })
-        }
+        teams::JoinPoll::Pending => Ok(TeamConnectResult {
+            status: "pending",
+            registry: None,
+            request_token: None,
+        }),
+        teams::JoinPoll::Denied => Ok(TeamConnectResult {
+            status: "denied",
+            registry: None,
+            request_token: None,
+        }),
+        teams::JoinPoll::Unknown => Ok(TeamConnectResult {
+            status: "unknown",
+            registry: None,
+            request_token: None,
+        }),
     }
 }
 
@@ -2587,7 +2707,10 @@ async fn team_join_poll(
 /// for anyone connected to a team and starved every other command (probe_servers, etc.).
 /// Running the blocking pull on a worker thread keeps the event loop free.
 #[tauri::command]
-async fn team_sync(app: tauri::AppHandle, state: State<'_, RegistryState>) -> Result<Registry, String> {
+async fn team_sync(
+    app: tauri::AppHandle,
+    state: State<'_, RegistryState>,
+) -> Result<Registry, String> {
     refresh_from_disk(state.inner())?;
     let result = tauri::async_runtime::spawn_blocking(teams::sync_now)
         .await
@@ -3101,7 +3224,9 @@ struct ImportItem {
 /// Show exactly what the bulk client import would add without changing the
 /// registry. The same import key is accepted by `import_servers` after review.
 #[tauri::command]
-async fn preview_import_servers(state: State<'_, RegistryState>) -> Result<Vec<ImportItem>, String> {
+async fn preview_import_servers(
+    state: State<'_, RegistryState>,
+) -> Result<Vec<ImportItem>, String> {
     let detected = tauri::async_runtime::spawn_blocking(clients::detect_clients)
         .await
         .map_err(|e| e.to_string())?;
@@ -3508,7 +3633,10 @@ struct ReapOutcome {
 /// Stop obsolete gateway processes (older versions / stale paths), keeping the
 /// current resolved binary. Safe to run any time; used from Settings and launch.
 #[tauri::command]
-fn stop_stale_gateways(bridge: State<HttpBridgeState>, advice: State<RestartAdvice>) -> ReapOutcome {
+fn stop_stale_gateways(
+    bridge: State<HttpBridgeState>,
+    advice: State<RestartAdvice>,
+) -> ReapOutcome {
     reap_stale_and_restore_bridge(bridge.inner(), advice.inner())
 }
 
@@ -3592,10 +3720,7 @@ fn announce_restart_needed(
 ///
 /// Connected clients are unaffected by the new process: they authenticate with the
 /// per-client bearers in `http_clients`, not the bridge's own env token.
-fn reap_stale_and_restore_bridge(
-    bridge: &HttpBridgeState,
-    advice: &RestartAdvice,
-) -> ReapOutcome {
+fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState, advice: &RestartAdvice) -> ReapOutcome {
     let mut extra_keep = Vec::new();
     if let Some(p) = clients::resolve_gateway_path() {
         extra_keep.push(p);
@@ -4201,6 +4326,9 @@ pub fn run() {
             set_human_approval,
             list_pending_approvals,
             decide_approval,
+            list_routine_suggestions,
+            approve_routine_suggestion,
+            dismiss_routine_suggestion,
             list_allowed_tools,
             revoke_allowed_tool,
             set_tool_override,
@@ -4219,6 +4347,7 @@ pub fn run() {
             release_quarantine,
             set_lazy_discovery,
             set_code_mode,
+            set_allow_routine_writes,
             set_allow_agent_control,
             set_client_discovery,
             team_connect,
@@ -4543,10 +4672,7 @@ pub fn run() {
 /// empty registry. Closing the dialog exits; the user can then resolve a stuck lock or restore
 /// one of the preserved backup/unreadable files before relaunching (SOU-331).
 fn run_registry_startup_failure(error: String, context: tauri::Context) {
-    let message = registry_startup_failure_message(
-        registry::resolved_path().as_deref(),
-        &error,
-    );
+    let message = registry_startup_failure_message(registry::resolved_path().as_deref(), &error);
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .setup(move |app| {
@@ -4782,7 +4908,11 @@ mod tests {
         }
     }
 
-    fn detected_client(id: &str, servers: Vec<&str>, plugin_servers: Vec<&str>) -> clients::DetectedClient {
+    fn detected_client(
+        id: &str,
+        servers: Vec<&str>,
+        plugin_servers: Vec<&str>,
+    ) -> clients::DetectedClient {
         clients::DetectedClient {
             id: id.into(),
             name: id.into(),
@@ -4835,11 +4965,7 @@ mod tests {
 
     #[test]
     fn selected_servers_to_import_respects_the_reviewed_keys() {
-        let detected = vec![detected_client(
-            "cursor",
-            vec!["linear", "github"],
-            vec![],
-        )];
+        let detected = vec![detected_client("cursor", vec!["linear", "github"], vec![])];
         let selected = std::collections::HashSet::from(["name:github".to_string()]);
         let picked = selected_servers_to_import(&detected, &Registry::default(), Some(&selected));
         assert_eq!(picked.len(), 1);
@@ -5002,7 +5128,6 @@ mod tests {
         assert_ne!(a, c, "different server identity must map to different lock keys");
     }
 
-
     #[test]
     fn oauth_waiter_uses_attempt_completion_id() {
         let unique = SystemTime::now()
@@ -5079,7 +5204,10 @@ mod tests {
     #[test]
     fn tool_identities_attribute_alias_to_server_and_profiles() {
         use std::collections::{BTreeMap, BTreeSet};
-        let servers = vec![plain_server("gh", "GitHub"), plain_server("my-server", "My Server")];
+        let servers = vec![
+            plain_server("gh", "GitHub"),
+            plain_server("my-server", "My Server"),
+        ];
         let profiles = vec![Profile {
             id: "default".into(),
             name: "Default".into(),
@@ -5814,8 +5942,7 @@ mod tests {
         // Blank in any form means "keep the vaulted one".
         assert_eq!(supplied_secret(Some(String::new())), None);
         assert_eq!(supplied_secret(Some("   ".into())), None);
-        assert_eq!(supplied_secret(Some("	
-".into())), None);
+        assert_eq!(supplied_secret(Some("\t\n".into())), None);
         assert_eq!(supplied_secret(None), None);
     }
 }
