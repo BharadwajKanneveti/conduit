@@ -126,6 +126,7 @@ describe("runsShell", () => {
     ["sh", true],
     ["bash", true],
     ["zsh", true],
+    ["fish", true],
     ["cmd", true],
     ["powershell", true],
     ["pwsh", true],
@@ -141,7 +142,15 @@ describe("runsShell", () => {
     ["npx", false],
     ["node", false],
     ["bash-language-server", false],
-    ["fish", false],
+    // env alone launches nothing; env with a shell target is a shell.
+    ["/usr/bin/env", false],
+    // Packed invocations (whole command line in `command`, empty args) are split
+    // like the backend's normalize_invocation before classifying.
+    ["bash -c 'curl … | sh'", true],
+    ["env bash -c 'x'", true],
+    ["npx -y @scope/pkg", false],
+    // A path with spaces is not split, so the packed rule can't misread it.
+    ["/opt/my tools/server --stdio", false],
     // Only a trailing .exe is stripped.
     ["bash.exe.bak", false],
     // Missing command.
@@ -149,6 +158,26 @@ describe("runsShell", () => {
     ["", false],
   ])("classifies %j as %s", (command, expected) => {
     expect(runsShell(command)).toBe(expected);
+  });
+
+  it("classifies packed Windows shells and env-launched shells via args", () => {
+    expect(runsShell("C:\\Windows\\System32\\cmd.exe /c evil", [])).toBe(false); // path, not split
+    expect(runsShell("C:\\Windows\\System32\\cmd.exe", ["/c", "evil"])).toBe(true);
+    expect(runsShell("cmd.bat", [])).toBe(true);
+    expect(runsShell("/usr/bin/env", ["bash", "-c", "x"])).toBe(true);
+    expect(runsShell("/usr/bin/env", ["node", "server.js"])).toBe(false);
+  });
+
+  it("follows env past option operands and stays conservative on unknown options", () => {
+    expect(runsShell("env", ["-u", "HISTFILE", "bash", "-c", "x"])).toBe(true);
+    expect(runsShell("env", ["-C", "/tmp", "sh", "-c", "x"])).toBe(true);
+    expect(runsShell("env", ["--unset=HISTFILE", "bash", "-c", "x"])).toBe(true);
+    expect(runsShell("env", ["--chdir", "/tmp", "zsh"])).toBe(true);
+    expect(runsShell("env", ["-i", "FOO=1", "node", "server.js"])).toBe(false);
+    expect(runsShell("env", ["-u", "HISTFILE", "node", "server.js"])).toBe(false);
+    // -S repacks a whole command line; classify as shell rather than miss one.
+    expect(runsShell("env", ["-S", "bash -c x"])).toBe(true);
+    expect(runsShell("env", ["-S", "node server.js"])).toBe(true);
   });
 });
 

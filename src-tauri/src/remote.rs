@@ -823,15 +823,18 @@ fn guard_connect_target(server: &ServerEntry) -> Result<(), String> {
 /// The first custom secret env var that has a value vaulted in the keychain.
 /// For HTTP servers that don't use OAuth (e.g. Magica with a `BEARER` API key),
 /// this is the token we send as `Authorization: Bearer ***`.
-fn first_vaulted_secret(server: &ServerEntry) -> Option<String> {
+/// Errs on a failed vault read (SBS-789) — this fallback is the ONLY token
+/// source for such servers, so swallowing the error here would connect
+/// anonymous exactly like the `HTTP_AUTH_KEY` path used to.
+fn first_vaulted_secret(server: &ServerEntry) -> Result<Option<String>, String> {
     for e in &server.env {
         if e.secret && e.value.is_none() {
-            if let Some(v) = secrets::get_secret(&server.id, &e.key) {
-                return Some(v);
+            if let Some(v) = secrets::get_secret_result(&server.id, &e.key)? {
+                return Ok(Some(v));
             }
         }
     }
-    None
+    Ok(None)
 }
 
 /// Connect to a remote server, injecting any vaulted token. On an auth error,
@@ -894,8 +897,15 @@ pub fn connect_remote_with_handler(
             .expect("uses_client_credentials checked it");
         acquire_client_credentials(server_id, url, config)?;
     }
-    let stored_auth = secrets::get_secret(server_id, secrets::HTTP_AUTH_KEY)
-        .or_else(|| first_vaulted_secret(server));
+    // A vault read failure is not "no token" (SBS-789): connecting anonymous on a
+    // locked keychain would surface as a bogus 401/"needs sign-in" and can hand an
+    // unauthenticated session to a server the user believes is authenticated.
+    let stored_auth = match secrets::get_secret_result(server_id, secrets::HTTP_AUTH_KEY) {
+        Ok(Some(v)) => Some(v),
+        Ok(None) => first_vaulted_secret(server)
+            .map_err(|e| format!("could not read the vaulted auth token: {e}"))?,
+        Err(e) => return Err(format!("could not read the vaulted auth token: {e}")),
+    };
     let auth = match refresh_token_if_needed(server_id)? {
         Some(fresh) => Some(fresh),
         None => stored_auth,

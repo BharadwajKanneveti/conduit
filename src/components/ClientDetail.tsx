@@ -340,20 +340,6 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
     return next;
   }
 
-  async function handleImportOne(server: McpServer) {
-    setBusy(true);
-    try {
-      await importOne(server);
-      toast.success(`Imported ${server.name} into Toolport`, {
-        description: "Enable it to serve it to every client through the gateway.",
-      });
-    } catch (e) {
-      toastError(`${e}`);
-    } finally {
-      setBusy(false);
-    }
-  }
-
   async function handleImportAll() {
     setBulkImportServers(toImport);
   }
@@ -796,7 +782,9 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
                 isPlugin={pluginNames.has(server.name.toLowerCase())}
                 imported={importedNames.has(server.name.toLowerCase())}
                 busy={busy}
-                onImport={() => handleImportOne(server)}
+                // Same review dialog as "Import all": a per-row import must show the
+                // same shell/private-host warnings before anything is added.
+                onImport={() => setBulkImportServers([server])}
               />
             ))}
           </div>

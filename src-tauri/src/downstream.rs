@@ -3000,6 +3000,7 @@ pub fn is_download_launcher(command: &str, args: &[String]) -> bool {
     let base = base
         .strip_suffix(".exe")
         .or_else(|| base.strip_suffix(".cmd"))
+        .or_else(|| base.strip_suffix(".bat"))
         .or_else(|| base.strip_suffix(".ps1"))
         .unwrap_or(&base);
     let first = args.first().map(String::as_str);
@@ -7553,6 +7554,7 @@ mod tests {
             "bunx",
             "/usr/local/bin/npx",
             r"C:\Program Files\nodejs\npx.cmd",
+            r"C:\Program Files\nodejs\npx.bat",
             "NPX.EXE",
             "uvx.exe",
         ] {

@@ -840,13 +840,15 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
   }
 
   // Stop waiting on an in-flight call: invalidate its id so the eventual result is
-  // dropped, and reset the UI. The downstream call still has its own server-side
-  // timeout; this just frees the user from a stuck "Calling…" state.
+  // dropped, and reset the UI. A Tauri invoke can't be aborted, so this is NOT an
+  // abort — the downstream tool keeps executing and its side effects still happen.
+  // The copy must say so; Playground skips approval gates, so implying a destructive
+  // call was stopped would be a false all-clear.
   function cancelCall() {
     callSeq.current++;
     if (tickerRef.current) clearInterval(tickerRef.current);
     setCalling(false);
-    setCallError("Call cancelled.");
+    setCallError("Stopped waiting — the call may still be running on the server.");
   }
 
   if (servers.length === 0) {
