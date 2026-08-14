@@ -727,6 +727,9 @@ fn prewarm_launcher(server: &ServerEntry) {
         for e in &server.env {
             match e.value.clone() {
                 Some(v) => env.push((e.key.clone(), v)),
+                // Only secret entries have vaulted values; a plain unset var
+                // must not pick up a same-named secret from the vault.
+                None if !e.secret => {}
                 None => match secrets::get_secret_result(&server.id, &e.key) {
                     Ok(Some(v)) => env.push((e.key.clone(), v)),
                     // Unset stays lenient (the point is warming the download

@@ -167,6 +167,18 @@ describe("runsShell", () => {
     expect(runsShell("/usr/bin/env", ["bash", "-c", "x"])).toBe(true);
     expect(runsShell("/usr/bin/env", ["node", "server.js"])).toBe(false);
   });
+
+  it("follows env past option operands and stays conservative on unknown options", () => {
+    expect(runsShell("env", ["-u", "HISTFILE", "bash", "-c", "x"])).toBe(true);
+    expect(runsShell("env", ["-C", "/tmp", "sh", "-c", "x"])).toBe(true);
+    expect(runsShell("env", ["--unset=HISTFILE", "bash", "-c", "x"])).toBe(true);
+    expect(runsShell("env", ["--chdir", "/tmp", "zsh"])).toBe(true);
+    expect(runsShell("env", ["-i", "FOO=1", "node", "server.js"])).toBe(false);
+    expect(runsShell("env", ["-u", "HISTFILE", "node", "server.js"])).toBe(false);
+    // -S repacks a whole command line; classify as shell rather than miss one.
+    expect(runsShell("env", ["-S", "bash -c x"])).toBe(true);
+    expect(runsShell("env", ["-S", "node server.js"])).toBe(true);
+  });
 });
 
 describe("isPrivateHostUrl", () => {

@@ -47,6 +47,10 @@ function isLinkLocalHost(hostname: string): boolean {
     .toLowerCase()
     .replace(/^\[|\]$/g, "")
     .replace(/\.$/, "");
+  // Well-known metadata hostnames resolve to the metadata service without a
+  // link-local literal ever appearing in the URL. A renderer can't do DNS, so
+  // match the names directly (mirrors oauth.rs `ip_is_link_local`'s intent).
+  if (host === "metadata.google.internal" || host === "metadata") return true;
   const v4 = (dotted: string): boolean => {
     const match = dotted.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
     if (!match) return false;
@@ -70,6 +74,9 @@ function isLinkLocalHost(hostname: string): boolean {
     return v4(`${(hi >> 8) & 0xff}.${hi & 0xff}.${(lo >> 8) & 0xff}.${lo & 0xff}`);
   }
   if (host === "::" || host === "0:0:0:0:0:0:0:0") return true; // unspecified
+  // AWS IMDS on IPv6 (same service as 169.254.169.254; oauth.rs treats it as
+  // link-local too).
+  if (host === "fd00:ec2::254") return true;
   const first = parseInt(host.split(":")[0] || "0", 16);
   if (Number.isNaN(first)) return false;
   return (first & 0xffc0) === 0xfe80; // fe80::/10 link-local

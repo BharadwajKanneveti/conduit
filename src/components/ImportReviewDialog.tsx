@@ -177,10 +177,35 @@ export function runsShell(command: string | null, args: string[] = []): boolean 
     .pop()!
     .toLowerCase()
     .replace(/\.(exe|cmd|bat)$/, "");
-  // `env` just launches its first non-flag argument; classify that instead.
+  // `env` just launches a command; classify that instead. GNU env options that
+  // take a separate operand (-u NAME, -C DIR) must be skipped with their value,
+  // or `env -u FOO bash -c '…'` would classify FOO and miss the shell. Unknown
+  // options (notably -S, which repacks a whole command line) classify as shell
+  // conservatively rather than silently dropping the warning.
   if (base === "env") {
-    const target = argv.find((a) => !a.startsWith("-") && !a.includes("="));
-    return target != null && runsShell(target, argv.slice(argv.indexOf(target) + 1));
+    for (let i = 0; i < argv.length; i++) {
+      const a = argv[i];
+      if (a.startsWith("--")) {
+        const name = a.split("=")[0];
+        if (name === "--ignore-environment") continue;
+        if (name === "--unset" || name === "--chdir") {
+          if (!a.includes("=")) i++;
+          continue;
+        }
+        return true;
+      }
+      if (a.startsWith("-")) {
+        if (a === "-" || a === "-i") continue; // both mean ignore-environment
+        if (a === "-u" || a === "-C") {
+          i++;
+          continue;
+        }
+        return true;
+      }
+      if (a.includes("=")) continue; // NAME=VALUE assignment
+      return runsShell(a, argv.slice(i + 1));
+    }
+    return false;
   }
   return ["cmd", "sh", "bash", "zsh", "fish", "powershell", "pwsh"].includes(base);
 }

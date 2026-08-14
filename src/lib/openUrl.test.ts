@@ -34,6 +34,9 @@ describe("openExternal", () => {
     await openExternal("http://[fe80::1]/");
     await openExternal("http://[::ffff:169.254.169.254]/");
     await openExternal("http://[::]/");
+    await openExternal("http://[fd00:ec2::254]/latest/meta-data/");
+    await openExternal("http://metadata.google.internal/computeMetadata/v1/");
+    await openExternal("http://metadata/computeMetadata/v1/");
     expect(openUrl).not.toHaveBeenCalled();
   });
 

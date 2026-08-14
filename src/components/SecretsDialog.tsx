@@ -145,9 +145,11 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
           setAuthProbeError(false);
         })
         .catch(() => {
-          // Unknown ≠ absent (SBS-789): keep the badge off but say the check
-          // failed rather than implying no token is vaulted.
-          if (fresh()) setAuthProbeError(true);
+          // Unknown ≠ absent (SBS-789): drop any stale badge and say the check
+          // failed rather than asserting either presence or absence.
+          if (!fresh()) return;
+          setAuthSet(false);
+          setAuthProbeError(true);
         });
       // Seed the headless form from the registry. The secret is deliberately not
       // fetched: only whether one exists, so it can never be read back out.
@@ -210,6 +212,9 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     try {
       await setAuthToken(server.id, authInput);
       setAuthSet(true);
+      // A successful write is an authoritative "token present" — clear any
+      // earlier failed-probe warning.
+      setAuthProbeError(false);
       setAuthInput("");
       toast.success("Saved auth token");
       onChanged?.();
@@ -305,6 +310,7 @@ export function SecretsDialog({ server, onSaved, trigger, onChanged }: Props) {
     try {
       await authenticateOauth(server.id, server.url);
       setAuthSet(true);
+      setAuthProbeError(false);
       toast.success("Authenticated");
       onChanged?.();
     } catch (e) {
