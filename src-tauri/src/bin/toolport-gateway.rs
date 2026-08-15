@@ -20429,6 +20429,106 @@ mod tests {
             Some(None)
         );
     }
+    
+    #[test]
+    fn mcp_http_audit_entry_records_client_and_client_name() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-http-audit-client-{}",
+            routines::generate_id().unwrap()
+        ));
+        let _data_dir = conduit_lib::registry::DataDirOverride::set(&dir);
+
+        let mut reg = Registry::default();
+        reg.http_clients.push(registry::HttpClient {
+            id: "c1".into(),
+            label: "Cursor".into(),
+            token_sha256: registry::sha256_hex("client-token"),
+            profile: String::new(),
+        });
+
+        let (_, caller) =
+            resolve_http_caller(&reg, None, Some("client-token"), false).unwrap();
+
+        // Use a real in-memory downstream route so the tools/call request reaches
+        // execute_call(), which is where the audit entry is recorded.
+        let (router, _calls, _catalog) = counting_router(false);
+
+        let mut state = http_state(true);
+        state.router = Arc::new(Mutex::new(router));
+
+        let search = SearchGuard::default();
+        let confirm = ConfirmGuard::new();
+
+        let init = handle_http(
+            &state,
+            &search,
+            &confirm,
+            "POST",
+            "/mcp",
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {},
+                    "clientInfo": {
+                        "name": "test",
+                        "version": "0"
+                    }
+                }
+            })
+            .to_string(),
+            None,
+            None,
+            None,
+            Some(&caller),
+        );
+
+        assert_eq!(init.status, 200, "body={}", init.body);
+        let sid = mcp_session_of(&init);
+
+        let call = handle_http(
+            &state,
+            &search,
+            &confirm,
+            "POST",
+            "/mcp",
+            &json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "s__work",
+                    "arguments": {}
+                }
+            })
+            .to_string(),
+            Some(&sid),
+            None,
+            None,
+            Some(&caller),
+        );
+
+        assert_eq!(call.status, 200, "body={}", call.body);
+
+        let audit = std::fs::read_to_string(dir.join("audit.jsonl"))
+            .expect("audit log exists");
+
+        let entry: Value = audit
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|entry| entry["tool"] == "work")
+            .expect("HTTP tool call audit entry");
+
+        assert_eq!(entry["client"], "client:c1");
+        assert_eq!(entry["clientName"], "Cursor");
+
+        drop(_data_dir);
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     #[test]
     fn http_client_label_attributes_registered_clients() {
