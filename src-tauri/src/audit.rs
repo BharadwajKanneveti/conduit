@@ -97,6 +97,7 @@ pub fn record_timed_with_hash(
         duration_ms,
         error,
         client,
+        None,
         args_hash,
         None,
     )
@@ -116,6 +117,7 @@ pub fn record_timed_with_pii(
     duration_ms: Option<u64>,
     error: Option<&str>,
     client: Option<&str>,
+    client_name: Option<&str>,
     args_hash: Option<&str>,
     pii: Option<PiiPass>,
 ) {
@@ -126,6 +128,7 @@ pub fn record_timed_with_pii(
         duration_ms,
         error,
         client,
+        client_name,
         args_hash,
         pii,
     ));
@@ -141,6 +144,7 @@ fn timed_entry(
     duration_ms: Option<u64>,
     error: Option<&str>,
     client: Option<&str>,
+    client_name: Option<&str>,
     args_hash: Option<&str>,
     pii: Option<PiiPass>,
 ) -> Value {
@@ -165,6 +169,9 @@ fn timed_entry(
     // log answers "who invoked this?". Absent for the local stdio client / open tokens.
     if let Some(c) = client.filter(|c| !c.is_empty()) {
         entry["client"] = json!(c);
+    }
+    if let Some(name) = client_name.filter(|name| !name.is_empty()) {
+        entry["clientName"] = json!(name);
     }
     if let Some(h) = args_hash.filter(|h| !h.is_empty()) {
         entry["argsHash"] = json!(h);
@@ -1385,6 +1392,56 @@ mod tests {
     }
 
     #[test]
+    fn timed_entry_records_client_name_when_present() {
+        let entry = timed_entry(
+            "crm",
+            "crm__lookup",
+            true,
+            Some(12),
+            None,
+            Some("http-client"),
+            Some("claude"),
+            Some("deadbeef"),
+            None,
+        );
+
+        assert_eq!(entry["client"], "http-client");
+        assert_eq!(entry["clientName"], "claude");
+        assert_eq!(entry["argsHash"], "deadbeef");
+    }
+
+    #[test]
+    fn timed_entry_omits_empty_or_missing_client_name() {
+        let missing = timed_entry(
+            "crm",
+            "crm__lookup",
+            true,
+            Some(12),
+            None,
+            Some("http-client"),
+            None,
+            None,
+            None,
+        );
+
+        assert!(missing.get("clientName").is_none());
+
+        let empty = timed_entry(
+            "crm",
+            "crm__lookup",
+            true,
+            Some(12),
+            None,
+            Some("http-client"),
+            Some(""),
+            None,
+            None,
+        );
+
+        assert!(empty.get("clientName").is_none());
+    }
+
+    #[test]
     fn timed_entry_records_the_pii_pass_as_a_count_and_flags_an_incomplete_one() {
         let pass = |replaced, complete| {
             timed_entry(
@@ -1394,6 +1451,7 @@ mod tests {
                 Some(12),
                 None,
                 Some("claude"),
+                None,
                 Some("deadbeef"),
                 Some(PiiPass { replaced, complete }),
             )
@@ -1425,6 +1483,7 @@ mod tests {
             Some(12),
             None,
             Some("claude"),
+            None,
             Some("deadbeef"),
             None,
         );
@@ -1445,6 +1504,7 @@ mod tests {
             "crm__lookup",
             true,
             Some(12),
+            None,
             None,
             None,
             None,

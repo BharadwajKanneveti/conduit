@@ -4152,6 +4152,7 @@ fn execute_call(
     router: &Router,
     cached: &[Value],
     client: Option<&str>,
+    client_name: Option<&str>,
     allowed: Option<&std::collections::HashSet<String>>,
     cancel: Option<downstream::CancelContext>,
     confirm: Option<&ConfirmGuard>,
@@ -4711,6 +4712,7 @@ fn execute_call(
                 Some(ms),
                 err.as_deref(),
                 client,
+                client_name,
                 Some(&call_args_hash),
                 pii,
             );
@@ -4757,6 +4759,7 @@ fn execute_call(
                 Some(ms),
                 Some(&defended_err),
                 client,
+                client_name,
                 Some(&call_args_hash),
                 pii,
             );
@@ -6013,6 +6016,7 @@ fn run_script_dispatch(
     router_arc: Option<&Arc<Router>>,
     cached: &[Value],
     client: Option<&str>,
+    client_name: Option<&str>,
     allowed: Option<&std::collections::HashSet<String>>,
     cancel: Option<downstream::CancelContext>,
     arguments: &Value,
@@ -6191,6 +6195,7 @@ fn execute_script_dispatch_with_candidate(
     let live_owned = live_router.cloned();
     let cached_owned = cached.to_vec();
     let client_owned = client.map(str::to_string);
+    let client_name_owned = client_name.map(str::to_string);
     let allowed_owned = allowed.cloned();
     let cancel_owned = cancel;
     let receipts = Arc::new(Mutex::new(Vec::<ToolReceipt>::new()));
@@ -6213,6 +6218,7 @@ fn execute_script_dispatch_with_candidate(
                 &router_owned,
                 &cached_owned,
                 client_owned.as_deref(),
+                client_name_owned.as_deref(),
                 allowed_owned.as_ref(),
                 cancel_owned.clone(),
                 None,
@@ -7312,6 +7318,7 @@ fn handle_request(
         allowed,
         None,
         client,
+        None,
         Some(&search_index),
         None,
         None,
@@ -7336,6 +7343,7 @@ fn handle_request_with_cancel(
     // label), threaded in rather than stored on the shared router so concurrent
     // requests can't cross-contaminate and dispatch needn't hold the router lock.
     client: Option<&str>,
+    client_name: Option<&str>,
     // Immutable index built from the same catalog snapshot as `cached`. Scoped
     // HTTP clients and cold live-router fallbacks rebuild from their filtered
     // source rather than risk indexing a tool they cannot see.
@@ -8069,6 +8077,7 @@ fn handle_request_with_cancel(
                         router_arc,
                         cached,
                         client,
+                        client_name,
                         allowed,
                         cancel,
                         &arguments,
@@ -8133,6 +8142,7 @@ fn handle_request_with_cancel(
                 router,
                 cached,
                 client,
+                client_name,
                 allowed,
                 cancel,
                 Some(confirm),
@@ -11898,6 +11908,7 @@ fn process_request(
     allowed: Option<&std::collections::HashSet<String>>,
     cancel: Option<downstream::CancelContext>,
     client: Option<&str>,
+    client_name: Option<&str>,
 ) -> Option<Value> {
     let _transport = UpstreamTransportGuard::enter(if state.http {
         UpstreamTransport::Http
@@ -12122,6 +12133,7 @@ fn process_request(
         allowed,
         cancel,
         client,
+        client_name,
         Some(&cache_snapshot.search),
         // The same live Arc<Router> just cloned off the lock, so a code-mode script's
         // downstream calls run against this request's consistent catalog snapshot.
@@ -12176,6 +12188,7 @@ fn handle_stdio_request(
             None,
             Some(cancel_context),
             None,
+            None
         )
     }))
     .unwrap_or_else(|_| {
@@ -12856,6 +12869,7 @@ fn handle_mcp_http(
     headers: McpHttpRequestHeaders<'_>,
     allowed: Option<&std::collections::HashSet<String>>,
     client: Option<&str>,
+    client_name: Option<&str>,
     session_owner: Option<&McpSessionOwner>,
 ) -> HttpOut {
     let prefer_sse = mcp_prefers_sse(headers.accept);
@@ -13031,7 +13045,7 @@ fn handle_mcp_http(
             // Notifications / JSON-RPC responses: 202 with empty body.
             if !has_id {
                 let _session = McpSessionGuard::enter(session_id.clone());
-                let _ = process_request(state, &req, guard, confirm, allowed, None, client);
+                let _ = process_request(state, &req, guard, confirm, allowed, None, client, client_name);
                 let out = HttpOut::new(202, "text/plain", String::new());
                 return match session_id.as_deref() {
                     Some(sid) => out.with_header("Mcp-Session-Id", sid),
@@ -13040,7 +13054,7 @@ fn handle_mcp_http(
             }
 
             let _session = McpSessionGuard::enter(session_id.clone());
-            let resp = process_request(state, &req, guard, confirm, allowed, None, client);
+            let resp = process_request(state, &req, guard, confirm, allowed, None, client, client_name);
             match resp {
                 Some(resp) => {
                     let status = if is_modern {
@@ -13090,6 +13104,7 @@ fn handle_http_with_headers(
     // identity, not the display label (labels are not unique across HTTP clients).
     // Audit still receives this same id string; Activity may show `client:{id}`.
     let client = caller.map(|value| value.session_owner.identity.as_str());
+    let client_name = caller.and_then(|value| value.audit_label.as_deref());
     let session_owner = caller.map(|value| &value.session_owner);
     if method == "OPTIONS" {
         return HttpOut::new(204, "text/plain", String::new());
@@ -13106,6 +13121,7 @@ fn handle_http_with_headers(
             headers,
             allowed,
             client,
+            client_name,
             session_owner,
         );
     }
@@ -13163,6 +13179,7 @@ fn handle_http_with_headers(
                     headers,
                     allowed,
                     client,
+                    client_name,
                     session_owner,
                 );
             }
@@ -13182,7 +13199,7 @@ fn handle_http_with_headers(
                 "method": "tools/call",
                 "params": { "name": name, "arguments": args }
             });
-            match process_request(state, &req, guard, confirm, allowed, None, client) {
+            match process_request(state, &req, guard, confirm, allowed, None, client, client_name) {
                 Some(resp) => {
                     if let Some(err) = resp.get("error") {
                         let msg = err
@@ -14850,6 +14867,7 @@ fn main() {
                 None,
                 None,
                 None,
+                None
             );
             continue;
         };
@@ -16310,6 +16328,7 @@ mod tests {
             Some("cursor"),
             None,
             None,
+            None,
             Some(&ConfirmGuard::new()),
             "s__delete",
             json!({ "id": 7 }),
@@ -16880,7 +16899,7 @@ mod tests {
                        return { name: a.structuredContent.user.name, \
                                 sum: a.structuredContent.user.age + b.structuredContent.user.age };"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
         assert_eq!(result["isError"].as_bool(), Some(false));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         assert_eq!(result["structuredContent"]["toolportScript"]["calls"], 2);
@@ -17287,7 +17306,7 @@ mod tests {
             ];"
         });
 
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
         let serialized = serde_json::to_string(&result).unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
 
@@ -17337,7 +17356,7 @@ mod tests {
                        var t = r.content[0].text; \
                        return { len: t.length, head: t.slice(0, 8), shaped: t.indexOf('Toolport shaped') >= 0 };"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
         assert_eq!(result["isError"].as_bool(), Some(false));
         let v = &result["structuredContent"]["result"];
         assert_eq!(v["shaped"], false);
@@ -17382,6 +17401,7 @@ mod tests {
             Some("alice"),
             None,
             None,
+            None,
             &args,
             None,
         );
@@ -17406,6 +17426,7 @@ mod tests {
             Some(&router),
             &[],
             Some("scoped"),
+            None,
             Some(&allowed),
             None,
             &args,
@@ -17448,6 +17469,7 @@ mod tests {
             Some(&router),
             &cached,
             Some("scoped"),
+            None,
             Some(&allowed),
             None,
             &args,
@@ -17493,7 +17515,7 @@ mod tests {
             "script": "var a = servers.s.big({}); return a.structuredContent.user.name;"
         });
         let result =
-            run_script_dispatch(&reg, Some(&router), &cached, None, None, None, &args, None);
+            run_script_dispatch(&reg, Some(&router), &cached, None, None, None, None, &args, None);
         assert_eq!(result["isError"].as_bool(), Some(false));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         assert_eq!(result["structuredContent"]["toolportScript"]["calls"], 1);
@@ -17513,7 +17535,7 @@ mod tests {
         let cached = vec![json!({ "name": "s__big", "annotations": { "destructiveHint": true } })];
         let args = json!({ "script": "return toolport.call('s__big', {});" });
         let result =
-            run_script_dispatch(&reg, Some(&router), &cached, None, None, None, &args, None);
+            run_script_dispatch(&reg, Some(&router), &cached, None, None, None, None, &args, None);
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], true);
         let call_result = &result["structuredContent"]["result"];
         assert_eq!(call_result["isError"].as_bool(), Some(true));
@@ -17532,6 +17554,7 @@ mod tests {
             &reg,
             Some(&router),
             &[],
+            None,
             None,
             None,
             None,
@@ -17557,6 +17580,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &json!({ "script": "return 1;" }),
             None,
         );
@@ -17574,7 +17598,7 @@ mod tests {
         let reg = Registry::default();
         let router = Arc::new(paging_router("x".to_string()));
         let args = json!({ "script": "this is not valid javascript )(" });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert_eq!(result["structuredContent"]["toolportScript"]["ok"], false);
     }
@@ -17722,7 +17746,7 @@ mod tests {
             "script": "toolport.call('s__tool', { id: 1 }); toolport.call('s__tool', { id: 2 }); return 'done';"
         });
         let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
 
         assert_eq!(result["isError"].as_bool(), Some(false));
         let validate = &result["structuredContent"]["toolportValidate"];
@@ -17752,7 +17776,7 @@ mod tests {
             "script": "toolport.call('s__tool', {}); toolport.call('s__missing', {}); return 'done';"
         });
         let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         let validate = &result["structuredContent"]["toolportValidate"];
@@ -17780,7 +17804,7 @@ mod tests {
             "script": "toolport.call('a__one', {}); toolport.call('b__two', {}); return 'done';"
         });
         let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
 
         let unresolved = &result["structuredContent"]["toolportValidate"]["unresolved"];
         assert_eq!(unresolved.as_array().map(Vec::len), Some(2));
@@ -17805,7 +17829,7 @@ mod tests {
             "script": "var r = toolport.call('s__tool', {}); if (r.structuredContent.rows) { toolport.call('s__tool', { follow: true }); } return 'done';"
         });
         let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
 
         let validate = &result["structuredContent"]["toolportValidate"];
         assert_eq!(validate["finished"], true, "the guarded read never throws");
@@ -17839,7 +17863,7 @@ mod tests {
             "script": "toolport.call('s__tool', { totally: 'wrong' }); return 'done';"
         });
         let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
 
         assert_eq!(result["structuredContent"]["toolportValidate"]["ok"], true);
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
@@ -17856,7 +17880,7 @@ mod tests {
         let catalog = validate_catalog();
         let args = json!({ "validate": true, "script": "this is not valid javascript )(" });
         let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         let validate = &result["structuredContent"]["toolportValidate"];
@@ -17881,6 +17905,7 @@ mod tests {
             &reg,
             Some(&router),
             &validate_catalog(),
+            None,
             None,
             None,
             None,
@@ -17914,7 +17939,7 @@ mod tests {
             "script": "return servers.nope.missing({});"
         });
         let result =
-            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, &args, None);
+            run_script_dispatch(&reg, Some(&router), &catalog, None, None, None, None, &args, None);
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert_eq!(result["structuredContent"]["toolportValidate"]["ok"], false);
@@ -17940,7 +17965,7 @@ mod tests {
         let args = json!({
             "script": "toolport.call('s__tool', {}); throw new Error('E'.repeat(20000));"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
 
         // Restore before asserting so a failure cannot leak the override.
         match previous {
@@ -17978,7 +18003,7 @@ mod tests {
         let args = json!({
             "script": "toolport.checkpoint({ resume: 'x'.repeat(1000) }); try { toolport.checkpoint({ resume: 'y'.repeat(4000) }); } catch (_) {} throw new Error('E'.repeat(20000));"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
 
         match previous {
             Some(value) => std::env::set_var("TOOLPORT_RESULT_BUDGET", value),
@@ -18009,7 +18034,7 @@ mod tests {
         let args = json!({
             "script": "toolport.checkpoint({ lastInsertedId: 7 }); throw new Error('boom');"
         });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         assert_eq!(
@@ -18023,7 +18048,7 @@ mod tests {
         let reg = Registry::default();
         let router = Arc::new(routed_router("s", "tool"));
         let args = json!({ "script": "throw new Error('boom');" });
-        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, &args, None);
+        let result = run_script_dispatch(&reg, Some(&router), &[], None, None, None, None, &args, None);
 
         assert_eq!(result["isError"].as_bool(), Some(true));
         let text = result["content"][0]["text"].as_str().unwrap_or_default();
@@ -18103,6 +18128,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             Some(&search_index),
             Some(&router),
             None,
@@ -18126,6 +18152,7 @@ mod tests {
             None,
             &SearchGuard::default(),
             &ConfirmGuard::new(),
+            None,
             None,
             None,
             None,
