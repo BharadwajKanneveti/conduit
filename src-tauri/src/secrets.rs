@@ -667,19 +667,171 @@ mod platform;
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 mod platform {
     use keyring::Entry;
+    use std::sync::Mutex;
+    use std::time::Duration;
 
     use super::{account, SERVICE};
 
+    /// Serializes every Secret Service operation in this process (SBS-815).
+    ///
+    /// The `sync-secret-service` backend negotiates a fresh encrypted session
+    /// (`dh-ietf1024-sha256-aes128-cbc-pkcs7`) per operation. gnome-keyring 50
+    /// races its own per-client bookkeeping when several of those land at once
+    /// and aborts the daemon outright (`gkd_secret_service_get_pkcs11_session:
+    /// assertion 'client' failed` -> `aes_negotiate: assertion 'session' failed`
+    /// -> SIGABRT in `g_variant_new_va`). systemd restarts it, but the login
+    /// keyring comes back LOCKED, so a crash costs the user every vault read
+    /// until they unlock it by hand.
+    ///
+    /// These calls used to be serialized for free by the GTK main loop. SBS-813
+    /// moved them onto the blocking pool, where they are genuinely concurrent,
+    /// so the serialization has to be explicit now.
+    static SERVICE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Base wait before the single retry in `with_service`. systemd brings the
+    /// daemon back within ~1s of an abort, so one pause slightly longer than that
+    /// turns a crash into a recovered operation.
+    const RETRY_DELAY: Duration = Duration::from_millis(1200);
+
+    /// Distinct retry slots a process can land in. A process occupies exactly one,
+    /// so two processes are either in the same slot or a whole `RETRY_SLOT_MS`
+    /// apart — a continuous jitter cannot promise that, and a linear
+    /// `pid * k % window` is worse still: it puts every pid pair a fixed distance
+    /// apart, so a whole class of pid spacings collapses onto a few milliseconds.
+    const RETRY_SLOTS: u64 = 5;
+
+    /// Slot width, comfortably longer than one DH session negotiation, so two
+    /// processes in different slots cannot overlap their handshakes.
+    const RETRY_SLOT_MS: u64 = 150;
+
+    /// True when the error means the connection died under us rather than
+    /// answering the question.
+    ///
+    /// Only `PlatformFailure` qualifies. keyring 3.6.3 maps exactly `Locked`,
+    /// `NoResult` and `Prompt` onto `NoStorageAccess` (`secret_service.rs`
+    /// `decode_error`) and everything else — including a vanished D-Bus peer —
+    /// onto `PlatformFailure`. So `NoStorageAccess` never means a dead daemon; it
+    /// means the collection is locked or an unlock prompt was dismissed. Retrying
+    /// it cannot succeed, and it is the state the login keyring comes back in
+    /// after the crash this module guards against, so treating it as transient
+    /// would tax every later vault read with a pointless sleep and could raise a
+    /// second unlock prompt. `NoEntry` is likewise an answer, not a failure.
+    fn is_transient(err: &keyring::Error) -> bool {
+        matches!(err, keyring::Error::PlatformFailure(_))
+    }
+
+    /// Cross-process serialization for Secret Service access.
+    ///
+    /// `SERVICE_LOCK` only covers this process, but the app and the gateway are
+    /// two processes talking to the same daemon and either pair racing is enough
+    /// to abort it. This is the registry's own file-lock primitive on a dedicated
+    /// `secret-service.lock`, so both binaries queue behind one another instead of
+    /// negotiating sessions at the same moment.
+    ///
+    /// Best effort on purpose. If the lock cannot be taken — no data directory, or
+    /// a peer held it past the timeout — the operation still runs under the
+    /// in-process mutex and the staggered retry. Failing a vault read because a
+    /// lock file was contended would be a worse outcome than the race it guards.
+    fn cross_process_guard() -> Option<crate::registry::FileLock> {
+        let dir = crate::registry::conduit_dir()?;
+        crate::registry::lock_at_for(&dir.join("secret-service"), LOCK_TIMEOUT).ok()
+    }
+
+    /// Deadline for `cross_process_guard`, deliberately NOT the registry's 5s
+    /// default. That default is sized for a load-modify-save of a whole file;
+    /// this lock guards one D-Bus call that normally takes tens of milliseconds.
+    ///
+    /// The longest a peer can legitimately hold it is its own staggered retry:
+    /// `RETRY_DELAY` plus the widest slot (1200 + 4 × 150 = 1800ms) plus the two
+    /// attempts either side. 2.5s covers that with headroom and still bounds the
+    /// wait — which matters because `install_gateway` and `uninstall_gateway`
+    /// reach the vault on the GTK main loop, where 5s of held lock would be a
+    /// visible freeze. Past the deadline the operation proceeds unlocked rather
+    /// than failing, so this caps a stall; it does not turn one into an error.
+    const LOCK_TIMEOUT: Duration = Duration::from_millis(2500);
+
+    /// Wait before the retry, staggered per process.
+    ///
+    /// Belt and braces behind `cross_process_guard`: when that lock is
+    /// unavailable, a crash can still be triggered by the app and the gateway
+    /// racing. If both then slept exactly `RETRY_DELAY` they would wake on the
+    /// same tick and negotiate two sessions at once — the same race again, with
+    /// each side's single retry already spent.
+    fn retry_delay() -> Duration {
+        RETRY_DELAY + Duration::from_millis(retry_slot(std::process::id()) * RETRY_SLOT_MS)
+    }
+
+    /// Which retry slot this pid occupies, via splitmix64's finalizer: one changed
+    /// bit in the pid changes about half the output bits, so pids differing by 1,
+    /// 2 or 4 — the usual spacing when one process spawns another — do not fall
+    /// into a fixed pattern the way a plain multiply-and-mod does.
+    fn retry_slot(pid: u32) -> u64 {
+        let mut z = u64::from(pid).wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
+        z % RETRY_SLOTS
+    }
+
+    /// Run one Secret Service operation with the process lock held, retrying it
+    /// once if the service died mid-call.
+    ///
+    /// `op` covers `Entry::new` as well as the read or write, but only for
+    /// convenience: in keyring 3.6.3 `Entry::new` just builds an in-memory
+    /// attribute map (`SsCredential::new_with_target`) and never touches D-Bus.
+    /// The retry exists for the read or write that follows it, which is where
+    /// `SecretService::connect` opens the session.
+    ///
+    /// The lock is deliberately held across the retry sleep: any thread that would
+    /// take it in that window is talking to the same restarting daemon and would
+    /// only fail. Most callers are on the blocking pool (SBS-813), but
+    /// `install_gateway` and `uninstall_gateway` are still sync commands that
+    /// reach the vault on the GTK main loop, so a genuine daemon death can stall
+    /// window controls for the delay. Narrowing `is_transient` keeps that off the
+    /// common paths (a locked keyring no longer sleeps at all); moving those two
+    /// commands onto the blocking pool is the real fix and is tracked separately.
+    ///
+    /// Other processes are covered by `cross_process_guard`; the staggered retry
+    /// backs that up for the case where the file lock could not be taken.
+    fn with_service<T>(op: impl FnMut() -> Result<T, keyring::Error>) -> Result<T, keyring::Error> {
+        with_service_after(retry_delay(), op)
+    }
+
+    fn with_service_after<T>(
+        delay: Duration,
+        mut op: impl FnMut() -> Result<T, keyring::Error>,
+    ) -> Result<T, keyring::Error> {
+        // Always this order — in-process mutex, then the file lock — so two
+        // threads can never hold one and wait on the other.
+        let _serialized = SERVICE_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _across_processes = cross_process_guard();
+        match op() {
+            Err(e) if is_transient(&e) => {
+                // Say so. Otherwise the only evidence that SBS-815 recovery ran
+                // is a 1.2-1.7s stall, and a vault failure that persists past the
+                // retry (the keyring coming back LOCKED, say) looks identical to
+                // one that never had a daemon crash behind it.
+                eprintln!("conduit: secret service died mid-call ({e}); retrying once");
+                std::thread::sleep(delay);
+                let retried = op();
+                if let Err(e) = &retried {
+                    eprintln!("conduit: secret service still failing after the retry ({e})");
+                }
+                retried
+            }
+            other => other,
+        }
+    }
+
     pub fn set_secret(server_id: &str, key: &str, value: &str) -> Result<(), String> {
-        Entry::new(SERVICE, &account(server_id, key))
-            .map_err(|e| e.to_string())?
-            .set_password(value)
+        with_service(|| Entry::new(SERVICE, &account(server_id, key))?.set_password(value))
             .map_err(|e| e.to_string())
     }
 
     pub fn get_secret_result(server_id: &str, key: &str) -> Result<Option<String>, String> {
-        let entry = Entry::new(SERVICE, &account(server_id, key)).map_err(|e| e.to_string())?;
-        match entry.get_password() {
+        match with_service(|| Entry::new(SERVICE, &account(server_id, key))?.get_password()) {
             Ok(v) => Ok(Some(v)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(e.to_string()),
@@ -687,11 +839,193 @@ mod platform {
     }
 
     pub fn delete_secret(server_id: &str, key: &str) -> Result<(), String> {
-        let entry = Entry::new(SERVICE, &account(server_id, key)).map_err(|e| e.to_string())?;
-        match entry.delete_credential() {
+        match with_service(|| Entry::new(SERVICE, &account(server_id, key))?.delete_credential()) {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(e.to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn dead_daemon() -> keyring::Error {
+            keyring::Error::PlatformFailure("org.freedesktop.secrets vanished".into())
+        }
+
+        /// The gnome-keyring 50 abort recovery path (SBS-815): the daemon dies
+        /// mid-operation, systemd restarts it, and the retry succeeds where the
+        /// first attempt could not.
+        #[test]
+        fn a_secret_service_op_retries_once_when_the_daemon_dies_mid_call() {
+            let calls = AtomicUsize::new(0);
+            let result = with_service_after(Duration::ZERO, || {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(dead_daemon())
+                } else {
+                    Ok("recovered")
+                }
+            });
+
+            assert_eq!(result.unwrap(), "recovered");
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "one retry, not a loop");
+        }
+
+        /// `NoEntry` answers the question, so retrying it would only double the
+        /// D-Bus traffic that causes the crash in the first place.
+        #[test]
+        fn a_secret_service_op_does_not_retry_a_definitive_answer() {
+            let calls = AtomicUsize::new(0);
+            let result = with_service_after(Duration::ZERO, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(keyring::Error::NoEntry)
+            });
+
+            assert!(matches!(result, Err(keyring::Error::NoEntry)));
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "no retry for an answer");
+        }
+
+        /// A locked keyring is exactly the state the daemon comes back in after
+        /// the crash, and keyring reports it as `NoStorageAccess`. Retrying it
+        /// cannot succeed, would tax every later read with a sleep, and can raise
+        /// a second unlock prompt — so it must be attempted once only.
+        #[test]
+        fn a_secret_service_op_does_not_retry_a_locked_keyring() {
+            let calls = AtomicUsize::new(0);
+            let result = with_service_after(Duration::ZERO, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(keyring::Error::NoStorageAccess(
+                    "the collection is locked".into(),
+                ))
+            });
+
+            assert!(matches!(result, Err(keyring::Error::NoStorageAccess(_))));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "a locked collection is an answer, not a dead daemon"
+            );
+        }
+
+        /// The app and the gateway must not wake from the retry on the same tick,
+        /// or they re-run the very race that killed the daemon. Slots make the
+        /// separation structural: different slot => a full `RETRY_SLOT_MS` apart,
+        /// never a few milliseconds.
+        #[test]
+        fn the_retry_stagger_separates_processes_by_a_whole_slot() {
+            for pid in [1_u32, 2, 999, 4_100, 65_535, u32::MAX] {
+                assert!(retry_slot(pid) < RETRY_SLOTS, "slot out of range for {pid}");
+            }
+
+            // Two processes in different slots are a whole slot apart, which is
+            // longer than the DH handshake they must not overlap.
+            let delay_of = |pid: u32| retry_slot(pid) * RETRY_SLOT_MS;
+            let a = 4_100_u32;
+            let b = (a + 1..).find(|p| retry_slot(*p) != retry_slot(a)).unwrap();
+            assert!(delay_of(a).abs_diff(delay_of(b)) >= RETRY_SLOT_MS);
+        }
+
+        /// The failure mode of the multiply-and-mod stagger this replaced: it was
+        /// linear, so EVERY pair of pids a given distance apart landed the same
+        /// fixed gap apart (22ms for a delta of 2), and a whole class of spawn
+        /// spacings collapsed together. A mixing hash must not do that.
+        #[test]
+        fn the_retry_stagger_does_not_map_a_pid_delta_to_one_fixed_gap() {
+            for delta in [1_u32, 2, 4] {
+                let gaps: std::collections::HashSet<u64> = (4_000_u32..4_200)
+                    .map(|pid| {
+                        (retry_slot(pid) * RETRY_SLOT_MS)
+                            .abs_diff(retry_slot(pid + delta) * RETRY_SLOT_MS)
+                    })
+                    .collect();
+                assert!(
+                    gaps.len() > 2,
+                    "delta {delta} produces only {} distinct gap(s) — the stagger is linear",
+                    gaps.len()
+                );
+            }
+        }
+
+        /// The cross-process deadline has to sit in a window: long enough to wait
+        /// out a peer's staggered retry (giving up exactly while the daemon is
+        /// restarting would drop the serialization when it matters most), short
+        /// enough that a held lock is not a visible freeze on the GTK main-loop
+        /// callers. Pins the relationship so bumping the retry constants alone
+        /// cannot silently invalidate it.
+        #[test]
+        fn the_cross_process_deadline_outlasts_a_peer_retry_but_stays_bounded() {
+            let widest_retry_sleep =
+                RETRY_DELAY + Duration::from_millis((RETRY_SLOTS - 1) * RETRY_SLOT_MS);
+
+            assert!(
+                LOCK_TIMEOUT > widest_retry_sleep,
+                "{LOCK_TIMEOUT:?} would abandon the lock while a peer is still retrying \
+                 ({widest_retry_sleep:?})"
+            );
+            assert!(
+                LOCK_TIMEOUT < Duration::from_secs(5),
+                "the registry's 5s default is for a file rewrite, not one D-Bus call"
+            );
+        }
+
+        /// A hash that funnelled every nearby pid into one slot would separate
+        /// nothing, so check the slots are actually used.
+        #[test]
+        fn the_retry_stagger_uses_every_slot() {
+            let used: std::collections::HashSet<u64> =
+                (4_000_u32..4_100).map(retry_slot).collect();
+            assert_eq!(
+                used.len() as u64,
+                RETRY_SLOTS,
+                "100 consecutive pids should reach all {RETRY_SLOTS} slots, saw {used:?}"
+            );
+        }
+
+        /// A service that stays down surfaces the failure instead of retrying
+        /// forever — callers distinguish a read failure from "never saved"
+        /// (SBS-789), so the error has to reach them.
+        #[test]
+        fn a_secret_service_op_gives_up_after_a_single_retry() {
+            let calls = AtomicUsize::new(0);
+            let result = with_service_after(Duration::ZERO, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Err::<(), _>(dead_daemon())
+            });
+
+            assert!(result.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 2, "one attempt, one retry");
+        }
+
+        /// The actual fix: concurrent callers never negotiate two sessions at
+        /// once, which is what races gnome-keyring's per-client bookkeeping.
+        #[test]
+        fn secret_service_ops_never_overlap_across_threads() {
+            static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+            static MAX_IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+
+            std::thread::scope(|scope| {
+                for _ in 0..8 {
+                    scope.spawn(|| {
+                        with_service_after(Duration::ZERO, || {
+                            let now = IN_FLIGHT.fetch_add(1, Ordering::SeqCst) + 1;
+                            MAX_IN_FLIGHT.fetch_max(now, Ordering::SeqCst);
+                            // Wide enough that unserialized threads would overlap.
+                            std::thread::sleep(Duration::from_millis(5));
+                            IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+                            Ok::<_, keyring::Error>(())
+                        })
+                        .unwrap();
+                    });
+                }
+            });
+
+            assert_eq!(
+                MAX_IN_FLIGHT.load(Ordering::SeqCst),
+                1,
+                "two sessions negotiated at once is exactly what crashes the daemon"
+            );
         }
     }
 }
