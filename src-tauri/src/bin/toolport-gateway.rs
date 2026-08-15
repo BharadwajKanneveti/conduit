@@ -12198,7 +12198,7 @@ fn handle_stdio_request(
             None,
             Some(cancel_context),
             None,
-            None
+            None,
         )
     }))
     .unwrap_or_else(|_| {
@@ -14877,7 +14877,7 @@ fn main() {
                 None,
                 None,
                 None,
-                None
+                None,
             );
             continue;
         };
@@ -20429,7 +20429,7 @@ mod tests {
             Some(None)
         );
     }
-    
+
     #[test]
     fn mcp_http_audit_entry_records_client_and_client_name() {
         let _env = ENV_LOCK.lock().unwrap_or_else(|error| error.into_inner());
