@@ -1087,6 +1087,61 @@ impl Router {
         self.blocked.get(exposed_name).map(String::as_str)
     }
 
+    /// Re-adopt the routes (and exposed tool entries) for tools that came back
+    /// from a previous catalog during a guarded rebuild. The rebuild guard
+    /// keeps the previous catalog for a server whose fresh connect implausibly
+    /// shrank, but the rebuilt router was indexed from that degraded connect,
+    /// so `route_of` would miss every restored tool while the cache still
+    /// advertises it. `previous` is the pre-rebuild router, whose `routes` map
+    /// is the authoritative `(server id, original downstream name)` source --
+    /// never re-derive the original name by splitting the exposed name on `__`
+    /// (overrides and `_2` collision suffixes make that split wrong, see
+    /// [`Self::route_of`]). Only exposed names this router does not already
+    /// route are adopted, so a healthy server is never touched. Policy is
+    /// re-evaluated per restored tool before adoption: the rebuilt router only
+    /// indexed the degraded connect, so tools quarantined or disabled since the
+    /// previous build are absent from its `blocked` map and must not slip back
+    /// in through the guarded catalog (which still carries them from the cache).
+    pub fn adopt_restored_routes(&mut self, previous: &Router, catalog: &[Value]) {
+        for tool in catalog {
+            let Some(exposed) = tool.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if self.routes.contains_key(exposed) || self.blocked.contains_key(exposed) {
+                continue;
+            }
+            // The previous router indexed the same exposed name; reuse its
+            // (server, original) pair verbatim instead of re-deriving it.
+            let Some((server_id, original)) = previous.route_of(exposed) else {
+                continue;
+            };
+            // Re-evaluate policy before adopting. The rebuilt router only indexed
+            // the degraded connect, so a tool quarantined / disabled / scoped out
+            // since the previous build has no entry in `self.blocked` yet and the
+            // guarded catalog (from the disk cache) still carries it. Adopting it
+            // now would silently bypass the quarantine and scope guards while the
+            // cache keeps advertising it (review on #717).
+            if let Some(reason) = self
+                .policy
+                .blocked_reason(exposed, server_id, original, tool)
+            {
+                self.blocked.insert(exposed.to_string(), reason.to_string());
+                continue;
+            }
+            self.routes
+                .insert(exposed.to_string(), (server_id.to_string(), original.to_string()));
+            // Re-adopt the exposed tool entry so aggregated_tools() and the
+            // quarantine/fingerprint paths see the restored tool, matching what
+            // the cache advertises.
+            if !self.tools.iter().any(|t| {
+                t.get("name").and_then(Value::as_str) == Some(exposed)
+            }) {
+                self.tools.push(tool.clone());
+            }
+            self.seen.insert(exposed.to_string());
+        }
+    }
+
     /// Re-derive the exposed tool/resource/template/prompt aggregation from the
     /// current servers' (possibly refreshed) lists, in the original add order so
     /// exposed names and their `_2` collision suffixes stay stable. The server
@@ -2819,6 +2874,171 @@ mod tests {
         assert_eq!(router.route_of("say"), Some(("srv", "echo")), "renamed tool resolves to origin");
         assert_eq!(router.route_of("srv__add"), Some(("srv", "add")), "normal tool resolves");
         assert_eq!(router.route_of("nope"), None, "unknown name resolves to nothing");
+    }
+
+    /// A transport that advertises `n` tools (`t0`..`t(n-1)`) and echoes calls
+    /// back as `server:tool`, like MockTransport but with a configurable catalog.
+    struct CatalogTransport {
+        label: String,
+        n: usize,
+    }
+
+    impl Transport for CatalogTransport {
+        fn request(&mut self, method: &str, params: Value) -> Result<Value, TransportError> {
+            match method {
+                "initialize" => Ok(json!({
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": { "resources": {}, "prompts": {}, "completions": {} }
+                })),
+                "tools/list" => Ok(json!({
+                    "tools": (0..self.n)
+                        .map(|i| json!({ "name": format!("t{i}"), "description": "" }))
+                        .collect::<Vec<_>>()
+                })),
+                "tools/call" => {
+                    let name = params.get("name").and_then(|n| n.as_str()).unwrap_or("");
+                    Ok(json!({
+                        "content": [{ "type": "text", "text": format!("{}:{}", self.label, name) }],
+                        "isError": false
+                    }))
+                }
+                "resources/list" => Ok(json!({ "resources": [] })),
+                "prompts/list" => Ok(json!({ "prompts": [] })),
+                other => Err(TransportError::Fatal(format!("unexpected method {other}"))),
+            }
+        }
+
+        fn notify(&mut self, _method: &str, _params: Value) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn catalog_server(id: &str, n: usize) -> DownstreamServer {
+        let mut ds = DownstreamServer::connect(
+            id.to_string(),
+            Box::new(CatalogTransport {
+                label: id.to_string(),
+                n,
+            }),
+        )
+        .unwrap();
+        ds.load_resources_prompts();
+        ds
+    }
+
+    fn router_with_catalogs(specs: &[(&str, usize)]) -> Router {
+        let mut router = Router::new();
+        for (id, n) in specs {
+            router.add(catalog_server(id, *n));
+        }
+        router
+    }
+
+    #[test]
+    fn adopt_restored_routes_reroutes_a_guarded_rebuild() {
+        // A rebuild guard keeps the previous catalog for a server whose fresh
+        // connect implausibly shrank (40 -> 3). The rebuilt router was indexed
+        // from the degraded connect, so route_of misses the 37 restored tools
+        // while the cache still advertises them (issue #700).
+        let previous = router_with_catalogs(&[("atlassian", 40), ("github", 5)]);
+        let mut rebuilt = router_with_catalogs(&[("atlassian", 3), ("github", 5)]);
+
+        // Simulate the gateway guard: the guarded catalog keeps atlassian's
+        // previous 40 tools and github's fresh 5.
+        let guarded = previous.aggregated_tools();
+        rebuilt.adopt_restored_routes(&previous, &guarded);
+
+        // Every advertised tool now routes, to the ORIGINAL downstream name.
+        assert_eq!(rebuilt.route_of("atlassian__t39"), Some(("atlassian", "t39")));
+        assert_eq!(rebuilt.route_of("atlassian__t37"), Some(("atlassian", "t37")));
+        assert_eq!(
+            rebuilt.route_of("github__t4"),
+            Some(("github", "t4")),
+            "healthy server's own routes are untouched"
+        );
+        // A call to one of the 37 restored tools reaches the downstream server.
+        let result = rebuilt
+            .route_call("atlassian__t39", json!({}))
+            .unwrap();
+        assert_eq!(
+            result["content"][0]["text"].as_str().unwrap(),
+            "atlassian:t39",
+            "the call reaches the downstream under its original name"
+        );
+        // aggregated_tools() now matches what the cache advertises.
+        let names: std::collections::HashSet<String> = rebuilt
+            .aggregated_tools()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(names.contains("atlassian__t39"));
+        assert_eq!(names.len(), 45, "40 restored + 5 healthy");
+    }
+
+    #[test]
+    fn adopt_restored_routes_never_adopts_a_newly_quarantined_tool() {
+        // A tool quarantined since the previous build is absent from the degraded
+        // connect, so the rebuilt router's `blocked` map has no entry for it --
+        // but the guarded catalog (kept from the previous/cached catalog) still
+        // carries it. Adoption must re-check policy instead of blindly restoring
+        // the route, or quarantine would be silently bypassed (review on #717).
+        let previous = router_with_catalogs(&[("atlassian", 40)]);
+        let mut rebuilt = router_with_catalogs(&[("atlassian", 3)]);
+        // Quarantine a tool the degraded connect never returned, mirroring the
+        // live flow: requarantine re-indexes from the current (degraded) connect.
+        rebuilt.requarantine(BTreeSet::from(["atlassian__t30".to_string()]));
+        assert!(rebuilt.block_reason("atlassian__t30").is_none());
+
+        let guarded = previous.aggregated_tools();
+        rebuilt.adopt_restored_routes(&previous, &guarded);
+
+        // The quarantined tool must not be routed or advertised again.
+        assert!(rebuilt.block_reason("atlassian__t30").is_some());
+        assert!(rebuilt.route_of("atlassian__t30").is_none());
+        let names: std::collections::HashSet<String> = rebuilt
+            .aggregated_tools()
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(|s| s.to_string()))
+            .collect();
+        assert!(!names.contains("atlassian__t30"));
+        // The other 39 restored tools are still adopted (3 degraded + 36 more).
+        assert!(names.contains("atlassian__t39"));
+        assert_eq!(names.len(), 39, "3 degraded + 36 restored, t30 quarantined");
+    }
+
+    #[test]
+    fn adopt_restored_routes_never_touches_an_already_routed_tool() {
+        // A tool the rebuilt router already routes (one of the 3 the degraded
+        // connect returned) must keep its live mapping, not be overwritten.
+        // The previous router carries an override renaming one of those same
+        // tools (t1 -> renamed-t1), so its catalog disagrees with the rebuilt
+        // router's live routes; adoption must leave every live name alone and
+        // adopt the renamed slot under its renamed exposure.
+        let mut previous = Router::new();
+        previous.set_overrides(HashMap::from([(
+            "atlassian".to_string(),
+            HashMap::from([(
+                "t1".to_string(),
+                ToolOverride {
+                    name: Some("renamed-t1".into()),
+                    description: None,
+                },
+            )]),
+        )]));
+        previous.add(catalog_server("atlassian", 40));
+        let mut rebuilt = router_with_catalogs(&[("atlassian", 3)]);
+        let guarded = previous.aggregated_tools();
+        rebuilt.adopt_restored_routes(&previous, &guarded);
+
+        // Live routes for tools the degraded connect still advertises are kept,
+        // even though the previous catalog disagrees about one of them.
+        assert_eq!(rebuilt.route_of("atlassian__t0"), Some(("atlassian", "t0")));
+        assert_eq!(rebuilt.route_of("atlassian__t1"), Some(("atlassian", "t1")));
+        assert_eq!(rebuilt.route_of("atlassian__t2"), Some(("atlassian", "t2")));
+        // The renamed slot from the previous catalog is adopted under its
+        // renamed (sanitized) exposure — never re-derived by splitting on `__`
+        // — pointing at the same downstream tool.
+        assert_eq!(rebuilt.route_of("renamed_t1"), Some(("atlassian", "t1")));
     }
 
     #[test]
