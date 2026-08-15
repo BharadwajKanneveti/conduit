@@ -1059,11 +1059,38 @@ fn ensure_client_http_token(
     client_id: &str,
     profile: Option<&str>,
 ) -> Result<String, String> {
+    ensure_client_http_token_with(state, client_id, profile, crate::secrets::get_secret_result)
+}
+
+/// [`ensure_client_http_token`] with the vault read injected.
+///
+/// The vault server id is fixed here, so the reserved-namespace trick the other
+/// fail-closed tests use cannot reach it. Injecting the read is how
+/// [`revoke_client_http_token_with`] solves the same problem in this file.
+fn ensure_client_http_token_with(
+    state: &RegistryState,
+    client_id: &str,
+    profile: Option<&str>,
+    read_vaulted_token: impl FnOnce(&str, &str) -> Result<Option<String>, String>,
+) -> Result<String, String> {
     const VAULT_SERVER: &str = "__toolport_http_clients__";
     let http_id = format!("client:{client_id}");
     let desired_profile = profile.unwrap_or("").trim().to_string();
     // Reuse vaulted token when we still have a matching http_clients row.
-    if let Some(existing) = crate::secrets::get_secret(VAULT_SERVER, client_id) {
+    //
+    // A failed vault READ must not fall through to minting a replacement. `get_secret`
+    // collapses a read error into `None`, so a locked or flaky keychain looked exactly
+    // like "this client has no bearer yet": the mint path below then overwrites the
+    // vaulted copy AND `retain`s the client's `http_clients` row away for a new one.
+    // The bearer the client is already configured with now hashes to no row, so every
+    // request it makes 401s until the user reconnects that client by hand. Only a
+    // confirmed "nothing vaulted" may mint (SBS-840 class).
+    if let Some(existing) = read_vaulted_token(VAULT_SERVER, client_id)
+        // Complete sentence, capitalized: `install_gateway`'s caller renders this
+        // verbatim in a toast (`ClientDetail.tsx` `toastError(`${e}`)`), so a bare
+        // lowercase fragment would reach the user untethered.
+        .map_err(|e| format!("Could not read the saved token for {client_id}: {e}"))?
+    {
         let hash = registry::sha256_hex(&existing);
         let mut matched = false;
         let mut profile_stale = false;
@@ -7127,6 +7154,77 @@ mod tests {
             let on_disk = registry::load().expect("scratch registry loads");
             on_disk.http_clients.iter().any(|c| c.id == self.http_id)
         }
+    }
+
+    /// SBS-840 class, the instance left behind by that sweep. A failed vault READ
+    /// must not fall through to minting a replacement bearer. `get_secret` collapsed
+    /// a read error into `None`, which looks exactly like "this client has no bearer
+    /// yet", so the mint path overwrote the vaulted copy and `retain`ed the client's
+    /// `http_clients` row away for a new one. The bearer the client was already
+    /// configured with then hashed to no row, so every request it made 401'd until
+    /// the user reconnected that client by hand.
+    #[test]
+    fn ensure_client_http_token_propagates_a_failed_vault_read_instead_of_minting() {
+        let fixture = RevokeFixture::new("sbs-840-ensure-read");
+
+        let err = ensure_client_http_token_with(
+            &fixture.state,
+            &fixture.client_id,
+            None,
+            |_server, _client| Err("the keychain is locked".into()),
+        )
+        .expect_err("a failed vault read must not mint a replacement bearer");
+
+        assert!(
+            err.starts_with("Could not read the saved token"),
+            "the vault read failure must reach the caller as a complete sentence \
+             (the frontend renders it verbatim), got: {err}"
+        );
+        assert!(
+            err.contains("the keychain is locked"),
+            "the underlying cause must survive, got: {err}"
+        );
+        // The `expect_err` above is what pins the reported bug; today's mint path
+        // returns `Ok`, so execution never reaches here under it.
+        //
+        // This guards the ORDERING invariant instead: nothing may error out after
+        // already replacing the row. Assert the HASH rather than the id, because the
+        // mint path `retain`s the old row away and pushes a new one under the SAME
+        // id, so an id-only check cannot tell a surviving bearer from a replaced one.
+        // `http_client_for_token` matches on `token_sha256`, so that is what decides
+        // whether the client's configured token still authenticates.
+        let on_disk = registry::load().expect("scratch registry loads");
+        let row = on_disk
+            .http_clients
+            .iter()
+            .find(|c| c.id == fixture.http_id)
+            .expect("a failed vault read must not drop the client's http_clients row");
+        assert_eq!(
+            row.token_sha256,
+            registry::sha256_hex("leftover-bearer"),
+            "the row must still carry the ORIGINAL bearer's hash; a new hash means a \
+             replacement was minted and the client's configured token is now dead"
+        );
+    }
+
+    /// The reuse path is unchanged by the fix: a confirmed vaulted token that still
+    /// matches a registered row is handed back as-is, with nothing minted. Guards
+    /// against over-correcting the above into "never reuse".
+    #[test]
+    fn ensure_client_http_token_reuses_a_vaulted_token_that_matches_its_row() {
+        let fixture = RevokeFixture::new("sbs-840-ensure-reuse");
+
+        let token = ensure_client_http_token_with(
+            &fixture.state,
+            &fixture.client_id,
+            None,
+            // The fixture's row is registered against this exact token.
+            |_server, _client| Ok(Some("leftover-bearer".to_string())),
+        )
+        .expect("a matching vaulted token must be reused");
+
+        assert_eq!(token, "leftover-bearer");
+        assert!(fixture.http_row_present());
     }
 
     #[test]
