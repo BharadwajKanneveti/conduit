@@ -18,6 +18,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A flagged tool result can no longer self-close its provenance wrap.** A
+  payload that embedded `[/conduit: end external data]` (or `[/Toolport`) used
+  to terminate the wrap and leave a forged `[Toolport: …]` line reading as
+  gateway voice. The close tag is now per-call and includes a random nonce,
+  and an embedded close marker is stripped to a plain note that cannot read as
+  a terminator. The match runs on the folded form, so a close hidden with
+  zero-width characters, a Cyrillic homoglyph or fullwidth brackets is caught
+  too. (SBS-892)
 - **A Personal-scoped HTTP bearer can no longer call a team server whose id
   collides after sanitizing.** A personal server named Team Slack becomes
   `team-slack`; a team server named slack becomes `team_slack`. The HTTP bridge
