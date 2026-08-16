@@ -18,6 +18,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A space no longer smuggles a forged Toolport marker past the voice rewrite.**
+  The gateway-voice matcher folded zero-width, bidi, fullwidth and homoglyph
+  evasions but compared whitespace literally, so `[ Toolport advisor: …]` with a
+  plain space (or a tab, a newline, a no-break space, or a doubled space inside
+  the brand) reached the model unchanged while the zero-width form was caught.
+  Whitespace is now folded like the other evasions: ignored before the brand and
+  collapsed to one space inside it. (SBS-896)
 - **Team Instructions now follow `XDG_CONFIG_HOME` for Goose and Zed.** Connect
   already wrote those clients' MCP configs under XDG (#757 / SBS-847); the rules
   writer still hardcoded `~/.config`, so an org push could succeed and never
