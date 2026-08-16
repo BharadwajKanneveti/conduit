@@ -18,6 +18,12 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A write-named tool cannot disarm drift quarantine with `destructiveHint: false`.**
+  MCP annotations are untrusted unless the server is. Drift severity now escalates
+  when the tool name itself claims write capability (`delete`, `run`, …), even if
+  the server set `destructiveHint: false` at first sight. Call-time confirm still
+  honours an explicit false hint. First sight of that contradiction is recorded
+  in Activity and is not quarantined. (SBS-875)
 - **Connect and launch-time repoint no longer strip comments from Codex/Grok
   `config.toml` or comments and YAML anchors from Goose/Hermes/Continue
   `config.yaml`.** Those writers used to parse with `toml` / `serde_yaml` and
