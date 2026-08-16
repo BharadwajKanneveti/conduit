@@ -3,17 +3,24 @@ import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 
 import { ThemeProvider } from "@/lib/theme";
+import { toastError } from "@/lib/toast";
 import { SettingsView } from "./SettingsView";
 import {
   approveRoutineSuggestion,
+  clientsNeedingRestart,
   dismissRoutineSuggestion,
   listRoutineSuggestions,
   isAutostartEnabled,
   listServerTools,
   setAllowRoutineWrites,
   setCodeMode,
+  stopStaleGateways,
 } from "@/lib/api";
 import type { Registry, RoutineSuggestion } from "@/lib/types";
+
+vi.mock("@/lib/toast", () => ({
+  toastError: vi.fn(),
+}));
 
 vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
@@ -29,6 +36,8 @@ vi.mock("@/lib/api", async (importOriginal) => {
     listRoutineSuggestions: vi.fn().mockResolvedValue([]),
     approveRoutineSuggestion: vi.fn(),
     dismissRoutineSuggestion: vi.fn(),
+    clientsNeedingRestart: vi.fn().mockResolvedValue([]),
+    stopStaleGateways: vi.fn(),
   };
 });
 vi.mock("@tauri-apps/api/event", () => ({
@@ -44,6 +53,9 @@ const mockedSetCodeMode = vi.mocked(setCodeMode);
 const mockedListRoutineSuggestions = vi.mocked(listRoutineSuggestions);
 const mockedApproveRoutineSuggestion = vi.mocked(approveRoutineSuggestion);
 const mockedDismissRoutineSuggestion = vi.mocked(dismissRoutineSuggestion);
+const mockedClientsNeedingRestart = vi.mocked(clientsNeedingRestart);
+const mockedStopStaleGateways = vi.mocked(stopStaleGateways);
+const mockedToastError = vi.mocked(toastError);
 const mockedListen = vi.mocked(listen);
 
 const registry: Registry = {
@@ -277,6 +289,9 @@ describe("SettingsView routine suggestions", () => {
     mockedListen.mockResolvedValue(() => {});
     mockedListRoutineSuggestions.mockReset();
     mockedListRoutineSuggestions.mockResolvedValue([]);
+    mockedClientsNeedingRestart.mockReset();
+    mockedClientsNeedingRestart.mockResolvedValue([]);
+    mockedToastError.mockReset();
   });
 
   const suggestion: RoutineSuggestion = {
@@ -572,5 +587,66 @@ describe("SettingsView launch at login", () => {
     await waitFor(() => expect(control).toBeEnabled());
     expect(control).toHaveAttribute("aria-checked", "true");
     expect(screen.queryByText(/couldn't read the os setting/i)).not.toBeInTheDocument();
+  });
+});
+
+describe("SettingsView restart check", () => {
+  it("shows an error toast when the old-gateway check fails", async () => {
+    mockedClientsNeedingRestart.mockRejectedValue(new Error("backend down"));
+    renderSettings();
+
+    await waitFor(() => {
+      expect(mockedToastError).toHaveBeenCalledWith(
+        "Couldn't check for apps using an old gateway",
+      );
+    });
+  });
+
+  it("retries the check from the error panel", async () => {
+    mockedClientsNeedingRestart
+      .mockRejectedValueOnce(new Error("backend down"))
+      .mockResolvedValueOnce([{ client: "Codex", gateway: "old", clientPid: 1234 }]);
+    const user = userEvent.setup();
+    renderSettings();
+
+    const retry = await screen.findByRole("button", {
+      name: "Retry checking for old gateway",
+    });
+    await user.click(retry);
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(/1 app is still launching an old gateway/i),
+      ).toBeInTheDocument();
+    });
+    expect(
+      screen.queryByRole("button", { name: "Retry checking for old gateway" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("clears the error panel when Stop old gateways answers the same question", async () => {
+    // A successful run IS a fresh answer to "which apps need a restart", so
+    // leaving the failure panel up would say the check failed directly above
+    // the check's own result.
+    mockedClientsNeedingRestart.mockRejectedValue(new Error("backend down"));
+    mockedStopStaleGateways.mockResolvedValue({
+      killed: [],
+      failed: [],
+      needsRestart: [{ client: "Codex", gateway: "old", clientPid: 1234 }],
+    });
+    const user = userEvent.setup();
+    renderSettings();
+
+    await screen.findByRole("button", { name: "Retry checking for old gateway" });
+    await user.click(screen.getByRole("button", { name: "Run" }));
+
+    await waitFor(() => {
+      expect(
+        screen.queryByRole("button", { name: "Retry checking for old gateway" }),
+      ).not.toBeInTheDocument();
+    });
+    expect(
+      screen.getByText(/1 app is still launching an old gateway/i),
+    ).toBeInTheDocument();
   });
 });
