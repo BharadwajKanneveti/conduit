@@ -18,6 +18,13 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **SECURITY.md now matches the HTTP bind admission policy.** Every bind, loopback
+  or not, needs HTTP authentication: a bearer token, or at least one registered
+  HTTP client in `registry.json`. A hand-launched loopback gateway with neither
+  does not bind; it exits 1 unless `--insecure-loopback` is passed, and that flag
+  opens an unauthenticated listener only while no token is set and no HTTP clients
+  are registered. SECURITY.md also now explains what a registered HTTP client is
+  and how the desktop app creates one. (SBS-878)
 - **Connect keeps stow/chezmoi config symlinks.** Writing a client config
   (Connect, Disconnect, migrate, launch-time re-point) used to replace a
   symlink at the config path with a regular file, leaving the file in the
