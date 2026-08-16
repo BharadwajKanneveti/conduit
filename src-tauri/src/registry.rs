@@ -17,6 +17,12 @@ use crate::router::sanitize_segment;
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
+/// Serializes tests that read/write the `TOOLPORT_REGISTRY` env var (the env is
+/// process-global, so parallel tests in different modules would otherwise race).
+/// Declared outside the test module so desktop.rs tests can share it too.
+#[cfg(test)]
+pub(crate) static REGISTRY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 const REGISTRY_VERSION: u32 = 1;
 
 /// Per-process counter for unique atomic-write temp names.
