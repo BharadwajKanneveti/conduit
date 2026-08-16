@@ -18,6 +18,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A transient missing quarantine store no longer installs an empty block set.**
+  Rewriting `quarantine.json` uses a temp file plus rename, so a reader can see
+  `NotFound` for a tick. That used to look like "nothing is blocked" and the
+  gateway would un-hide every quarantined tool. The read now retries the same
+  way the pin store already does, and a miss after those retries is an error
+  unless this profile has never written pins (a real first run). A rebuild
+  keeps the live set, or hides the catalog on a cold start until the store
+  reads. (SBS-871)
 - **Codex Connect honors `CODEX_HOME`.** Connect, migrate, and launch-time
   re-point wrote `~/.codex/config.toml` even when Codex was reading
   `$CODEX_HOME/config.toml`, so a relocated live config never got a gateway
