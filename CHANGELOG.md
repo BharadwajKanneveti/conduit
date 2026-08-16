@@ -18,6 +18,15 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **Unreadable activity/security log no longer renders as empty healthy.** A failed
+  read of `audit.jsonl`, `security.jsonl`, `inspect.jsonl`, or `search-trace.jsonl`
+  used to come back as an empty list, so Activity showed **No tool calls yet** /
+  **Protection active**. A missing file is still empty (honest). Any other IO error
+  now rejects the invoke (including the dashboard's `audit_stats`), and the existing
+  error/retry UI surfaces it. `GET /metrics` answers 500 on the same unreadable log
+  instead of 200 with every series missing, so a Prometheus scrape fails rather than
+  reading as an idle instance. Security events also no longer lose an older row when
+  a corrupt or mid-write line lands in the newest page. (SBS-873)
 - **Windows keyring and install.ps1 tests can now block merge.** Branch
   protection still requires only the check named `Build + test`. That name now
   belongs to a merge-gate job that fails unless the Linux suite, the
