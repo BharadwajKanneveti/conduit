@@ -19,7 +19,12 @@ import { parse } from "yaml";
 const REQUIRED_CHECK_NAME = "Build + test";
 
 /** Jobs that must be green before the required check can be green. */
-const GATED_JOB_IDS = ["build-test", "cross-platform-rust", "installer-script"];
+const GATED_JOB_IDS = [
+  "build-test",
+  "cross-platform-rust",
+  "installer-script",
+  "pinned-install-urls",
+];
 
 interface WorkflowStep {
   name?: string;
@@ -206,6 +211,21 @@ describe("CI required merge gate (SBS-874)", () => {
     expect(runScripts(job).join("\n")).toContain("scripts/install.Tests.ps1");
   });
 
+  // SBS-894: being in the gate's `needs` only proves the job ran. A job that
+  // greps for nothing is green forever, so the gate would keep passing while
+  // the control it names does nothing.
+  it("still greps every movable ref in the pinned-URL job", () => {
+    const job = jobs["pinned-install-urls"];
+    expect(job).toBeDefined();
+    const script = runScripts(job).join("\n");
+    expect(script).toContain("git grep");
+    for (const movableRef of ["main", "master", "HEAD"]) {
+      expect(script, `${movableRef}/scripts/ is not covered`).toContain(movableRef);
+    }
+    // The grep is only a gate if a hit exits non-zero.
+    expect(script).toMatch(/exit 1/);
+  });
+
   it("still runs Windows keyring tests on a windows-latest matrix cell", () => {
     const job = jobs["cross-platform-rust"];
     expect(job).toBeDefined();
@@ -225,7 +245,7 @@ jobs:
   merge-gate:
     name: Build + test
     if: always()
-    needs: [build-test, cross-platform-rust, installer-script]
+    needs: [build-test, cross-platform-rust, installer-script, pinned-install-urls]
     runs-on: ubuntu-22.04
     steps:
       - name: Require everything
@@ -233,6 +253,7 @@ jobs:
           echo "build-test=\${{ needs.build-test.result }}"
           echo "cross-platform-rust=\${{ needs.cross-platform-rust.result }}"
           echo "installer-script=\${{ needs.installer-script.result }}"
+          echo "pinned-install-urls=\${{ needs.pinned-install-urls.result }}"
 `);
     const gate = jobsWithCheckName(fixture.jobs, REQUIRED_CHECK_NAME)[0][1];
     // Passes the name / always() / needs assertions, but gates nothing.
@@ -287,14 +308,15 @@ jobs:
         run: |
           test "\${{ needs.build-test.result }}" = "success"
           test "\${{ needs.cross-platform-rust.result }}" = "success"
-          test "\${{ needs.installer-script.result }}" = "success"`;
+          test "\${{ needs.installer-script.result }}" = "success"
+          test "\${{ needs.pinned-install-urls.result }}" = "success"`;
     const gateWith = (extra: string, runsOn = "ubuntu-22.04") =>
       parseWorkflow(`
 jobs:
   merge-gate:
     name: Build + test
     if: always()
-    needs: [build-test, cross-platform-rust, installer-script]
+    needs: [build-test, cross-platform-rust, installer-script, pinned-install-urls]
     runs-on: ${runsOn}
     steps:
       - name: Require everything${extra}${script}
