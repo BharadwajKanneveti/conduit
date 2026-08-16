@@ -18,6 +18,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A diagnostics bundle or second gateway can no longer see an empty `gateway.log` or lose a connect-failure line.** Trim used to rewrite the shared log in place, so a concurrent diagnostics read could land in the empty window and a concurrent append could be overwritten by the pre-truncate snapshot. Trim now replaces the file atomically under the same lock as append.
 - **SECURITY.md now matches the HTTP bind admission policy.** Every bind, loopback
   or not, needs HTTP authentication: a bearer token, or at least one registered
   HTTP client in `registry.json`. A hand-launched loopback gateway with neither
