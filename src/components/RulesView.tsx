@@ -34,6 +34,14 @@ const PREVIEW_BLOCKED_REASON: Partial<Record<InstructionsApplyState, string>> = 
   error: "the file could not be read or written, so it was left untouched.",
 };
 const BLOCKING_STATES = new Set(Object.keys(PREVIEW_BLOCKED_REASON));
+const RESERVED_MARKERS = [
+  "<!-- toolport:rules:start",
+  "<!-- toolport:rules:end -->",
+  "<!-- toolport:team-instructions:start",
+  "<!-- toolport:team-instructions:end -->",
+  "<!-- Managed by Toolport",
+  "<!-- Toolport personal rules",
+];
 
 /**
  * Agent rules: write your own instructions once and have Toolport put them in every AI client's
@@ -82,6 +90,18 @@ export function RulesView() {
     setPreview(null);
   }
 
+  /** Reseat a reloaded view without discarding an unsaved draft held across an unmount. */
+  function adoptPreservingDraft(next: RulesViewData) {
+    const set = next.sets.find((s) => s.id === next.activeSetId);
+    const held = set ? getRulesDraft(set.id) : undefined;
+    adopt(next);
+    if (held) {
+      setDraft(held.content);
+      setDraftName(held.name);
+      setRulesDraft(set!.id, held);
+    }
+  }
+
   useEffect(() => {
     let cancelled = false;
     rulesView()
@@ -110,11 +130,13 @@ export function RulesView() {
   }, []);
 
   /** Run a mutating call, adopt the refreshed view, and surface any failure in place. */
-  async function run(fn: () => Promise<RulesViewData>) {
+  async function run(fn: () => Promise<RulesViewData>, preserveDraft = false) {
     setBusy(true);
     setError(null);
     try {
-      adopt(await fn());
+      const next = await fn();
+      if (preserveDraft) adoptPreservingDraft(next);
+      else adopt(next);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -142,9 +164,22 @@ export function RulesView() {
     }
   }
 
+  function assertDraftHasNoMarkers() {
+    if (RESERVED_MARKERS.some((marker) => draft.includes(marker))) {
+      throw new Error(
+        "Remove Toolport's generated markers before saving. Paste only your rules, not the preview wrapper.",
+      );
+    }
+  }
+
+  async function saveDraft() {
+    assertDraftHasNoMarkers();
+    return rulesSaveSet(draftName, draft, active!.id);
+  }
+
   /** Persist an unsaved draft, adopting the refreshed view. No-op when nothing changed. */
   async function flushDraft() {
-    if (dirty && active) adopt(await rulesSaveSet(draftName, draft, active.id));
+    if (dirty && active) adopt(await saveDraft());
   }
 
   /**
@@ -225,7 +260,7 @@ export function RulesView() {
           variant="outline"
           className="self-start"
           disabled={busy}
-          onClick={() => run(rulesView)}
+          onClick={() => run(rulesView, true)}
         >
           <RefreshCw className="size-3.5" />
           Try again
@@ -317,11 +352,7 @@ export function RulesView() {
               className="mb-3 w-full resize-y rounded-lg border bg-background p-3 font-mono text-xs text-foreground"
             />
             <div className="flex flex-wrap items-center gap-2">
-              <Button
-                size="sm"
-                disabled={busy || !dirty}
-                onClick={() => run(() => rulesSaveSet(draftName, draft, active.id))}
-              >
+              <Button size="sm" disabled={busy || !dirty} onClick={() => run(saveDraft)}>
                 {dirty ? "Save and apply" : "Saved"}
               </Button>
               <Button
@@ -380,17 +411,20 @@ export function RulesView() {
                 </span>
               </label>
               <span className="flex shrink-0 items-center gap-2">
-                {/* Only meaningful while a set is active. With none, the backend reports Applied
-                    for "correctly nothing on disk", and an "Applied / up to date" badge moments
-                    after the user deleted their rules reads as though they were still in place. */}
-                {c.enabled && active && <RuleStateBadge state={c.state} />}
+                {/* With no active set, Applied means correctly empty and is hidden. Refusal/error
+                    states still matter because they mean cleanup left rules on disk. */}
+                {c.enabled && (active || c.state !== "applied") && (
+                  <RuleStateBadge state={c.state} />
+                )}
                 <button
                   type="button"
                   disabled={busy || !active}
                   title={
                     active
                       ? "See exactly what would be written"
-                      : "Create a rule set first"
+                      : data.sets.length > 0
+                        ? "Pick a rule set first"
+                        : "Create a rule set first"
                   }
                   onClick={() => openPreview(c.id)}
                   className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
@@ -450,13 +484,21 @@ export function RulesView() {
         open={confirmDelete !== null}
         onOpenChange={(o) => !o && setConfirmDelete(null)}
         title="Delete this rule set?"
-        description="Toolport removes what it wrote from every client. Your own content in those files is left alone."
+        description={
+          confirmDelete === data.activeSetId
+            ? "Toolport removes what it wrote from every client. Your own content in those files is left alone."
+            : "This unused rule set is deleted. The active set and client files stay unchanged."
+        }
         confirmLabel="Delete"
         destructive
         onConfirm={() => {
           const id = confirmDelete;
           setConfirmDelete(null);
-          if (id) void run(() => rulesDeleteSet(id));
+          if (id) {
+            void (id === data.activeSetId
+              ? run(() => rulesDeleteSet(id))
+              : act(() => rulesDeleteSet(id)));
+          }
         }}
       />
     </div>
