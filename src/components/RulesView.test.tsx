@@ -121,6 +121,47 @@ describe("RulesView", () => {
     expect(api.rulesSaveSet).not.toHaveBeenCalled();
   });
 
+  it("preview says so when the write would be refused, instead of just showing bytes", async () => {
+    // Windsurf's cap is a refusal, not a truncation. A preview that looks like any other write,
+    // followed by nothing landing, reads as a bug rather than a documented limit.
+    api.rulesPreview.mockResolvedValue({
+      clientId: "codex",
+      path: "/home/a/.codex/AGENTS.md",
+      strategy: "sentinelBlock",
+      before: "# Mine\n",
+      after: "# Mine\n\nAlways run tests.\n",
+      state: "too_long",
+    });
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+
+    await userEvent.click(screen.getAllByRole("button", { name: /Preview/ })[0]);
+
+    expect(
+      await screen.findByText(/will not be written to this client/),
+    ).toHaveTextContent(/hard limit/);
+  });
+
+  it("preview shows no warning when the write would land", async () => {
+    api.rulesPreview.mockResolvedValue({
+      clientId: "codex",
+      path: "/home/a/.codex/AGENTS.md",
+      strategy: "sentinelBlock",
+      before: "# Mine\n",
+      after: "# Mine\n\nAlways run tests.\n",
+      state: "stale",
+    });
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+
+    await userEvent.click(screen.getAllByRole("button", { name: /Preview/ })[0]);
+
+    expect(await screen.findByText(/owns only the marked block/)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/will not be written to this client/),
+    ).not.toBeInTheDocument();
+  });
+
   it("switching sets saves an unsaved draft first, so edits are never dropped", async () => {
     api.rulesView.mockResolvedValue(
       view({

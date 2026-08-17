@@ -14,7 +14,25 @@ import {
   rulesSetClientEnabled,
   rulesView,
 } from "@/lib/api";
-import type { RulesPreview, RulesView as RulesViewData } from "@/lib/types";
+import type {
+  InstructionsApplyState,
+  RulesPreview,
+  RulesView as RulesViewData,
+} from "@/lib/types";
+
+/**
+ * States where `write_target` refuses the write outright, so the previewed bytes describe what
+ * WOULD land rather than what will. `too_long` is a refusal, not a truncation: Toolport never
+ * writes a file it knows the client will silently cut short.
+ */
+const PREVIEW_BLOCKED_REASON: Partial<Record<InstructionsApplyState, string>> = {
+  blocked_override:
+    "a local override file makes this client ignore it, so writing would be invisible.",
+  too_long:
+    "the finished file would exceed this client's hard limit, and a truncated rules file is worse than none.",
+  error: "the file could not be read or written, so it was left untouched.",
+};
+const BLOCKING_STATES = new Set(Object.keys(PREVIEW_BLOCKED_REASON));
 
 /**
  * Agent rules: write your own instructions once and have Toolport put them in every AI client's
@@ -299,6 +317,15 @@ export function RulesView() {
               ? "Toolport owns this whole file. Nothing of yours lives in it."
               : "Toolport owns only the marked block. Every other byte in this file is left exactly as it is."}
           </p>
+          {/* The bytes below are what an unblocked write would produce. When this client refuses
+              the write, saying so here matters more than the bytes do: a preview that looks like
+              a normal write, followed by nothing landing, reads as a bug rather than a rule. */}
+          {BLOCKING_STATES.has(preview.state) && (
+            <Callout variant="warning" className="mb-2 text-xs">
+              This is what Toolport would write, but it will not be written to this
+              client: {PREVIEW_BLOCKED_REASON[preview.state]}
+            </Callout>
+          )}
           <pre className="max-h-64 overflow-auto rounded-lg border bg-muted/20 p-3 font-mono text-xs whitespace-pre-wrap text-foreground">
             {preview.after}
           </pre>
