@@ -20,8 +20,8 @@ Entries before the rename below shipped under the project's former name, Conduit
   rules tab holds one or more named rule sets and writes the active one into every
   AI client's own global rules location (`AGENTS.md`, `GEMINI.md`, `.goosehints`,
   Windsurf's `global_rules.md`, and a `toolport-rules.md` in the rules directory of
-  clients that read one), so keeping 13 clients in agreement is no longer 13 files
-  to hand-edit. Your own content is never overwritten:
+  clients that read one), so keeping every supported client in agreement no longer
+  means hand-editing each file. Your own content is never overwritten:
   Toolport either owns its own file in the client's rules directory or owns a
   marked block inside a shared file and leaves every other byte exactly as it is.
   Each client is off until you turn it on, a per-client preview shows the exact
