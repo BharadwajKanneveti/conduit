@@ -419,6 +419,24 @@ pub struct Profile {
     pub tool_scope: HashMap<String, Vec<String>>,
 }
 
+/// One named set of the user's own agent rules (CLAUDE.md / AGENTS.md / GEMINI.md content),
+/// applied to every opted-in AI client by [`crate::rules`]. Several sets can exist so a user can
+/// switch between, say, "Work" and "Personal"; exactly one is active at a time.
+///
+/// `(id, revision)` is what the personal sentinel marker carries, standing in for the team
+/// scope's `(team_id, version)` — see [`crate::instructions::Scope`]. `revision` therefore only
+/// moves when `content` actually changes, so a rename is not a rewrite of every client's file.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuleSet {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub content: String,
+    #[serde(default)]
+    pub revision: i64,
+}
+
 /// Maps a project folder to a profile, so the gateway can auto-scope a client to the right
 /// server set based on the working directory (MCP `root`) it reports, instead of a manual
 /// profile switch. A client whose reported root is `path` or a descendant of it resolves to
@@ -724,6 +742,23 @@ pub struct Registry {
     /// the rest of the registry JSON is unchanged.
     #[serde(default)]
     pub secrets_generation: u64,
+    /// The user's own agent rule sets. Several can exist; `active_rule_set_id` picks the one
+    /// written to clients. See [`crate::rules`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_sets: Vec<RuleSet>,
+    /// Which of `rule_sets` is currently applied. `None` = none; every file we wrote is removed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_rule_set_id: Option<String>,
+    /// Per-client opt-in for personal rules, keyed by client id. ABSENT MEANS OFF: writing into
+    /// someone's `~/.claude/rules` or `AGENTS.md` is not something to do unasked, so a client
+    /// only receives rules once the user turns it on.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub rules_clients: HashMap<String, bool>,
+    /// Absolute paths of the personal-rules files we have written, so cleanup after a set
+    /// switch / client opt-out / uninstall touches exactly what we created and nothing else.
+    /// Same role as `TeamConnection::team_instructions_targets`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules_targets: Vec<String>,
     /// Top-level fields THIS build doesn't know, preserved verbatim across
     /// load -> save. The registry is shared by mixed versions of the app and
     /// long-running gateways (a dev build, the installed release, and gateways
@@ -978,6 +1013,10 @@ impl Default for Registry {
             client_managed_entries: HashMap::new(),
             http_clients: Vec::new(),
             secrets_generation: 0,
+            rule_sets: Vec::new(),
+            active_rule_set_id: None,
+            rules_clients: HashMap::new(),
+            rules_targets: Vec::new(),
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -1700,6 +1739,78 @@ impl Registry {
             tool_scope: HashMap::new(),
         });
         id
+    }
+
+    /// The rule set currently applied to clients, if any.
+    pub fn active_rule_set(&self) -> Option<&RuleSet> {
+        let id = self.active_rule_set_id.as_deref()?;
+        self.rule_sets.iter().find(|s| s.id == id)
+    }
+
+    /// Create a set (`id: None`) or update one in place. Returns the set's id.
+    ///
+    /// `revision` moves ONLY when `content` changes: it rides in the on-disk sentinel marker, so
+    /// bumping it on a rename would restale every client's file and force a pointless rewrite.
+    /// A newly created set becomes active when nothing else is, so the first set a user writes
+    /// applies without a second step.
+    pub fn upsert_rule_set(&mut self, id: Option<&str>, name: &str, content: &str) -> String {
+        let name = if name.trim().is_empty() {
+            "Rules"
+        } else {
+            name.trim()
+        };
+        if let Some(id) = id {
+            if let Some(existing) = self.rule_sets.iter_mut().find(|s| s.id == id) {
+                if existing.content != content {
+                    existing.content = content.to_string();
+                    existing.revision += 1;
+                }
+                existing.name = name.to_string();
+                return existing.id.clone();
+            }
+        }
+        let id = unique_id(&slugify(name), &self.rule_set_ids());
+        self.rule_sets.push(RuleSet {
+            id: id.clone(),
+            name: name.to_string(),
+            content: content.to_string(),
+            revision: 1,
+        });
+        if self.active_rule_set_id.is_none() {
+            self.active_rule_set_id = Some(id.clone());
+        }
+        id
+    }
+
+    /// Remove a set. Removing the ACTIVE one clears the selection rather than silently promoting
+    /// another, so the next apply removes our files instead of writing someone else's rules.
+    pub fn remove_rule_set(&mut self, id: &str) {
+        self.rule_sets.retain(|s| s.id != id);
+        if self.active_rule_set_id.as_deref() == Some(id) {
+            self.active_rule_set_id = None;
+        }
+    }
+
+    /// Select the active set. An unknown id clears the selection (same effect as `None`).
+    pub fn set_active_rule_set(&mut self, id: Option<&str>) {
+        self.active_rule_set_id = id
+            .filter(|id| self.rule_sets.iter().any(|s| s.id == *id))
+            .map(str::to_string);
+    }
+
+    /// Opt one client in or out of personal rules. `false` is stored explicitly rather than
+    /// removed so the UI can tell "turned off" from "never seen".
+    pub fn set_rules_client_enabled(&mut self, client_id: &str, enabled: bool) {
+        self.rules_clients.insert(client_id.to_string(), enabled);
+    }
+
+    /// Whether a client receives personal rules. Absent = off (see the field docs).
+    pub fn rules_client_enabled(&self, client_id: &str) -> bool {
+        self.rules_clients.get(client_id).copied().unwrap_or(false)
+    }
+
+    fn rule_set_ids(&self) -> Vec<String> {
+        self.rule_sets.iter().map(|s| s.id.clone()).collect()
     }
 
     pub fn remove_profile(&mut self, id: &str) -> Result<(), String> {
