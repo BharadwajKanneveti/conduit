@@ -450,26 +450,41 @@ pub fn current_state(t: &Target, id: &str, version: i64, content: &str) -> Apply
 /// cleanup survives a client that was uninstalled or whose detection changed. An owned file (our
 /// header) is deleted whole; a shared file has only that scope's sentinel block stripped, and is
 /// deleted if nothing but whitespace remains. A file that is neither (already cleaned, or
-/// user-replaced) is left untouched. Best-effort: unreadable/missing paths are a no-op.
+/// user-replaced) is left untouched.
 ///
 /// `scope` is required, not sniffed: a shared file can hold BOTH a team and a personal block, and
 /// leaving a team must strip only the team one. The "nothing but whitespace remains" delete is
 /// therefore also correct — a surviving other-scope block is not whitespace, so the file stays.
-pub fn remove_recorded(path: &std::path::Path, scope: Scope) {
+///
+/// Returns whether this scope's artifact is now GONE from `path`. `false` means the file still
+/// holds our block (unreadable, locked, read-only, or a hand-mangled marker pair) and the caller
+/// must KEEP the path on record: cleanup is driven by that recorded list, so forgetting a path we
+/// failed to clean strands the block forever with nothing left that would ever look for it.
+pub fn remove_recorded(path: &std::path::Path, scope: Scope) -> bool {
     let existing = match std::fs::read_to_string(path) {
+        // Already gone: nothing of ours can be there, so the caller may stop tracking it.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        // Unreadable (locked, permissions): we cannot tell, so report NOT cleaned. A caller that
+        // dropped the path here would strand our block forever, since cleanup is by recorded path
+        // and nothing else would ever look at this file again.
+        Err(_) => return false,
         Ok(s) => s,
-        Err(_) => return,
     };
     if existing.contains(scope.sentinel_start_prefix()) {
-        if let Some(stripped) = remove_block(&existing, scope) {
-            if stripped.trim().is_empty() {
-                let _ = std::fs::remove_file(path);
-            } else {
-                let _ = write_atomic(path, &stripped);
-            }
+        let Some(stripped) = remove_block(&existing, scope) else {
+            // A START marker with no END: a hand-mangled file we must not guess at, and our
+            // marker is still in it.
+            return false;
+        };
+        if stripped.trim().is_empty() {
+            std::fs::remove_file(path).is_ok()
+        } else {
+            write_atomic(path, &stripped).is_ok()
         }
     } else if existing.starts_with(scope.owned_header_prefix()) {
-        let _ = std::fs::remove_file(path);
+        std::fs::remove_file(path).is_ok()
+    } else {
+        true // neither ours nor recognizable: already cleaned, or the user replaced it
     }
 }
 
@@ -1121,8 +1136,41 @@ mod tests {
         let path = s.path("someones.md");
         let foreign = "# not ours\njust user content\n";
         std::fs::write(&path, foreign).unwrap();
-        remove_recorded(&path, Scope::Team);
-        remove_recorded(&path, Scope::Personal);
+        assert!(remove_recorded(&path, Scope::Team), "nothing of ours to clean");
+        assert!(remove_recorded(&path, Scope::Personal));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), foreign);
+    }
+
+    /// The return value is what lets a caller keep a path on record when cleanup did not actually
+    /// happen. Callers drive cleanup off that record, so a `true` here on a file that still holds
+    /// our block would strand it permanently.
+    #[test]
+    fn remove_recorded_reports_whether_our_artifact_is_really_gone() {
+        let s = Scratch::new();
+
+        // Absent file: nothing of ours can be there.
+        assert!(remove_recorded(&s.path("never-existed.md"), Scope::Personal));
+
+        // A real removal.
+        let t = block_target(s.path("AGENTS.md"), Scope::Personal);
+        write_target(&t, SET, 1, "My rule");
+        assert!(remove_recorded(&t.path, Scope::Personal));
+        assert!(!t.path.exists());
+
+        // A START marker with no END: hand-mangled, our marker is still in the file, and we must
+        // not guess where the block ends. Reported as NOT cleaned so the caller keeps looking.
+        let mangled = s.path("mangled.md");
+        std::fs::write(
+            &mangled,
+            format!("{PERSONAL_SENTINEL_START_PREFIX} set=x v=1 -->\nrules, no end marker\n"),
+        )
+        .unwrap();
+        assert!(
+            !remove_recorded(&mangled, Scope::Personal),
+            "a marker we could not remove must not be reported as gone"
+        );
+        assert!(std::fs::read_to_string(&mangled)
+            .unwrap()
+            .contains(PERSONAL_SENTINEL_START_PREFIX));
     }
 }
