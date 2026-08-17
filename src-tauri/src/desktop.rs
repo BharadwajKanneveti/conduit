@@ -5312,6 +5312,15 @@ pub fn run() {
                             .join(", ")
                     );
                 }
+                // Re-assert the user's personal agent rules (SBS-821), on this same launch
+                // thread because it is the one already allowed to touch client files on disk.
+                // Picks up a client installed, reinstalled, or updated since the last apply
+                // without the user opening the Rules tab. Cheap and quiet: it returns before
+                // scanning anything when no rule set is configured and nothing was ever
+                // written, and `write_target` no-ops when a client's block already matches, so
+                // a steady-state launch touches no files.
+                rules::apply_on_startup();
+
                 // Stop obsolete gateway processes. Path-based identity on all OS
                 // (SOU-414); not gated on repoint (SOU-306).
                 //
