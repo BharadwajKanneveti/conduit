@@ -366,6 +366,28 @@ fn read_existing(path: &std::path::Path) -> Result<String, String> {
     }
 }
 
+/// Serializes read-modify-write on rules files.
+///
+/// Team and personal blocks share ONE file for every sentinel client (Codex, Gemini CLI, Windsurf,
+/// Goose, Zed, ...), and both writers read the file, insert their own span, and write it back.
+/// Without this, a team sync and a personal apply that read the same bytes concurrently each write
+/// back only their own block and whichever lands second silently drops the other's. That is not
+/// hypothetical: the ~25s team-sync loop and `rules::apply_on_startup` both run at launch.
+///
+/// A process mutex is the whole exposure. Both writers live in the desktop app, and the gateway
+/// binary never touches rules files. Deliberately NOT a `<path>.lock` file next to the target:
+/// that would leave Toolport's litter inside the user's client directories, which is the one thing
+/// this module is otherwise scrupulous about never doing.
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Hold the rules-write lock. Poisoning is irrelevant here: the guard protects a file, not an
+/// invariant in memory, so a panicking writer leaves nothing for the next one to misread.
+fn write_lock() -> std::sync::MutexGuard<'static, ()> {
+    WRITE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Create parent dirs then write atomically (temp + rename, 0600), reusing the registry's
 /// hardened primitive so a crash mid-write can't leave a torn rules file.
 fn write_atomic(path: &std::path::Path, contents: &str) -> Result<(), String> {
@@ -379,6 +401,8 @@ fn write_atomic(path: &std::path::Path, contents: &str) -> Result<(), String> {
 /// never overwrites a shared file it couldn't read, and skips (reporting why) when a client
 /// shadow-file or hard cap makes the write pointless.
 pub fn write_target(t: &Target, id: &str, version: i64, content: &str) -> ApplyState {
+    // Held across the read AND the write: the other scope shares this file (see `WRITE_LOCK`).
+    let _guard = write_lock();
     // Codex-style shadow file: the client ignores our target entirely, so writing it would be
     // invisible and confusing. Report it instead.
     if let Some(shadow) = &t.blocked_if_present {
@@ -479,6 +503,8 @@ pub fn current_state(t: &Target, id: &str, version: i64, content: &str) -> Apply
 /// must KEEP the path on record: cleanup is driven by that recorded list, so forgetting a path we
 /// failed to clean strands the block forever with nothing left that would ever look for it.
 pub fn remove_recorded(path: &std::path::Path, scope: Scope) -> bool {
+    // Stripping our span is also read-modify-write on a file the other scope may be writing.
+    let _guard = write_lock();
     let existing = match std::fs::read_to_string(path) {
         // Already gone: nothing of ours can be there, so the caller may stop tracking it.
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
@@ -1157,6 +1183,77 @@ mod tests {
         assert!(remove_recorded(&path, Scope::Team), "nothing of ours to clean");
         assert!(remove_recorded(&path, Scope::Personal));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), foreign);
+    }
+
+    /// Team and personal share one file for every sentinel client, and both writers read it then
+    /// write it back. Unserialized, each would write back only its own block and the later write
+    /// would drop the other's. Run over many rounds because a single interleaving may not race.
+    #[test]
+    fn concurrent_team_and_personal_writes_both_survive() {
+        let s = Scratch::new();
+        for round in 0..200 {
+            let path = s.path(&format!("AGENTS-{round}.md"));
+            let user = "# Mine\nkeep me\n";
+            std::fs::write(&path, user).unwrap();
+
+            let team = block_target(path.clone(), Scope::Team);
+            let personal = block_target(path.clone(), Scope::Personal);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    write_target(&team, TEAM, 1, "Org rule");
+                });
+                scope.spawn(|| {
+                    write_target(&personal, SET, 1, "My rule");
+                });
+            });
+
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(after.starts_with(user), "round {round}: user bytes preserved");
+            assert!(after.contains("Org rule"), "round {round}: team block lost");
+            assert!(after.contains("My rule"), "round {round}: personal block lost");
+        }
+    }
+
+    /// Same shared file, but one writer is removing while the other writes. Stripping a span is
+    /// read-modify-write too, so it needs the same serialization.
+    #[test]
+    fn a_concurrent_remove_does_not_swallow_the_other_scopes_write() {
+        let s = Scratch::new();
+        for round in 0..200 {
+            let path = s.path(&format!("AGENTS-rm-{round}.md"));
+            let user = "# Mine\nkeep me\n";
+            std::fs::write(&path, user).unwrap();
+
+            let team = block_target(path.clone(), Scope::Team);
+            let personal = block_target(path.clone(), Scope::Personal);
+            // Fixture: both blocks present, then the team leaves while personal re-applies.
+            write_target(&team, TEAM, 1, "Org rule");
+            write_target(&personal, SET, 1, "My rule");
+
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    remove_recorded(&path, Scope::Team);
+                });
+                scope.spawn(|| {
+                    write_target(&personal, SET, 2, "My rule v2");
+                });
+            });
+
+            // Serialized, BOTH orders converge on the same end state, so this is deterministic:
+            // remove-then-write leaves user + personal v2; write-then-remove writes personal v2
+            // and then strips the team span from it. Either way the team block is gone and the
+            // new personal block is there. Unserialized, one of the two is lost.
+            let after = std::fs::read_to_string(&path).unwrap();
+            assert!(after.starts_with(user), "round {round}: user bytes preserved");
+            assert!(
+                after.contains("My rule v2"),
+                "round {round}: the personal write was swallowed by the team removal"
+            );
+            assert!(
+                !after.contains(SENTINEL_START_PREFIX),
+                "round {round}: the removed team block came back"
+            );
+        }
     }
 
     #[test]
