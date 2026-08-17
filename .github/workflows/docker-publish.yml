@@ -40,15 +40,24 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libssl-dev pkg-config libdbus-1-dev
 
-      - name: Cache cargo + target
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+      # Cache DEPENDENCY build artifacts only, never the workspace's own crates.
+      # History: a naive actions/cache of all of `src-tauri/target` keyed on Cargo.lock
+      # once served a stale local-crate compile that cargo trusted (the crate recompiled 0
+      # times), so v0.3.12/v0.3.13 shipped signed binaries missing a command. docker-publish
+      # still used that shape (SBS-926): a source change that did not touch the lockfile
+      # could restore `src-tauri/target` and upload a stale toolport-gateway to GHCR.
+      # Swatinem/rust-cache is the same class of fix as release.yml: before saving it
+      # evicts workspace members (the crate + bins) from the cache, so they ALWAYS
+      # recompile from the current commit, while third-party deps are restored. Do NOT
+      # replace this with a plain actions/cache of `target/`. `key` isolates this job
+      # from release.yml's Linux rust-cache (empty matrix.target), which builds a
+      # different feature set. cache-bin: false keeps ~/.cargo/bin (which rust-cache
+      # caches by default) out of this cache; this job does not install tools there.
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            src-tauri/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          workspaces: src-tauri
+          key: docker-gateway
+          cache-bin: "false"
 
       - name: Build toolport-gateway
         run: cargo build --release --bin toolport-gateway --manifest-path src-tauri/Cargo.toml --no-default-features

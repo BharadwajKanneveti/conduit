@@ -6,6 +6,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Fixed
+
+- **The GHCR gateway image rebuilds from the current commit.** `docker-publish` was still
+  caching all of `src-tauri/target` keyed only on Cargo.lock, the same shape that shipped
+  v0.3.12/v0.3.13 with a stale signed binary. It now uses the same Swatinem/rust-cache
+  eviction as `release.yml`, so workspace crates always recompile while third-party deps
+  stay cached. (SBS-926)
+
 ### Removed
 
 - **Toolport Studio is no longer a supported client.** The project is discontinued, so
