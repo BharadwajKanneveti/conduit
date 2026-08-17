@@ -154,6 +154,9 @@ export function RulesView() {
   async function openPreview(clientId: string) {
     setBusy(true);
     setError(null);
+    // Drop any previous preview up front. If this one fails, a card left over from ANOTHER client
+    // would sit there under the error looking like it belongs to the client just clicked.
+    setPreview(null);
     try {
       await flushDraft();
       setPreview(await rulesPreview(clientId));
@@ -166,6 +169,29 @@ export function RulesView() {
 
   if (loading) {
     return <p className="text-sm text-muted-foreground">Loading…</p>;
+  }
+
+  // A failed load has no data, and every empty-state line below reads off `data`. Rendering them
+  // would tell the user their machine has no clients and no rule sets, which is a claim we have no
+  // basis for: we never found out. Show the failure and a way to retry instead.
+  if (!data) {
+    return (
+      <div className="flex flex-col gap-3">
+        <Callout variant="danger" role="alert">
+          {error ?? "Could not load your agent rules."}
+        </Callout>
+        <Button
+          size="sm"
+          variant="outline"
+          className="self-start"
+          disabled={busy}
+          onClick={() => run(rulesView)}
+        >
+          <RefreshCw className="size-3.5" />
+          Try again
+        </Button>
+      </div>
+    );
   }
 
   const clients = data?.clients ?? [];
@@ -220,14 +246,23 @@ export function RulesView() {
               value={draftName}
               disabled={busy}
               aria-label="Rule set name"
-              onChange={(e) => setDraftName(e.target.value)}
+              onChange={(e) => {
+                setDraftName(e.target.value);
+                setPreview(null);
+              }}
               className="mb-2 h-9"
             />
             <textarea
               value={draft}
               disabled={busy}
               aria-label="Rules"
-              onChange={(e) => setDraft(e.target.value)}
+              // Editing invalidates an open preview: the card is rendered from the SAVED set, so
+              // it would keep showing the old bytes under a button that promises the exact ones.
+              // Clearing beats leaving a card that quietly stops being true as you type.
+              onChange={(e) => {
+                setDraft(e.target.value);
+                setPreview(null);
+              }}
               rows={12}
               spellCheck={false}
               placeholder="Always run the tests before you say you're done."

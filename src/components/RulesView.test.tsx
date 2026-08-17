@@ -312,6 +312,61 @@ describe("RulesView", () => {
     expect(screen.getByRole("button", { name: "Personal" })).toBeInTheDocument();
   });
 
+  it("a failed preview does not leave another client's card on screen", async () => {
+    api.rulesPreview.mockResolvedValueOnce({
+      clientId: "codex",
+      path: "/home/a/.codex/AGENTS.md",
+      strategy: "sentinelBlock",
+      before: "",
+      after: "Always run tests.\n",
+      state: "stale",
+    });
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+
+    const previews = screen.getAllByRole("button", { name: /Preview/ });
+    await userEvent.click(previews[0]);
+    expect(await screen.findByText("/home/a/.codex/AGENTS.md")).toBeInTheDocument();
+
+    // Second client's preview fails. Codex's bytes must not sit under the error looking like
+    // they belong to Claude Code.
+    api.rulesPreview.mockRejectedValueOnce(new Error("permission denied"));
+    await userEvent.click(screen.getAllByRole("button", { name: /Preview/ })[1]);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("permission denied");
+    expect(screen.queryByText("/home/a/.codex/AGENTS.md")).not.toBeInTheDocument();
+  });
+
+  it("editing clears an open preview instead of letting it go stale", async () => {
+    api.rulesPreview.mockResolvedValue({
+      clientId: "codex",
+      path: "/home/a/.codex/AGENTS.md",
+      strategy: "sentinelBlock",
+      before: "",
+      after: "Always run tests.\n",
+      state: "stale",
+    });
+    render(<RulesView />);
+    const editor = await screen.findByLabelText("Rules");
+
+    await userEvent.click(screen.getAllByRole("button", { name: /Preview/ })[0]);
+    expect(await screen.findByText("/home/a/.codex/AGENTS.md")).toBeInTheDocument();
+
+    await userEvent.type(editor, " And lint.");
+    expect(screen.queryByText("/home/a/.codex/AGENTS.md")).not.toBeInTheDocument();
+  });
+
+  it("a failed load says so instead of claiming the machine is empty", async () => {
+    api.rulesView.mockRejectedValue(new Error("registry unreadable"));
+    render(<RulesView />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("registry unreadable");
+    // We never found out what is on this machine, so we must not report an answer.
+    expect(screen.queryByText(/No AI clients/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/No rule set yet/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Try again/ })).toBeInTheDocument();
+  });
+
   it("with no set, the editor is replaced by a prompt and preview is unavailable", async () => {
     api.rulesView.mockResolvedValue(view({ sets: [], activeSetId: undefined }));
     render(<RulesView />);
