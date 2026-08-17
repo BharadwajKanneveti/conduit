@@ -22,6 +22,14 @@ Entries before the rename below shipped under the project's former name, Conduit
   a letter badge, so 31 of the 34 supported clients now carry their own mark. Crush, Jan
   and Witsy keep the badge, since none of them publish a usable vector mark.
 
+### Fixed
+
+- **Kimi Shared HTTP Connect writes `url`, not Qwen's `httpUrl`.** Connect, rescope
+  and reset for Kimi went through the generic JSON editor, which remapped remotes
+  via Qwen's `url` → `httpUrl` whenever the map key was not VS Code `"servers"`.
+  Kimi requires `url` and rejects `httpUrl`. The Kimi writer already emitted the
+  right shape; Shared HTTP now uses that same formatter. (SBS-921)
+
 ## [1.14.0] - 2026-08-16
 
 Agents can now keep what worked. A proven multi-tool orchestration can become a
