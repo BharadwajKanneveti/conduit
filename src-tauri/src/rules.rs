@@ -215,8 +215,12 @@ fn apply_to(installed: &[ClientTarget]) -> Result<RulesView, String> {
     })
 }
 
-/// Dry-run one client's write. `None` when the client is unknown, not installed, or has no rules
-/// location we manage.
+/// Dry-run one client's write. `None` when the client has no rules location we manage, or when no
+/// set is active (there is nothing to show).
+///
+/// Deliberately NOT gated on the client being installed: this answers "what would land here",
+/// which is a fair question about a client the user is about to install, and the caller only
+/// offers it for clients it detected anyway.
 pub fn preview(client_id: &str) -> Result<Option<RulesPreview>, String> {
     let reg = crate::registry::load()?;
     let Some(target) = crate::clients::client_rules_target(client_id, Scope::Personal) else {

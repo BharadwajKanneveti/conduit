@@ -3158,7 +3158,7 @@ async fn rules_set_client_enabled(
 }
 
 /// Dry-run one client's write so the UI can show the exact before/after before the first apply.
-/// Never touches disk. `None` when the client is not installed or has no rules file we manage.
+/// Never writes. `None` when the client has no rules file we manage, or no set is active.
 #[tauri::command]
 async fn rules_preview(client_id: String) -> Result<Option<rules::RulesPreview>, String> {
     tauri::async_runtime::spawn_blocking(move || rules::preview(&client_id))
