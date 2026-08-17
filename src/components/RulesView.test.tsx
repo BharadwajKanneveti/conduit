@@ -15,7 +15,7 @@ const api = vi.hoisted(() => ({
 
 vi.mock("@/lib/api", () => api);
 
-import { clearRulesDraftCache } from "@/lib/rulesDraftCache";
+import { clearRulesDraftCache, setRulesDraft } from "@/lib/rulesDraftCache";
 import { RulesView } from "./RulesView";
 
 function view(over: Partial<RulesViewData> = {}): RulesViewData {
@@ -92,6 +92,23 @@ describe("RulesView", () => {
     await waitFor(() =>
       expect(api.rulesSaveSet).toHaveBeenCalledWith("Work", "Be brief.", "work"),
     );
+  });
+
+  it("refuses to save generated Toolport markers pasted from a preview", async () => {
+    render(<RulesView />);
+    const editor = await screen.findByLabelText("Rules");
+
+    await userEvent.clear(editor);
+    await userEvent.type(
+      editor,
+      "<!-- toolport:rules:start set=work v=2 -->\nAlways run tests.",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "Save and apply" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      /Remove Toolport's generated markers/,
+    );
+    expect(api.rulesSaveSet).not.toHaveBeenCalled();
   });
 
   it("toggling a client off calls through with false", async () => {
@@ -315,6 +332,10 @@ describe("RulesView", () => {
     expect(await screen.findByText(/Pick one above/)).toBeInTheDocument();
     expect(screen.queryByText(/No rule set yet/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Personal" })).toBeInTheDocument();
+    expect(screen.getAllByRole("button", { name: /Preview/ })[0]).toHaveAttribute(
+      "title",
+      "Pick a rule set first",
+    );
   });
 
   it("a failed preview does not leave another client's card on screen", async () => {
@@ -370,6 +391,25 @@ describe("RulesView", () => {
     expect(screen.queryByText(/No AI clients/)).not.toBeInTheDocument();
     expect(screen.queryByText(/No rule set yet/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Try again/ })).toBeInTheDocument();
+  });
+
+  it("restores a held draft when retrying a failed load", async () => {
+    setRulesDraft("work", {
+      name: "Work",
+      content: "Always run tests. And lint.",
+    });
+    api.rulesView
+      .mockRejectedValueOnce(new Error("registry unreadable"))
+      .mockResolvedValueOnce(view());
+    render(<RulesView />);
+
+    await screen.findByRole("alert");
+    await userEvent.click(screen.getByRole("button", { name: /Try again/ }));
+
+    expect(await screen.findByLabelText("Rules")).toHaveValue(
+      "Always run tests. And lint.",
+    );
+    expect(screen.getByRole("button", { name: "Save and apply" })).toBeEnabled();
   });
 
   /**
@@ -463,24 +503,54 @@ describe("RulesView", () => {
    * Deleting a set that is not active must not activate it on the way. Activation applies, so
    * every opted-in client's file would be rewritten to the set being discarded and then emptied.
    */
-  it("deletes a non-active set without activating it first", async () => {
-    api.rulesView.mockResolvedValue(
+  it("saves the active draft before deleting a non-active set", async () => {
+    const sets = [
+      { id: "work", name: "Work", content: "Always run tests.", revision: 2 },
+      { id: "personal", name: "Personal", content: "Be brief.", revision: 1 },
+    ];
+    const saved = view({
+      sets: [
+        { id: "work", name: "Work", content: "Always run tests. And lint.", revision: 3 },
+        sets[1],
+      ],
+    });
+    api.rulesView.mockResolvedValue(view({ sets }));
+    api.rulesSaveSet.mockResolvedValue(saved);
+    api.rulesDeleteSet.mockResolvedValue(
       view({
         sets: [
-          { id: "work", name: "Work", content: "Always run tests.", revision: 2 },
-          { id: "personal", name: "Personal", content: "Be brief.", revision: 1 },
+          {
+            id: "work",
+            name: "Work",
+            content: "Always run tests. And lint.",
+            revision: 3,
+          },
         ],
       }),
     );
-    api.rulesDeleteSet.mockResolvedValue(view());
     render(<RulesView />);
-    await screen.findByLabelText("Rules");
+    const editor = await screen.findByLabelText("Rules");
 
+    await userEvent.type(editor, " And lint.");
     await userEvent.click(screen.getByRole("button", { name: "Delete Personal" }));
+    expect(
+      screen.getByText(/active set and client files stay unchanged/i),
+    ).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Delete" }));
 
+    await waitFor(() =>
+      expect(api.rulesSaveSet).toHaveBeenCalledWith(
+        "Work",
+        "Always run tests. And lint.",
+        "work",
+      ),
+    );
     await waitFor(() => expect(api.rulesDeleteSet).toHaveBeenCalledWith("personal"));
     expect(api.rulesSetActive).not.toHaveBeenCalled();
+    expect(api.rulesSaveSet.mock.invocationCallOrder[0]).toBeLessThan(
+      api.rulesDeleteSet.mock.invocationCallOrder[0],
+    );
+    expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests. And lint.");
   });
 
   it("shows no state badge while no set is applied", async () => {
@@ -506,6 +576,26 @@ describe("RulesView", () => {
     expect(screen.queryByText("Applied")).not.toBeInTheDocument();
   });
 
+  it("shows a stale cleanup state when no set is active", async () => {
+    api.rulesView.mockResolvedValue(
+      view({
+        activeSetId: undefined,
+        clients: [
+          {
+            id: "codex",
+            name: "Codex",
+            enabled: true,
+            path: "/home/a/.codex/AGENTS.md",
+            state: "stale",
+          },
+        ],
+      }),
+    );
+    render(<RulesView />);
+
+    expect(await screen.findByText("Not applied yet")).toBeInTheDocument();
+  });
+
   it("with no set, the editor is replaced by a prompt and preview is unavailable", async () => {
     api.rulesView.mockResolvedValue(view({ sets: [], activeSetId: undefined }));
     render(<RulesView />);
@@ -514,6 +604,7 @@ describe("RulesView", () => {
     expect(screen.queryByLabelText("Rules")).not.toBeInTheDocument();
     for (const b of screen.getAllByRole("button", { name: /Preview/ })) {
       expect(b).toBeDisabled();
+      expect(b).toHaveAttribute("title", "Create a rule set first");
     }
   });
 
