@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Eye, FileText, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Eye, FileText, Plus, RefreshCw, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Callout } from "@/components/Callout";
@@ -14,6 +14,7 @@ import {
   rulesSetClientEnabled,
   rulesView,
 } from "@/lib/api";
+import { forgetRulesDraft, getRulesDraft, setRulesDraft } from "@/lib/rulesDraftCache";
 import type {
   InstructionsApplyState,
   RulesPreview,
@@ -64,9 +65,15 @@ export function RulesView() {
   const dirty =
     active !== null && (draft !== active.content || draftName !== active.name);
 
+  /**
+   * Reseat the editor on the refreshed view. A save just landed, so the cached draft for that set
+   * is spent: drop it, or the next mount would resurrect text the user already committed and show
+   * it as unsaved.
+   */
   function adopt(next: RulesViewData) {
     setData(next);
     const set = next.sets.find((s) => s.id === next.activeSetId) ?? null;
+    if (set) forgetRulesDraft(set.id);
     setDraft(set?.content ?? "");
     setDraftName(set?.name ?? "");
     // The preview card describes one client's file under whichever set was active when it was
@@ -79,7 +86,17 @@ export function RulesView() {
     let cancelled = false;
     rulesView()
       .then((v) => {
-        if (!cancelled) adopt(v);
+        if (cancelled) return;
+        // Read the held draft BEFORE `adopt`, which clears the cache entry for the set it seats.
+        const set = v.sets.find((s) => s.id === v.activeSetId);
+        const held = set ? getRulesDraft(set.id) : undefined;
+        adopt(v);
+        // Restore text typed before the tab was switched away, onto the set it was typed for.
+        if (held) {
+          setDraft(held.content);
+          setDraftName(held.name);
+          setRulesDraft(set!.id, held);
+        }
       })
       .catch((e) => {
         if (!cancelled) setError(String(e));
@@ -102,6 +119,26 @@ export function RulesView() {
       setError(String(e));
     } finally {
       setBusy(false);
+    }
+  }
+
+  /**
+   * Apply an edit to the editor, and hold the result against an unmount.
+   *
+   * Editing also invalidates any open preview: that card is rendered from the set as it stood when
+   * it was opened, so leaving it up would show bytes that quietly stop matching as you type.
+   */
+  function editDraft(next: { name?: string; content?: string }) {
+    const name = next.name ?? draftName;
+    const content = next.content ?? draft;
+    setDraftName(name);
+    setDraft(content);
+    setPreview(null);
+    if (!active) return;
+    if (content === active.content && name === active.name) {
+      forgetRulesDraft(active.id); // typed back to the saved text: nothing to hold
+    } else {
+      setRulesDraft(active.id, { name, content });
     }
   }
 
@@ -147,9 +184,11 @@ export function RulesView() {
   }
 
   /**
-   * Open the dry run for one client. Saves first: the backend renders the preview from the SAVED
-   * set, so previewing a dirty editor would show the previous bytes under a button that promises
-   * to show exactly what would be written.
+   * Open the dry run for one client.
+   *
+   * Sends the DRAFT to the backend rather than saving it first. Saving applies to every opted-in
+   * client, so a save-then-preview would have this button write the files it claims to be a dry
+   * run of. It does not go through `act` for the same reason.
    */
   async function openPreview(clientId: string) {
     setBusy(true);
@@ -158,8 +197,7 @@ export function RulesView() {
     // would sit there under the error looking like it belongs to the client just clicked.
     setPreview(null);
     try {
-      await flushDraft();
-      setPreview(await rulesPreview(clientId));
+      setPreview(await rulesPreview(clientId, dirty ? draft : undefined));
     } catch (e) {
       setError(String(e));
     } finally {
@@ -219,20 +257,37 @@ export function RulesView() {
 
         <div className="mb-3 flex flex-wrap items-center gap-1.5">
           {(data?.sets ?? []).map((s) => (
-            <button
+            // Each set carries its own delete. Offering it only for the ACTIVE set meant deleting
+            // any other one required selecting it first, which applies it: every opted-in client's
+            // file would be rewritten to the set being thrown away, then emptied again.
+            <span
               key={s.id}
-              type="button"
-              disabled={busy}
-              onClick={() => selectSet(s.id)}
-              aria-current={s.id === data?.activeSetId}
-              className={`rounded-md border px-2.5 py-1 text-xs transition-colors ${
+              className={`inline-flex items-center gap-1 rounded-md border pr-1 pl-2.5 text-xs transition-colors ${
                 s.id === data?.activeSetId
                   ? "border-primary bg-primary/10 text-foreground"
-                  : "text-muted-foreground hover:bg-accent hover:text-foreground"
+                  : "text-muted-foreground"
               }`}
             >
-              {s.name}
-            </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => selectSet(s.id)}
+                aria-current={s.id === data?.activeSetId}
+                className="py-1 hover:text-foreground"
+              >
+                {s.name}
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                aria-label={`Delete ${s.name}`}
+                title={`Delete ${s.name}`}
+                onClick={() => setConfirmDelete(s.id)}
+                className="rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-destructive"
+              >
+                <X className="size-3" />
+              </button>
+            </span>
           ))}
           <Button variant="outline" size="sm" disabled={busy} onClick={newSet}>
             <Plus className="size-3.5" />
@@ -246,23 +301,14 @@ export function RulesView() {
               value={draftName}
               disabled={busy}
               aria-label="Rule set name"
-              onChange={(e) => {
-                setDraftName(e.target.value);
-                setPreview(null);
-              }}
+              onChange={(e) => editDraft({ name: e.target.value })}
               className="mb-2 h-9"
             />
             <textarea
               value={draft}
               disabled={busy}
               aria-label="Rules"
-              // Editing invalidates an open preview: the card is rendered from the SAVED set, so
-              // it would keep showing the old bytes under a button that promises the exact ones.
-              // Clearing beats leaving a card that quietly stops being true as you type.
-              onChange={(e) => {
-                setDraft(e.target.value);
-                setPreview(null);
-              }}
+              onChange={(e) => editDraft({ content: e.target.value })}
               rows={12}
               spellCheck={false}
               placeholder="Always run the tests before you say you're done."
@@ -284,15 +330,6 @@ export function RulesView() {
               >
                 <RefreshCw className="size-3.5" />
                 Re-apply
-              </Button>
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={busy}
-                onClick={() => setConfirmDelete(active.id)}
-              >
-                <Trash2 className="size-3.5" />
-                Delete set
               </Button>
             </div>
           </>
@@ -341,7 +378,10 @@ export function RulesView() {
                 </span>
               </label>
               <span className="flex shrink-0 items-center gap-2">
-                {c.enabled && <RuleStateBadge state={c.state} />}
+                {/* Only meaningful while a set is active. With none, the backend reports Applied
+                    for "correctly nothing on disk", and an "Applied / up to date" badge moments
+                    after the user deleted their rules reads as though they were still in place. */}
+                {c.enabled && active && <RuleStateBadge state={c.state} />}
                 <button
                   type="button"
                   disabled={busy || !active}
