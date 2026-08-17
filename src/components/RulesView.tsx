@@ -83,18 +83,36 @@ export function RulesView() {
     }
   }
 
-  /** Switch the edited set. An unsaved draft is kept by saving it first, never silently dropped. */
+  /**
+   * Persist an unsaved draft before an action that reseats the editor. Every such action calls
+   * this first: losing typed rules to a stray click on another set is not an acceptable outcome,
+   * and `adopt` reseats the draft unconditionally on the refreshed view.
+   */
+  async function flushDraft() {
+    if (dirty && active) await rulesSaveSet(draftName, draft, active.id);
+  }
+
+  /** Switch the edited set. */
   async function selectSet(id: string) {
-    if (dirty && active) {
-      const name = draftName;
-      const content = draft;
-      await run(async () => {
-        await rulesSaveSet(name, content, active.id);
-        return rulesSetActive(id);
-      });
-      return;
-    }
-    await run(() => rulesSetActive(id));
+    await run(async () => {
+      await flushDraft();
+      return rulesSetActive(id);
+    });
+  }
+
+  /**
+   * Create a set and switch to it. The backend only auto-activates a new set when nothing else
+   * is active (so a background create can never hijack the user's current rules), which means
+   * this button has to select it explicitly: someone who asks for a new set means to edit it.
+   */
+  async function newSet() {
+    const known = new Set((data?.sets ?? []).map((s) => s.id));
+    await run(async () => {
+      await flushDraft();
+      const created = await rulesSaveSet("New rules", "");
+      const fresh = created.sets.find((s) => !known.has(s.id));
+      return fresh ? rulesSetActive(fresh.id) : created;
+    });
   }
 
   if (loading) {
@@ -141,12 +159,7 @@ export function RulesView() {
               {s.name}
             </button>
           ))}
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={busy}
-            onClick={() => run(() => rulesSaveSet("New rules", ""))}
-          >
+          <Button variant="outline" size="sm" disabled={busy} onClick={newSet}>
             <Plus className="size-3.5" />
             New set
           </Button>

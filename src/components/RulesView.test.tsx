@@ -148,6 +148,52 @@ describe("RulesView", () => {
     expect(api.rulesSetActive).toHaveBeenCalledWith("personal");
   });
 
+  it("creating a set switches to it, so the editor is not still on the old one", async () => {
+    // The backend only auto-activates a new set when nothing else is active, so without an
+    // explicit select this button would look like it did nothing.
+    const created = view({
+      sets: [
+        { id: "work", name: "Work", content: "Always run tests.", revision: 2 },
+        { id: "new-rules", name: "New rules", content: "", revision: 1 },
+      ],
+    });
+    api.rulesSaveSet.mockResolvedValue(created);
+    api.rulesSetActive.mockResolvedValue({ ...created, activeSetId: "new-rules" });
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+
+    await userEvent.click(screen.getByRole("button", { name: "New set" }));
+
+    await waitFor(() => expect(api.rulesSetActive).toHaveBeenCalledWith("new-rules"));
+    expect(screen.getByLabelText("Rules")).toHaveValue("");
+    expect(screen.getByLabelText("Rule set name")).toHaveValue("New rules");
+  });
+
+  it("creating a set saves an unsaved draft first, so edits are never dropped", async () => {
+    const created = view({
+      sets: [
+        { id: "work", name: "Work", content: "Always run tests. And lint.", revision: 3 },
+        { id: "new-rules", name: "New rules", content: "", revision: 1 },
+      ],
+    });
+    api.rulesSaveSet.mockResolvedValue(created);
+    api.rulesSetActive.mockResolvedValue({ ...created, activeSetId: "new-rules" });
+    render(<RulesView />);
+    const editor = await screen.findByLabelText("Rules");
+
+    await userEvent.type(editor, " And lint.");
+    await userEvent.click(screen.getByRole("button", { name: "New set" }));
+
+    await waitFor(() =>
+      expect(api.rulesSaveSet).toHaveBeenCalledWith(
+        "Work",
+        "Always run tests. And lint.",
+        "work",
+      ),
+    );
+    expect(api.rulesSaveSet).toHaveBeenCalledWith("New rules", "");
+  });
+
   it("with no set, the editor is replaced by a prompt and preview is unavailable", async () => {
     api.rulesView.mockResolvedValue(view({ sets: [], activeSetId: undefined }));
     render(<RulesView />);
