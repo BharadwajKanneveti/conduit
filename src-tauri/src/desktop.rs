@@ -3159,9 +3159,15 @@ async fn rules_set_client_enabled(
 
 /// Dry-run one client's write so the UI can show the exact before/after before the first apply.
 /// Never writes. `None` when the client has no rules file we manage, or no set is active.
+///
+/// `content` previews unsaved editor text. It exists so the UI never has to save-then-preview: a
+/// save applies to every opted-in client, which would make "dry run" a write.
 #[tauri::command]
-async fn rules_preview(client_id: String) -> Result<Option<rules::RulesPreview>, String> {
-    tauri::async_runtime::spawn_blocking(move || rules::preview(&client_id))
+async fn rules_preview(
+    client_id: String,
+    content: Option<String>,
+) -> Result<Option<rules::RulesPreview>, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::preview(&client_id, content.as_deref()))
         .await
         .map_err(|e| e.to_string())?
 }

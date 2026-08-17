@@ -119,8 +119,17 @@ fn status_from(
         .map(|c| {
             let state = match (&c.target, set) {
                 (None, _) => ApplyState::Unsupported,
-                // No active set: nothing is meant to be on disk, so nothing is stale.
-                (Some(_), None) => ApplyState::Applied,
+                // No active set: the desired end state is "nothing of ours on disk", so the
+                // question is presence, not content. Reporting Applied unconditionally here hid a
+                // cleanup that failed — the block was still sitting in the file while the row
+                // said "up to date".
+                (Some(t), None) => {
+                    if instructions::is_present(&t.path, Scope::Personal) {
+                        ApplyState::Stale
+                    } else {
+                        ApplyState::Applied
+                    }
+                }
                 (Some(t), Some(s)) => instructions::current_state(t, &s.id, s.revision, &s.content),
             };
             ClientStatus {
@@ -280,7 +289,10 @@ fn apply_to_with_set(
 /// Deliberately NOT gated on the client being installed: this answers "what would land here",
 /// which is a fair question about a client the user is about to install, and the caller only
 /// offers it for clients it detected anyway.
-pub fn preview(client_id: &str) -> Result<Option<RulesPreview>, String> {
+/// `content`, when given, is previewed INSTEAD of the saved set's content. That is what makes this
+/// honest for an editor with unsaved text: the alternative (save first, then preview) would apply
+/// the draft to every opted-in client's file, which is the exact opposite of what a dry run is for.
+pub fn preview(client_id: &str, content: Option<&str>) -> Result<Option<RulesPreview>, String> {
     let reg = crate::registry::load()?;
     let Some(target) = crate::clients::client_rules_target(client_id, Scope::Personal) else {
         return Ok(None);
@@ -288,6 +300,7 @@ pub fn preview(client_id: &str) -> Result<Option<RulesPreview>, String> {
     let Some(set) = reg.active_rule_set() else {
         return Ok(None);
     };
+    let content = content.unwrap_or(set.content.as_str());
     // An unreadable file must NOT read as empty. Preview is the safeguard the user leans on
     // before letting Toolport touch a file they own, and "" would render the dry-run as a
     // first-time write of a file that actually has content we could not see. Only a genuinely
@@ -299,15 +312,11 @@ pub fn preview(client_id: &str) -> Result<Option<RulesPreview>, String> {
     };
     let after = match target.strategy {
         Strategy::OwnedFile => {
-            instructions::render_owned_file(Scope::Personal, &set.id, set.revision, &set.content)
+            instructions::render_owned_file(Scope::Personal, &set.id, set.revision, content)
         }
-        Strategy::SentinelBlock => instructions::upsert_block(
-            &before,
-            Scope::Personal,
-            &set.id,
-            set.revision,
-            &set.content,
-        ),
+        Strategy::SentinelBlock => {
+            instructions::upsert_block(&before, Scope::Personal, &set.id, set.revision, content)
+        }
     };
     Ok(Some(RulesPreview {
         client_id: client_id.to_string(),
@@ -317,7 +326,7 @@ pub fn preview(client_id: &str) -> Result<Option<RulesPreview>, String> {
             Strategy::SentinelBlock => "sentinelBlock",
         }
         .to_string(),
-        state: instructions::current_state(&target, &set.id, set.revision, &set.content),
+        state: instructions::current_state(&target, &set.id, set.revision, content),
         before,
         after,
     }))
@@ -325,6 +334,23 @@ pub fn preview(client_id: &str) -> Result<Option<RulesPreview>, String> {
 
 /// Create or update a set, then apply. Returns the refreshed view.
 pub fn save_set(id: Option<&str>, name: &str, content: &str) -> Result<RulesView, String> {
+    // Refuse content carrying Toolport's own markers, at the point the user submits it.
+    //
+    // `write_target` already refuses such content, but only at write time: without this the text
+    // is persisted first, and then EVERY opted-in client reports a write error until the user
+    // works out which invisible HTML comment is to blame. The realistic way in is copying out of
+    // the preview panel, which shows the rendered file including its markers.
+    //
+    // Rejected, not auto-stripped: silently editing someone's rules is worse than telling them.
+    if instructions::content_carries_a_marker(content) {
+        return Err(
+            "These rules contain Toolport's own marker comments (toolport:rules:start / :end, or \
+             the team-instructions equivalents). Toolport uses those to find the block it owns, so \
+             it cannot store them as rules. Remove them and save again — if you copied this out of \
+             the preview, copy just your own text."
+                .to_string(),
+        );
+    }
     crate::registry::update(|reg| reg.upsert_rule_set(id, name, content).map(|_| ()))?;
     apply()
 }
@@ -557,16 +583,28 @@ mod tests {
         assert!(!rows[0].enabled);
     }
 
+    /// With no active set, the desired end state is "nothing of ours on disk", so the row must
+    /// report PRESENCE. Reporting Applied unconditionally told the user their rules were up to
+    /// date while a block we failed to clean was still sitting in the file.
     #[test]
-    fn with_no_active_set_every_client_reads_as_settled() {
+    fn with_no_active_set_the_row_reports_whether_our_block_is_gone() {
         let s = Scratch::new();
-        let installed = vec![client("codex", Some(sentinel(s.path("AGENTS.md"))))];
+        let target = sentinel(s.path("AGENTS.md"));
+        let installed = vec![client("codex", Some(target.clone()))];
         let reg = crate::registry::Registry::default();
-        let rows = status_from(&reg, &installed, None);
+
+        // Nothing on disk: the end state is reached.
         assert_eq!(
-            rows[0].state,
-            ApplyState::Applied,
-            "nothing is meant to be on disk, so nothing is stale"
+            status_from(&reg, &installed, None)[0].state,
+            ApplyState::Applied
+        );
+
+        // Our block still there after a failed cleanup: NOT settled.
+        instructions::write_target(&target, "work", 1, "Be brief.");
+        assert_eq!(
+            status_from(&reg, &installed, None)[0].state,
+            ApplyState::Stale,
+            "a leftover block must not read as up to date"
         );
     }
 
@@ -795,6 +833,94 @@ mod tests {
             view.clients[0].state,
             ApplyState::Error,
             "and the failure is reported rather than hidden"
+        );
+    }
+
+    /// Preview must render the DRAFT without saving it. Saving applies to every opted-in client,
+    /// so a save-then-preview would make the dry run a write, which is the one thing this control
+    /// promises not to do.
+    #[test]
+    fn preview_renders_unsaved_content_without_touching_disk() {
+        let _dirs = crate::registry::data_dir_test_lock();
+        let s = Scratch::new();
+        let _data_dir = crate::registry::DataDirOverride::set(s.path("data"));
+
+        crate::registry::update(|reg| {
+            reg.upsert_rule_set(None, "Work", "Saved rules.")?;
+            Ok(())
+        })
+        .unwrap();
+
+        let target = sentinel(s.path("AGENTS.md"));
+        std::fs::write(&target.path, "# Mine\n").unwrap();
+        let before = std::fs::read_to_string(&target.path).unwrap();
+
+        let set = crate::registry::load()
+            .unwrap()
+            .active_rule_set()
+            .cloned()
+            .unwrap();
+
+        // Rendering the draft is the same call the command makes, minus the client lookup.
+        let rendered = instructions::upsert_block(
+            &before,
+            Scope::Personal,
+            &set.id,
+            set.revision,
+            "Draft rules.",
+        );
+        assert!(rendered.contains("Draft rules."));
+        assert!(!rendered.contains("Saved rules."));
+
+        // And nothing was written: the file is byte-identical and the set still holds saved text.
+        assert_eq!(std::fs::read_to_string(&target.path).unwrap(), before);
+        assert_eq!(
+            crate::registry::load()
+                .unwrap()
+                .active_rule_set()
+                .unwrap()
+                .content,
+            "Saved rules."
+        );
+    }
+
+    /// Marker text must be refused when the user submits it, not when the write fails. Realistic
+    /// way in: copying out of the preview panel, which shows the rendered file with its markers.
+    #[test]
+    fn saving_rules_that_contain_our_markers_is_refused_up_front() {
+        let _dirs = crate::registry::data_dir_test_lock();
+        let s = Scratch::new();
+        let _data_dir = crate::registry::DataDirOverride::set(s.path("data"));
+
+        crate::registry::update(|reg| {
+            reg.upsert_rule_set(None, "Work", "Good rules.")?;
+            Ok(())
+        })
+        .unwrap();
+        let id = crate::registry::load()
+            .unwrap()
+            .active_rule_set()
+            .unwrap()
+            .id
+            .clone();
+
+        for bad in [
+            format!("{} set=x v=1 -->", instructions::PERSONAL_SENTINEL_START_PREFIX),
+            instructions::PERSONAL_SENTINEL_END.to_string(),
+            instructions::SENTINEL_END.to_string(),
+        ] {
+            let err = save_set(Some(&id), "Work", &bad).expect_err("must be refused");
+            assert!(err.contains("marker"), "unhelpful message: {err}");
+        }
+
+        // Refused, so the good rules are still what is stored: no half-written state.
+        assert_eq!(
+            crate::registry::load()
+                .unwrap()
+                .active_rule_set()
+                .unwrap()
+                .content,
+            "Good rules."
         );
     }
 

@@ -15,6 +15,7 @@ const api = vi.hoisted(() => ({
 
 vi.mock("@/lib/api", () => api);
 
+import { clearRulesDraftCache } from "@/lib/rulesDraftCache";
 import { RulesView } from "./RulesView";
 
 function view(over: Partial<RulesViewData> = {}): RulesViewData {
@@ -45,6 +46,9 @@ function view(over: Partial<RulesViewData> = {}): RulesViewData {
 describe("RulesView", () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Held drafts are module state, so they outlive a component and would otherwise leak from one
+    // case into the next as phantom unsaved text.
+    clearRulesDraftCache();
     api.rulesView.mockResolvedValue(view());
   });
 
@@ -240,10 +244,11 @@ describe("RulesView", () => {
    * refreshes the view reseats the editor from the SAVED set, so any of them that forgets to
    * flush first silently replaces what the user typed with the old text.
    */
+  // Preview is deliberately NOT in this list: it must not save, because saving applies to every
+  // opted-in client. It sends the draft to the backend instead, covered separately below.
   it.each([
     ["toggling a client", () => screen.getByLabelText("Claude Code")],
     ["Re-apply", () => screen.getByRole("button", { name: "Re-apply" })],
-    ["Preview", () => screen.getAllByRole("button", { name: /Preview/ })[0]],
   ])("%s saves an unsaved draft instead of discarding it", async (_label, target) => {
     const saved = view({
       sets: [
@@ -365,6 +370,140 @@ describe("RulesView", () => {
     expect(screen.queryByText(/No AI clients/)).not.toBeInTheDocument();
     expect(screen.queryByText(/No rule set yet/)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Try again/ })).toBeInTheDocument();
+  });
+
+  /**
+   * The control says it writes nothing, so it must write nothing. Routing it through a save (to
+   * make the bytes accurate) applied the draft to every opted-in client's file first, which is the
+   * opposite of a dry run.
+   */
+  it("preview of an unsaved draft writes nothing and still shows the typed text", async () => {
+    api.rulesPreview.mockResolvedValue({
+      clientId: "codex",
+      path: "/home/a/.codex/AGENTS.md",
+      strategy: "sentinelBlock",
+      before: "# Mine\n",
+      after: "# Mine\n\nAlways run tests. And lint.\n",
+      state: "stale",
+    });
+    render(<RulesView />);
+    const editor = await screen.findByLabelText("Rules");
+
+    await userEvent.type(editor, " And lint.");
+    await userEvent.click(screen.getAllByRole("button", { name: /Preview/ })[0]);
+
+    // The draft goes to the backend as an argument, not through a save.
+    await waitFor(() =>
+      expect(api.rulesPreview).toHaveBeenCalledWith(
+        "codex",
+        "Always run tests. And lint.",
+      ),
+    );
+    expect(api.rulesSaveSet).not.toHaveBeenCalled();
+    expect(api.rulesApply).not.toHaveBeenCalled();
+    // Scoped to the preview block: the same text is also in the textarea the user just typed it in.
+    expect(
+      await screen.findByText(/And lint\./, { selector: "pre" }),
+    ).toBeInTheDocument();
+  });
+
+  it("previewing a clean editor sends no draft override", async () => {
+    api.rulesPreview.mockResolvedValue(null);
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+
+    await userEvent.click(screen.getAllByRole("button", { name: /Preview/ })[0]);
+    await waitFor(() =>
+      expect(api.rulesPreview).toHaveBeenCalledWith("codex", undefined),
+    );
+  });
+
+  it("keeps an unsaved draft across leaving and returning to the tab", async () => {
+    const { unmount } = render(<RulesView />);
+    const editor = await screen.findByLabelText("Rules");
+    await userEvent.type(editor, " And lint.");
+
+    // Switching sidebar views unmounts this tree with no chance to flush. Losing the text there
+    // would break the same promise every in-tab action keeps.
+    unmount();
+    expect(api.rulesSaveSet).not.toHaveBeenCalled();
+
+    render(<RulesView />);
+    expect(await screen.findByLabelText("Rules")).toHaveValue(
+      "Always run tests. And lint.",
+    );
+    expect(screen.getByRole("button", { name: "Save and apply" })).toBeEnabled();
+  });
+
+  it("does not resurrect a draft that was already saved", async () => {
+    const saved = view({
+      sets: [
+        { id: "work", name: "Work", content: "Always run tests. And lint.", revision: 3 },
+      ],
+    });
+    api.rulesSaveSet.mockResolvedValue(saved);
+    const { unmount } = render(<RulesView />);
+    const editor = await screen.findByLabelText("Rules");
+
+    await userEvent.type(editor, " And lint.");
+    await userEvent.click(screen.getByRole("button", { name: "Save and apply" }));
+    await waitFor(() => expect(api.rulesSaveSet).toHaveBeenCalled());
+    unmount();
+
+    api.rulesView.mockResolvedValue(saved);
+    render(<RulesView />);
+    // Same text, but from the saved set, so it must not read as unsaved work.
+    expect(await screen.findByLabelText("Rules")).toHaveValue(
+      "Always run tests. And lint.",
+    );
+    expect(screen.getByRole("button", { name: "Saved" })).toBeDisabled();
+  });
+
+  /**
+   * Deleting a set that is not active must not activate it on the way. Activation applies, so
+   * every opted-in client's file would be rewritten to the set being discarded and then emptied.
+   */
+  it("deletes a non-active set without activating it first", async () => {
+    api.rulesView.mockResolvedValue(
+      view({
+        sets: [
+          { id: "work", name: "Work", content: "Always run tests.", revision: 2 },
+          { id: "personal", name: "Personal", content: "Be brief.", revision: 1 },
+        ],
+      }),
+    );
+    api.rulesDeleteSet.mockResolvedValue(view());
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete Personal" }));
+    await userEvent.click(screen.getByRole("button", { name: "Delete" }));
+
+    await waitFor(() => expect(api.rulesDeleteSet).toHaveBeenCalledWith("personal"));
+    expect(api.rulesSetActive).not.toHaveBeenCalled();
+  });
+
+  it("shows no state badge while no set is applied", async () => {
+    // The backend reports Applied for "correctly nothing on disk". Rendering that as
+    // "Applied / up to date" right after the user deleted their rules reads as still in place.
+    api.rulesView.mockResolvedValue(
+      view({
+        activeSetId: undefined,
+        clients: [
+          {
+            id: "codex",
+            name: "Codex",
+            enabled: true,
+            path: "/home/a/.codex/AGENTS.md",
+            state: "applied",
+          },
+        ],
+      }),
+    );
+    render(<RulesView />);
+
+    expect(await screen.findByText(/No set is applied right now/)).toBeInTheDocument();
+    expect(screen.queryByText("Applied")).not.toBeInTheDocument();
   });
 
   it("with no set, the editor is replaced by a prompt and preview is unavailable", async () => {

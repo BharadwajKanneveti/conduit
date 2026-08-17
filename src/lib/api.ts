@@ -587,10 +587,19 @@ export function rulesSetClientEnabled(
 
 /**
  * Dry-run one client's write: the exact before/after bytes, without touching disk. `null` when
- * the client is not installed, has no rules file we manage, or no set is active.
+ * the client has no rules file we manage, or no set is active.
+ *
+ * Pass `content` to preview unsaved editor text. Do NOT save first to get an accurate preview: a
+ * save applies to every opted-in client, which would turn the dry run into a write.
  */
-export function rulesPreview(clientId: string): Promise<RulesPreview | null> {
-  return invoke<RulesPreview | null>("rules_preview", { clientId });
+export function rulesPreview(
+  clientId: string,
+  content?: string,
+): Promise<RulesPreview | null> {
+  return invoke<RulesPreview | null>("rules_preview", {
+    clientId,
+    content: content ?? null,
+  });
 }
 
 /** Re-apply the active set to every opted-in client. */
