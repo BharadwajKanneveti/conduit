@@ -9876,9 +9876,15 @@ command = "npx"
     /// strips the hint `entry_to_json` would emit.
     #[test]
     fn kimi_shared_http_connect_writes_url_not_qwen_http_url() {
+        let _data_lock = crate::registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let root = std::env::temp_dir().join(format!("toolport-kimi-sbs921-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("toolport-kimi-sbs921-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        let data_dir = root.join("toolport-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _data_dir = crate::registry::DataDirOverride::set(&data_dir);
         let path = root.join("mcp.json");
         std::fs::write(
             &path,
@@ -9918,7 +9924,14 @@ command = "npx"
             written["mcpServers"].get("keep").is_some(),
             "Connect must preserve existing servers: {written}"
         );
+        let backups = data_dir.join("backups").join("kimi-code");
+        assert_eq!(
+            std::fs::read_dir(&backups).unwrap().count(),
+            1,
+            "the fixture backup must stay under the overridden test data dir"
+        );
 
+        drop(_data_dir);
         drop(_restore);
         std::fs::remove_dir_all(&root).ok();
     }
