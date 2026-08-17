@@ -22,6 +22,17 @@ Entries before the rename below shipped under the project's former name, Conduit
   a letter badge, so 31 of the 34 supported clients now carry their own mark. Crush, Jan
   and Witsy keep the badge, since none of them publish a usable vector mark.
 
+### Fixed
+
+- **A refused Team Instructions rewrite no longer deletes the last-good org rules.**
+  `apply_instructions_to` only recorded a target when `write_target` returned
+  `Applied`. Error, TooLong (a Windsurf char-cap miss) and BlockedOverride then
+  hit `remove_recorded`, which stripped the working v1 block, persisted the new
+  content watermark, and left later syncs with nothing to retry — coverage of
+  the missing file against too-long v2 is `TooLong`, not `Stale`. Last-good now
+  stays on disk and in the recorded set when a rewrite is refused; a real
+  removal (org cleared, client gone, path moved) still cleans up. (SBS-917)
+
 ## [1.14.0] - 2026-08-16
 
 Agents can now keep what worked. A proven multi-tool orchestration can become a

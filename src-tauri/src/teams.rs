@@ -993,36 +993,53 @@ fn apply_instructions_to(
     }
 
     let mut written: Vec<String> = Vec::new();
+    // Paths we still manage whose rewrite was refused. `write_target` leaves those files
+    // untouched (Error / TooLong / BlockedOverride); they are not obsolete. Treating a
+    // non-Applied outcome as "remove last-good" deleted working org rules and then
+    // persisted the new watermark, so later syncs never retried (SBS-917).
+    let mut keep: Vec<String> = Vec::new();
     if let Some(content) = desired {
         for target in targets {
             let key = target.path.to_string_lossy().to_string();
-            if instructions::write_target(target, team_id, version, content) == ApplyState::Applied
-            {
-                written.push(key);
+            match instructions::write_target(target, team_id, version, content) {
+                ApplyState::Applied => written.push(key),
+                _ => {
+                    // Not a successful replace. Keep last-good on disk and in the
+                    // recorded set so leave/disconnect can still clean it up.
+                    if prev_targets.iter().any(|old| old == &key) {
+                        keep.push(key);
+                    }
+                }
             }
         }
     }
-    // Remove any file we wrote before but did NOT (re)write now: instructions were removed or
-    // disabled, a client was uninstalled, or a target path changed. Iterating the RECORDED list
-    // (not a fresh client scan) means cleanup survives a client that has since disappeared.
+    // Remove any file we wrote before that is no longer a live target we still
+    // manage: instructions were removed or disabled, a client was uninstalled,
+    // or a target path changed. Iterating the RECORDED list (not a fresh client
+    // scan) means cleanup survives a client that has since disappeared. A refused
+    // rewrite of a still-current target is not that — last-good stays (SBS-917).
     for old in &prev_targets {
-        if !written.iter().any(|w| w == old) {
+        if !written.iter().any(|w| w == old) && !keep.iter().any(|k| k == old) {
             instructions::remove_recorded(std::path::Path::new(old));
         }
     }
 
-    // Persist the content+version we just applied and the written set, so a steady-state cycle can
-    // recompute coverage and `disconnect` can clean up. The compare-and-set returns false if the
-    // team changed/cleared while we were writing (a race with `disconnect`/team-switch): our
-    // just-written files then have no record to clean them by, so roll them back rather than
-    // orphan them.
+    // Persist the content+version we just attempted (coverage reports against this
+    // watermark, so a refused v2 still shows TooLong rather than a stale v1 Applied)
+    // and the live recorded set (Applied + last-good). The compare-and-set returns
+    // false if the team changed/cleared while we were writing (a race with
+    // `disconnect`/team-switch): our just-written files then have no record to
+    // clean them by, so roll them back rather than orphan them. Last-good paths
+    // were not newly written, so they are not in `written` and are left alone.
     let new_content = desired.map(str::to_string);
+    let mut recorded_targets = written.clone();
+    recorded_targets.extend(keep);
     let recorded = crate::registry::update(|reg| {
         if let Some(t) = reg.team.as_mut() {
             if t.team_id == team_id {
                 t.team_instructions_content = new_content.clone();
                 t.team_instructions_version = version;
-                t.team_instructions_targets = written.clone();
+                t.team_instructions_targets = recorded_targets.clone();
                 return Ok(true);
             }
         }
@@ -2021,6 +2038,181 @@ mod tests {
             recorded,
             vec![target.path.to_string_lossy().to_string()],
             "the recorded target must follow the move, so leave/disconnect cleans up the right file"
+        );
+    }
+
+    /// Write last-good org rules to `path` and record them on the connected team.
+    /// Caller holds `data_dir_test_lock` and a `DataDirOverride`.
+    fn seed_applied_instructions(team: &str, version: i64, content: &str, path: &std::path::Path) {
+        use crate::instructions::{ApplyState, Strategy, Target};
+        let target = Target {
+            path: path.to_path_buf(),
+            strategy: Strategy::SentinelBlock,
+            char_cap: None,
+            blocked_if_present: None,
+        };
+        assert_eq!(
+            crate::instructions::write_target(&target, team, version, content),
+            ApplyState::Applied,
+            "fixture: last-good v{version} must land on disk"
+        );
+        let conn: TeamConnection = serde_json::from_value(json!({
+            "serverUrl": "https://teams.example.com",
+            "teamId": team,
+            "role": "member",
+            "teamInstructionsContent": content,
+            "teamInstructionsVersion": version,
+            "teamInstructionsTargets": [path.to_string_lossy()],
+        }))
+        .expect("team connection fixture");
+        crate::registry::update(|reg| {
+            reg.team = Some(conn);
+            Ok(())
+        })
+        .expect("seed the registry");
+    }
+
+    fn loaded_instructions() -> (Option<String>, i64, Vec<String>) {
+        match crate::registry::load().ok().and_then(|reg| reg.team) {
+            Some(t) => (
+                t.team_instructions_content,
+                t.team_instructions_version,
+                t.team_instructions_targets,
+            ),
+            None => (None, 0, Vec::new()),
+        }
+    }
+
+    /// SBS-917: a refused rewrite must not treat last-good as obsolete. `write_target`
+    /// leaves the file untouched on Error / TooLong / BlockedOverride; deleting it and
+    /// dropping the path from the recorded set used to strip working org rules. The new
+    /// content watermark is still persisted so coverage reports TooLong for v2 rather
+    /// than Applied for leftover v1.
+    #[test]
+    fn apply_instructions_keeps_last_good_when_rewrite_is_refused() {
+        use crate::instructions::{ApplyState, Strategy, Target};
+
+        let _env = crate::clients::env_test_lock();
+        let _dirs = crate::registry::data_dir_test_lock();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-sbs917-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(scratch.join("data"));
+
+        const TEAM: &str = "team_sbs917";
+        const V1: &str = "Keep the approved workflow.";
+        const V2: &str = "A much longer org rule set that a char-cap client will refuse.";
+
+        // --- TooLong (the Windsurf worst case in the ticket) ---
+        let too_long_path = scratch.join("windsurf-rules.md");
+        seed_applied_instructions(TEAM, 1, V1, &too_long_path);
+        let too_long_target = Target {
+            path: too_long_path.clone(),
+            strategy: Strategy::SentinelBlock,
+            char_cap: Some(20),
+            blocked_if_present: None,
+        };
+        apply_instructions_to(TEAM, 2, Some(V2), std::slice::from_ref(&too_long_target));
+        let on_disk = std::fs::read_to_string(&too_long_path).unwrap_or_default();
+        let (content, version, recorded) = loaded_instructions();
+        assert!(
+            on_disk.contains(V1) && !on_disk.contains(V2),
+            "TooLong must leave last-good v1 on disk, not strip it: {on_disk:?}"
+        );
+        assert_eq!(
+            recorded,
+            vec![too_long_path.to_string_lossy().to_string()],
+            "last-good path must stay recorded so disconnect can still clean it up"
+        );
+        assert_eq!(
+            content.as_deref(),
+            Some(V2),
+            "coverage watermark must advance to the refused v2"
+        );
+        assert_eq!(version, 2);
+        assert_eq!(
+            crate::instructions::current_state(&too_long_target, TEAM, 2, V2),
+            ApplyState::TooLong,
+            "coverage of the refused v2 is TooLong, not Stale — that is why a deleted last-good never retried"
+        );
+
+        // --- Error (org content embeds our own sentinel; write_target refuses) ---
+        let err_path = scratch.join("error-rules.md");
+        seed_applied_instructions(TEAM, 1, V1, &err_path);
+        let err_target = Target {
+            path: err_path.clone(),
+            strategy: Strategy::SentinelBlock,
+            char_cap: None,
+            blocked_if_present: None,
+        };
+        let poisoned = format!("{} injected", crate::instructions::SENTINEL_START_PREFIX);
+        apply_instructions_to(TEAM, 3, Some(&poisoned), std::slice::from_ref(&err_target));
+        let on_disk = std::fs::read_to_string(&err_path).unwrap_or_default();
+        let (_, _, recorded) = loaded_instructions();
+        assert!(
+            on_disk.contains(V1) && !on_disk.contains("injected"),
+            "Error must leave last-good v1 on disk: {on_disk:?}"
+        );
+        assert_eq!(recorded, vec![err_path.to_string_lossy().to_string()]);
+
+        // --- BlockedOverride (Codex-style shadow file) ---
+        let blocked_path = scratch.join("AGENTS.md");
+        let shadow = scratch.join("AGENTS.override.md");
+        seed_applied_instructions(TEAM, 1, V1, &blocked_path);
+        std::fs::write(&shadow, "opt out").unwrap();
+        let blocked_target = Target {
+            path: blocked_path.clone(),
+            strategy: Strategy::SentinelBlock,
+            char_cap: None,
+            blocked_if_present: Some(shadow),
+        };
+        apply_instructions_to(TEAM, 4, Some(V2), std::slice::from_ref(&blocked_target));
+        let on_disk = std::fs::read_to_string(&blocked_path).unwrap_or_default();
+        let (_, _, recorded) = loaded_instructions();
+        assert!(
+            on_disk.contains(V1) && !on_disk.contains(V2),
+            "BlockedOverride must leave last-good v1 on disk: {on_disk:?}"
+        );
+        assert_eq!(recorded, vec![blocked_path.to_string_lossy().to_string()]);
+
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    /// SBS-917: keeping last-good on a refused rewrite must not stop a real removal.
+    /// When the org clears instructions, every recorded path is obsolete and must go.
+    #[test]
+    fn apply_instructions_still_removes_last_good_when_org_clears_instructions() {
+        use crate::instructions::{Strategy, Target};
+
+        let _env = crate::clients::env_test_lock();
+        let _dirs = crate::registry::data_dir_test_lock();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-sbs917-clear-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(scratch.join("data"));
+        let path = scratch.join("rules.md");
+        const TEAM: &str = "team_sbs917_clear";
+        const V1: &str = "Keep the approved workflow.";
+        seed_applied_instructions(TEAM, 1, V1, &path);
+        let target = Target {
+            path: path.clone(),
+            strategy: Strategy::SentinelBlock,
+            char_cap: None,
+            blocked_if_present: None,
+        };
+        apply_instructions_to(TEAM, 2, None, std::slice::from_ref(&target));
+        let leftover = std::fs::read_to_string(&path).unwrap_or_default();
+        let (_, _, recorded) = loaded_instructions();
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(
+            !leftover.contains(V1),
+            "clearing org instructions must still strip last-good, not keep it: {leftover:?}"
+        );
+        assert!(
+            recorded.is_empty(),
+            "recorded set must be empty after a successful removal"
         );
     }
 
