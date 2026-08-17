@@ -153,9 +153,11 @@ export function RulesView() {
    * `adopt` reseats the editor from the SAVED set, so any action that refreshes the view would
    * otherwise discard whatever the user had typed and put the old text back. That is not an edge
    * case: "type your rules, then switch a client on" is the first thing anyone does. Flushing
-   * first turns that discard into a save. Save skips it because flushing before it would do the
-   * same write twice; Delete skips it because the only deletable set is the active one, so
-   * saving into it first is pure waste.
+   * first turns that discard into a save.
+   *
+   * Three deliberate exceptions. Save IS the flush. Delete would save into a set that is about to
+   * be thrown away. Preview promises to write nothing, so it sends the draft as an argument
+   * instead (see `openPreview`).
    */
   async function act(fn: () => Promise<RulesViewData>) {
     await run(async () => {
