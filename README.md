@@ -87,8 +87,9 @@ fixes both.
 - **Per-agent scoping.** Give each client only the servers it should see. A coding
   agent literally cannot call a billing tool that isn't in its profile.
 - **One set of agent rules.** Write your instructions once and Toolport applies them
-  to every client's own rules file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, and the
-  rest) instead of you editing each by hand. Keep several named sets and switch
+  to every client's own global rules location (`AGENTS.md`, `GEMINI.md`,
+  `.goosehints`, and a `toolport-rules.md` in the rules directory of clients that
+  read one) instead of you editing each by hand. Keep several named sets and switch
   between them. Your own content is never overwritten: Toolport either owns its own
   file or owns a marked block and leaves every other byte alone, and turning a client
   off removes what it wrote. Each client is off until you turn it on, and a preview

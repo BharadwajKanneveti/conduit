@@ -28,28 +28,30 @@ file alone.
 
 ## Before anything is written
 
-- **Every client starts switched off.** Nothing is written until you turn a client
-  on in the Clients list.
+- **Every client starts switched off.** Nothing is written until you tick a client
+  in the **Clients** section of the **Agent rules** tab. (Not the Clients entry in
+  the sidebar: that one connects a client to the MCP gateway and has nothing to do
+  with rules.)
 - **Preview shows the exact bytes.** Each client has a Preview button that renders
   the file Toolport would write, without writing it.
 
 ## Supported clients
 
-| Client            | Rules file                                                           | Strategy     |
-| ----------------- | -------------------------------------------------------------------- | ------------ |
-| Claude Code       | `~/.claude/rules/toolport-rules.md`                                  | Owned file   |
-| VS Code (Copilot) | `~/.claude/rules/toolport-rules.md` (shared with Claude Code)        | Owned file   |
-| Kiro              | `~/.kiro/steering/toolport-rules.md`                                 | Owned file   |
-| Roo Code          | `~/.roo/rules/toolport-rules.md`                                     | Owned file   |
-| Cline             | `~/Documents/Cline/Rules/toolport-rules.md`                          | Owned file   |
-| Codex             | `$CODEX_HOME/AGENTS.md` (default `~/.codex/AGENTS.md`)               | Marked block |
-| Gemini CLI        | `$GEMINI_CLI_HOME/.gemini/GEMINI.md` (default `~/.gemini/GEMINI.md`) | Marked block |
-| Antigravity       | `~/.gemini/GEMINI.md` (shared with Gemini CLI)                       | Marked block |
-| Windsurf          | `~/.codeium/windsurf/memories/global_rules.md`                       | Marked block |
-| Goose             | `.goosehints` beside `config.yaml` (honours `GOOSE_PATH_ROOT`)       | Marked block |
-| Zed               | `AGENTS.md` in Zed's config directory                                | Marked block |
-| Pi                | `~/.pi/agent/AGENTS.md`                                              | Marked block |
-| Oh My Pi          | `~/.omp/agent/AGENTS.md`                                             | Marked block |
+| Client      | Rules file                                                           | Strategy     |
+| ----------- | -------------------------------------------------------------------- | ------------ |
+| Claude Code | `~/.claude/rules/toolport-rules.md`                                  | Owned file   |
+| VS Code     | `~/.claude/rules/toolport-rules.md` (shared with Claude Code)        | Owned file   |
+| Kiro        | `~/.kiro/steering/toolport-rules.md`                                 | Owned file   |
+| Roo Code    | `~/.roo/rules/toolport-rules.md`                                     | Owned file   |
+| Cline       | `~/Documents/Cline/Rules/toolport-rules.md`                          | Owned file   |
+| Codex       | `$CODEX_HOME/AGENTS.md` (default `~/.codex/AGENTS.md`)               | Marked block |
+| Gemini CLI  | `$GEMINI_CLI_HOME/.gemini/GEMINI.md` (default `~/.gemini/GEMINI.md`) | Marked block |
+| Antigravity | `~/.gemini/GEMINI.md` (shared with Gemini CLI)                       | Marked block |
+| Windsurf    | `~/.codeium/windsurf/memories/global_rules.md`                       | Marked block |
+| Goose       | `.goosehints` beside `config.yaml` (honours `GOOSE_PATH_ROOT`)       | Marked block |
+| Zed         | `AGENTS.md` in Zed's config directory                                | Marked block |
+| Pi          | `~/.pi/agent/AGENTS.md`                                              | Marked block |
+| Oh My Pi    | `~/.omp/agent/AGENTS.md`                                             | Marked block |
 
 On Linux, Goose and Zed follow `XDG_CONFIG_HOME`. On Windows, Goose and Zed use the
 roaming config directory.
@@ -57,11 +59,19 @@ roaming config directory.
 Where two clients share a file, Toolport writes it once. Both are covered even if
 only one is installed.
 
+The VS Code row resolves to Claude Code's rules directory, which is what Toolport
+has always done for team instructions. That covers a VS Code install running a
+Claude-compatible extension. It is **not** a claim that GitHub Copilot Chat reads
+that directory: Copilot's own instruction files are `.github/copilot-instructions.md`
+and repo-level `AGENTS.md`, which Toolport does not write. If Copilot is your only
+assistant in VS Code, paste the rules into its own file.
+
 ### Clients with no rules file Toolport can write
 
 **Cursor** and **Warp** keep their global rules in their own UI or account rather
-than in a file on disk. They appear in the Clients list marked "Copy manually", so
-you can paste your rules in yourself. Toolport does not silently skip them.
+than in a file on disk. They have no checkbox; the Clients section names them
+underneath ("No rules file Toolport can write for Cursor, Warp"), so you know to
+paste your rules in yourself. Toolport does not silently skip them.
 
 ## Per-client states
 
@@ -71,7 +81,7 @@ you can paste your rules in yourself. Toolport does not silently skip them.
 | Not applied yet             | The current rules are not on disk for this client yet. Use Re-apply.                                                                                                                                                       |
 | Blocked by a local override | The client has an override file making it ignore the file Toolport writes. Codex's `AGENTS.override.md` is the case this covers: while it exists, Codex ignores `AGENTS.md` entirely, so writing there would be invisible. |
 | Too long for this client    | The client caps its global rules file and these rules would exceed it. Windsurf caps its file at 6,000 characters, counted across the whole file, including anything you have in it.                                       |
-| Copy manually               | No rules file Toolport can write. See above.                                                                                                                                                                               |
+| Copy manually               | No rules file Toolport can write. Shown in the Teams tab; the Agent rules tab lists these clients separately instead. See above.                                                                                           |
 | Write error                 | The file could not be read or written. It was left untouched.                                                                                                                                                              |
 
 ## Team instructions

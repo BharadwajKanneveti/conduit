@@ -18,16 +18,17 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 - **Agent rules: write your instructions once, apply them everywhere.** A new Agent
   rules tab holds one or more named rule sets and writes the active one into every
-  AI client's own global rules file (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`,
-  `.goosehints`, Windsurf's `global_rules.md`), so keeping 13 clients in agreement
-  is no longer 13 files to hand-edit. Your own content is never overwritten:
+  AI client's own global rules location (`AGENTS.md`, `GEMINI.md`, `.goosehints`,
+  Windsurf's `global_rules.md`, and a `toolport-rules.md` in the rules directory of
+  clients that read one), so keeping 13 clients in agreement is no longer 13 files
+  to hand-edit. Your own content is never overwritten:
   Toolport either owns its own file in the client's rules directory or owns a
   marked block inside a shared file and leaves every other byte exactly as it is.
   Each client is off until you turn it on, a per-client preview shows the exact
   bytes before the first write, and turning a client off or deleting the set
   removes what Toolport wrote and nothing else. Cursor and Warp keep their globals
-  in their own UI, so they are listed as "Copy manually" rather than silently
-  skipped. Needs no MCP server or gateway. Team instructions are unaffected and
+  in their own UI, so the tab names them as clients it cannot write rather than
+  silently skipping them. Needs no MCP server or gateway. Team instructions are unaffected and
   coexist in the same files. See [docs/agent-rules.md](docs/agent-rules.md).
 - **Official brand marks for 14 more clients.** Grok Build, OpenCode, Qwen Code, Kimi
   Code, JetBrains Junie, Kilo Code, GitHub Copilot CLI, Amp, Pi, Oh My Pi, Factory Droid,
