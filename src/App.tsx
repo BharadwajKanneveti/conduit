@@ -575,11 +575,12 @@ function App() {
 
   // Bucket each server so the list can lead with what needs action. A server
   // needs attention when it's enabled but its probe failed (auth or error).
-  type Group = "attention" | "active" | "disabled";
+  type Group = "attention" | "checking" | "active" | "disabled";
   const groupOf = (s: ServerEntry): Group => {
     if (!registry || !isEnabled(registry, s.id)) return "disabled";
     const h = health[s.id];
-    return h && !h.ok ? "attention" : "active";
+    if (!h) return "checking";
+    return h.ok ? "active" : "attention";
   };
   const attentionServers = servers.filter((s) => groupOf(s) === "attention");
   const attentionCount = attentionServers.length;
@@ -599,6 +600,7 @@ function App() {
   const visible = servers.filter(matches);
   const grouped: Record<Group, ServerEntry[]> = {
     attention: visible.filter((s) => groupOf(s) === "attention").sort(byName),
+    checking: visible.filter((s) => groupOf(s) === "checking").sort(byName),
     active: visible.filter((s) => groupOf(s) === "active").sort(byName),
     disabled: visible.filter((s) => groupOf(s) === "disabled").sort(byName),
   };
@@ -951,7 +953,7 @@ function App() {
             </div>
           </header>
 
-          {view === "servers" && !backendReachable && (
+          {!backendReachable && (
             <Callout
               variant="warning"
               role="status"
@@ -959,8 +961,8 @@ function App() {
             >
               <WifiOff className="size-4 shrink-0" aria-hidden="true" />
               <span className="min-w-0 flex-1">
-                Toolport's backend didn't respond to the last health check, so server
-                status below may be stale.
+                Toolport's backend didn't respond to the last health check. Some features
+                may be unavailable, and server status may be stale.
               </span>
               <Button
                 variant="outline"
@@ -1001,6 +1003,7 @@ function App() {
                       <ClientsView
                         clients={clients}
                         registry={registry}
+                        loading={loading}
                         onSelectClient={selectClient}
                       />
                     )
@@ -1061,6 +1064,9 @@ function App() {
                       )}
                       <ServerGroup title="To finish" count={grouped.attention.length}>
                         {grouped.attention.map(serverRow)}
+                      </ServerGroup>
+                      <ServerGroup title="Checking" count={grouped.checking.length}>
+                        {grouped.checking.map(serverRow)}
                       </ServerGroup>
                       <ServerGroup title="Ready" count={grouped.active.length}>
                         {grouped.active.map(serverRow)}
@@ -1234,24 +1240,28 @@ export function serverPostureCopy({
     ? "Reachability status unavailable"
     : enabled === 0
       ? "No servers enabled"
-      : probing || checked < enabled
+      : probing
         ? "Checking server reachability"
-        : attention === 0
-          ? `${connected} enabled server${connected === 1 ? "" : "s"} reachable`
-          : `${connected} of ${enabled} enabled servers reachable`;
+        : checked < enabled
+          ? "Reachability check incomplete"
+          : attention === 0
+            ? `${connected} enabled server${connected === 1 ? "" : "s"} reachable`
+            : `${connected} of ${enabled} enabled servers reachable`;
   const detail = !backendReachable
     ? connected > 0
       ? `Last known: ${connected} reachable. Status may be out of date.`
       : "The last health check did not complete."
     : enabled === 0
       ? `${disabled} server${disabled === 1 ? "" : "s"} disabled in this profile.`
-      : probing || checked < enabled
+      : probing
         ? `${checked} of ${enabled} checked so far.`
-        : attention > 0
-          ? `${attention} need${attention === 1 ? "s" : ""} a quick check.`
-          : disabled > 0
-            ? `${disabled} disabled in this profile.`
-            : "Everything enabled in this profile is ready.";
+        : checked < enabled
+          ? `${checked} of ${enabled} checked. Refresh to try again.`
+          : attention > 0
+            ? `${attention} need${attention === 1 ? "s" : ""} a quick check.`
+            : disabled > 0
+              ? `${disabled} disabled in this profile.`
+              : "Everything enabled in this profile is ready.";
   return { healthy, title, detail };
 }
 

@@ -43,6 +43,14 @@ const STATUS_TEXT: Record<Status, string> = {
   error: "text-destructive",
 };
 
+const STATUS_ARIA_LABEL: Record<Status, string> = {
+  disabled: "Server disabled",
+  checking: "Checking connection",
+  connected: "Connected",
+  "needs-auth": "Authentication required",
+  error: "Connection error",
+};
+
 const ACTION =
   "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
 
@@ -141,6 +149,11 @@ export function RegistryServerRow({
         ) : null}
 
         <span className="ml-auto flex shrink-0 items-center gap-2.5">
+          <span
+            role="status"
+            aria-label={STATUS_ARIA_LABEL[status]}
+            className="sr-only"
+          />
           {status === "needs-auth" ? (
             <SecretsDialog
               server={server}

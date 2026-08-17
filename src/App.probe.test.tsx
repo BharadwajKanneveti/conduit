@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { act, render, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import App from "./App";
 import type { ProbeResult } from "@/lib/types";
 
@@ -43,7 +44,13 @@ vi.mock("@/lib/theme", () => ({
   useTheme: () => ({ resolved: "light" }),
 }));
 
-vi.mock("@/components/AppSidebar", () => ({ AppSidebar: () => null }));
+vi.mock("@/components/AppSidebar", () => ({
+  AppSidebar: ({ onSelectView }: { onSelectView: (view: "clients") => void }) => (
+    <button type="button" onClick={() => onSelectView("clients")}>
+      Clients
+    </button>
+  ),
+}));
 vi.mock("@/components/PendingApprovals", () => ({ PendingApprovals: () => null }));
 vi.mock("@/components/QuarantineAlert", () => ({ QuarantineAlert: () => null }));
 
@@ -109,5 +116,47 @@ describe("App onboarding probe wiring", () => {
     // ...and no trailing probeServers pass was queued behind it.
     await act(async () => {});
     expect(probeServers).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("App health visibility", () => {
+  it("keeps the backend warning visible after navigating away from Servers", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    probeServers.mockRejectedValue(new Error("backend unavailable"));
+
+    render(<App />);
+
+    expect(await screen.findByText(/backend didn't respond/i)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Clients" }));
+    expect(screen.getByText(/backend didn't respond/i)).toBeInTheDocument();
+  });
+
+  it("keeps an enabled server with no health result out of Ready", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    getRegistry.mockResolvedValue({
+      version: 1,
+      servers: [
+        {
+          id: "server-1",
+          name: "Unchecked server",
+          transport: "stdio",
+          command: "example",
+          args: [],
+          env: [],
+          url: null,
+          source: "manual",
+        },
+      ],
+      profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
+      activeProfileId: "default",
+    });
+    probeServers.mockResolvedValue([]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("button", { name: /checking 1/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
   });
 });

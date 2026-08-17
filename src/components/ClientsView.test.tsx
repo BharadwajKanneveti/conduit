@@ -46,6 +46,55 @@ describe("ClientsView", () => {
     expect(rows[1]).toHaveTextContent("Ready to connect");
   });
 
+  it("does not describe a customized gateway entry as connected", () => {
+    render(
+      <ClientsView
+        clients={[
+          client({
+            gatewayInstalled: true,
+            entryState: "customized",
+          }),
+        ]}
+        registry={null}
+        onSelectClient={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("Custom configuration")).toBeInTheDocument();
+    expect(screen.getByText("1 using custom configuration.")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Your installed clients are connected to Toolport."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("mentions config-read errors alongside connected clients", () => {
+    render(
+      <ClientsView
+        clients={[
+          client({
+            id: "claude-desktop",
+            name: "Claude Desktop",
+            gatewayInstalled: true,
+            entryState: "managed",
+          }),
+          client({
+            id: "cursor",
+            name: "Cursor",
+            error: "invalid JSON",
+          }),
+        ]}
+        registry={null}
+        onSelectClient={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("1 client connected")).toBeInTheDocument();
+    expect(screen.getByText("1 config read needs attention.")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Your installed clients are connected to Toolport."),
+    ).not.toBeInTheDocument();
+  });
+
   it("opens the selected client", async () => {
     const onSelectClient = vi.fn();
     render(
@@ -94,6 +143,13 @@ describe("ClientsView", () => {
 
     expect(screen.getByText("No AI clients detected")).toBeInTheDocument();
     expect(screen.getByText(/install claude desktop/i)).toBeInTheDocument();
+  });
+
+  it("shows loading placeholders before client detection completes", () => {
+    render(<ClientsView clients={[]} registry={null} loading onSelectClient={vi.fn()} />);
+
+    expect(screen.getByLabelText("Loading AI clients")).toBeInTheDocument();
+    expect(screen.queryByText("No AI clients detected")).not.toBeInTheDocument();
   });
 
   it("explains an inventory containing only clients that are not installed", () => {

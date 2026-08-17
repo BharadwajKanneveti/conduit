@@ -270,7 +270,7 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
           {/* Scoped to the current set, so a NEW quarantine re-opens the card rather
               than inheriting an earlier dismissal. */}
           <Button size="sm" variant="ghost" onClick={() => setDismissedFor(signature)}>
-            Review later
+            Dismiss
           </Button>
         </div>
       </div>

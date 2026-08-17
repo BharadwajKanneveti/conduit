@@ -4,12 +4,14 @@ import { ClientLogo } from "@/components/ClientLogo";
 import { Badge } from "@/components/ui/badge";
 import { EmptyState } from "@/components/ui/empty-state";
 import { SectionHeader } from "@/components/ui/section-header";
+import { Skeleton } from "@/components/ui/skeleton";
 import { importableServers, type DetectedClient, type Registry } from "@/lib/types";
 
-type ClientStatus = "connected" | "ready" | "error" | "missing";
+type ClientStatus = "connected" | "ready" | "customized" | "error" | "missing";
 
 function statusOf(client: DetectedClient): ClientStatus {
   if (client.error) return "error";
+  if (client.entryState === "customized") return "customized";
   if (client.gatewayInstalled) return "connected";
   if (client.appPresent) return "ready";
   return "missing";
@@ -22,10 +24,12 @@ function sortClients(clients: DetectedClient[]): DetectedClient[] {
         return 0;
       case "ready":
         return 1;
-      case "error":
+      case "customized":
         return 2;
-      case "missing":
+      case "error":
         return 3;
+      case "missing":
+        return 4;
     }
   };
   return [...clients].sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
@@ -37,6 +41,8 @@ function StatusBadge({ status }: { status: ClientStatus }) {
       return <Badge variant="success">Connected</Badge>;
     case "ready":
       return <Badge variant="info">Ready to connect</Badge>;
+    case "customized":
+      return <Badge variant="warning">Custom configuration</Badge>;
     case "error":
       return <Badge variant="warning">Couldn&apos;t read config</Badge>;
     case "missing":
@@ -100,10 +106,12 @@ function ClientRow({
 export function ClientsView({
   clients,
   registry,
+  loading = false,
   onSelectClient,
 }: {
   clients: DetectedClient[];
   registry: Registry | null;
+  loading?: boolean;
   onSelectClient: (id: string) => void;
 }) {
   const [showMissing, setShowMissing] = useState(false);
@@ -112,6 +120,25 @@ export function ClientsView({
   const missing = sorted.filter((client) => statusOf(client) === "missing");
   const connected = present.filter((client) => statusOf(client) === "connected").length;
   const ready = present.filter((client) => statusOf(client) === "ready").length;
+  const customized = present.filter((client) => statusOf(client) === "customized").length;
+  const errors = present.filter((client) => statusOf(client) === "error").length;
+  const allConnected = present.length > 0 && connected === present.length;
+  const summaryIssues = [
+    customized > 0 ? `${customized} using custom configuration` : null,
+    errors > 0
+      ? `${errors} config read${errors === 1 ? "" : "s"} need${errors === 1 ? "s" : ""} attention`
+      : null,
+  ].filter((part): part is string => part !== null);
+
+  if (loading && clients.length === 0) {
+    return (
+      <div className="flex flex-col gap-2" aria-label="Loading AI clients">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <Skeleton key={i} className="h-14 w-full rounded-lg" />
+        ))}
+      </div>
+    );
+  }
 
   if (clients.length === 0) {
     return (
@@ -134,23 +161,39 @@ export function ClientsView({
         />
       )}
 
-      {connected + ready > 0 && (
-        <div className="flex items-center gap-3 rounded-xl border border-success/20 bg-success/5 px-4 py-3">
-          <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-success/10 text-success">
+      {present.length > 0 && (
+        <div
+          className={`flex items-center gap-3 rounded-xl border px-4 py-3 ${
+            allConnected
+              ? "border-success/20 bg-success/5"
+              : "border-border/70 bg-card/40"
+          }`}
+        >
+          <div
+            className={`grid size-8 shrink-0 place-items-center rounded-lg ${
+              allConnected
+                ? "bg-success/10 text-success"
+                : "bg-muted text-muted-foreground"
+            }`}
+          >
             <MonitorCog className="size-4" />
           </div>
           <div>
             <p className="text-sm font-semibold">
-              {connected === 0
-                ? `${ready} client${ready === 1 ? "" : "s"} ready to connect`
-                : `${connected} client${connected === 1 ? "" : "s"} connected`}
+              {allConnected || connected > 0
+                ? `${connected} client${connected === 1 ? "" : "s"} connected`
+                : ready > 0
+                  ? `${ready} client${ready === 1 ? "" : "s"} ready to connect`
+                  : `${present.length} installed client${present.length === 1 ? "" : "s"}`}
             </p>
             <p className="text-xs text-muted-foreground">
-              {connected > 0 && ready > 0
-                ? `${ready} more installed and ready when you are.`
-                : connected > 0
-                  ? "Your installed clients are connected to Toolport."
-                  : "Choose a client below to connect it to Toolport."}
+              {allConnected
+                ? "Your installed clients are connected to Toolport."
+                : summaryIssues.length > 0
+                  ? `${summaryIssues.join(". ")}.`
+                  : connected > 0 && ready > 0
+                    ? `${ready} more installed and ready when you are.`
+                    : "Choose a client below to connect it to Toolport."}
             </p>
           </div>
         </div>
