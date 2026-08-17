@@ -10916,8 +10916,10 @@ rules:
         let _xdg = EnvRestore::set("XDG_CONFIG_HOME", &xdg_config);
         let _goose_root = EnvRestore::set("GOOSE_PATH_ROOT", Path::new(""));
 
-        let goose = client_rules_target("goose").expect("goose has a rules target");
-        let zed = client_rules_target("zed").expect("zed has a rules target");
+        let goose = client_rules_target("goose", crate::instructions::Scope::Team)
+            .expect("goose has a rules target");
+        let zed = client_rules_target("zed", crate::instructions::Scope::Team)
+            .expect("zed has a rules target");
         let goose_config = client_config_path("goose").expect("goose config");
         let zed_config = client_config_path("zed").expect("zed config");
 
