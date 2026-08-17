@@ -908,29 +908,23 @@ fn installed_rules_targets() -> Vec<crate::instructions::Target> {
         .collect()
 }
 
-/// True when a current target is a path we have never written AND does not already hold the
-/// current block. That is the signature of a RELOCATED rules file: the org text is unchanged, so
-/// the hash skip in [`apply_instructions_to`] would fire, but a release moved where the client
-/// reads its rules from (Goose/Zed following `XDG_CONFIG_HOME` or `GOOSE_PATH_ROOT`, SBS-899).
-/// Without this a member who upgrades in place keeps the block at the OLD path forever and
-/// coverage reports Stale until an admin happens to edit the text.
+/// True when a current target does not hold the current block. This bypasses the content hash
+/// skip both when a release relocates a rules file and when a previously refused rewrite becomes
+/// writable again. Without it, a retained last-good path stays on the old content forever after
+/// a shadow file is removed or a transient write error clears.
 ///
 /// Reusing `current_state` keeps the check from spinning the sync loop: a target that can never
-/// be written (a Codex shadow file, an over-cap Windsurf file) never lands in the recorded set,
-/// but it reports `BlockedOverride` / `TooLong` rather than `Stale`, so it is not read as a
-/// relocation and does not make every cycle rewrite every rules file.
-fn targets_relocated(
+/// be written reports `BlockedOverride` / `TooLong` rather than `Stale`, so it does not make
+/// every cycle rewrite every rules file.
+fn targets_need_apply(
     team_id: &str,
     version: i64,
     content: &str,
     targets: &[crate::instructions::Target],
-    recorded: &[String],
 ) -> bool {
     use crate::instructions::{self, ApplyState};
     targets.iter().any(|target| {
-        let key = target.path.to_string_lossy().to_string();
-        !recorded.iter().any(|old| *old == key)
-            && instructions::current_state(target, team_id, version, content) == ApplyState::Stale
+        instructions::current_state(target, team_id, version, content) == ApplyState::Stale
     })
 }
 
@@ -939,7 +933,7 @@ fn targets_relocated(
 /// must never affect the already-applied, already-saved server config. Skips entirely when the
 /// org content is unchanged since the last write (hash match) and every client's rules file is
 /// still at the path we wrote it to, so the ~25s sync loop only ever touches rules files when an
-/// admin actually edits the instructions or a target moves ([`targets_relocated`]).
+/// admin actually edits the instructions or a target needs repair ([`targets_need_apply`]).
 fn apply_instructions(team_id: &str, version: i64, desired: Option<&str>) {
     apply_instructions_to(team_id, version, desired, &installed_rules_targets());
 }
@@ -979,14 +973,12 @@ fn apply_instructions_to(
         },
         Err(_) => return,
     };
-    // Skip only when the content AND the target paths are both unchanged. A release that moves
-    // where a client reads its rules from (Goose/Zed under XDG, SBS-899) leaves the org text
-    // identical, so the content check on its own would return here and strand an existing
-    // member's block at the old path until an admin happened to edit the instructions.
-    let relocated = desired.is_some_and(|content| {
-        targets_relocated(team_id, version, content, targets, &prev_targets)
-    });
-    if desired == prev_content.as_deref() && !relocated {
+    // Skip only when the content is unchanged and every target already holds it. A moved target
+    // or a refusal that has since cleared leaves the org text identical but its current state
+    // Stale, so the content check alone would strand the old block.
+    let needs_apply =
+        desired.is_some_and(|content| targets_need_apply(team_id, version, content, targets));
+    if desired == prev_content.as_deref() && !needs_apply {
         return; // content unchanged and every target is still where we left it, so there is
                 // nothing to write or clean up (coverage is re-checked and reported every cycle
                 // by `report_instructions_status`, independent of this)
@@ -2165,7 +2157,7 @@ mod tests {
             path: blocked_path.clone(),
             strategy: Strategy::SentinelBlock,
             char_cap: None,
-            blocked_if_present: Some(shadow),
+            blocked_if_present: Some(shadow.clone()),
         };
         apply_instructions_to(TEAM, 4, Some(V2), std::slice::from_ref(&blocked_target));
         let on_disk = std::fs::read_to_string(&blocked_path).unwrap_or_default();
@@ -2175,6 +2167,14 @@ mod tests {
             "BlockedOverride must leave last-good v1 on disk: {on_disk:?}"
         );
         assert_eq!(recorded, vec![blocked_path.to_string_lossy().to_string()]);
+
+        std::fs::remove_file(&shadow).unwrap();
+        apply_instructions_to(TEAM, 4, Some(V2), std::slice::from_ref(&blocked_target));
+        let retried = std::fs::read_to_string(&blocked_path).unwrap_or_default();
+        assert!(
+            retried.contains(V2) && !retried.contains(V1),
+            "the same v2 must be retried after the override refusal lifts: {retried:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&scratch);
     }
