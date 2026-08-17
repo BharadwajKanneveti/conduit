@@ -6,6 +6,19 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Fixed
+
+- **HITL and routine audit rows no longer count as successful tool calls.**
+  Prometheus `toolport_tool_calls_total`, Activity "calls logged", and team
+  showback `calls` treated every `audit.jsonl` line as a routed call and a
+  missing `ok` as success. An approved human-approval gate writes a
+  `kind:approval` decision (`ok:true` on purpose, so a deny stays out of the
+  error rate) plus the timed exec, so one approval showed as two successful
+  calls. Advisor / suggestion / candidate lines omit `ok` and were counted as
+  successes while the Activity list painted them as failures. Aggregators now
+  require `ok` to be present and skip `kind` in {approval, routine, advisor,
+  suggestion, candidate}. (SBS-932)
+
 ### Removed
 
 - **Toolport Studio is no longer a supported client.** The project is discontinued, so
