@@ -836,6 +836,66 @@ const STDERR_TAIL_CAP: usize = 4096;
 /// or broken server can't stream gigabytes to exhaust gateway memory. Generous: real
 /// MCP responses are tiny.
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Bound a `read_line` so a newline-less write cannot grow `line` without
+/// limit. Same cap and stop rule as the stdout drain (SBS-930).
+fn read_capped_line<R: BufRead>(
+    reader: &mut R,
+    line: &mut String,
+    max_bytes: u64,
+) -> std::io::Result<usize> {
+    reader.take(max_bytes).read_line(line)
+}
+
+fn is_unterminated_capped_line(n: usize, line: &str, max_bytes: u64) -> bool {
+    n as u64 >= max_bytes && !line.ends_with('\n')
+}
+
+/// Keep the most recent `tail_cap` bytes of a child's stderr for error
+/// reporting. The *read* that feeds this must itself be bounded; this only
+/// trims what we retain after a line is already in memory.
+fn append_stderr_tail(buf: &Mutex<String>, line: &str, tail_cap: usize) {
+    if let Ok(mut guard) = buf.lock() {
+        guard.push_str(line);
+        if guard.len() > tail_cap {
+            let cut = guard.len() - tail_cap;
+            guard.drain(..cut);
+        }
+    }
+}
+
+/// Drain stderr line-by-line into `buf`. Each read is capped at `read_cap`
+/// (the same `take` stdout uses). An unterminated full-cap line is treated
+/// as abuse / a broken server: we keep the truncated prefix in the tail and
+/// stop, so a multi-GB newline-less write cannot OOM the gateway.
+///
+/// Returns the largest `line` length observed, so tests can prove the
+/// read itself is bounded — `STDERR_TAIL_CAP` alone would hide the leak.
+fn drain_stderr_bounded<R: BufRead>(
+    mut reader: R,
+    buf: &Mutex<String>,
+    read_cap: u64,
+    tail_cap: usize,
+) -> usize {
+    let mut line = String::new();
+    let mut max_line = 0;
+    loop {
+        line.clear();
+        match read_capped_line(&mut reader, &mut line, read_cap) {
+            Ok(0) => break,
+            Ok(n) => {
+                max_line = max_line.max(line.len());
+                append_stderr_tail(buf, &line, tail_cap);
+                if is_unterminated_capped_line(n, &line, read_cap) {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    max_line
+}
+
 /// Bound paginated MCP catalog traversal so a malicious server cannot keep the
 /// gateway in an infinite cursor chain or grow its in-memory catalog without limit.
 const MAX_LIST_PAGES: usize = 1_000;
@@ -3241,10 +3301,10 @@ impl StdioTransport {
                 // grow this String without limit (a plain `read_line` would). `take`
                 // stops at the cap; a full-cap line with no terminator is a protocol
                 // violation, so we close the connection.
-                match (&mut reader).take(MAX_RESPONSE_BYTES).read_line(&mut line) {
+                match read_capped_line(&mut reader, &mut line, MAX_RESPONSE_BYTES) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if n as u64 >= MAX_RESPONSE_BYTES && !line.ends_with('\n') {
+                        if is_unterminated_capped_line(n, &line, MAX_RESPONSE_BYTES) {
                             eprintln!(
                                 "toolport: downstream emitted an unterminated line >= {MAX_RESPONSE_BYTES} bytes; closing connection"
                             );
@@ -3268,25 +3328,18 @@ impl StdioTransport {
 
         // Drain stderr into a shared buffer, capped so a chatty server can't grow
         // it without bound. We keep the most recent output (where the fatal error
-        // usually is).
+        // usually is). The *read* is bounded the same way as stdout: STDERR_TAIL_CAP
+        // only trims after a line is in memory, so a newline-less write used to
+        // grow `line` without limit (SBS-930).
         let stderr_buf = Arc::new(Mutex::new(String::new()));
         let stderr_writer = Arc::clone(&stderr_buf);
         std::thread::spawn(move || {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            while let Ok(n) = reader.read_line(&mut line) {
-                if n == 0 {
-                    break;
-                }
-                if let Ok(mut buf) = stderr_writer.lock() {
-                    buf.push_str(&line);
-                    if buf.len() > STDERR_TAIL_CAP {
-                        let cut = buf.len() - STDERR_TAIL_CAP;
-                        buf.drain(..cut);
-                    }
-                }
-                line.clear();
-            }
+            drain_stderr_bounded(
+                BufReader::new(stderr),
+                &stderr_writer,
+                MAX_RESPONSE_BYTES,
+                STDERR_TAIL_CAP,
+            );
         });
 
         Ok(StdioTransport {
@@ -11712,5 +11765,40 @@ mod tests {
             &protocol_meta_for("2026-07-28"),
             "declaring nothing must not alter the standard per-request meta"
         );
+    }
+
+    /// SBS-930. `STDERR_TAIL_CAP` only trims the *kept* buffer after `read_line`
+    /// returns. A newline-less write larger than the read cap must stop at the
+    /// cap instead of growing the line String to the full payload. The returned
+    /// max line length is the leak: the kept tail would look fine either way.
+    #[test]
+    fn newline_less_stderr_write_stops_at_the_read_cap() {
+        let payload = vec![b'x'; 1024];
+        let mut reader = std::io::Cursor::new(payload);
+        let buf = Mutex::new(String::new());
+        let max_line = super::drain_stderr_bounded(&mut reader, &buf, 64, 16);
+        assert!(
+            max_line <= 64,
+            "line grew to {max_line} bytes; unbounded read_line would take the full 1024"
+        );
+        assert_eq!(
+            reader.position(),
+            64,
+            "drain must stop at the cap, not slurp the rest of the blob"
+        );
+        let kept = buf.lock().unwrap();
+        assert!(kept.len() <= 16, "kept tail grew to {}", kept.len());
+        assert!(kept.chars().all(|c| c == 'x'));
+    }
+
+    /// Ordinary newline-terminated stderr still lands in the tail, and a chatty
+    /// server is still trimmed to the most recent bytes.
+    #[test]
+    fn stderr_tail_keeps_the_most_recent_bytes() {
+        let reader = std::io::Cursor::new(b"aaaa\nbbbb\ncccc\n");
+        let buf = Mutex::new(String::new());
+        let max_line = super::drain_stderr_bounded(reader, &buf, 1024, 8);
+        assert!(max_line <= 5, "each line is 5 bytes including newline");
+        assert_eq!(buf.lock().unwrap().as_str(), "bb\ncccc\n");
     }
 }
