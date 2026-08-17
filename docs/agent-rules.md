@@ -26,6 +26,16 @@ Either way, your own instructions are never overwritten. Turning a client off, o
 deleting the active set, removes what Toolport wrote and leaves the rest of the
 file alone.
 
+Deleting the set that is currently applied clears the selection rather than
+promoting another one, so nothing is pushed to your clients that you did not pick.
+Deleting any other set changes nothing on disk.
+
+One thing Toolport will not store: rules containing its own marker comments
+(`toolport:rules:start` and friends). It uses those to find the block it owns, so
+it refuses the save and tells you. This only comes up if you copy out of the
+preview pane, which shows the finished file including the markers. Copy just your
+own text.
+
 ## Before anything is written
 
 - **Every client starts switched off.** Nothing is written until you tick a client
@@ -33,7 +43,9 @@ file alone.
   the sidebar: that one connects a client to the MCP gateway and has nothing to do
   with rules.)
 - **Preview shows the exact bytes.** Each client has a Preview button that renders
-  the file Toolport would write, without writing it.
+  the file Toolport would write, without writing it. It reflects whatever is in the
+  editor, saved or not, and previewing never saves: a save applies to every client
+  you have switched on, so it would defeat the point.
 
 ## Supported clients
 
