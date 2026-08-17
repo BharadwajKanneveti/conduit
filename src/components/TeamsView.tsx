@@ -45,7 +45,7 @@ const INSTR_STATE_META: Record<
   { label: string; className: string; Icon: typeof Check }
 > = {
   applied: { label: "Applied", className: "text-success", Icon: Check },
-  stale: { label: "Not applied yet", className: "text-warning", Icon: Clock },
+  stale: { label: "Pending sync", className: "text-info", Icon: Clock },
   blocked_override: {
     label: "Blocked by a local override",
     className: "text-warning",

@@ -9,7 +9,10 @@ import {
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
+  ArrowLeft,
   ChevronDown,
+  CircleCheck,
+  KeyRound,
   MoreHorizontal,
   Download,
   Plus,
@@ -74,6 +77,9 @@ const Onboarding = lazy(() =>
 );
 const ClientDetail = lazy(() =>
   import("@/components/ClientDetail").then((m) => ({ default: m.ClientDetail })),
+);
+const ClientsView = lazy(() =>
+  import("@/components/ClientsView").then((m) => ({ default: m.ClientsView })),
 );
 const ActivityView = lazy(() =>
   import("@/components/ActivityView").then((m) => ({ default: m.ActivityView })),
@@ -479,12 +485,12 @@ function App() {
     };
   }, [teamId]);
 
-  function selectClient(id: string | null) {
+  function selectClient(id: string) {
     setSelectedClientId(id);
-    setView("servers");
+    setView("clients");
   }
 
-  // Catalog and Activity are top-level destinations, so leave any selected client.
+  // Top-level destinations leave any selected client detail behind.
   function selectView(v: View) {
     setSelectedClientId(null);
     setView(v);
@@ -560,7 +566,12 @@ function App() {
   const enabledCount = registry
     ? servers.filter((s) => isEnabled(registry, s.id)).length
     : 0;
-  const connectedCount = servers.filter((s) => health[s.id]?.ok).length;
+  // Probe results can outlive a profile toggle, so only count servers that are
+  // still enabled. Otherwise a newly disabled server makes the posture claim
+  // more reachable "enabled servers" than the profile actually contains.
+  const connectedCount = registry
+    ? servers.filter((s) => isEnabled(registry, s.id) && health[s.id]?.ok).length
+    : 0;
 
   // Bucket each server so the list can lead with what needs action. A server
   // needs attention when it's enabled but its probe failed (auth or error).
@@ -570,7 +581,11 @@ function App() {
     const h = health[s.id];
     return h && !h.ok ? "attention" : "active";
   };
-  const attentionCount = servers.filter((s) => groupOf(s) === "attention").length;
+  const attentionServers = servers.filter((s) => groupOf(s) === "attention");
+  const attentionCount = attentionServers.length;
+  const checkedCount = registry
+    ? servers.filter((s) => isEnabled(registry, s.id) && health[s.id]).length
+    : 0;
 
   const q = query.trim().toLowerCase();
   const matches = (s: ServerEntry) =>
@@ -587,6 +602,11 @@ function App() {
     active: visible.filter((s) => groupOf(s) === "active").sort(byName),
     disabled: visible.filter((s) => groupOf(s) === "disabled").sort(byName),
   };
+  // The posture and next action summarize the profile, not the current search.
+  // Keep these counts independent of `visible` so a filter cannot produce a
+  // misleading "0 servers" action while hiding an affected row.
+  const authAttention = attentionServers.filter((s) => health[s.id]?.authRequired);
+  const errorAttention = attentionServers.filter((s) => !health[s.id]?.authRequired);
 
   // Count what would actually be imported: drop the gateway entry and anything
   // already in the registry, then dedupe by name across clients (the backend
@@ -769,11 +789,8 @@ function App() {
     <TooltipProvider delayDuration={200}>
       <div className="flex h-screen overflow-hidden bg-background text-foreground">
         <AppSidebar
-          clients={clients}
           registry={registry}
           onRegistryChange={setRegistry}
-          selectedClientId={selectedClientId}
-          onSelectClient={selectClient}
           view={view}
           onSelectView={selectView}
           onReplayOnboarding={() => {
@@ -785,18 +802,26 @@ function App() {
         <main className="flex min-w-0 flex-1 flex-col">
           <header className="flex items-center justify-between gap-4 border-b px-6 py-4">
             <div className="flex min-w-0 flex-1 items-center gap-3">
-              {view !== "activity" &&
-                view !== "catalog" &&
-                view !== "playground" &&
-                view !== "teams" &&
-                view !== "settings" &&
-                selectedClient && (
+              {view === "clients" && selectedClient && (
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="-ml-2 text-muted-foreground"
+                    onClick={() => selectView("clients")}
+                    aria-label="Back to clients"
+                  >
+                    <ArrowLeft className="size-4" />
+                    Clients
+                  </Button>
+                  <div className="h-7 w-px bg-border" aria-hidden="true" />
                   <ClientLogo
                     id={selectedClient.id}
                     name={selectedClient.name}
                     size={32}
                   />
-                )}
+                </>
+              )}
               <div className="min-w-0">
                 <h1 className="truncate text-lg font-semibold tracking-tight">
                   {view === "activity"
@@ -809,8 +834,8 @@ function App() {
                           ? "Teams"
                           : view === "settings"
                             ? "Settings"
-                            : selectedClient
-                              ? selectedClient.name
+                            : view === "clients"
+                              ? (selectedClient?.name ?? "Clients")
                               : "Servers"}
                 </h1>
                 <p className="truncate text-sm text-muted-foreground">
@@ -824,8 +849,10 @@ function App() {
                           ? "Share one MCP server set across your team"
                           : view === "settings"
                             ? "Global discovery and security policy"
-                            : selectedClient
-                              ? "MCP client"
+                            : view === "clients"
+                              ? selectedClient
+                                ? "MCP client"
+                                : "Manage Toolport in your installed AI tools"
                               : loading || !registry
                                 ? "Loading…"
                                 : "One gateway in front of every MCP server you run"}
@@ -833,7 +860,7 @@ function App() {
               </div>
             </div>
             <div className="flex shrink-0 items-center gap-2">
-              {view === "servers" && !selectedClient && (
+              {view === "servers" && (
                 <>
                   <div className="relative">
                     <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -924,7 +951,7 @@ function App() {
             </div>
           </header>
 
-          {!backendReachable && (
+          {view === "servers" && !backendReachable && (
             <Callout
               variant="warning"
               role="status"
@@ -962,7 +989,22 @@ function App() {
                     </div>
                   }
                 >
-                  {view === "activity" ? (
+                  {view === "clients" ? (
+                    selectedClient ? (
+                      <ClientDetail
+                        client={selectedClient}
+                        registry={registry}
+                        onChanged={load}
+                        onRegistryChange={setRegistry}
+                      />
+                    ) : (
+                      <ClientsView
+                        clients={clients}
+                        registry={registry}
+                        onSelectClient={selectClient}
+                      />
+                    )
+                  ) : view === "activity" ? (
                     <ActivityView refreshKey={activityKey} registry={registry} />
                   ) : view === "catalog" ? (
                     <CatalogView registry={registry} onAdded={setRegistry} />
@@ -972,13 +1014,6 @@ function App() {
                     <TeamsView registry={registry} onRegistryChange={setRegistry} />
                   ) : view === "settings" ? (
                     <SettingsView registry={registry} onRegistryChange={setRegistry} />
-                  ) : selectedClient ? (
-                    <ClientDetail
-                      client={selectedClient}
-                      registry={registry}
-                      onChanged={load}
-                      onRegistryChange={setRegistry}
-                    />
                   ) : loading && registry === null ? (
                     <div className="flex flex-col gap-2">
                       {Array.from({ length: 6 }).map((_, i) => (
@@ -1009,29 +1044,29 @@ function App() {
                     </div>
                   ) : (
                     <div className="flex flex-col gap-5">
-                      <StatusBar
-                        total={servers.length}
+                      <ServerPosture
+                        backendReachable={backendReachable}
+                        probing={probing}
+                        enabled={enabledCount}
+                        checked={checkedCount}
                         connected={connectedCount}
                         attention={attentionCount}
                         disabled={servers.length - enabledCount}
                       />
-                      <ServerGroup
-                        title="Needs attention"
-                        dot="bg-warning"
-                        count={grouped.attention.length}
-                      >
+                      {backendReachable && attentionCount > 0 && (
+                        <ServerNextAction
+                          authServers={authAttention}
+                          errorServers={errorAttention}
+                        />
+                      )}
+                      <ServerGroup title="To finish" count={grouped.attention.length}>
                         {grouped.attention.map(serverRow)}
                       </ServerGroup>
-                      <ServerGroup
-                        title="Active"
-                        dot="bg-success"
-                        count={grouped.active.length}
-                      >
+                      <ServerGroup title="Ready" count={grouped.active.length}>
                         {grouped.active.map(serverRow)}
                       </ServerGroup>
                       <ServerGroup
                         title="Disabled"
-                        dot="bg-muted-foreground/40"
                         count={grouped.disabled.length}
                         defaultCollapsed
                       >
@@ -1174,48 +1209,150 @@ function App() {
   );
 }
 
-/** At-a-glance server health as a row of chips: the primary status summary, promoted out
- * of the grey header caption into a scannable status bar with the same semantic dots the
- * groups use. */
-function StatusBar({
-  total,
+/** A factual reachability baseline. Security posture remains in Settings; this only
+ * summarizes the health probe and never presents a stale or partial check as healthy. */
+export function serverPostureCopy({
+  backendReachable,
+  probing,
+  enabled,
+  checked,
   connected,
   attention,
   disabled,
 }: {
-  total: number;
+  backendReachable: boolean;
+  probing: boolean;
+  enabled: number;
+  checked: number;
   connected: number;
   attention: number;
   disabled: number;
 }) {
-  const chip =
-    "inline-flex items-center gap-2 rounded-full border border-border/60 bg-card/50 px-3 py-1.5 text-xs font-semibold";
-  const dot = "size-1.5 rounded-full";
+  const complete = enabled > 0 && checked === enabled && !probing;
+  const healthy = backendReachable && complete && attention === 0;
+  const title = !backendReachable
+    ? "Reachability status unavailable"
+    : enabled === 0
+      ? "No servers enabled"
+      : probing || checked < enabled
+        ? "Checking server reachability"
+        : attention === 0
+          ? `${connected} enabled server${connected === 1 ? "" : "s"} reachable`
+          : `${connected} of ${enabled} enabled servers reachable`;
+  const detail = !backendReachable
+    ? connected > 0
+      ? `Last known: ${connected} reachable. Status may be out of date.`
+      : "The last health check did not complete."
+    : enabled === 0
+      ? `${disabled} server${disabled === 1 ? "" : "s"} disabled in this profile.`
+      : probing || checked < enabled
+        ? `${checked} of ${enabled} checked so far.`
+        : attention > 0
+          ? `${attention} need${attention === 1 ? "s" : ""} a quick check.`
+          : disabled > 0
+            ? `${disabled} disabled in this profile.`
+            : "Everything enabled in this profile is ready.";
+  return { healthy, title, detail };
+}
+
+function ServerPosture({
+  backendReachable,
+  probing,
+  enabled,
+  checked,
+  connected,
+  attention,
+  disabled,
+}: {
+  backendReachable: boolean;
+  probing: boolean;
+  enabled: number;
+  checked: number;
+  connected: number;
+  attention: number;
+  disabled: number;
+}) {
+  const { healthy, title, detail } = serverPostureCopy({
+    backendReachable,
+    probing,
+    enabled,
+    checked,
+    connected,
+    attention,
+    disabled,
+  });
+
   return (
-    <div className="flex flex-wrap gap-2">
-      <span className={chip}>
-        <span className="tabular-nums">{total}</span>
-        <span className="font-normal text-muted-foreground">servers</span>
-      </span>
-      <span className={chip}>
-        <span className={`${dot} bg-success`} />
-        <span className="tabular-nums">{connected}</span>
-        <span className="font-normal text-muted-foreground">connected</span>
-      </span>
-      {attention > 0 && (
-        <span className={`${chip} border-warning/40`}>
-          <span className={`${dot} bg-warning`} />
-          <span className="tabular-nums">{attention}</span>
-          <span className="font-normal text-muted-foreground">
-            need{attention === 1 ? "s" : ""} attention
-          </span>
-        </span>
-      )}
-      <span className={chip}>
-        <span className={`${dot} bg-muted-foreground/40`} />
-        <span className="tabular-nums">{disabled}</span>
-        <span className="font-normal text-muted-foreground">disabled</span>
-      </span>
+    <div
+      role="status"
+      className={`flex items-center gap-3 rounded-xl border px-4 py-3 ${
+        healthy ? "border-success/20 bg-success/5" : "border-border/70 bg-card/40"
+      }`}
+    >
+      <div
+        className={`grid size-8 shrink-0 place-items-center rounded-lg ${
+          healthy
+            ? "bg-success/10 text-success"
+            : probing
+              ? "bg-info/10 text-info"
+              : "bg-muted text-muted-foreground"
+        }`}
+      >
+        {healthy ? (
+          <CircleCheck className="size-4" />
+        ) : (
+          <RefreshCw className={`size-4 ${probing ? "animate-spin" : ""}`} />
+        )}
+      </div>
+      <div>
+        <p className="text-sm font-semibold">{title}</p>
+        <p className="text-xs text-muted-foreground">{detail}</p>
+      </div>
+    </div>
+  );
+}
+
+/** One page-level owner for the next useful action. The rows below retain the
+ * controls and evidence, but no longer compete with multiple warning summaries. */
+function ServerNextAction({
+  authServers,
+  errorServers,
+}: {
+  authServers: ServerEntry[];
+  errorServers: ServerEntry[];
+}) {
+  const authCount = authServers.length;
+  const errorCount = errorServers.length;
+  const title =
+    authCount === 1 && errorCount === 0
+      ? `Sign in to ${authServers[0].name}`
+      : authCount > 0 && errorCount === 0
+        ? `Sign in to ${authCount} servers`
+        : errorCount === 1 && authCount === 0
+          ? `${errorServers[0].name} couldn't start`
+          : errorCount > 0 && authCount === 0
+            ? `${errorCount} servers couldn't start`
+            : `${authCount + errorCount} servers need a quick check`;
+  const detail =
+    authCount > 0 && errorCount === 0
+      ? "Use Authenticate below to finish setup. Everything else stays available."
+      : errorCount > 0 && authCount === 0
+        ? "Open the affected rows below for the error and recovery details."
+        : `${authCount} need sign-in; ${errorCount} couldn't start. The other servers stay available.`;
+
+  return (
+    <div className="flex items-start gap-3 rounded-xl border border-warning/25 bg-card/45 px-4 py-3">
+      <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-warning/10 text-warning">
+        {authCount > 0 && errorCount === 0 ? (
+          <KeyRound className="size-4" />
+        ) : (
+          <TriangleAlert className="size-4" />
+        )}
+      </div>
+      <div>
+        <p className="text-sm font-semibold">{title}</p>
+        <p className="text-xs text-muted-foreground">{detail}</p>
+      </div>
     </div>
   );
 }
@@ -1225,13 +1362,11 @@ function StatusBar({
  * group; the Disabled bucket starts collapsed. */
 function ServerGroup({
   title,
-  dot,
   count,
   defaultCollapsed = false,
   children,
 }: {
   title: string;
-  dot: string;
   count: number;
   defaultCollapsed?: boolean;
   children: ReactNode;
@@ -1265,7 +1400,6 @@ function ServerGroup({
           }`}
           aria-hidden="true"
         />
-        <span className={`size-2 rounded-full ${dot}`} aria-hidden="true" />
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
           {title}
         </h2>

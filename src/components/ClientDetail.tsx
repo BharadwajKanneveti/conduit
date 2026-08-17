@@ -33,6 +33,7 @@ import {
   type ServerEntry,
 } from "@/lib/types";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Card, CardContent } from "@/components/ui/card";
 import {
   Dialog,
@@ -422,19 +423,24 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
       <div className="flex items-start justify-between gap-4">
         <div className="min-w-0">
           {customized ? (
-            <span className="mb-1 inline-flex items-center gap-1 rounded-full border border-warning/30 bg-warning/10 px-2 py-0.5 text-xs font-medium text-warning">
+            <Badge variant="warning" className="mb-1">
               <TriangleAlert className="size-3" />
               custom configuration
-            </span>
+            </Badge>
           ) : installed ? (
-            <span className="mb-1 inline-flex items-center gap-1 rounded-full border border-success/30 bg-success/10 px-2 py-0.5 text-xs font-medium text-success">
+            <Badge variant="success" className="mb-1">
               <Link2 className="size-3" />
-              connected to Toolport
-            </span>
+              connected
+            </Badge>
+          ) : present ? (
+            <Badge variant="info" className="mb-1">
+              <Monitor className="size-3" />
+              ready to connect
+            </Badge>
           ) : (
-            <span className="mb-1 inline-flex items-center gap-1 rounded-full border border-border bg-muted/40 px-2 py-0.5 text-xs font-medium text-muted-foreground">
-              not connected
-            </span>
+            <Badge variant="outline" className="mb-1 text-muted-foreground">
+              not installed
+            </Badge>
           )}
           <p className="truncate font-mono text-xs text-muted-foreground">
             {client.configExists
@@ -445,8 +451,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
           </p>
           {customized && (
             <p className="mt-1 text-xs text-muted-foreground">
-              Custom configuration - not managed by Toolport. Hand-edited gateway entry is
-              left as-is until you reset it.
+              Toolport is leaving your hand-edited gateway entry as-is. Reset it only if
+              you want Toolport to manage the entry.
             </p>
           )}
           {installed && !customized && (
@@ -461,9 +467,8 @@ export function ClientDetail({ client, registry, onChanged, onRegistryChange }: 
             </p>
           )}
           {!present && !installed && (
-            <p className="mt-1 text-xs text-warning">
-              {client.name} doesn't appear to be installed here. Install it first, then
-              connect.
+            <p className="mt-1 text-xs text-muted-foreground">
+              Install {client.name} on this machine before connecting it to Toolport.
             </p>
           )}
         </div>
@@ -893,14 +898,14 @@ function GatewayFlow({ clientName, servers }: { clientName: string; servers: str
   return (
     <div className="flex flex-wrap items-center justify-center gap-1 rounded-xl border border-border/60 bg-card/40 px-4 py-5">
       <div className="flex flex-col items-center gap-2 text-center">
-        <div className="grid size-14 place-items-center rounded-2xl border border-border bg-secondary text-xl">
+        <div className="grid size-14 place-items-center rounded-xl border border-border bg-secondary text-xl">
           <Monitor className="size-6 text-muted-foreground" />
         </div>
         <div className="text-2xs font-semibold">{clientName}</div>
       </div>
-      <div className={`${link} bg-gradient-to-r from-border to-primary`} />
+      <div className={`${link} bg-border`} />
       <div className="flex flex-col items-center gap-2 text-center">
-        <div className="grid size-16 place-items-center rounded-2xl border border-primary/45 bg-primary/10 shadow-[0_0_0_5px_color-mix(in_oklch,var(--primary)_12%,transparent),0_16px_34px_-16px_color-mix(in_oklch,var(--primary)_50%,transparent)]">
+        <div className="grid size-16 place-items-center rounded-xl border border-primary/35 bg-primary/10">
           <svg width="30" height="30" viewBox="0 0 32 32" aria-hidden="true">
             <circle
               cx="16"
@@ -918,7 +923,7 @@ function GatewayFlow({ clientName, servers }: { clientName: string; servers: str
           <span className="block font-normal text-muted-foreground">gateway</span>
         </div>
       </div>
-      <div className={`${link} bg-gradient-to-r from-primary to-border`} />
+      <div className={`${link} bg-border`} />
       <div className="flex flex-col gap-1">
         {shown.map((s) => (
           <span

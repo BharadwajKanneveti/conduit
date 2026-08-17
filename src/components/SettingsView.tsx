@@ -581,11 +581,11 @@ function PostureSummary({
   blockOnInjection: boolean;
 }) {
   const active = [
-    humanApproval && "human approval required",
-    denyDestructive && "destructive tools blocked",
-    confirmDestructive && "destructive calls confirmed",
-    quarantineOnDrift && "drifted tools quarantined",
-    blockOnInjection && "injection hits blocked",
+    humanApproval && "human approval on",
+    denyDestructive && "destructive tools denied",
+    confirmDestructive && "destructive calls ask first",
+    quarantineOnDrift && "changed tools paused",
+    blockOnInjection && "injection-like output blocked",
   ].filter(Boolean) as string[];
   // A hard gate (block or human-approval) = guarded; softer measures alone = partial.
   const gated = humanApproval || denyDestructive || blockOnInjection;
@@ -595,19 +595,19 @@ function PostureSummary({
       Icon: ShieldCheck,
       ring: "border-success/30 bg-success/5",
       tint: "text-success",
-      label: "Protected",
+      label: "Guardrails active",
     },
     partial: {
       Icon: ShieldAlert,
       ring: "border-warning/35 bg-warning/5",
       tint: "text-warning",
-      label: "Partly protected",
+      label: "Some guardrails active",
     },
     open: {
-      Icon: ShieldX,
-      ring: "border-destructive/35 bg-destructive/5",
-      tint: "text-destructive",
-      label: "Unprotected",
+      Icon: ShieldAlert,
+      ring: "border-warning/35 bg-warning/5",
+      tint: "text-warning",
+      label: "Approval gates are off",
     },
   }[state];
   const { Icon } = meta;
@@ -618,7 +618,7 @@ function PostureSummary({
         <span className={`font-medium ${meta.tint}`}>{meta.label}.</span>{" "}
         <span className="text-muted-foreground">
           {state === "open"
-            ? "No blocking or approval is active, so every tool call runs unattended."
+            ? "Tool calls run without a Toolport approval or blocking gate."
             : `Active: ${active.join(", ")}.`}
         </span>
       </p>

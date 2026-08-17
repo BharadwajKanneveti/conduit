@@ -742,7 +742,7 @@ function ConnectClients({
       {present.length === 0 ? (
         <p className="rounded-md bg-muted/50 px-3 py-2 text-sm text-muted-foreground">
           No clients detected yet. Install Claude Desktop, Cursor, VS Code, or another
-          supported tool, then connect it from the sidebar.
+          supported tool, then connect it from Clients.
         </p>
       ) : (
         <div className="flex flex-col gap-2">

@@ -250,7 +250,7 @@ describe("QuarantineAlert", () => {
     listQuarantined.mockResolvedValue([tool()]);
     render(<QuarantineAlert />);
 
-    await userEvent.click(await screen.findByRole("button", { name: /keep blocked/i }));
+    await userEvent.click(await screen.findByRole("button", { name: /review later/i }));
     expect(screen.queryByRole("region")).not.toBeInTheDocument();
 
     listQuarantined.mockResolvedValue([tool(), tool({ tool: "linear__delete_issue" })]);
@@ -269,7 +269,7 @@ describe("QuarantineAlert", () => {
     listQuarantined.mockResolvedValue([first]);
     render(<QuarantineAlert />);
 
-    await userEvent.click(await screen.findByRole("button", { name: /keep blocked/i }));
+    await userEvent.click(await screen.findByRole("button", { name: /review later/i }));
     expect(screen.queryByRole("region")).not.toBeInTheDocument();
 
     // Released elsewhere, then quarantined again: same tool, same profile, new event.

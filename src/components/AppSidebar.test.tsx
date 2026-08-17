@@ -4,7 +4,6 @@ import userEvent from "@testing-library/user-event";
 import type { ReactNode } from "react";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import type { DetectedClient } from "@/lib/types";
 import { AppSidebar } from "./AppSidebar";
 
 const getSavingsSummary = vi.fn();
@@ -54,23 +53,6 @@ vi.mock("@/components/ShareDialog", () => ({
   ShareDialog: ({ trigger }: { trigger: ReactNode }) => trigger,
 }));
 
-function client(overrides: Partial<DetectedClient> = {}): DetectedClient {
-  return {
-    id: "cursor",
-    name: "Cursor",
-    usesConnectors: false,
-    configPath: "/tmp/cursor.json",
-    configExists: true,
-    appPresent: true,
-    servers: [],
-    pluginServers: [],
-    gatewayInstalled: false,
-    entryState: "absent",
-    error: null,
-    ...overrides,
-  };
-}
-
 beforeEach(() => {
   getSavingsSummary.mockReset();
   listQuarantined.mockReset();
@@ -95,16 +77,13 @@ afterEach(() => {
 });
 
 describe("AppSidebar accessibility", () => {
-  it("names both navigation landmarks and exposes client selection state", () => {
+  it("promotes Clients into the primary navigation", () => {
     render(
       <TooltipProvider>
         <AppSidebar
-          clients={[client()]}
           registry={null}
           onRegistryChange={vi.fn()}
-          selectedClientId="cursor"
-          onSelectClient={vi.fn()}
-          view="servers"
+          view="clients"
           onSelectView={vi.fn()}
           onReplayOnboarding={vi.fn()}
         />
@@ -112,35 +91,11 @@ describe("AppSidebar accessibility", () => {
     );
 
     expect(screen.getByRole("navigation", { name: "Views" })).toBeInTheDocument();
-    expect(screen.getByRole("navigation", { name: "Clients" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /cursor/i })).toHaveAttribute(
+    expect(screen.queryByRole("navigation", { name: "Clients" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Clients" })).toHaveAttribute(
       "aria-current",
       "page",
     );
-  });
-
-  it("exposes whether the not-detected client list is expanded", async () => {
-    render(
-      <TooltipProvider>
-        <AppSidebar
-          clients={[client(), client({ id: "zed", name: "Zed", appPresent: false })]}
-          registry={null}
-          onRegistryChange={vi.fn()}
-          selectedClientId={null}
-          onSelectClient={vi.fn()}
-          view="servers"
-          onSelectView={vi.fn()}
-          onReplayOnboarding={vi.fn()}
-        />
-      </TooltipProvider>,
-    );
-
-    const toggle = screen.getByRole("button", { name: /not detected/i });
-    expect(toggle).toHaveAttribute("aria-expanded", "false");
-
-    await userEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("button", { name: /zed/i })).toBeInTheDocument();
   });
 
   it("rechecks updates when a stale tray-hidden window is shown", async () => {
@@ -150,11 +105,8 @@ describe("AppSidebar accessibility", () => {
     render(
       <TooltipProvider>
         <AppSidebar
-          clients={[client()]}
           registry={null}
           onRegistryChange={vi.fn()}
-          selectedClientId={null}
-          onSelectClient={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
           onReplayOnboarding={vi.fn()}
@@ -178,11 +130,8 @@ describe("AppSidebar accessibility", () => {
     render(
       <TooltipProvider>
         <AppSidebar
-          clients={[client()]}
           registry={null}
           onRegistryChange={vi.fn()}
-          selectedClientId={null}
-          onSelectClient={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
           onReplayOnboarding={vi.fn()}
@@ -214,11 +163,8 @@ describe("AppSidebar accessibility", () => {
     render(
       <TooltipProvider>
         <AppSidebar
-          clients={[client()]}
           registry={null}
           onRegistryChange={vi.fn()}
-          selectedClientId={null}
-          onSelectClient={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
           onReplayOnboarding={vi.fn()}
@@ -246,11 +192,8 @@ describe("AppSidebar accessibility", () => {
     render(
       <TooltipProvider>
         <AppSidebar
-          clients={[client()]}
           registry={null}
           onRegistryChange={vi.fn()}
-          selectedClientId={null}
-          onSelectClient={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
           onReplayOnboarding={vi.fn()}
@@ -287,11 +230,8 @@ describe("AppSidebar accessibility", () => {
     render(
       <TooltipProvider>
         <AppSidebar
-          clients={[client()]}
           registry={null}
           onRegistryChange={vi.fn()}
-          selectedClientId={null}
-          onSelectClient={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
           onReplayOnboarding={vi.fn()}
@@ -321,11 +261,8 @@ describe("AppSidebar accessibility", () => {
     render(
       <TooltipProvider>
         <AppSidebar
-          clients={[client()]}
           registry={null}
           onRegistryChange={vi.fn()}
-          selectedClientId={null}
-          onSelectClient={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
           onReplayOnboarding={vi.fn()}
@@ -351,11 +288,8 @@ describe("AppSidebar quarantine badge", () => {
     return render(
       <TooltipProvider>
         <AppSidebar
-          clients={[client()]}
           registry={null}
           onRegistryChange={vi.fn()}
-          selectedClientId={null}
-          onSelectClient={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
           onReplayOnboarding={vi.fn()}
@@ -499,11 +433,8 @@ describe("AppSidebar open data folder", () => {
     render(
       <TooltipProvider>
         <AppSidebar
-          clients={[client()]}
           registry={null}
           onRegistryChange={vi.fn()}
-          selectedClientId={null}
-          onSelectClient={vi.fn()}
           view="servers"
           onSelectView={vi.fn()}
           onReplayOnboarding={vi.fn()}

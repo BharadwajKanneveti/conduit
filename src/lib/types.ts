@@ -2,7 +2,7 @@ export type Transport = "stdio" | "http" | "sse" | "unknown";
 
 /** The main content views, selected from the sidebar. */
 export type View =
-  "servers" | "activity" | "catalog" | "playground" | "teams" | "settings";
+  "servers" | "clients" | "activity" | "catalog" | "playground" | "teams" | "settings";
 
 export interface McpServer {
   name: string;

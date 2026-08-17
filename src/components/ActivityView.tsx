@@ -254,8 +254,7 @@ function SecurityResting() {
       <ShieldCheck className="size-4 shrink-0 text-owned" />
       <span>
         <span className="font-medium text-foreground">Protection active.</span> Toolport
-        watches every tool for tampering (rug pulls), poisoned definitions, and injected
-        output (agentjacking). No issues right now.
+        is watching tool definitions and results. Nothing needs your attention right now.
       </span>
     </div>
   );

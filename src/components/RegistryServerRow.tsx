@@ -35,17 +35,6 @@ function statusOf(enabled: boolean, health?: ProbeResult): Status {
   return "error";
 }
 
-const DOT: Record<Status, string> = {
-  disabled: "bg-muted-foreground/40",
-  // Distinct hue so "checking" survives without its pulse under prefers-reduced-motion.
-  checking: "bg-info/70 animate-pulse",
-  connected: "bg-success",
-  "needs-auth": "bg-warning",
-  error: "bg-destructive",
-};
-
-// The status word carries the color too, not just the 8px dot, so a broken or
-// needs-attention server reads at a glance instead of hinging on a tiny dot.
 const STATUS_TEXT: Record<Status, string> = {
   disabled: "text-muted-foreground",
   checking: "text-muted-foreground",
@@ -53,21 +42,6 @@ const STATUS_TEXT: Record<Status, string> = {
   "needs-auth": "text-warning",
   error: "text-destructive",
 };
-
-function statusAriaLabel(status: Status, label: string): string {
-  switch (status) {
-    case "disabled":
-      return "Server disabled";
-    case "checking":
-      return "Checking connection";
-    case "connected":
-      return `Connected, ${label}`;
-    case "needs-auth":
-      return "Authentication required";
-    case "error":
-      return "Connection error";
-  }
-}
 
 const ACTION =
   "inline-flex items-center gap-1.5 rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring";
@@ -112,7 +86,7 @@ export function RegistryServerRow({
 
   const label =
     status === "connected"
-      ? `${health?.toolCount ?? 0} tool${health?.toolCount === 1 ? "" : "s"}`
+      ? `Ready · ${health?.toolCount ?? 0} tool${health?.toolCount === 1 ? "" : "s"}`
       : status === "error"
         ? "Error"
         : status === "checking"
@@ -152,14 +126,6 @@ export function RegistryServerRow({
             aria-label={`Toggle ${server.name}`}
           />
         </span>
-
-        <span
-          className={`size-2 shrink-0 rounded-full ${DOT[status]}`}
-          aria-label={
-            installing ? "Installing the server package" : statusAriaLabel(status, label)
-          }
-          role="status"
-        />
 
         <span className="min-w-0 truncate text-sm font-medium">{server.name}</span>
 
@@ -333,10 +299,7 @@ function StatusLabel({
   error: string | null;
 }) {
   const text = (
-    <span
-      aria-hidden="true"
-      className={`text-xs font-medium whitespace-nowrap ${STATUS_TEXT[status]}`}
-    >
+    <span className={`text-xs font-medium whitespace-nowrap ${STATUS_TEXT[status]}`}>
       {label}
     </span>
   );

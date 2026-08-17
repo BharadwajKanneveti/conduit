@@ -171,14 +171,14 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
     <div className="pointer-events-none fixed inset-x-0 bottom-0 z-40 flex justify-center px-4 pb-4">
       <div
         role="region"
-        aria-label={`${items.length} tool${many ? "s" : ""} blocked after a high-risk change`}
+        aria-label={`Toolport paused ${items.length} changed tool${many ? "s" : ""}`}
         className="animate-in fade-in slide-in-from-bottom-2 pointer-events-auto relative w-full max-w-lg overflow-hidden rounded-xl border border-warning/40 bg-popover/95 shadow-2xl ring-1 ring-warning/10 backdrop-blur"
       >
         {/* Announced politely rather than moving focus. This card appears while you are
             working, so stealing focus would be hostile; it is a status surface, not a
             dialog, which is why it is a labelled region rather than an alertdialog. */}
         <div aria-live="polite" className="sr-only">
-          {items.length} tool{many ? "s" : ""} blocked after a high-risk change.
+          Toolport paused {items.length} changed tool{many ? "s" : ""} for review.
         </div>
         <div className="flex items-start gap-2.5 border-b border-border/60 px-4 py-3">
           <ShieldAlert
@@ -187,11 +187,11 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
           />
           <div className="min-w-0">
             <p className="text-sm font-medium">
-              {items.length} tool{many ? "s" : ""} blocked after a high-risk change
+              Toolport paused {items.length} changed tool{many ? "s" : ""}
             </p>
             <p className="mt-0.5 text-xs text-muted-foreground">
-              Toolport hid {many ? "these" : "this"} from every client. Re-approve only if
-              you expected the change.
+              {many ? "They can’t" : "It can’t"} run from any client until you review the
+              change. Everything else stays available.
             </p>
           </div>
         </div>
@@ -270,7 +270,7 @@ export function QuarantineAlert({ onReview }: { onReview?: () => void }) {
           {/* Scoped to the current set, so a NEW quarantine re-opens the card rather
               than inheriting an earlier dismissal. */}
           <Button size="sm" variant="ghost" onClick={() => setDismissedFor(signature)}>
-            Keep blocked
+            Review later
           </Button>
         </div>
       </div>
