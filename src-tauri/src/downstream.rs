@@ -837,14 +837,24 @@ const STDERR_TAIL_CAP: usize = 4096;
 /// MCP responses are tiny.
 const MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
 
-/// Bound a `read_line` so a newline-less write cannot grow `line` without
+/// Bound a line read so a newline-less write cannot grow `line` without
 /// limit. Same cap and stop rule as the stdout drain (SBS-930).
 fn read_capped_line<R: BufRead>(
     reader: &mut R,
     line: &mut String,
     max_bytes: u64,
 ) -> std::io::Result<usize> {
-    reader.take(max_bytes).read_line(line)
+    let mut bytes = Vec::new();
+    let n = reader.take(max_bytes).read_until(b'\n', &mut bytes)?;
+    let decoded = String::from_utf8_lossy(&bytes);
+    let mut keep = decoded
+        .len()
+        .min(usize::try_from(max_bytes).unwrap_or(usize::MAX));
+    while !decoded.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    line.push_str(&decoded[..keep]);
+    Ok(n)
 }
 
 fn is_unterminated_capped_line(n: usize, line: &str, max_bytes: u64) -> bool {
@@ -858,7 +868,10 @@ fn append_stderr_tail(buf: &Mutex<String>, line: &str, tail_cap: usize) {
     if let Ok(mut guard) = buf.lock() {
         guard.push_str(line);
         if guard.len() > tail_cap {
-            let cut = guard.len() - tail_cap;
+            let mut cut = guard.len() - tail_cap;
+            while !guard.is_char_boundary(cut) {
+                cut += 1;
+            }
             guard.drain(..cut);
         }
     }
@@ -887,6 +900,9 @@ fn drain_stderr_bounded<R: BufRead>(
                 max_line = max_line.max(line.len());
                 append_stderr_tail(buf, &line, tail_cap);
                 if is_unterminated_capped_line(n, &line, read_cap) {
+                    eprintln!(
+                        "toolport: downstream emitted an unterminated stderr line >= {read_cap} bytes; stopping stderr drain"
+                    );
                     break;
                 }
             }
@@ -11789,6 +11805,33 @@ mod tests {
         let kept = buf.lock().unwrap();
         assert!(kept.len() <= 16, "kept tail grew to {}", kept.len());
         assert!(kept.chars().all(|c| c == 'x'));
+    }
+
+    #[test]
+    fn capped_stderr_keeps_a_utf8_prefix_when_the_cap_splits_a_character() {
+        let payload = "中".repeat(64);
+        let mut reader = std::io::Cursor::new(payload.as_bytes());
+        let buf = Mutex::new(String::new());
+        let max_line = super::drain_stderr_bounded(&mut reader, &buf, 64, 16);
+
+        assert!(max_line <= 64);
+        assert_eq!(reader.position(), 64);
+        let kept = buf.lock().unwrap();
+        assert!(!kept.is_empty());
+        assert!(kept.len() <= 16);
+        assert!(kept.chars().all(|c| c == '中'));
+    }
+
+    #[test]
+    fn stderr_tail_trimming_stays_on_a_utf8_boundary() {
+        let buf = Mutex::new(String::new());
+        let line = format!("é{}", "x".repeat(4095));
+
+        super::append_stderr_tail(&buf, &line, 4096);
+
+        let kept = buf.lock().unwrap();
+        assert!(kept.len() <= 4096);
+        assert_eq!(kept.as_str(), "x".repeat(4095));
     }
 
     /// Ordinary newline-terminated stderr still lands in the tail, and a chatty
