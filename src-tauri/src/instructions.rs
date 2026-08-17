@@ -194,10 +194,28 @@ impl Scope {
 /// content carrying a *team* START marker, placed before the real team block, would make the
 /// team's [`find_block`] span the personal block and swallow it on the next org sync. Refusing
 /// every family is the only safe rule.
-fn content_carries_a_marker(content: &str) -> bool {
+pub fn content_carries_a_marker(content: &str) -> bool {
     ALL_SCOPES
         .iter()
         .any(|s| content.contains(s.sentinel_start_prefix()) || content.contains(s.sentinel_end()))
+}
+
+/// Read-only: is this scope's managed artifact present at `path` right now?
+///
+/// Distinct from [`current_state`], which asks "does the file match THIS content". This asks only
+/// "is anything of ours there", which is the question when there is no longer any content to
+/// match: after a rule set is cleared, "nothing of ours on disk" is success and a leftover block
+/// is not. An unreadable file counts as present, for the same reason [`remove_recorded`] reports
+/// it as not-cleaned: we cannot see inside, so we must not claim it is clean.
+pub fn is_present(path: &std::path::Path, scope: Scope) -> bool {
+    match std::fs::read_to_string(path) {
+        Ok(existing) => {
+            existing.contains(scope.sentinel_start_prefix())
+                || existing.starts_with(scope.owned_header_prefix())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
 }
 
 /// Stable content hash reported to the server as the "effective rules receipt": it identifies
@@ -1139,6 +1157,40 @@ mod tests {
         assert!(remove_recorded(&path, Scope::Team), "nothing of ours to clean");
         assert!(remove_recorded(&path, Scope::Personal));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), foreign);
+    }
+
+    #[test]
+    fn is_present_answers_only_whether_something_of_ours_is_there() {
+        let s = Scratch::new();
+        let absent = s.path("nope.md");
+        assert!(!is_present(&absent, Scope::Personal));
+
+        // A file that is entirely someone else's.
+        let foreign = s.path("theirs.md");
+        std::fs::write(&foreign, "# mine\n").unwrap();
+        assert!(!is_present(&foreign, Scope::Personal));
+
+        // Our block, and the other scope's block, are told apart.
+        let shared = block_target(s.path("AGENTS.md"), Scope::Personal);
+        write_target(&shared, SET, 1, "My rule");
+        assert!(is_present(&shared.path, Scope::Personal));
+        assert!(
+            !is_present(&shared.path, Scope::Team),
+            "a personal block is not a team block"
+        );
+
+        // Presence does not care whether the content is current, unlike `current_state`.
+        assert_eq!(
+            current_state(&shared, SET, 2, "My rule"),
+            ApplyState::Stale,
+            "fixture: a newer revision is not applied"
+        );
+        assert!(is_present(&shared.path, Scope::Personal));
+
+        // Owned files are recognised by their header.
+        let owned = owned_target(s.path("rules").join("toolport-rules.md"), Scope::Personal);
+        write_target(&owned, SET, 1, "My rule");
+        assert!(is_present(&owned.path, Scope::Personal));
     }
 
     /// The return value is what lets a caller keep a path on record when cleanup did not actually
