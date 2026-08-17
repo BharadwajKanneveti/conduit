@@ -307,9 +307,19 @@ pub fn remove_block(existing: &str, scope: Scope) -> Option<String> {
             cut_start -= 1;
         }
     }
+    // A block at offset 0 has no preceding separator to eat, so the loop above cannot run — but
+    // the blank line BETWEEN it and whatever follows is still ours, added when that next thing was
+    // appended. Without this, removing the first of two blocks from a file we created (team writes
+    // AGENTS.md, personal appends, member leaves the team) leaves "\n{survivor}" where a lone
+    // append would have written "{survivor}". Symmetric with the trailing-separator rule above:
+    // exactly one newline, and only the one we are responsible for.
+    let mut tail_start = cut_end;
+    if cut_start == 0 && existing[tail_start..].starts_with('\n') {
+        tail_start += 1;
+    }
     let mut out = String::with_capacity(existing.len());
     out.push_str(&existing[..cut_start]);
-    out.push_str(&existing[cut_end..]);
+    out.push_str(&existing[tail_start..]);
     Some(out)
 }
 
@@ -706,6 +716,37 @@ mod tests {
         let neither = remove_block(&remove_block(&both, Scope::Team).unwrap(), Scope::Personal)
             .expect("personal block still present");
         assert_eq!(neither, user);
+    }
+
+    /// The same invariant when the FILE ITSELF is ours: Toolport created it (the client had no
+    /// rules file), one scope appended after the other, and now the first scope leaves. The
+    /// survivor must look exactly as a lone append into an absent file would have written it,
+    /// with no leftover leading blank line. A block at offset 0 has no preceding separator, so
+    /// this is the case the generic separator rule cannot reach.
+    #[test]
+    fn removing_the_leading_scope_from_a_file_we_created_leaves_no_stray_newline() {
+        let personal_alone = upsert_block("", Scope::Personal, SET, 1, "My rule");
+        let team_alone = upsert_block("", Scope::Team, TEAM, 1, "Org rule");
+
+        // Team created the file, personal appended. Team leaves.
+        let team_then_personal = upsert_block(&team_alone, Scope::Personal, SET, 1, "My rule");
+        assert_eq!(
+            remove_block(&team_then_personal, Scope::Team).expect("team block present"),
+            personal_alone
+        );
+
+        // And the mirror image.
+        let personal_then_team = upsert_block(&personal_alone, Scope::Team, TEAM, 1, "Org rule");
+        assert_eq!(
+            remove_block(&personal_then_team, Scope::Personal).expect("personal block present"),
+            team_alone
+        );
+
+        // Removing the LAST one still empties the file, so `remove_recorded` deletes it.
+        assert!(remove_block(&personal_alone, Scope::Personal)
+            .expect("block present")
+            .trim()
+            .is_empty());
     }
 
     #[test]

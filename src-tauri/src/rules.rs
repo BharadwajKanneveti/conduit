@@ -169,6 +169,21 @@ fn apply_to(installed: &[ClientTarget]) -> Result<RulesView, String> {
     let prev_targets = reg.rules_targets.clone();
     let targets = enabled_targets(&reg, installed);
 
+    // Every path this apply still WANTS to own, whether or not writing it succeeded. Cleanup is
+    // driven by this rather than by the successful writes: a client that failed to write (a full
+    // disk, a permission error, Windsurf's cap, a Codex override that appeared) is still opted in,
+    // and deleting its last known-good block because today's write failed would turn a transient
+    // failure into lost rules. Only a path that is no longer desired at all (opted out,
+    // uninstalled, set cleared, path moved) gets removed.
+    let desired: Vec<String> = if set.is_some() {
+        targets
+            .iter()
+            .map(|t| t.path.to_string_lossy().to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let mut written: Vec<String> = Vec::new();
     if let Some(s) = set.as_ref() {
         for target in &targets {
@@ -179,30 +194,50 @@ fn apply_to(installed: &[ClientTarget]) -> Result<RulesView, String> {
             }
         }
     }
-    // Anything we wrote before and did not write now: the set changed or was cleared, a client
-    // was opted out or uninstalled, or its rules path moved. Iterating the RECORDED list rather
-    // than a fresh scan means cleanup survives a client that has since disappeared.
     for old in &prev_targets {
-        if !written.iter().any(|w| w == old) {
+        if !desired.iter().any(|d| d == old) {
             instructions::remove_recorded(std::path::Path::new(old), Scope::Personal);
         }
     }
 
-    // Record what is now on disk. The compare-and-set fails if the active set changed underneath
-    // us (the user switched sets while we were writing): the files we just wrote would then have
-    // no record to clean them by, so roll them back rather than orphan them.
+    // What we now own on disk: everything written this pass, plus any still-desired path we owned
+    // before and could not rewrite — our older block is very likely still sitting in that file, so
+    // dropping it from the record would strand it forever (nothing would ever clean it up).
+    let mut owned = written.clone();
+    for old in &prev_targets {
+        if desired.iter().any(|d| d == old) && !owned.iter().any(|o| o == old) {
+            owned.push(old.clone());
+        }
+    }
+
+    // Record it. The compare-and-set fails if the active set changed underneath us (the user
+    // switched sets while we were writing), which means a newer apply has taken over.
     let expected = set.as_ref().map(|s| (s.id.clone(), s.revision));
     let recorded = crate::registry::update(|reg| {
         let current = reg.active_rule_set().map(|s| (s.id.clone(), s.revision));
         if current != expected {
             return Ok(false);
         }
-        reg.rules_targets = written.clone();
+        reg.rules_targets = owned.clone();
         Ok(true)
     });
     if !matches!(recorded, Ok((_, true))) {
-        for path in &written {
-            instructions::remove_recorded(std::path::Path::new(path), Scope::Personal);
+        // Our writes have no record to clean them by, so take them back out — but ONLY where the
+        // block on disk is still the one we wrote. The apply that raced ahead of us may already
+        // have written the new set to these same paths, and deleting that would leave the user's
+        // active rules missing while the UI reported success.
+        for target in &targets {
+            let path = target.path.to_string_lossy().to_string();
+            if !written.contains(&path) {
+                continue; // we never wrote this one, so there is nothing of ours to take back
+            }
+            let still_ours = set.as_ref().is_some_and(|s| {
+                instructions::current_state(target, &s.id, s.revision, &s.content)
+                    == ApplyState::Applied
+            });
+            if still_ours {
+                instructions::remove_recorded(std::path::Path::new(&path), Scope::Personal);
+            }
         }
     }
 
@@ -229,7 +264,15 @@ pub fn preview(client_id: &str) -> Result<Option<RulesPreview>, String> {
     let Some(set) = reg.active_rule_set() else {
         return Ok(None);
     };
-    let before = std::fs::read_to_string(&target.path).unwrap_or_default();
+    // An unreadable file must NOT read as empty. Preview is the safeguard the user leans on
+    // before letting Toolport touch a file they own, and "" would render the dry-run as a
+    // first-time write of a file that actually has content we could not see. Only a genuinely
+    // absent file is empty; anything else is reported.
+    let before = match std::fs::read_to_string(&target.path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("Could not read {}: {e}", target.path.display())),
+    };
     let after = match target.strategy {
         Strategy::OwnedFile => {
             instructions::render_owned_file(Scope::Personal, &set.id, set.revision, &set.content)
@@ -258,10 +301,7 @@ pub fn preview(client_id: &str) -> Result<Option<RulesPreview>, String> {
 
 /// Create or update a set, then apply. Returns the refreshed view.
 pub fn save_set(id: Option<&str>, name: &str, content: &str) -> Result<RulesView, String> {
-    crate::registry::update(|reg| {
-        reg.upsert_rule_set(id, name, content);
-        Ok(())
-    })?;
+    crate::registry::update(|reg| reg.upsert_rule_set(id, name, content).map(|_| ()))?;
     apply()
 }
 
@@ -377,12 +417,12 @@ mod tests {
     #[test]
     fn a_new_set_becomes_active_when_nothing_else_is() {
         let mut reg = crate::registry::Registry::default();
-        let id = reg.upsert_rule_set(None, "Work", "Always run tests.");
+        let id = reg.upsert_rule_set(None, "Work", "Always run tests.").expect("create");
         assert_eq!(reg.active_rule_set_id.as_deref(), Some(id.as_str()));
         assert_eq!(reg.active_rule_set().map(|s| s.revision), Some(1));
 
         // A SECOND set does not steal the selection.
-        let other = reg.upsert_rule_set(None, "Personal", "Be brief.");
+        let other = reg.upsert_rule_set(None, "Personal", "Be brief.").expect("create");
         assert_ne!(other, id, "ids must be unique");
         assert_eq!(reg.active_rule_set_id.as_deref(), Some(id.as_str()));
     }
@@ -390,24 +430,41 @@ mod tests {
     #[test]
     fn revision_moves_on_content_change_only() {
         let mut reg = crate::registry::Registry::default();
-        let id = reg.upsert_rule_set(None, "Work", "v1");
+        let id = reg.upsert_rule_set(None, "Work", "v1").expect("create");
         assert_eq!(reg.active_rule_set().unwrap().revision, 1);
 
         // A rename rides in the marker but is not a content change, so rewriting every client's
         // file for it would be pure churn.
-        reg.upsert_rule_set(Some(&id), "Renamed", "v1");
+        reg.upsert_rule_set(Some(&id), "Renamed", "v1").expect("update");
         assert_eq!(reg.active_rule_set().unwrap().revision, 1);
         assert_eq!(reg.active_rule_set().unwrap().name, "Renamed");
 
-        reg.upsert_rule_set(Some(&id), "Renamed", "v2");
+        reg.upsert_rule_set(Some(&id), "Renamed", "v2").expect("update");
         assert_eq!(reg.active_rule_set().unwrap().revision, 2);
+    }
+
+    #[test]
+    fn saving_against_an_unknown_id_errors_rather_than_duplicating() {
+        let mut reg = crate::registry::Registry::default();
+        let id = reg.upsert_rule_set(None, "Work", "v1").expect("create");
+        let err = reg
+            .upsert_rule_set(Some("deleted-in-another-window"), "Work", "v2")
+            .expect_err("an unknown id must not create");
+        assert!(err.contains("no longer exists"), "unexpected message: {err}");
+        assert_eq!(reg.rule_sets.len(), 1, "must not grow a duplicate set");
+        assert_eq!(reg.active_rule_set().unwrap().id, id);
+        assert_eq!(
+            reg.active_rule_set().unwrap().content,
+            "v1",
+            "the real set must be untouched"
+        );
     }
 
     #[test]
     fn removing_the_active_set_clears_the_selection() {
         let mut reg = crate::registry::Registry::default();
-        let a = reg.upsert_rule_set(None, "A", "a");
-        let b = reg.upsert_rule_set(None, "B", "b");
+        let a = reg.upsert_rule_set(None, "A", "a").expect("create");
+        let b = reg.upsert_rule_set(None, "B", "b").expect("create");
         reg.remove_rule_set(&a);
         assert_eq!(
             reg.active_rule_set_id, None,
@@ -578,7 +635,12 @@ mod tests {
     /// `apply_to`. Callers must already hold the data-dir guard and override.
     fn seed_and_apply(content: &str, enabled: &[&str], installed: &[ClientTarget]) -> RulesView {
         crate::registry::update(|reg| {
-            reg.upsert_rule_set(Some("work"), "Work", content);
+            // First call creates (the id is not there yet), later calls update in place.
+            if reg.rule_sets.iter().any(|s| s.id == "work") {
+                reg.upsert_rule_set(Some("work"), "Work", content)?;
+            } else {
+                reg.upsert_rule_set(None, "Work", content)?;
+            }
             for id in enabled {
                 reg.set_rules_client_enabled(id, true);
             }
@@ -663,6 +725,55 @@ mod tests {
         assert_eq!(reg.rules_targets, vec![zed_path.to_string_lossy().to_string()]);
     }
 
+    /// A write that fails must NOT be treated as an opt-out. The client is still enabled, so its
+    /// last known-good block stays on disk and its path stays recorded; a transient failure must
+    /// not cost the user the rules they already had.
+    #[test]
+    fn a_failed_write_keeps_the_previous_good_block_and_its_record() {
+        let _dirs = crate::registry::data_dir_test_lock();
+        let s = Scratch::new();
+        let _data_dir = crate::registry::DataDirOverride::set(s.path("data"));
+
+        let codex = client("codex", Some(sentinel(s.path("AGENTS.md"))));
+        let installed = vec![codex.clone()];
+        let path = codex.target.clone().unwrap().path;
+
+        seed_and_apply("Good rules.", &["codex"], &installed);
+        let good = std::fs::read_to_string(&path).unwrap();
+        assert!(good.contains("Good rules."));
+
+        // Content carrying our own frozen marker is refused by `write_target` (it would corrupt
+        // the block), which is the cheapest way to drive a real per-client failure: exactly what a
+        // user pasting an existing AGENTS.md into the editor would hit.
+        crate::registry::update(|reg| {
+            let id = reg.active_rule_set().unwrap().id.clone();
+            reg.upsert_rule_set(
+                Some(&id),
+                "Work",
+                &format!("Bad {} rules.", instructions::PERSONAL_SENTINEL_END),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        let view = apply_to(&installed).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            good,
+            "the previous good block must survive a failed rewrite"
+        );
+        assert_eq!(
+            crate::registry::load().unwrap().rules_targets,
+            vec![path.to_string_lossy().to_string()],
+            "a still-desired path stays recorded, or nothing would ever clean it up"
+        );
+        assert_eq!(
+            view.clients[0].state,
+            ApplyState::Error,
+            "and the failure is reported rather than hidden"
+        );
+    }
+
     #[test]
     fn switching_sets_rewrites_in_place_and_clearing_removes_everything() {
         let _dirs = crate::registry::data_dir_test_lock();
@@ -678,7 +789,7 @@ mod tests {
 
         // A second set replaces the first set's span rather than stacking a second block.
         crate::registry::update(|reg| {
-            let id = reg.upsert_rule_set(None, "Other", "Rules B.");
+            let id = reg.upsert_rule_set(None, "Other", "Rules B.").expect("create");
             reg.set_active_rule_set(Some(&id));
             Ok(())
         })
