@@ -41,23 +41,15 @@ jobs:
           - os: ubuntu-22.04
             bundles: deb,appimage
     runs-on: ${{ matrix.os }}
-    env:
-      # Azure Trusted Signing credentials for Windows Authenticode. These stay empty
-      # until you add the repo secrets, which keeps signing inert: the setup step
-      # below is gated on AZURE_CLIENT_ID being non-empty, so a release tagged before
-      # the secrets exist builds an unsigned Windows installer exactly as before.
-      # trusted-signing-cli reads these via DefaultAzureCredential during the build.
-      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
     steps:
       # Third-party actions are pinned to full commit SHAs (not mutable tags): this
       # workflow holds the Apple/Azure/Tauri signing secrets, so a compromised upstream
       # tag must not be able to inject code into a signed release. Version in the comment.
       # persist-credentials: false so the GITHUB_TOKEN isn't left in .git/config where a
-      # malicious npm/cargo dependency install script (run with the signing secrets in
-      # env) could read and exfiltrate it. Nothing here uses the persisted credential:
-      # the only token use is an explicit GH_TOKEN env var on the manifest step.
+      # malicious npm/cargo dependency install script could read and exfiltrate it.
+      # Azure/Tauri/Apple signing secrets are step-scoped (SBS-925), so those scripts
+      # never see them either. Nothing here uses the persisted credential: the only
+      # token use is an explicit GH_TOKEN env var on the manifest step.
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
@@ -134,9 +126,12 @@ jobs:
           echo "disk:"; df -h /
           echo "mem:"; free -h
 
-      # Windows Authenticode signing via Azure Trusted Signing. Gated on the
-      # AZURE_CLIENT_ID secret being present, so until the signing secrets exist
-      # this step is skipped and the Windows build is unsigned, exactly as before.
+      # Windows Authenticode signing via Azure Trusted Signing. Gated on a boolean
+      # derived from whether AZURE_CLIENT_ID is set (GitHub forbids `secrets` in
+      # `steps.if`), so until the signing secrets exist this step is skipped and the
+      # Windows build is unsigned, exactly as before. The actual AZURE_* values are
+      # injected only on the Build installer step so install scripts
+      # never see them (SBS-925).
       # trusted-signing-cli is a small Rust tool (the runner already has cargo).
       # Tauri runs it as a per-binary signCommand, signing the app exe, the bundled
       # gateway sidecar, and the NSIS installer BEFORE it computes the updater
@@ -147,7 +142,10 @@ jobs:
       # the compiled binary so a release only rebuilds it when the key is bumped. Bump the
       # `-v1` suffix to force a fresh install (e.g. to pick up a new version of the tool).
       - name: Cache trusted-signing-cli
-        if: matrix.os == 'windows-latest' && env.AZURE_CLIENT_ID != ''
+        if: matrix.os == 'windows-latest' && env.AZURE_SIGNING_CONFIGURED == 'true'
+        env:
+          # Presence flag only. steps.if cannot read secrets.
+          AZURE_SIGNING_CONFIGURED: ${{ secrets.AZURE_CLIENT_ID != '' }}
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cargo/bin/trusted-signing-cli.exe
@@ -155,7 +153,10 @@ jobs:
 
       - name: Set up Windows code signing (Azure Trusted Signing)
         id: winsign
-        if: matrix.os == 'windows-latest' && env.AZURE_CLIENT_ID != ''
+        if: matrix.os == 'windows-latest' && env.AZURE_SIGNING_CONFIGURED == 'true'
+        env:
+          # Presence flag only. steps.if cannot read secrets.
+          AZURE_SIGNING_CONFIGURED: ${{ secrets.AZURE_CLIENT_ID != '' }}
         shell: pwsh
         run: |
           if (-not (Test-Path "$env:USERPROFILE\.cargo\bin\trusted-signing-cli.exe")) {
@@ -185,6 +186,11 @@ jobs:
           # as-is.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Azure Trusted Signing. Step-scoped and Windows-only so install
+          # scripts and macOS/Linux builds never see the signer (SBS-925).
+          AZURE_TENANT_ID: ${{ matrix.os == 'windows-latest' && secrets.AZURE_TENANT_ID || '' }}
+          AZURE_CLIENT_ID: ${{ matrix.os == 'windows-latest' && secrets.AZURE_CLIENT_ID || '' }}
+          AZURE_CLIENT_SECRET: ${{ matrix.os == 'windows-latest' && secrets.AZURE_CLIENT_SECRET || '' }}
           # macOS is intentionally built UNSIGNED here. The keychain-access-group
           # fix needs the gateway nested in its own .app + embedded provisioning
           # profiles + inside-out signing, none of which Tauri's built-in macOS

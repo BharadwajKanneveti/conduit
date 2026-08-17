@@ -6,6 +6,12 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Security
+
+- **Release job no longer inherits Azure Trusted Signing credentials during
+  frontend install.** They are now step-scoped to the Windows tauri build,
+  matching TAURI and APPLE. (SBS-925)
+
 ### Removed
 
 - **Toolport Studio is no longer a supported client.** The project is discontinued, so

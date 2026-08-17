@@ -54,8 +54,9 @@ Get-ChildItem Cert:\CurrentUser\My | Format-List Subject, Thumbprint
 ## Azure Trusted Signing in this repo's CI (the live setup)
 
 The release workflow (`.github/workflows/release.yml`) already wires this up, and
-stays **inert until the secrets exist** (the signing step is gated on
-`AZURE_CLIENT_ID`, so an earlier-tagged release just builds unsigned). It installs
+stays **inert until the secrets exist** (signing is gated on whether
+`AZURE_CLIENT_ID` is set, via a boolean flag — the secret is not in the
+job env — so an earlier-tagged release just builds unsigned). It installs
 `trusted-signing-cli`, writes a `signCommand` config, and Tauri signs the app exe,
 the bundled gateway sidecar, and the NSIS installer during the build (before the
 updater `.sig` is computed, so auto-update keeps working).
