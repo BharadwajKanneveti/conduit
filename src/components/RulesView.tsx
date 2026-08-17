@@ -69,6 +69,10 @@ export function RulesView() {
     const set = next.sets.find((s) => s.id === next.activeSetId) ?? null;
     setDraft(set?.content ?? "");
     setDraftName(set?.name ?? "");
+    // The preview card describes one client's file under whichever set was active when it was
+    // opened. Anything that reseats the editor can invalidate it, and a preview showing a path
+    // and bytes that no longer match what is on screen is worse than showing no preview at all.
+    setPreview(null);
   }
 
   useEffect(() => {
@@ -101,21 +105,31 @@ export function RulesView() {
     }
   }
 
-  /**
-   * Persist an unsaved draft before an action that reseats the editor. Every such action calls
-   * this first: losing typed rules to a stray click on another set is not an acceptable outcome,
-   * and `adopt` reseats the draft unconditionally on the refreshed view.
-   */
+  /** Persist an unsaved draft, adopting the refreshed view. No-op when nothing changed. */
   async function flushDraft() {
-    if (dirty && active) await rulesSaveSet(draftName, draft, active.id);
+    if (dirty && active) adopt(await rulesSaveSet(draftName, draft, active.id));
+  }
+
+  /**
+   * Every action EXCEPT Save and Delete goes through here.
+   *
+   * `adopt` reseats the editor from the SAVED set, so any action that refreshes the view would
+   * otherwise discard whatever the user had typed and put the old text back. That is not an edge
+   * case: "type your rules, then switch a client on" is the first thing anyone does. Flushing
+   * first turns that discard into a save. Save skips it because flushing before it would do the
+   * same write twice; Delete skips it because the only deletable set is the active one, so
+   * saving into it first is pure waste.
+   */
+  async function act(fn: () => Promise<RulesViewData>) {
+    await run(async () => {
+      await flushDraft();
+      return fn();
+    });
   }
 
   /** Switch the edited set. */
   async function selectSet(id: string) {
-    await run(async () => {
-      await flushDraft();
-      return rulesSetActive(id);
-    });
+    await act(() => rulesSetActive(id));
   }
 
   /**
@@ -125,12 +139,29 @@ export function RulesView() {
    */
   async function newSet() {
     const known = new Set((data?.sets ?? []).map((s) => s.id));
-    await run(async () => {
-      await flushDraft();
+    await act(async () => {
       const created = await rulesSaveSet("New rules", "");
       const fresh = created.sets.find((s) => !known.has(s.id));
       return fresh ? rulesSetActive(fresh.id) : created;
     });
+  }
+
+  /**
+   * Open the dry run for one client. Saves first: the backend renders the preview from the SAVED
+   * set, so previewing a dirty editor would show the previous bytes under a button that promises
+   * to show exactly what would be written.
+   */
+  async function openPreview(clientId: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      await flushDraft();
+      setPreview(await rulesPreview(clientId));
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
   }
 
   if (loading) {
@@ -214,7 +245,7 @@ export function RulesView() {
                 variant="outline"
                 size="sm"
                 disabled={busy}
-                onClick={() => run(rulesApply)}
+                onClick={() => act(rulesApply)}
               >
                 <RefreshCw className="size-3.5" />
                 Re-apply
@@ -230,6 +261,13 @@ export function RulesView() {
               </Button>
             </div>
           </>
+        ) : (data?.sets.length ?? 0) > 0 ? (
+          // Deleting the active set clears the selection rather than promoting a sibling, so the
+          // other sets are still right there. Saying "no rule set yet" would be a plain lie about
+          // what is on screen.
+          <p className="text-sm text-muted-foreground">
+            No set is applied right now. Pick one above to edit and apply it.
+          </p>
         ) : (
           <p className="text-sm text-muted-foreground">
             No rule set yet. Create one and it applies to the clients you switch on below.
@@ -254,9 +292,14 @@ export function RulesView() {
                   checked={c.enabled}
                   disabled={busy}
                   aria-label={c.name}
-                  onChange={(e) =>
-                    run(() => rulesSetClientEnabled(c.id, e.target.checked))
-                  }
+                  onChange={(e) => {
+                    // Read the new value NOW. `act` awaits a possible draft save first, and by
+                    // the time the inner callback runs React has re-rendered this controlled
+                    // input back to `c.enabled`, so a lazy `e.target.checked` reads the OLD
+                    // value and the toggle silently does nothing.
+                    const next = e.target.checked;
+                    act(() => rulesSetClientEnabled(c.id, next));
+                  }}
                 />
                 <span className="truncate" title={c.path}>
                   {c.name}
@@ -272,13 +315,7 @@ export function RulesView() {
                       ? "See exactly what would be written"
                       : "Create a rule set first"
                   }
-                  onClick={async () => {
-                    try {
-                      setPreview(await rulesPreview(c.id));
-                    } catch (e) {
-                      setError(String(e));
-                    }
-                  }}
+                  onClick={() => openPreview(c.id)}
                   className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
                 >
                   <Eye className="size-3" />

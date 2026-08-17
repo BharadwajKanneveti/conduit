@@ -235,6 +235,83 @@ describe("RulesView", () => {
     expect(api.rulesSaveSet).toHaveBeenCalledWith("New rules", "");
   });
 
+  /**
+   * "Type your rules, then switch a client on" is the first thing anyone does. Every action that
+   * refreshes the view reseats the editor from the SAVED set, so any of them that forgets to
+   * flush first silently replaces what the user typed with the old text.
+   */
+  it.each([
+    ["toggling a client", () => screen.getByLabelText("Claude Code")],
+    ["Re-apply", () => screen.getByRole("button", { name: "Re-apply" })],
+    ["Preview", () => screen.getAllByRole("button", { name: /Preview/ })[0]],
+  ])("%s saves an unsaved draft instead of discarding it", async (_label, target) => {
+    const saved = view({
+      sets: [
+        { id: "work", name: "Work", content: "Always run tests. And lint.", revision: 3 },
+      ],
+    });
+    api.rulesSaveSet.mockResolvedValue(saved);
+    api.rulesSetClientEnabled.mockResolvedValue(saved);
+    api.rulesApply.mockResolvedValue(saved);
+    api.rulesPreview.mockResolvedValue(null);
+    render(<RulesView />);
+    const editor = await screen.findByLabelText("Rules");
+
+    await userEvent.type(editor, " And lint.");
+    await userEvent.click(target());
+
+    await waitFor(() =>
+      expect(api.rulesSaveSet).toHaveBeenCalledWith(
+        "Work",
+        "Always run tests. And lint.",
+        "work",
+      ),
+    );
+    expect(screen.getByLabelText("Rules")).toHaveValue("Always run tests. And lint.");
+  });
+
+  it("clears a stale preview when the view is reseated", async () => {
+    api.rulesPreview.mockResolvedValue({
+      clientId: "codex",
+      path: "/home/a/.codex/AGENTS.md",
+      strategy: "sentinelBlock",
+      before: "",
+      after: "Always run tests.\n",
+      state: "stale",
+    });
+    api.rulesApply.mockResolvedValue(view());
+    render(<RulesView />);
+    await screen.findByLabelText("Rules");
+
+    await userEvent.click(screen.getAllByRole("button", { name: /Preview/ })[0]);
+    expect(await screen.findByText("/home/a/.codex/AGENTS.md")).toBeInTheDocument();
+
+    // A preview naming a path and bytes that no longer match the editor is worse than none.
+    await userEvent.click(screen.getByRole("button", { name: "Re-apply" }));
+    await waitFor(() =>
+      expect(screen.queryByText("/home/a/.codex/AGENTS.md")).not.toBeInTheDocument(),
+    );
+  });
+
+  it("does not claim there are no sets when a deleted set left siblings behind", async () => {
+    // `remove_rule_set` clears the selection rather than promoting a sibling, so the other sets
+    // are still on screen. Saying none exist would contradict the chips right above.
+    api.rulesView.mockResolvedValue(
+      view({
+        sets: [
+          { id: "work", name: "Work", content: "Always run tests.", revision: 2 },
+          { id: "personal", name: "Personal", content: "Be brief.", revision: 1 },
+        ],
+        activeSetId: undefined,
+      }),
+    );
+    render(<RulesView />);
+
+    expect(await screen.findByText(/Pick one above/)).toBeInTheDocument();
+    expect(screen.queryByText(/No rule set yet/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Personal" })).toBeInTheDocument();
+  });
+
   it("with no set, the editor is replaced by a prompt and preview is unavailable", async () => {
     api.rulesView.mockResolvedValue(view({ sets: [], activeSetId: undefined }));
     render(<RulesView />);
