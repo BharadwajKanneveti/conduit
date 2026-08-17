@@ -123,8 +123,11 @@ describe("release Azure signer env scope (SBS-925)", () => {
       "Set up Windows code signing (Azure Trusted Signing)",
     );
     const cache = stepByName(build, "Cache trusted-signing-cli");
+    expect(build.env?.AZURE_SIGNING_CONFIGURED).toContain("secrets.AZURE_CLIENT_ID");
     expect(setup?.if).toContain("AZURE_SIGNING_CONFIGURED");
     expect(cache?.if).toContain("AZURE_SIGNING_CONFIGURED");
+    expect(setup?.env?.AZURE_SIGNING_CONFIGURED).toBeUndefined();
+    expect(cache?.env?.AZURE_SIGNING_CONFIGURED).toBeUndefined();
     expect(envHasAny(setup?.env, AZURE_SIGNER_KEYS)).toBe(false);
     expect(envHasAny(cache?.env, AZURE_SIGNER_KEYS)).toBe(false);
   });

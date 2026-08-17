@@ -41,6 +41,9 @@ jobs:
           - os: ubuntu-22.04
             bundles: deb,appimage
     runs-on: ${{ matrix.os }}
+    env:
+      # Presence flag only; job-level env is available when steps.if is evaluated.
+      AZURE_SIGNING_CONFIGURED: ${{ secrets.AZURE_CLIENT_ID != '' }}
     steps:
       # Third-party actions are pinned to full commit SHAs (not mutable tags): this
       # workflow holds the Apple/Azure/Tauri signing secrets, so a compromised upstream
@@ -143,9 +146,6 @@ jobs:
       # `-v1` suffix to force a fresh install (e.g. to pick up a new version of the tool).
       - name: Cache trusted-signing-cli
         if: matrix.os == 'windows-latest' && env.AZURE_SIGNING_CONFIGURED == 'true'
-        env:
-          # Presence flag only. steps.if cannot read secrets.
-          AZURE_SIGNING_CONFIGURED: ${{ secrets.AZURE_CLIENT_ID != '' }}
         uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: ~/.cargo/bin/trusted-signing-cli.exe
@@ -154,9 +154,6 @@ jobs:
       - name: Set up Windows code signing (Azure Trusted Signing)
         id: winsign
         if: matrix.os == 'windows-latest' && env.AZURE_SIGNING_CONFIGURED == 'true'
-        env:
-          # Presence flag only. steps.if cannot read secrets.
-          AZURE_SIGNING_CONFIGURED: ${{ secrets.AZURE_CLIENT_ID != '' }}
         shell: pwsh
         run: |
           if (-not (Test-Path "$env:USERPROFILE\.cargo\bin\trusted-signing-cli.exe")) {
