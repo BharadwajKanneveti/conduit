@@ -1753,21 +1753,32 @@ impl Registry {
     /// bumping it on a rename would restale every client's file and force a pointless rewrite.
     /// A newly created set becomes active when nothing else is, so the first set a user writes
     /// applies without a second step.
-    pub fn upsert_rule_set(&mut self, id: Option<&str>, name: &str, content: &str) -> String {
+    ///
+    /// An `id` that names no existing set is an ERROR, not a create. Falling through to create
+    /// would silently duplicate a set whenever a second window (or a stale view) saved against an
+    /// id that had since been deleted, leaving the user with two "Work" sets and an edit that
+    /// went somewhere they did not mean.
+    pub fn upsert_rule_set(
+        &mut self,
+        id: Option<&str>,
+        name: &str,
+        content: &str,
+    ) -> Result<String, String> {
         let name = if name.trim().is_empty() {
             "Rules"
         } else {
             name.trim()
         };
         if let Some(id) = id {
-            if let Some(existing) = self.rule_sets.iter_mut().find(|s| s.id == id) {
-                if existing.content != content {
-                    existing.content = content.to_string();
-                    existing.revision += 1;
-                }
-                existing.name = name.to_string();
-                return existing.id.clone();
+            let Some(existing) = self.rule_sets.iter_mut().find(|s| s.id == id) else {
+                return Err("That rule set no longer exists.".to_string());
+            };
+            if existing.content != content {
+                existing.content = content.to_string();
+                existing.revision += 1;
             }
+            existing.name = name.to_string();
+            return Ok(existing.id.clone());
         }
         let id = unique_id(&slugify(name), &self.rule_set_ids());
         self.rule_sets.push(RuleSet {
@@ -1779,7 +1790,7 @@ impl Registry {
         if self.active_rule_set_id.is_none() {
             self.active_rule_set_id = Some(id.clone());
         }
-        id
+        Ok(id)
     }
 
     /// Remove a set. Removing the ACTIVE one clears the selection rather than silently promoting
