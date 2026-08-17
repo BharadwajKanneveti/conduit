@@ -19,6 +19,8 @@ import type {
   ProbeResult,
   Registry,
   RoutineSuggestion,
+  RulesPreview,
+  RulesView,
   SavingsSummary,
   SearchTrace,
   ToolIdentity,
@@ -544,6 +546,56 @@ export function teamInstructionsStatus(): Promise<InstructionsStatusView | null>
 /** Leave the team: remove its merged servers and clear the saved token. */
 export function teamDisconnect(): Promise<Registry> {
   return invoke<Registry>("team_disconnect");
+}
+
+// ---- Personal agent rules (SBS-821) ----
+//
+// Every mutating call returns the refreshed view, so the tab never has to re-fetch to stay
+// honest about what is on disk. All of these work with no MCP server configured.
+
+/** The user's rule sets, which one is active, and each installed client's on-disk state. */
+export function rulesView(): Promise<RulesView> {
+  return invoke<RulesView>("rules_view");
+}
+
+/** Create (`id` omitted) or update a rule set, then apply it to every opted-in client. */
+export function rulesSaveSet(
+  name: string,
+  content: string,
+  id?: string,
+): Promise<RulesView> {
+  return invoke<RulesView>("rules_save_set", { id: id ?? null, name, content });
+}
+
+/** Delete a rule set. Deleting the active one also removes the files Toolport wrote. */
+export function rulesDeleteSet(id: string): Promise<RulesView> {
+  return invoke<RulesView>("rules_delete_set", { id });
+}
+
+/** Switch the active set, or pass nothing to clear it and remove our files everywhere. */
+export function rulesSetActive(id?: string): Promise<RulesView> {
+  return invoke<RulesView>("rules_set_active", { id: id ?? null });
+}
+
+/** Opt one client in or out. Opting out removes that client's rules file. */
+export function rulesSetClientEnabled(
+  clientId: string,
+  enabled: boolean,
+): Promise<RulesView> {
+  return invoke<RulesView>("rules_set_client_enabled", { clientId, enabled });
+}
+
+/**
+ * Dry-run one client's write: the exact before/after bytes, without touching disk. `null` when
+ * the client is not installed, has no rules file we manage, or no set is active.
+ */
+export function rulesPreview(clientId: string): Promise<RulesPreview | null> {
+  return invoke<RulesPreview | null>("rules_preview", { clientId });
+}
+
+/** Re-apply the active set to every opted-in client. */
+export function rulesApply(): Promise<RulesView> {
+  return invoke<RulesView>("rules_apply");
 }
 
 export interface TeamPushPreview {
