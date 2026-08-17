@@ -1009,7 +1009,12 @@ fn apply_instructions_to(
     // (not a fresh client scan) means cleanup survives a client that has since disappeared.
     for old in &prev_targets {
         if !written.iter().any(|w| w == old) {
-            instructions::remove_recorded(std::path::Path::new(old), instructions::Scope::Team);
+            // Result ignored deliberately: this writer replaces `team_instructions_targets`
+            // wholesale below, so it has nowhere to carry "we could not clean that one" forward.
+            // Pre-existing behaviour, unchanged here; the personal writer in `rules.rs` does use
+            // the flag, and aligning Teams with it is its own change.
+            let _ =
+                instructions::remove_recorded(std::path::Path::new(old), instructions::Scope::Team);
         }
     }
 
@@ -1032,7 +1037,10 @@ fn apply_instructions_to(
     });
     if !matches!(recorded, Ok((_, true))) {
         for path in &written {
-            instructions::remove_recorded(std::path::Path::new(path), instructions::Scope::Team);
+            let _ = instructions::remove_recorded(
+                std::path::Path::new(path),
+                instructions::Scope::Team,
+            );
         }
     }
 }
@@ -1398,7 +1406,9 @@ pub fn disconnect() -> Result<(), String> {
         Ok(())
     })?;
     for path in &instr_targets {
-        crate::instructions::remove_recorded(
+        // Leaving the team clears the record either way, so there is nothing to carry a failure
+        // forward into. Same pre-existing behaviour as `apply_instructions_to`.
+        let _ = crate::instructions::remove_recorded(
             std::path::Path::new(path),
             crate::instructions::Scope::Team,
         );
