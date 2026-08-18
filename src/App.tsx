@@ -84,6 +84,9 @@ const CatalogView = lazy(() =>
 const PlaygroundView = lazy(() =>
   import("@/components/PlaygroundView").then((m) => ({ default: m.PlaygroundView })),
 );
+const RulesView = lazy(() =>
+  import("@/components/RulesView").then((m) => ({ default: m.RulesView })),
+);
 const TeamsView = lazy(() =>
   import("@/components/TeamsView").then((m) => ({ default: m.TeamsView })),
 );
@@ -805,13 +808,15 @@ function App() {
                       ? "Browse catalog"
                       : view === "playground"
                         ? "Playground"
-                        : view === "teams"
-                          ? "Teams"
-                          : view === "settings"
-                            ? "Settings"
-                            : selectedClient
-                              ? selectedClient.name
-                              : "Servers"}
+                        : view === "rules"
+                          ? "Agent rules"
+                          : view === "teams"
+                            ? "Teams"
+                            : view === "settings"
+                              ? "Settings"
+                              : selectedClient
+                                ? selectedClient.name
+                                : "Servers"}
                 </h1>
                 <p className="truncate text-sm text-muted-foreground">
                   {view === "activity"
@@ -820,15 +825,17 @@ function App() {
                       ? "Add MCP servers from the registry"
                       : view === "playground"
                         ? "Invoke a server's tools and see the raw result"
-                        : view === "teams"
-                          ? "Share one MCP server set across your team"
-                          : view === "settings"
-                            ? "Global discovery and security policy"
-                            : selectedClient
-                              ? "MCP client"
-                              : loading || !registry
-                                ? "Loading…"
-                                : "One gateway in front of every MCP server you run"}
+                        : view === "rules"
+                          ? "Write your rules once, apply them to every AI client"
+                          : view === "teams"
+                            ? "Share one MCP server set across your team"
+                            : view === "settings"
+                              ? "Global discovery and security policy"
+                              : selectedClient
+                                ? "MCP client"
+                                : loading || !registry
+                                  ? "Loading…"
+                                  : "One gateway in front of every MCP server you run"}
                 </p>
               </div>
             </div>
@@ -968,6 +975,8 @@ function App() {
                     <CatalogView registry={registry} onAdded={setRegistry} />
                   ) : view === "playground" ? (
                     <PlaygroundView registry={registry} onRegistryChange={setRegistry} />
+                  ) : view === "rules" ? (
+                    <RulesView />
                   ) : view === "teams" ? (
                     <TeamsView registry={registry} onRegistryChange={setRegistry} />
                   ) : view === "settings" ? (
