@@ -87,6 +87,9 @@ const PlaygroundView = lazy(() =>
 const RulesView = lazy(() =>
   import("@/components/RulesView").then((m) => ({ default: m.RulesView })),
 );
+const HooksView = lazy(() =>
+  import("@/components/HooksView").then((m) => ({ default: m.HooksView })),
+);
 const TeamsView = lazy(() =>
   import("@/components/TeamsView").then((m) => ({ default: m.TeamsView })),
 );
@@ -810,13 +813,15 @@ function App() {
                         ? "Playground"
                         : view === "rules"
                           ? "Agent rules"
-                          : view === "teams"
-                            ? "Teams"
-                            : view === "settings"
-                              ? "Settings"
-                              : selectedClient
-                                ? selectedClient.name
-                                : "Servers"}
+                          : view === "hooks"
+                            ? "Agent activity"
+                            : view === "teams"
+                              ? "Teams"
+                              : view === "settings"
+                                ? "Settings"
+                                : selectedClient
+                                  ? selectedClient.name
+                                  : "Servers"}
                 </h1>
                 <p className="truncate text-sm text-muted-foreground">
                   {view === "activity"
@@ -827,15 +832,17 @@ function App() {
                         ? "Invoke a server's tools and see the raw result"
                         : view === "rules"
                           ? "Write your rules once, apply them to every AI client"
-                          : view === "teams"
-                            ? "Share one MCP server set across your team"
-                            : view === "settings"
-                              ? "Global discovery and security policy"
-                              : selectedClient
-                                ? "MCP client"
-                                : loading || !registry
-                                  ? "Loading…"
-                                  : "One gateway in front of every MCP server you run"}
+                          : view === "hooks"
+                            ? "See what your agents do outside Toolport"
+                            : view === "teams"
+                              ? "Share one MCP server set across your team"
+                              : view === "settings"
+                                ? "Global discovery and security policy"
+                                : selectedClient
+                                  ? "MCP client"
+                                  : loading || !registry
+                                    ? "Loading…"
+                                    : "One gateway in front of every MCP server you run"}
                 </p>
               </div>
             </div>
@@ -977,6 +984,8 @@ function App() {
                     <PlaygroundView registry={registry} onRegistryChange={setRegistry} />
                   ) : view === "rules" ? (
                     <RulesView />
+                  ) : view === "hooks" ? (
+                    <HooksView />
                   ) : view === "teams" ? (
                     <TeamsView registry={registry} onRegistryChange={setRegistry} />
                   ) : view === "settings" ? (
