@@ -6,6 +6,16 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Security
+
+- **Downstream stderr drain no longer grows without bound on a newline-less write.**
+  Stdout was already capped at 16 MiB per line; stderr still used unbounded
+  `read_line` and only trimmed the kept tail afterwards. A hostile or buggy
+  stdio server that wrote a multi-GB chunk with no newline could OOM the
+  gateway and take every HTTP-bridge client with it. The drain now uses the
+  same `take(MAX_RESPONSE_BYTES)` bound as stdout and stops on an unterminated
+  full-cap line. (SBS-930)
+
 ### Fixed
 
 - **HITL and routine audit rows no longer count as successful tool calls.**
