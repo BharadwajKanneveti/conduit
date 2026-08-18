@@ -947,15 +947,39 @@ mod tests {
 
     // --- on-disk behavior ---------------------------------------------------
 
-    fn scratch(name: &str) -> PathBuf {
+    /// A scratch directory that is ALSO the process-global data dir for the test.
+    ///
+    /// Both halves are required. `install_at` on an existing file takes a backup, and
+    /// backups land under `registry::conduit_dir()`, so a test without the override
+    /// writes into the real Toolport data directory and races every other test doing
+    /// the same. That is what failed on CI Windows with "the system cannot find the
+    /// path specified" while passing locally.
+    ///
+    /// Field order IS drop order: the override is cleared before the lock is released,
+    /// so no other test can observe this scratch dir.
+    struct ScratchEnv {
+        dir: PathBuf,
+        _override: crate::registry::DataDirOverride,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for ScratchEnv {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn scratch_env(name: &str) -> ScratchEnv {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let lock = crate::registry::data_dir_test_lock();
         let dir = std::env::temp_dir().join(format!(
             "toolport-hooks-{name}-{}-{}",
             std::process::id(),
             SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        dir
+        let over = crate::registry::DataDirOverride::set(&dir);
+        ScratchEnv { dir, _override: over, _lock: lock }
     }
 
     fn read(path: &Path) -> String {
@@ -964,7 +988,8 @@ mod tests {
 
     #[test]
     fn install_creates_a_settings_file_that_did_not_exist() {
-        let dir = scratch("fresh");
+        let env = scratch_env("fresh");
+        let dir = env.dir.clone();
         let path = dir.join("settings.json");
 
         install_at(&path, &binary()).unwrap();
@@ -974,12 +999,12 @@ mod tests {
         // A file we created holds nothing but our block.
         assert_eq!(root.as_object().unwrap().len(), 1);
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn install_preserves_comments_and_every_unrelated_setting() {
-        let dir = scratch("comments");
+        let env = scratch_env("comments");
+        let dir = env.dir.clone();
         let path = dir.join("settings.json");
         let original = "{\n  // the model I actually want\n  \"model\": \"opus\",\n  \"permissions\": { \"allow\": [\"Bash(git status)\"] }\n}\n";
         std::fs::write(&path, original).unwrap();
@@ -1005,12 +1030,12 @@ mod tests {
             "uninstall must not leave an empty hooks object: {restored}"
         );
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn install_is_a_no_op_when_the_file_already_says_what_we_would_write() {
-        let dir = scratch("noop");
+        let env = scratch_env("noop");
+        let dir = env.dir.clone();
         let path = dir.join("settings.json");
 
         install_at(&path, &binary()).unwrap();
@@ -1019,12 +1044,12 @@ mod tests {
 
         assert_eq!(first, read(&path), "a second apply must not rewrite bytes");
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_duplicate_hooks_key_is_refused_and_the_file_is_left_alone() {
-        let dir = scratch("dupe");
+        let env = scratch_env("dupe");
+        let dir = env.dir.clone();
         let path = dir.join("settings.json");
         // Ambiguous: a rewrite would silently drop one of the two.
         let original = "{ \"hooks\": {}, \"hooks\": {} }";
@@ -1033,12 +1058,12 @@ mod tests {
         assert!(install_at(&path, &binary()).is_err());
         assert_eq!(read(&path), original, "the file must be untouched");
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_malformed_settings_file_is_refused_rather_than_replaced() {
-        let dir = scratch("malformed");
+        let env = scratch_env("malformed");
+        let dir = env.dir.clone();
         let path = dir.join("settings.json");
         let original = "{ this is not json";
         std::fs::write(&path, original).unwrap();
@@ -1047,22 +1072,22 @@ mod tests {
         assert!(remove_at(&path).is_err(), "removal must not rewrite it either");
         assert_eq!(read(&path), original);
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn removing_from_a_profile_that_no_longer_exists_is_success() {
-        let dir = scratch("gone");
+        let env = scratch_env("gone");
+        let dir = env.dir.clone();
         let path = dir.join("settings.json");
         // A profile the user deleted between apply and remove is a stronger form of
         // "removed", not an error to report.
         assert!(remove_at(&path).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn removing_leaves_a_foreign_hook_on_the_same_event_intact() {
-        let dir = scratch("foreign");
+        let env = scratch_env("foreign");
+        let dir = env.dir.clone();
         let path = dir.join("settings.json");
         std::fs::write(
             &path,
@@ -1079,7 +1104,6 @@ mod tests {
         let root: Value = crate::clients::read_settings_json(&path).unwrap().0;
         assert_eq!(root["hooks"]["PostToolUse"], json!([foreign_group()]));
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1087,9 +1111,8 @@ mod tests {
         // The hook path runs before any gateway startup, so it must work against a
         // data directory that holds nothing at all - no registry.json, no keychain.
         // This is the "does not touch the registry" property from the spec.
-        let _guard = crate::registry::data_dir_test_lock();
-        let dir = scratch("no-registry");
-        let _override = crate::registry::DataDirOverride::set(&dir);
+        let env = scratch_env("no-registry");
+        let dir = env.dir.clone();
 
         handle_event(
             "tool",
@@ -1103,15 +1126,11 @@ mod tests {
         assert_eq!(rows[0]["sessionId"], json!("s1"));
         assert!(!dir.join("registry.json").exists(), "no registry was created");
 
-        drop(_override);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn handle_event_survives_junk_stdin_and_an_unknown_event() {
-        let _guard = crate::registry::data_dir_test_lock();
-        let dir = scratch("junk");
-        let _override = crate::registry::DataDirOverride::set(&dir);
+        let _env = scratch_env("junk");
 
         // Unparseable payload: recorded, flagged, and with no `tool` key so no reader
         // can mistake it for an observed call.
@@ -1124,16 +1143,11 @@ mod tests {
         assert_eq!(rows[0]["malformed"], json!(true));
         assert!(rows[0].get("tool").is_none());
         assert!(rows[0].get("ok").is_none());
-
-        drop(_override);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn recorded_rows_are_one_json_line_each_and_newest_first() {
-        let _guard = crate::registry::data_dir_test_lock();
-        let dir = scratch("order");
-        let _override = crate::registry::DataDirOverride::set(&dir);
+        let _env = scratch_env("order");
 
         handle_event("session-start", &json!({ "session_id": "s1" }).to_string());
         handle_event("tool", &json!({ "session_id": "s1", "tool_name": "Read" }).to_string());
@@ -1146,8 +1160,6 @@ mod tests {
         assert_eq!(rows[0]["event"], json!("session-end"));
         assert_eq!(rows[2]["event"], json!("session-start"));
 
-        drop(_override);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1155,9 +1167,8 @@ mod tests {
         // The overwhelmingly common launch. It must not scan profiles, resolve a
         // gateway binary, or write to the registry, because it runs on the same
         // thread as every other launch task.
-        let _guard = crate::registry::data_dir_test_lock();
-        let dir = scratch("startup-off");
-        let _override = crate::registry::DataDirOverride::set(&dir);
+        let env = scratch_env("startup-off");
+        let dir = env.dir.clone();
 
         apply_on_startup();
 
@@ -1166,15 +1177,14 @@ mod tests {
             "a launch with the sensor off must not write anything"
         );
 
-        drop(_override);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_target_whose_removal_failed_stays_recorded_for_the_next_pass() {
         // The SBS-914 shape: dropping a path we could not clean strands the file,
         // because nothing would ever try again.
-        let dir = scratch("retry");
+        let env = scratch_env("retry");
+        let dir = env.dir.clone();
         let path = dir.join("settings.json");
         std::fs::write(&path, "{ not json }").unwrap();
 
@@ -1184,7 +1194,6 @@ mod tests {
         );
         assert!(path.exists(), "and must not be deleted or rewritten");
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1292,9 +1301,8 @@ mod tests {
         // Recording a candidate we never wrote makes a file the user broke into a
         // permanent retry: every later pass tries to remove a block that was never
         // there and fails on the same parse error.
-        let _guard = crate::registry::data_dir_test_lock();
-        let dir = scratch("never-written");
-        let _override = crate::registry::DataDirOverride::set(&dir);
+        let env = scratch_env("never-written");
+        let dir = env.dir.clone();
         let profile = dir.join("settings.json");
         std::fs::write(&profile, "{ not json").unwrap();
 
@@ -1307,8 +1315,6 @@ mod tests {
             "a profile we never wrote must not be recorded as ours"
         );
 
-        drop(_override);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1316,9 +1322,8 @@ mod tests {
         // The other half, and the one the naive "record only successful writes" rule
         // gets wrong: a block we really did write must stay tracked through a failure,
         // or a later disable will not clean it and the sensor keeps firing (SBS-914).
-        let _guard = crate::registry::data_dir_test_lock();
-        let dir = scratch("written-then-broken");
-        let _override = crate::registry::DataDirOverride::set(&dir);
+        let env = scratch_env("written-then-broken");
+        let dir = env.dir.clone();
         let profile = dir.join("settings.json");
 
         apply_to(Some(true), &[profile.clone()], Some(&binary())).unwrap();
@@ -1336,15 +1341,14 @@ mod tests {
             "a profile we wrote must stay recorded through a read failure"
         );
 
-        drop(_override);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn preview_text_is_the_bytes_install_actually_writes() {
         // The dry run must not claim a comment is about to disappear when the real
         // write keeps it (SBS-822 review).
-        let dir = scratch("preview-bytes");
+        let env = scratch_env("preview-bytes");
+        let dir = env.dir.clone();
         let path = dir.join("settings.json");
         let original =
             "{\n  // the model I actually want\n  \"model\": \"opus\"\n}\n";
@@ -1364,12 +1368,12 @@ mod tests {
         );
         assert!(previews[0].after.contains("// the model I actually want"));
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn preview_writes_nothing_at_all() {
-        let dir = scratch("preview-readonly");
+        let env = scratch_env("preview-readonly");
+        let dir = env.dir.clone();
         let path = dir.join("settings.json");
 
         // A profile with no settings file yet: the dry run must not create one.
@@ -1378,7 +1382,6 @@ mod tests {
         assert!(previews[0].after.contains(HOOK_MARKER));
         assert!(!path.exists(), "a dry run must not create the settings file");
 
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1386,9 +1389,8 @@ mod tests {
         // A failed apply must leave the registry exactly as it was. Otherwise `view()`
         // reports enabled with nothing installed and every startup retries the same
         // failing apply forever, with no path back (SBS-822 review).
-        let _guard = crate::registry::data_dir_test_lock();
-        let dir = scratch("enable-fails");
-        let _override = crate::registry::DataDirOverride::set(&dir);
+        let env = scratch_env("enable-fails");
+        let dir = env.dir.clone();
         let profile = dir.join(".claude").join("settings.json");
 
         // No resolvable binary is the real-world case this models: every non-Windows
@@ -1405,15 +1407,12 @@ mod tests {
             "and must not have written a settings file first"
         );
 
-        drop(_override);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn enabling_commits_the_opt_in_and_the_targets_together() {
-        let _guard = crate::registry::data_dir_test_lock();
-        let dir = scratch("enable-commits");
-        let _override = crate::registry::DataDirOverride::set(&dir);
+        let env = scratch_env("enable-commits");
+        let dir = env.dir.clone();
         let profile = dir.join(".claude").join("settings.json");
         std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
 
@@ -1438,15 +1437,12 @@ mod tests {
             &crate::clients::read_settings_json(&profile).unwrap().0
         ));
 
-        drop(_override);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn read_recent_reports_an_unreadable_log_instead_of_saying_nothing_happened() {
-        let _guard = crate::registry::data_dir_test_lock();
-        let dir = scratch("unreadable");
-        let _override = crate::registry::DataDirOverride::set(&dir);
+        let env = scratch_env("unreadable");
+        let dir = env.dir.clone();
 
         // A directory where the log file should be: readable as a path, not as a file.
         std::fs::create_dir_all(dir.join("hooks.jsonl")).unwrap();
@@ -1455,7 +1451,5 @@ mod tests {
             "an unreadable log must not read as an empty one (SBS-873)"
         );
 
-        drop(_override);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
