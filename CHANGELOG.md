@@ -70,6 +70,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **A refused Team Instructions rewrite no longer deletes the last-good org rules.**
+  `apply_instructions_to` only recorded a target when `write_target` returned
+  `Applied`. Error, TooLong (a Windsurf char-cap miss) and BlockedOverride then
+  hit `remove_recorded`, which stripped the working v1 block, persisted the new
+  content watermark, and left later syncs with nothing to retry — coverage of
+  the missing file against too-long v2 is `TooLong`, not `Stale`. Last-good now
+  stays on disk and in the recorded set when a rewrite is refused; a real
+  removal (org cleared, client gone, path moved) still cleans up. (SBS-917)
 - **Kimi Shared HTTP Connect writes `url`, not Qwen's `httpUrl`.** Connect, rescope
   and reset for Kimi went through the generic JSON editor, which remapped remotes
   via Qwen's `url` → `httpUrl` whenever the map key was not VS Code `"servers"`.
