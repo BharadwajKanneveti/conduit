@@ -19,7 +19,7 @@ function key(k: string, mods: Partial<ShortcutEvent> = {}): ShortcutEvent {
 }
 
 describe("resolveShortcut (SBS-143)", () => {
-  it("maps Ctrl+1..6 to the six views in order", () => {
+  it("maps Ctrl+1..7 to the seven views in order", () => {
     SHORTCUT_VIEWS.forEach((view, i) => {
       expect(resolveShortcut(key(String(i + 1), { ctrlKey: true }))).toEqual({
         kind: "view",
@@ -35,8 +35,16 @@ describe("resolveShortcut (SBS-143)", () => {
     });
   });
 
-  it("does not claim a seventh number", () => {
-    expect(resolveShortcut(key("7", { ctrlKey: true }))).toBeNull();
+  it("keeps the shipped mappings and appends Clients as the seventh view", () => {
+    expect(resolveShortcut(key("2", { ctrlKey: true }))).toEqual({
+      kind: "view",
+      view: "activity",
+    });
+    expect(resolveShortcut(key("7", { ctrlKey: true }))).toEqual({
+      kind: "view",
+      view: "clients",
+    });
+    expect(resolveShortcut(key("8", { ctrlKey: true }))).toBeNull();
   });
 
   it("focuses search on bare / only outside a text field", () => {
@@ -104,6 +112,7 @@ describe("shortcutHelp", () => {
   it("names the platform modifier so a Mac user is not told to press Ctrl", () => {
     expect(shortcutHelp(true)[0].keys).toContain("⌘");
     expect(shortcutHelp(false)[0].keys).toContain("Ctrl");
+    expect(shortcutHelp(false)[0].keys).toContain("7");
   });
 
   it("documents every action the resolver can produce", () => {

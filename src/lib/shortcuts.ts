@@ -8,6 +8,8 @@ export const SHORTCUT_VIEWS: View[] = [
   "playground",
   "teams",
   "settings",
+  // Keep the shipped 1–6 mappings stable; Clients was promoted later.
+  "clients",
 ];
 
 /** What a keystroke resolved to, or `null` when it is not a shortcut. */
@@ -52,7 +54,7 @@ export function isTextEntry(target: ShortcutTarget | null | undefined): boolean 
  * rather than through a rendered tree.
  *
  * Rules:
- *   * `Ctrl/Cmd+1..6` switch views, and work even while typing — an explicit modifier
+ *   * `Ctrl/Cmd+1..7` switch views, and work even while typing — an explicit modifier
  *     chord is never something the user meant as text.
  *   * `/` focuses search, but only outside a text field, or it eats the character.
  *   * `Ctrl/Cmd+F` also focuses search, everywhere. `Ctrl/Cmd+N` adds a server,
@@ -102,7 +104,7 @@ export interface ShortcutHelpRow {
 export function shortcutHelp(isMac: boolean): ShortcutHelpRow[] {
   const mod = isMac ? "⌘" : "Ctrl";
   return [
-    { keys: `${mod}1 – ${mod}6`, what: "Switch view" },
+    { keys: `${mod}1 – ${mod}7`, what: "Switch view" },
     { keys: `/ or ${mod}F`, what: "Focus the server search" },
     { keys: `${mod}N`, what: "Add a server" },
     { keys: `${mod}R`, what: "Refresh servers and clients" },
