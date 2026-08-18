@@ -176,7 +176,8 @@ fn apply_to(installed: &[ClientTarget]) -> Result<RulesView, String> {
     // Hold the registry's cross-process lock from the ONE authoritative load through every file
     // write/cleanup and the rules_targets save. Rule mutations also use this lock, so an older
     // apply cannot write stale bytes after a newer set wins, and a placeholder/default snapshot
-    // can never be mistaken for an intentional clear.
+    // can never be mistaken for an intentional clear. Team writes do not invert this order:
+    // `write_target`/`remove_recorded` release WRITE_LOCK before Teams calls registry::update.
     let (reg, ()) = crate::registry::update_authoritative(|reg| {
         let set = reg.active_rule_set().cloned();
         let prev_targets = reg.rules_targets.clone();
@@ -360,8 +361,14 @@ pub fn set_client_enabled(client_id: &str, enabled: bool) -> Result<RulesView, S
 /// a client updated (or reinstalled) since the last apply picks the rules back up without the
 /// user opening the Rules tab.
 pub fn apply_on_startup() {
-    match crate::registry::load() {
-        Ok(reg) if reg.active_rule_set().is_none() && reg.rules_targets.is_empty() => {
+    match crate::registry::load_resolved_with_source() {
+        Ok((_, source)) if !source.is_authoritative() => {
+            eprintln!(
+                "toolport: could not inspect personal rules authoritatively at startup ({source:?})"
+            );
+            return;
+        }
+        Ok((reg, _)) if reg.active_rule_set().is_none() && reg.rules_targets.is_empty() => {
             return; // nothing configured and nothing written: skip the client scan entirely
         }
         Ok(_) => {}
@@ -980,6 +987,46 @@ mod tests {
             crate::registry::load().unwrap().rules_targets,
             vec![recorded],
             "a path we failed to clean must stay recorded so the next pass retries it"
+        );
+    }
+
+    #[test]
+    fn a_recovered_registry_cannot_trigger_rules_cleanup() {
+        let _dirs = crate::registry::data_dir_test_lock();
+        let s = Scratch::new();
+        let data = s.path("data");
+        let _data_dir = crate::registry::DataDirOverride::set(&data);
+        let target = sentinel(s.path("AGENTS.md"));
+        let path = target.path.to_string_lossy().to_string();
+
+        assert_eq!(
+            instructions::write_target(&target, "work", 1, "Keep this rule."),
+            ApplyState::Applied
+        );
+        let before = std::fs::read_to_string(&target.path).unwrap();
+
+        crate::registry::update(|reg| {
+            reg.rule_sets.push(set("work", 1, "Keep this rule."));
+            reg.active_rule_set_id = Some("work".into());
+            reg.rules_targets = vec![path.clone()];
+            Ok(())
+        })
+        .unwrap();
+        // A second save creates an N-1 backup containing the active set and recorded target.
+        crate::registry::update(|reg| {
+            reg.deny_destructive = !reg.deny_destructive;
+            Ok(())
+        })
+        .unwrap();
+        std::fs::write(data.join("registry.json"), "{ not json").unwrap();
+
+        let error = apply_to(&[]).expect_err("backup recovery must refuse filesystem changes");
+
+        assert!(error.contains("not authoritative"), "unexpected error: {error}");
+        assert_eq!(
+            std::fs::read_to_string(&target.path).unwrap(),
+            before,
+            "a recovered snapshot must not remove recorded client rules"
         );
     }
 
