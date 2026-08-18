@@ -419,7 +419,13 @@ pub fn write_target(t: &Target, id: &str, version: i64, content: &str) -> ApplyS
         return ApplyState::Error;
     }
     let desired = match t.strategy {
-        Strategy::OwnedFile => render_owned_file(t.scope, id, version, content),
+        Strategy::OwnedFile => {
+            let desired = render_owned_file(t.scope, id, version, content);
+            if std::fs::read_to_string(&t.path).ok().as_deref() == Some(desired.as_str()) {
+                return ApplyState::Applied; // already up to date; skip the atomic replacement
+            }
+            desired
+        }
         Strategy::SentinelBlock => {
             let existing = match read_existing(&t.path) {
                 Ok(s) => s,
@@ -882,6 +888,31 @@ mod tests {
         assert!(on_disk.contains("Org rule"));
         remove_recorded(&t.path, Scope::Team);
         assert!(!t.path.exists(), "owned file should be deleted on leave");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn current_owned_file_reapply_skips_the_atomic_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let s = Scratch::new();
+        let t = owned_target(
+            s.path("rules").join(Scope::Personal.owned_file_name()),
+            Scope::Personal,
+        );
+        assert_eq!(write_target(&t, "work", 1, "My rule"), ApplyState::Applied);
+        let before = std::fs::metadata(&t.path).unwrap().modified().unwrap();
+
+        // Atomic replacement needs a writable parent. A byte-identical reapply must return before
+        // attempting that replacement, which also leaves the mtime untouched.
+        let parent = t.path.parent().unwrap();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let state = write_target(&t, "work", 1, "My rule");
+        let after = std::fs::metadata(&t.path).unwrap().modified().unwrap();
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert_eq!(state, ApplyState::Applied);
+        assert_eq!(after, before);
     }
 
     #[test]

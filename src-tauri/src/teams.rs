@@ -1001,16 +1001,18 @@ fn apply_instructions_to(
         }
         // Only the target set changed. Clean up paths for clients that disappeared without
         // rewriting still-current files or advancing their marker to an unrelated config version.
-        for old in &obsolete {
-            let _ = instructions::remove_recorded(
-                std::path::Path::new(old),
-                instructions::Scope::Team,
-            );
+        let mut retained = Vec::new();
+        for old in prev_targets {
+            let still_current = target_paths.iter().any(|current| current == &old);
+            if still_current
+                || !instructions::remove_recorded(
+                    std::path::Path::new(&old),
+                    instructions::Scope::Team,
+                )
+            {
+                retained.push(old);
+            }
         }
-        let retained: Vec<String> = prev_targets
-            .into_iter()
-            .filter(|old| target_paths.iter().any(|current| current == old))
-            .collect();
         let _ = crate::registry::update(|reg| {
             if let Some(t) = reg.team.as_mut() {
                 if t.team_id == team_id
@@ -1053,10 +1055,12 @@ fn apply_instructions_to(
     // rewrite of a still-current target is not that — last-good stays (SBS-917).
     for old in &prev_targets {
         if !written.iter().any(|w| w == old) && !keep.iter().any(|k| k == old) {
-            // Result ignored deliberately: this writer replaces `team_instructions_targets`
-            // wholesale below, so it has nowhere to carry "we could not clean that one" forward.
-            let _ =
-                instructions::remove_recorded(std::path::Path::new(old), instructions::Scope::Team);
+            // A failed cleanup must stay recorded. Cleanup is driven only by this list, so
+            // forgetting the path would strand the org block with nothing left to retry it.
+            if !instructions::remove_recorded(std::path::Path::new(old), instructions::Scope::Team)
+            {
+                keep.push(old.clone());
+            }
         }
     }
 
@@ -2360,6 +2364,44 @@ mod tests {
             recorded.is_empty(),
             "recorded set must be empty after a successful removal"
         );
+    }
+
+    #[test]
+    fn failed_instruction_cleanup_stays_recorded_and_retries() {
+        let _env = crate::clients::env_test_lock();
+        let _dirs = crate::registry::data_dir_test_lock();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-sbs917-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(scratch.join("data"));
+        let path = scratch.join("rules.md");
+        const TEAM: &str = "team_sbs917_cleanup";
+        const CONTENT: &str = "Keep the approved workflow.";
+        seed_applied_instructions(TEAM, 1, CONTENT, &path);
+        let valid = std::fs::read_to_string(&path).unwrap();
+
+        // A start marker without an end marker is deliberately not rewritten or removed.
+        // The path must remain recorded or no later sync would know to retry it.
+        std::fs::write(
+            &path,
+            format!("{}\nunterminated", crate::instructions::SENTINEL_START_PREFIX),
+        )
+        .unwrap();
+        apply_instructions_to(TEAM, 2, None, &[]);
+        let (content, version, recorded) = loaded_instructions();
+        assert_eq!(content, None);
+        assert_eq!(version, 2);
+        assert_eq!(recorded, vec![path.to_string_lossy().to_string()]);
+
+        // Once the file is readable and well-formed again, the unchanged-content cleanup path
+        // retries the recorded location and can finally forget it.
+        std::fs::write(&path, valid).unwrap();
+        apply_instructions_to(TEAM, 2, None, &[]);
+        let (_, _, recorded) = loaded_instructions();
+        assert!(!path.exists(), "the repaired recorded path should be cleaned");
+        assert!(recorded.is_empty(), "a successful retry may forget the path");
+        let _ = std::fs::remove_dir_all(&scratch);
     }
 
     #[test]

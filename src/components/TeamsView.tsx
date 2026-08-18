@@ -7,10 +7,6 @@ import {
   Users,
   Server,
   AlertTriangle,
-  Check,
-  Clock,
-  Ban,
-  Minus,
   FileText,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
@@ -18,6 +14,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Callout } from "@/components/Callout";
+import { RuleStateBadge } from "@/components/RuleStateBadge";
 import { TransportPill } from "@/components/TransportPill";
 import { Input } from "@/components/ui/input";
 import {
@@ -33,36 +30,7 @@ import {
 import { HOSTED_TEAMS_URL, teamUrlError } from "@/lib/teamUrl";
 import { isEnabled, activeProfile } from "@/lib/types";
 import type { TeamPushPreview } from "@/lib/api";
-import type {
-  Registry,
-  InstructionsStatusView,
-  InstructionsApplyState,
-} from "@/lib/types";
-
-/** How each per-client instructions state renders in the member's Teams tab (spec W4). */
-const INSTR_STATE_META: Record<
-  InstructionsApplyState,
-  { label: string; className: string; Icon: typeof Check }
-> = {
-  applied: { label: "Applied", className: "text-success", Icon: Check },
-  stale: { label: "Not applied yet", className: "text-warning", Icon: Clock },
-  blocked_override: {
-    label: "Blocked by a local override",
-    className: "text-warning",
-    Icon: Ban,
-  },
-  too_long: {
-    label: "Too long for this client",
-    className: "text-warning",
-    Icon: AlertTriangle,
-  },
-  unsupported: {
-    label: "Copy manually",
-    className: "text-muted-foreground",
-    Icon: Minus,
-  },
-  error: { label: "Write error", className: "text-destructive", Icon: AlertTriangle },
-};
+import type { Registry, InstructionsStatusView } from "@/lib/types";
 
 /**
  * Toolport Teams: join a team and have its shared MCP server set appear locally. The
@@ -632,24 +600,15 @@ export function TeamsView({
                 </p>
               ) : (
                 <ul className="grid gap-1.5">
-                  {instr.clients.map((c) => {
-                    const meta = INSTR_STATE_META[c.state];
-                    const Icon = meta.Icon;
-                    return (
-                      <li
-                        key={c.id}
-                        className="flex items-center justify-between gap-3 text-sm"
-                      >
-                        <span className="truncate">{c.name}</span>
-                        <span
-                          className={`flex shrink-0 items-center gap-1 text-xs ${meta.className}`}
-                        >
-                          <Icon className="size-3.5" />
-                          {meta.label}
-                        </span>
-                      </li>
-                    );
-                  })}
+                  {instr.clients.map((c) => (
+                    <li
+                      key={c.id}
+                      className="flex items-center justify-between gap-3 text-sm"
+                    >
+                      <span className="truncate">{c.name}</span>
+                      <RuleStateBadge state={c.state} />
+                    </li>
+                  ))}
                 </ul>
               )}
             </div>

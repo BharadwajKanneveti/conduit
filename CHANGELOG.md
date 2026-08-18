@@ -6,6 +6,19 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Security
+
+- **Release job no longer inherits Azure Trusted Signing credentials during
+  frontend install.** They are now step-scoped to the Windows tauri build,
+  matching TAURI and APPLE. (SBS-925)
+- **Downstream stderr drain no longer grows without bound on a newline-less write.**
+  Stdout was already capped at 16 MiB per line; stderr still used unbounded
+  `read_line` and only trimmed the kept tail afterwards. A hostile or buggy
+  stdio server that wrote a multi-GB chunk with no newline could OOM the
+  gateway and take every HTTP-bridge client with it. The drain now uses the
+  same `take(MAX_RESPONSE_BYTES)` bound as stdout and stops on an unterminated
+  full-cap line. (SBS-930)
+
 ### Fixed
 
 - **HITL and routine audit rows no longer count as successful tool calls.**
@@ -35,6 +48,20 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Added
 
+- **Agent rules: write your instructions once, apply them everywhere.** A new Agent
+  rules tab holds one or more named rule sets and writes the active one into every
+  AI client's own global rules location (`AGENTS.md`, `GEMINI.md`, `.goosehints`,
+  Windsurf's `global_rules.md`, and a `toolport-rules.md` in the rules directory of
+  clients that read one), so keeping every supported client in agreement no longer
+  means hand-editing each file. Your own content is never overwritten:
+  Toolport either owns its own file in the client's rules directory or owns a
+  marked block inside a shared file and leaves every other byte exactly as it is.
+  Each client is off until you turn it on, a per-client preview shows the exact
+  bytes before the first write, and turning a client off or deleting the set
+  removes what Toolport wrote and nothing else. Cursor and Warp keep their globals
+  in their own UI, so the tab names them as clients it cannot write rather than
+  silently skipping them. Needs no MCP server or gateway. Team instructions are unaffected and
+  coexist in the same files. See [docs/agent-rules.md](docs/agent-rules.md).
 - **Official brand marks for 14 more clients.** Grok Build, OpenCode, Qwen Code, Kimi
   Code, JetBrains Junie, Kilo Code, GitHub Copilot CLI, Amp, Pi, Oh My Pi, Factory Droid,
   BoltAI, AnythingLLM and Continue now show their own logo in the Clients view instead of
@@ -51,6 +78,11 @@ Entries before the rename below shipped under the project's former name, Conduit
   the missing file against too-long v2 is `TooLong`, not `Stale`. Last-good now
   stays on disk and in the recorded set when a rewrite is refused; a real
   removal (org cleared, client gone, path moved) still cleans up. (SBS-917)
+- **Kimi Shared HTTP Connect writes `url`, not Qwen's `httpUrl`.** Connect, rescope
+  and reset for Kimi went through the generic JSON editor, which remapped remotes
+  via Qwen's `url` → `httpUrl` whenever the map key was not VS Code `"servers"`.
+  Kimi requires `url` and rejects `httpUrl`. The Kimi writer already emitted the
+  right shape; Shared HTTP now uses that same formatter. (SBS-921)
 
 ## [1.14.0] - 2026-08-16
 

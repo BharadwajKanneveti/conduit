@@ -2,7 +2,7 @@ export type Transport = "stdio" | "http" | "sse" | "unknown";
 
 /** The main content views, selected from the sidebar. */
 export type View =
-  "servers" | "activity" | "catalog" | "playground" | "teams" | "settings";
+  "servers" | "activity" | "catalog" | "playground" | "rules" | "teams" | "settings";
 
 export interface McpServer {
   name: string;
@@ -553,6 +553,49 @@ export interface InstructionsStatusView {
   content: string;
   version: number;
   clients: InstructionsClientStatus[];
+}
+
+/**
+ * One of the user's own named rule sets (SBS-821). `revision` moves only when `content` changes,
+ * because it rides in the marker written into each client's file.
+ */
+export interface RuleSet {
+  id: string;
+  name: string;
+  content: string;
+  revision: number;
+}
+
+/**
+ * One client's row in the Rules tab. Reuses {@link InstructionsApplyState}: personal rules and
+ * team instructions run through the same writer, so the states (and their badges) are identical.
+ */
+export interface RulesClientStatus {
+  id: string;
+  name: string;
+  /** User opt-in. A client is off until turned on; nothing is written to it until then. */
+  enabled: boolean;
+  /** Absent when this client has no global-rules file Toolport can manage (Cursor, Warp). */
+  path?: string;
+  state: InstructionsApplyState;
+}
+
+/** Everything the Rules tab renders, from one `rules_view` call. */
+export interface RulesView {
+  sets: RuleSet[];
+  activeSetId?: string;
+  clients: RulesClientStatus[];
+}
+
+/** A dry run of one client's write, shown before the first apply. Nothing is written to get it. */
+export interface RulesPreview {
+  clientId: string;
+  path: string;
+  /** `ownedFile` = Toolport owns the file; `sentinelBlock` = it owns only the marked span. */
+  strategy: "ownedFile" | "sentinelBlock";
+  before: string;
+  after: string;
+  state: InstructionsApplyState;
 }
 
 export function activeProfile(registry: Registry): Profile | undefined {

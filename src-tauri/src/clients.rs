@@ -5300,6 +5300,33 @@ fn edit_droid_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(
     )
 }
 
+fn edit_qwen_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
+    edit_json_gateway_with(
+        path,
+        "mcpServers",
+        entry,
+        true,
+        Some(entry_to_qwen_json),
+        false,
+        false,
+    )
+}
+
+/// Kimi requires `url` (and `transport: "sse"` on legacy SSE). The generic
+/// editor used to remap remotes through `entry_to_qwen_json` (`url` → `httpUrl`)
+/// whenever the map key was not VS Code `"servers"`, which Kimi rejects (SBS-921).
+fn edit_kimi_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
+    edit_json_gateway_with(
+        path,
+        "mcpServers",
+        entry,
+        true,
+        Some(entry_to_kimi_json),
+        false,
+        false,
+    )
+}
+
 fn edit_json_gateway_with(
     path: &Path,
     key: &str,
@@ -5366,18 +5393,12 @@ fn edit_json_gateway_body(
         !gateway_identity_matches(name, name, command)
     });
     if let Some(entry) = entry {
+        // Default is the standard `url`/`command` shape. Qwen's `httpUrl` remap
+        // used to fire for every remote whose map key was not VS Code `"servers"`,
+        // so Kimi Shared HTTP Connect wrote a field Kimi rejects (SBS-921).
+        // Clients with a distinct remote schema pass their own formatter.
         let mut value = if let Some(formatter) = entry_formatter {
             formatter(entry)
-        } else if include_tools {
-            entry_to_json(entry)
-        } else if entry.command.is_none() && entry.url.is_some() {
-            // Remote-only entries: Qwen wants httpUrl+headers; VS Code "servers" keeps url.
-            // entry_to_qwen_json leaves url as-is for SSE and renames for streamable HTTP.
-            if key == "servers" {
-                entry_to_json(entry)
-            } else {
-                entry_to_qwen_json(entry)
-            }
         } else {
             entry_to_json(entry)
         };
@@ -5483,8 +5504,8 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
         Format::JsonCopilotMcpServers => edit_copilot_json_gateway(&path, entry)?,
         Format::JsonDroidMcpServers => edit_droid_json_gateway(&path, entry)?,
         Format::JsonAmpMcpServers => edit_json_gateway(&path, "amp.mcpServers", entry, true)?,
-        Format::JsonQwenMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
-        Format::JsonKimiMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
+        Format::JsonQwenMcpServers => edit_qwen_json_gateway(&path, entry)?,
+        Format::JsonKimiMcpServers => edit_kimi_json_gateway(&path, entry)?,
         Format::JsonServers => edit_json_gateway(&path, "servers", entry, lenient)?,
         Format::JsonMcp => edit_crush_gateway(&path, entry)?,
         Format::JsonOpenCodeMcp => edit_opencode_gateway(&path, entry)?,
@@ -7798,7 +7819,7 @@ bad = "not-a-table"
             let path = temp_path("ws3-qwen.json");
             std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
             let entry = gateway_entry_shared_http("qwen-code", None, &spec);
-            edit_json_gateway(&path, "mcpServers", Some(&entry), true).unwrap();
+            edit_qwen_json_gateway(&path, Some(&entry)).unwrap();
             let root: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             let slot = &root["mcpServers"][GATEWAY_ENTRY_NAME];
@@ -9861,6 +9882,74 @@ command = "npx"
         assert!(installed.iter().any(|s| s.name == GATEWAY_ENTRY_NAME));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-921: Shared HTTP Connect/rescope/reset for Kimi goes through
+    /// `install_gateway_shared_http` → `install_or_remove`. That used to remap
+    /// remotes via `entry_to_qwen_json` (`url` → `httpUrl`) whenever the key was
+    /// not VS Code `"servers"`. Kimi requires `url` and rejects `httpUrl`.
+    /// `type` must also stay off: Kimi ignores it, and `entry_to_kimi_json`
+    /// strips the hint `entry_to_json` would emit.
+    #[test]
+    fn kimi_shared_http_connect_writes_url_not_qwen_http_url() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _data_lock = crate::registry::data_dir_test_lock();
+        let root =
+            std::env::temp_dir().join(format!("toolport-kimi-sbs921-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let data_dir = root.join("toolport-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _data_dir = crate::registry::DataDirOverride::set(&data_dir);
+        let path = root.join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"keep":{"command":"node","args":["server.js"]}}}"#,
+        )
+        .unwrap();
+        let _restore = EnvRestore::set("KIMI_CODE_HOME", &root);
+
+        let spec = SharedHttpSpec {
+            url: "http://127.0.0.1:8765/mcp".into(),
+            token: "kimi-tok".into(),
+        };
+        install_gateway_shared_http("kimi-code", Some("Work"), &spec).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let slot = &written["mcpServers"][GATEWAY_ENTRY_NAME];
+        assert_eq!(
+            slot["url"],
+            spec.url,
+            "Kimi Shared HTTP must write url: {slot}"
+        );
+        assert!(
+            slot.get("httpUrl").is_none(),
+            "Kimi rejects Qwen's httpUrl: {slot}"
+        );
+        assert!(
+            slot.get("type").is_none(),
+            "Kimi ignores type; entry_to_kimi_json must strip it: {slot}"
+        );
+        assert!(
+            slot.get("transport").is_none(),
+            "streamable HTTP is Kimi's default; do not emit transport: {slot}"
+        );
+        assert_eq!(slot["headers"]["Authorization"], "Bearer kimi-tok");
+        assert!(
+            written["mcpServers"].get("keep").is_some(),
+            "Connect must preserve existing servers: {written}"
+        );
+        let backups = data_dir.join("backups").join("kimi-code");
+        assert_eq!(
+            std::fs::read_dir(&backups).unwrap().count(),
+            1,
+            "the fixture backup must stay under the overridden test data dir"
+        );
+
+        drop(_data_dir);
+        drop(_restore);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
