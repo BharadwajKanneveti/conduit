@@ -6,6 +6,16 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ## [Unreleased]
 
+### Security
+
+- **Downstream stderr drain no longer grows without bound on a newline-less write.**
+  Stdout was already capped at 16 MiB per line; stderr still used unbounded
+  `read_line` and only trimmed the kept tail afterwards. A hostile or buggy
+  stdio server that wrote a multi-GB chunk with no newline could OOM the
+  gateway and take every HTTP-bridge client with it. The drain now uses the
+  same `take(MAX_RESPONSE_BYTES)` bound as stdout and stops on an unterminated
+  full-cap line. (SBS-930)
+
 ### Fixed
 
 - **The GHCR gateway image rebuilds from the current commit.** `docker-publish` was still
@@ -13,6 +23,16 @@ Entries before the rename below shipped under the project's former name, Conduit
   v0.3.12/v0.3.13 with a stale signed binary. It now uses the same Swatinem/rust-cache
   eviction as `release.yml`, so workspace crates always recompile while third-party deps
   stay cached. (SBS-926)
+- **HITL and routine audit rows no longer count as successful tool calls.**
+  Prometheus `toolport_tool_calls_total`, Activity "calls logged", and team
+  showback `calls` treated every `audit.jsonl` line as a routed call and a
+  missing `ok` as success. An approved human-approval gate writes a
+  `kind:approval` decision (`ok:true` on purpose, so a deny stays out of the
+  error rate) plus the timed exec, so one approval showed as two successful
+  calls. Advisor / suggestion / candidate lines omit `ok` and were counted as
+  successes while the Activity list painted them as failures. Aggregators now
+  require `ok` to be present and skip `kind` in {approval, routine, advisor,
+  suggestion, candidate}. (SBS-932)
 - **Homebrew cask snapshot was three releases behind.** `packaging/homebrew/toolport.rb`
   still said 1.11.0 after 1.14.0 shipped, and `docs/RELEASING.md` had no tap-bump
   step, so the next release would leave `brew install --cask tsouth89/toolport/toolport`

@@ -40,6 +40,9 @@ pub fn render_from_parts(entries: &[Value], tokens_saved: u64, quarantined_tools
     let mut dur_count: BTreeMap<(String, String), u64> = BTreeMap::new();
 
     for e in entries {
+        let Some(ok) = crate::audit::tool_call_ok(e) else {
+            continue;
+        };
         let server = e
             .get("server")
             .and_then(Value::as_str)
@@ -56,7 +59,6 @@ pub fn render_from_parts(entries: &[Value], tokens_saved: u64, quarantined_tools
             .filter(|c| !c.is_empty())
             .unwrap_or("")
             .to_string();
-        let ok = e.get("ok").and_then(Value::as_bool).unwrap_or(true);
         *calls
             .entry((server.clone(), tool.clone(), client.clone(), ok))
             .or_insert(0) += 1;
@@ -179,6 +181,37 @@ mod tests {
         assert!(text.contains("toolport_tokens_saved_total 42"));
         assert!(text.contains("toolport_quarantined_tools 1"));
         assert!(text.contains("# TYPE toolport_tool_calls_total counter"));
+    }
+
+    /// An approved HITL writes decision + timed (2x). The decision is `ok:true`
+    /// on purpose; it still must not increment successful tool calls. An
+    /// advisor row that omits `ok` is unknown, not success (SBS-932).
+    #[test]
+    fn render_skips_hitl_and_omitted_ok_rows() {
+        let entries = vec![
+            json!({"server":"s1","tool":"echo","ok":true,"durationMs":10,"client":"web"}),
+            json!({"server":"s1","tool":"wipe","ok":true,"kind":"approval","decision":"denied","held":true,"client":"web"}),
+            json!({"server":"s1","tool":"wipe","ok":true,"kind":"approval","decision":"approved","held":false,"client":"web"}),
+            json!({"server":"s1","tool":"wipe","ok":true,"durationMs":15,"client":"web"}),
+            json!({"server":"toolport","tool":"routine.advisor.hint_shown","kind":"routine","action":"hint_shown"}),
+        ];
+        let text = render_from_parts(&entries, 0, 0);
+        assert!(text.contains(
+            r#"toolport_tool_calls_total{server="s1",tool="echo",client="web",ok="true"} 1"#
+        ));
+        assert!(text.contains(
+            r#"toolport_tool_calls_total{server="s1",tool="wipe",client="web",ok="true"} 1"#
+        ));
+        assert!(!text.contains(r#"tool="routine.advisor.hint_shown""#));
+        assert!(!text.contains(r#"ok="true"} 2"#));
+        // HITL deny is not a confirm-destructive hold.
+        assert!(!text.contains("toolport_held_calls_total{"));
+        assert!(text.contains(
+            r#"toolport_tool_call_duration_milliseconds_count{server="s1",tool="echo"} 1"#
+        ));
+        assert!(text.contains(
+            r#"toolport_tool_call_duration_milliseconds_count{server="s1",tool="wipe"} 1"#
+        ));
     }
 
     #[test]
