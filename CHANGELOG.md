@@ -21,6 +21,11 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Fixed
 
+- **The GHCR gateway image rebuilds from the current commit.** `docker-publish` was still
+  caching all of `src-tauri/target` keyed only on Cargo.lock, the same shape that shipped
+  v0.3.12/v0.3.13 with a stale signed binary. It now uses the same Swatinem/rust-cache
+  eviction as `release.yml`, so workspace crates always recompile while third-party deps
+  stay cached. (SBS-926)
 - **HITL and routine audit rows no longer count as successful tool calls.**
   Prometheus `toolport_tool_calls_total`, Activity "calls logged", and team
   showback `calls` treated every `audit.jsonl` line as a routed call and a
