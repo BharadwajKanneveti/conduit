@@ -121,6 +121,7 @@ const BULK_DISABLE_CONFIRM_MIN = 3;
 function App() {
   const { resolved: resolvedTheme } = useTheme();
   const [registry, setRegistry] = useState<Registry | null>(null);
+  const registryRef = useRef<Registry | null>(null);
   const [clients, setClients] = useState<DetectedClient[]>([]);
   const [importPreview, setImportPreview] = useState<ImportItem[] | null>(null);
   const [importing, setImporting] = useState(false);
@@ -214,6 +215,42 @@ function App() {
     [],
   );
 
+  const applyRegistryChange = useCallback(
+    (next: Registry) => {
+      const activeId = (value: Registry | null) =>
+        value?.activeProfileId ?? value?.profiles[0]?.id;
+      const enabledIds = (value: Registry | null) =>
+        new Set(
+          value?.profiles.find((profile) => profile.id === activeId(value))
+            ?.enabledServerIds ?? [],
+        );
+      const previous = registryRef.current;
+      const previousProfileId = activeId(previous);
+      const nextProfileId = activeId(next);
+      const previousEnabled = enabledIds(previous);
+      const nextEnabled = enabledIds(next);
+      const invalidate =
+        previousProfileId !== nextProfileId
+          ? nextEnabled
+          : new Set([...nextEnabled].filter((id) => !previousEnabled.has(id)));
+
+      if (invalidate.size > 0) {
+        // A profile switch or enablement must not inherit the previous profile/set's
+        // health. Clear those rows before the new registry lands, then probe the
+        // authoritative backend state.
+        setHealth((current) => {
+          const fresh = { ...current };
+          invalidate.forEach((id) => delete fresh[id]);
+          return fresh;
+        });
+      }
+      registryRef.current = next;
+      setRegistry(next);
+      if (invalidate.size > 0) void reprobeAfterMutation().catch(() => {});
+    },
+    [reprobeAfterMutation],
+  );
+
   // Refresh statuses when the user returns to the window, so a server that came
   // up (or went down) while they were away reflects reality without a manual
   // refresh. Guarded so rapid alt-tabbing doesn't re-spawn every server.
@@ -238,6 +275,7 @@ function App() {
           detectClients(),
           takeRegistryRecoveryNotice(),
         ]);
+        registryRef.current = reg;
         setRegistry(reg);
         setClients(dc);
         if (recovery) {
@@ -294,13 +332,13 @@ function App() {
   // without a manual reload.
   useEffect(() => {
     const unlisten = listen<Registry>("registry-changed", (e) => {
-      setRegistry(e.payload);
+      applyRegistryChange(e.payload);
       setActivityKey((k) => k + 1);
     });
     return () => {
       void unlisten.then((f) => f());
     };
-  }, []);
+  }, [applyRegistryChange]);
 
   // The tray remains available while the window is hidden. Its approvals entry
   // should reveal the app at the exact place where the waiting calls can be
@@ -460,7 +498,7 @@ function App() {
         try {
           const fresh = await teamSyncWait(WAIT_SECS);
           if (cancelled) break;
-          setRegistry(fresh);
+          applyRegistryChange(fresh);
         } catch {
           // Network blip or server down: back off before re-parking so we don't spin.
           // Removal is a clean 401/403 the backend turns into a cleared team + the
@@ -486,7 +524,7 @@ function App() {
         wake = null;
       }
     };
-  }, [teamId]);
+  }, [applyRegistryChange, teamId]);
 
   function selectClient(id: string) {
     setSelectedClientId(id);
@@ -670,18 +708,7 @@ function App() {
     setBusyId(serverId);
     try {
       const next = await setServerEnabled(profileId, serverId, enabled, reviewed);
-      if (enabled) {
-        // A previous probe can outlive a disable/re-enable cycle. Drop it before the
-        // enabled registry lands so the row and posture stay Checking until this
-        // enablement's probe produces a fresh result.
-        setHealth((current) => {
-          const fresh = { ...current };
-          delete fresh[serverId];
-          return fresh;
-        });
-      }
-      setRegistry(next);
-      if (enabled) void reprobeAfterMutation().catch(() => {});
+      applyRegistryChange(next);
     } catch (e) {
       toastError(`Couldn't toggle: ${e}`);
     } finally {
@@ -703,7 +730,7 @@ function App() {
   async function handleRemove(serverId: string, name: string) {
     setBusyId(serverId);
     try {
-      setRegistry(await removeServer(serverId));
+      applyRegistryChange(await removeServer(serverId));
       toast.success(`Removed "${name}"`);
     } catch (e) {
       toastError(`Couldn't remove: ${e}`);
@@ -730,8 +757,7 @@ function App() {
     }
     setTogglingAll(true);
     try {
-      setRegistry(await setAllEnabled(profileId, enable));
-      if (enable) void reprobeAfterMutation().catch(() => {});
+      applyRegistryChange(await setAllEnabled(profileId, enable));
       let message = enable ? "Enabled all servers" : "Disabled all servers";
       if (enable && pendingReview > 0) {
         message =
@@ -768,7 +794,7 @@ function App() {
     try {
       const before = registry?.servers.length ?? 0;
       const next = await importServers(selected);
-      setRegistry(next);
+      applyRegistryChange(next);
       const added = next.servers.length - before;
       toast.success(
         added > 0
@@ -793,7 +819,7 @@ function App() {
       health={health[server.id]}
       onToggle={(en) => handleToggle(server.id, en)}
       onRemove={() => handleRemove(server.id, server.name)}
-      onRegistryChange={setRegistry}
+      onRegistryChange={applyRegistryChange}
       onReprobe={() => void reprobeAfterMutation().catch(() => {})}
     />
   );
@@ -803,7 +829,7 @@ function App() {
       <div className="flex h-screen overflow-hidden bg-background text-foreground">
         <AppSidebar
           registry={registry}
-          onRegistryChange={setRegistry}
+          onRegistryChange={applyRegistryChange}
           view={view}
           onSelectView={selectView}
           onReplayOnboarding={() => {
@@ -1012,7 +1038,7 @@ function App() {
                         client={selectedClient}
                         registry={registry}
                         onChanged={load}
-                        onRegistryChange={setRegistry}
+                        onRegistryChange={applyRegistryChange}
                       />
                     ) : (
                       <ClientsView
@@ -1025,15 +1051,24 @@ function App() {
                   ) : view === "activity" ? (
                     <ActivityView refreshKey={activityKey} registry={registry} />
                   ) : view === "catalog" ? (
-                    <CatalogView registry={registry} onAdded={setRegistry} />
+                    <CatalogView registry={registry} onAdded={applyRegistryChange} />
                   ) : view === "playground" ? (
-                    <PlaygroundView registry={registry} onRegistryChange={setRegistry} />
+                    <PlaygroundView
+                      registry={registry}
+                      onRegistryChange={applyRegistryChange}
+                    />
                   ) : view === "rules" ? (
                     <RulesView />
                   ) : view === "teams" ? (
-                    <TeamsView registry={registry} onRegistryChange={setRegistry} />
+                    <TeamsView
+                      registry={registry}
+                      onRegistryChange={applyRegistryChange}
+                    />
                   ) : view === "settings" ? (
-                    <SettingsView registry={registry} onRegistryChange={setRegistry} />
+                    <SettingsView
+                      registry={registry}
+                      onRegistryChange={applyRegistryChange}
+                    />
                   ) : loading && registry === null ? (
                     <div className="flex flex-col gap-2">
                       {Array.from({ length: 6 }).map((_, i) => (
@@ -1119,7 +1154,7 @@ function App() {
             initialStep={onboardingStep}
             clients={clients}
             registry={registry}
-            onRegistryChange={setRegistry}
+            onRegistryChange={applyRegistryChange}
             onClientsRefresh={load}
             onBrowseCatalog={() => {
               setShowOnboarding(false);
@@ -1197,7 +1232,7 @@ function App() {
           autoOpen
           onClose={() => setAddServerOpen(false)}
           onSaved={(reg) => {
-            setRegistry(reg);
+            applyRegistryChange(reg);
             // A successful save closes the dialog internally without going through
             // onOpenChange, so `onClose` never fires and this stays mounted-but-open.
             // Without clearing it here the next Ctrl+N is a silent no-op. Same pattern
@@ -1265,8 +1300,10 @@ export function serverPostureCopy({
             ? `${connected} enabled server${connected === 1 ? "" : "s"} reachable`
             : `${connected} of ${enabled} enabled servers reachable`;
   const detail = !backendReachable
-    ? connected > 0
-      ? `Last known: ${connected} reachable. Status may be out of date.`
+    ? checked > 0
+      ? attention > 0
+        ? `Last known: ${connected} reachable; ${attention} need${attention === 1 ? "s" : ""} a quick check. Status may be out of date.`
+        : `Last known: ${connected} reachable. Status may be out of date.`
       : "The last health check did not complete."
     : enabled === 0
       ? `${disabled} server${disabled === 1 ? "" : "s"} disabled in this profile.`

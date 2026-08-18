@@ -152,7 +152,11 @@ export function RegistryServerRow({
           <span
             role="status"
             aria-label={
-              installing ? "Installing the server package" : STATUS_ARIA_LABEL[status]
+              installing
+                ? "Installing the server package"
+                : status === "connected"
+                  ? label.replace(" · ", ", ")
+                  : STATUS_ARIA_LABEL[status]
             }
             className="sr-only"
           />
@@ -314,7 +318,10 @@ function StatusLabel({
   error: string | null;
 }) {
   const text = (
-    <span className={`text-xs font-medium whitespace-nowrap ${STATUS_TEXT[status]}`}>
+    <span
+      aria-hidden="true"
+      className={`text-xs font-medium whitespace-nowrap ${STATUS_TEXT[status]}`}
+    >
       {label}
     </span>
   );

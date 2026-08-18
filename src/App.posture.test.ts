@@ -121,4 +121,22 @@ describe("serverPostureCopy", () => {
       detail: "The last health check did not complete.",
     });
   });
+
+  it("preserves an all-failed last-known check when the backend becomes unavailable", () => {
+    expect(
+      serverPostureCopy({
+        backendReachable: false,
+        probing: false,
+        enabled: 2,
+        checked: 2,
+        connected: 0,
+        attention: 2,
+        disabled: 0,
+      }),
+    ).toEqual({
+      healthy: false,
+      title: "Reachability status unavailable",
+      detail: "Last known: 0 reachable; 2 need a quick check. Status may be out of date.",
+    });
+  });
 });

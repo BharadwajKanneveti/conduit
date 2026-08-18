@@ -2,13 +2,14 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import App from "./App";
-import type { ProbeResult } from "@/lib/types";
+import type { ProbeResult, Registry } from "@/lib/types";
 
 const probeServers = vi.fn();
 const getRegistry = vi.fn();
 const detectClients = vi.fn();
 const takeRegistryRecoveryNotice = vi.fn();
 const setServerEnabled = vi.fn();
+const setAllEnabled = vi.fn();
 
 // Captures the props App hands to the (mocked) Onboarding wizard so the test can
 // invoke onProbe exactly the way the Done step does.
@@ -24,7 +25,7 @@ vi.mock("@/lib/api", () => ({
   previewImportServers: vi.fn(),
   probeServers: (...a: unknown[]) => probeServers(...a),
   removeServer: vi.fn(),
-  setAllEnabled: vi.fn(),
+  setAllEnabled: (...a: unknown[]) => setAllEnabled(...a),
   setSecret: vi.fn(),
   setServerEnabled: (...a: unknown[]) => setServerEnabled(...a),
   takeRegistryRecoveryNotice: (...a: unknown[]) => takeRegistryRecoveryNotice(...a),
@@ -46,10 +47,28 @@ vi.mock("@/lib/theme", () => ({
 }));
 
 vi.mock("@/components/AppSidebar", () => ({
-  AppSidebar: ({ onSelectView }: { onSelectView: (view: "clients") => void }) => (
-    <button type="button" onClick={() => onSelectView("clients")}>
-      Clients
-    </button>
+  AppSidebar: ({
+    registry,
+    onRegistryChange,
+    onSelectView,
+  }: {
+    registry: Registry | null;
+    onRegistryChange: (registry: Registry) => void;
+    onSelectView: (view: "clients") => void;
+  }) => (
+    <>
+      <button type="button" onClick={() => onSelectView("clients")}>
+        Clients
+      </button>
+      {registry?.profiles.some((profile) => profile.id === "work") && (
+        <button
+          type="button"
+          onClick={() => onRegistryChange({ ...registry, activeProfileId: "work" })}
+        >
+          Switch profile
+        </button>
+      )}
+    </>
   ),
 }));
 vi.mock("@/components/PendingApprovals", () => ({ PendingApprovals: () => null }));
@@ -218,5 +237,106 @@ describe("App health visibility", () => {
     expect(
       screen.queryByText(/1 of 1 enabled servers reachable/i),
     ).not.toBeInTheDocument();
+  });
+
+  it("drops stale health when all servers are re-enabled", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    const server = {
+      id: "server-1",
+      name: "Example",
+      transport: "stdio",
+      command: "example",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+    };
+    const enabledRegistry = {
+      version: 1,
+      servers: [server],
+      profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
+      activeProfileId: "default",
+    };
+    const disabledRegistry = {
+      ...enabledRegistry,
+      profiles: [{ id: "default", name: "Default", enabledServerIds: [] }],
+    };
+    const nextProbe = deferred<ProbeResult[]>();
+    probeServers
+      .mockResolvedValueOnce([
+        {
+          serverId: "server-1",
+          ok: true,
+          toolCount: 1,
+          error: null,
+          authRequired: false,
+        },
+      ])
+      .mockReturnValueOnce(nextProbe.promise);
+    getRegistry.mockResolvedValue(enabledRegistry);
+    setAllEnabled
+      .mockResolvedValueOnce(disabledRegistry)
+      .mockResolvedValueOnce(enabledRegistry);
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "More actions" }));
+    await userEvent.click(screen.getByText("Disable all"));
+    await waitFor(() => expect(setAllEnabled).toHaveBeenCalledWith("default", false));
+
+    await userEvent.click(screen.getByRole("button", { name: "More actions" }));
+    await userEvent.click(screen.getByText("Enable all"));
+
+    expect(
+      await screen.findByRole("button", { name: /checking 1/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+  });
+
+  it("invalidates health and probes after switching profiles", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    const server = (id: string, name: string) => ({
+      id,
+      name,
+      transport: "stdio",
+      command: "example",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+    });
+    getRegistry.mockResolvedValue({
+      version: 1,
+      servers: [server("server-1", "Default server"), server("server-2", "Work server")],
+      profiles: [
+        { id: "default", name: "Default", enabledServerIds: ["server-1"] },
+        { id: "work", name: "Work", enabledServerIds: ["server-2"] },
+      ],
+      activeProfileId: "default",
+    });
+    const nextProbe = deferred<ProbeResult[]>();
+    probeServers
+      .mockResolvedValueOnce([
+        {
+          serverId: "server-1",
+          ok: true,
+          toolCount: 1,
+          error: null,
+          authRequired: false,
+        },
+      ])
+      .mockReturnValueOnce(nextProbe.promise);
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Switch profile" }));
+
+    await waitFor(() => expect(probeServers).toHaveBeenCalledTimes(2));
+    expect(
+      await screen.findByRole("button", { name: /checking 1/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
   });
 });

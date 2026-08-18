@@ -46,7 +46,7 @@ describe("RegistryServerRow status accessibility", () => {
   it.each([
     ["Server disabled", false, undefined],
     ["Checking connection", true, undefined],
-    ["Connected", true, health({ ok: true, toolCount: 2 })],
+    ["Ready, 2 tools", true, health({ ok: true, toolCount: 2 })],
     ["Authentication required", true, health({ authRequired: true })],
     ["Connection error", true, health({ error: "connection refused" })],
   ] as const)("announces %s", (label, enabled, result) => {
