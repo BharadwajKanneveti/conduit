@@ -903,7 +903,9 @@ fn installed_rules_targets() -> Vec<crate::instructions::Target> {
         // into an absent client's home.
         .filter(|client| client.app_present)
         // `None` = unsupported or covered transitively (Antigravity/Copilot).
-        .filter_map(|client| crate::clients::client_rules_target(&client.id))
+        .filter_map(|client| {
+            crate::clients::client_rules_target(&client.id, crate::instructions::Scope::Team)
+        })
         .filter(|target| seen_paths.insert(target.path.clone()))
         .collect()
 }
@@ -1007,7 +1009,12 @@ fn apply_instructions_to(
     // (not a fresh client scan) means cleanup survives a client that has since disappeared.
     for old in &prev_targets {
         if !written.iter().any(|w| w == old) {
-            instructions::remove_recorded(std::path::Path::new(old));
+            // Result ignored deliberately: this writer replaces `team_instructions_targets`
+            // wholesale below, so it has nowhere to carry "we could not clean that one" forward.
+            // Pre-existing behaviour, unchanged here; the personal writer in `rules.rs` does use
+            // the flag, and aligning Teams with it is its own change.
+            let _ =
+                instructions::remove_recorded(std::path::Path::new(old), instructions::Scope::Team);
         }
     }
 
@@ -1030,7 +1037,10 @@ fn apply_instructions_to(
     });
     if !matches!(recorded, Ok((_, true))) {
         for path in &written {
-            instructions::remove_recorded(std::path::Path::new(path));
+            let _ = instructions::remove_recorded(
+                std::path::Path::new(path),
+                instructions::Scope::Team,
+            );
         }
     }
 }
@@ -1049,7 +1059,8 @@ fn build_instructions_receipt(
         .into_iter()
         .filter(|c| c.app_present)
         .map(|c| {
-            let state = match crate::clients::client_rules_target(&c.id) {
+            let state = match crate::clients::client_rules_target(&c.id, instructions::Scope::Team)
+            {
                 Some(target) => instructions::current_state(&target, team_id, version, content),
                 None => ApplyState::Unsupported,
             };
@@ -1096,7 +1107,8 @@ pub fn instructions_status() -> Option<InstructionsStatusView> {
         .into_iter()
         .filter(|c| c.app_present)
         .map(|c| {
-            let state = match crate::clients::client_rules_target(&c.id) {
+            let state = match crate::clients::client_rules_target(&c.id, instructions::Scope::Team)
+            {
                 Some(target) => instructions::current_state(&target, &team_id, version, &content),
                 None => ApplyState::Unsupported,
             };
@@ -1394,7 +1406,12 @@ pub fn disconnect() -> Result<(), String> {
         Ok(())
     })?;
     for path in &instr_targets {
-        crate::instructions::remove_recorded(std::path::Path::new(path));
+        // Leaving the team clears the record either way, so there is nothing to carry a failure
+        // forward into. Same pre-existing behaviour as `apply_instructions_to`.
+        let _ = crate::instructions::remove_recorded(
+            std::path::Path::new(path),
+            crate::instructions::Scope::Team,
+        );
     }
     let _ = clear_token();
     Ok(())
@@ -1966,6 +1983,7 @@ mod tests {
         let old_target = Target {
             path: old_path.clone(),
             strategy: Strategy::SentinelBlock,
+            scope: crate::instructions::Scope::Team,
             char_cap: None,
             blocked_if_present: None,
         };
@@ -1989,7 +2007,8 @@ mod tests {
         })
         .expect("seed the registry");
 
-        let target = crate::clients::client_rules_target("goose").expect("goose rules target");
+        let target = crate::clients::client_rules_target("goose", crate::instructions::Scope::Team)
+            .expect("goose rules target");
         assert_eq!(
             target.path,
             root.join("config").join(".goosehints"),
