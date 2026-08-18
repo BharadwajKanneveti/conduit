@@ -78,27 +78,22 @@ describe("release Azure signer env scope (SBS-925)", () => {
     expect(envHasAny(build.env, APPLE_SIGNER_KEYS)).toBe(false);
   });
 
-  it("keeps frontend and signer setup steps free of Azure signer secrets", () => {
-    const names = [
-      "Install dependencies",
-      "Set up Windows code signing (Azure Trusted Signing)",
-      "Cache trusted-signing-cli",
-    ];
-    for (const name of names) {
-      const step = stepByName(build, name);
-      expect(step, name).toBeDefined();
-      expect(envHasAny(step!.env, AZURE_SIGNER_KEYS), name).toBe(false);
-    }
-  });
-
   it("injects Azure signer secrets only on the Windows-gated Build installer step", () => {
     const step = stepByName(build, "Build installer");
     expect(step).toBeDefined();
+    for (const other of build.steps ?? []) {
+      if (other !== step) {
+        expect(envHasAny(other.env, AZURE_SIGNER_KEYS), other.name).toBe(false);
+      }
+    }
     for (const key of AZURE_SIGNER_KEYS) {
       const value = step!.env?.[key];
       expect(value, key).toBeDefined();
-      expect(value, key).toContain("windows-latest");
-      expect(value, key).toContain("secrets." + key);
+      expect(value, key).toMatch(
+        new RegExp(
+          String.raw`^\s*\$\{\{\s*matrix\.os\s*==\s*'windows-latest'\s*&&\s*secrets\.${key}\s*\|\|\s*''\s*\}\}\s*$`,
+        ),
+      );
     }
     for (const key of TAURI_SIGNER_KEYS) {
       expect(step!.env?.[key]).toContain("secrets." + key);
