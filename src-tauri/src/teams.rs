@@ -963,10 +963,11 @@ fn apply_instructions_to(
 ) {
     use crate::instructions::{self, ApplyState};
     // Prior state: only act if still connected to THIS team.
-    let (prev_content, prev_targets) = match crate::registry::load() {
+    let (prev_content, prev_version, prev_targets) = match crate::registry::load() {
         Ok(reg) => match reg.team.as_ref() {
             Some(t) if t.team_id == team_id => (
                 t.team_instructions_content.clone(),
+                t.team_instructions_version,
                 t.team_instructions_targets.clone(),
             ),
             _ => return,
@@ -976,12 +977,47 @@ fn apply_instructions_to(
     // Skip only when the content is unchanged and every target already holds it. A moved target
     // or a refusal that has since cleared leaves the org text identical but its current state
     // Stale, so the content check alone would strand the old block.
+    let content_unchanged = desired == prev_content.as_deref();
+    let state_version = if content_unchanged {
+        prev_version
+    } else {
+        version
+    };
     let needs_apply =
-        desired.is_some_and(|content| targets_need_apply(team_id, version, content, targets));
-    if desired == prev_content.as_deref() && !needs_apply {
-        return; // content unchanged and every target is still where we left it, so there is
-                // nothing to write or clean up (coverage is re-checked and reported every cycle
-                // by `report_instructions_status`, independent of this)
+        desired.is_some_and(|content| targets_need_apply(team_id, state_version, content, targets));
+    let target_paths: Vec<String> = targets
+        .iter()
+        .map(|target| target.path.to_string_lossy().to_string())
+        .collect();
+    let obsolete: Vec<&String> = prev_targets
+        .iter()
+        .filter(|old| !target_paths.iter().any(|current| current == *old))
+        .collect();
+    if content_unchanged && !needs_apply {
+        if obsolete.is_empty() {
+            return; // content unchanged and every target is still where we left it
+        }
+        // Only the target set changed. Clean up paths for clients that disappeared without
+        // rewriting still-current files or advancing their marker to an unrelated config version.
+        for old in &obsolete {
+            instructions::remove_recorded(std::path::Path::new(old));
+        }
+        let retained: Vec<String> = prev_targets
+            .into_iter()
+            .filter(|old| target_paths.iter().any(|current| current == old))
+            .collect();
+        let _ = crate::registry::update(|reg| {
+            if let Some(t) = reg.team.as_mut() {
+                if t.team_id == team_id
+                    && t.team_instructions_content == prev_content
+                    && t.team_instructions_version == prev_version
+                {
+                    t.team_instructions_targets = retained;
+                }
+            }
+            Ok(())
+        });
+        return;
     }
 
     let mut written: Vec<String> = Vec::new();
@@ -2033,6 +2069,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn unchanged_instructions_ignore_an_unrelated_config_version_bump() {
+        use crate::instructions::{Strategy, Target};
+
+        let _env = crate::clients::env_test_lock();
+        let _dirs = crate::registry::data_dir_test_lock();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-sbs917-version-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(scratch.join("data"));
+        let path = scratch.join("rules.md");
+        const TEAM: &str = "team_sbs917_version";
+        const CONTENT: &str = "Use the approved workflow.";
+        seed_applied_instructions(TEAM, 4, CONTENT, &path);
+        let target = Target {
+            path: path.clone(),
+            strategy: Strategy::SentinelBlock,
+            char_cap: None,
+            blocked_if_present: None,
+        };
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        apply_instructions_to(TEAM, 5, Some(CONTENT), std::slice::from_ref(&target));
+
+        let after = std::fs::read_to_string(&path).unwrap();
+        let (_, version, recorded) = loaded_instructions();
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert_eq!(
+            after, before,
+            "a server-only config bump must not rewrite rules"
+        );
+        assert_eq!(
+            version, 4,
+            "the persisted instruction marker version stays authoritative"
+        );
+        assert_eq!(recorded, vec![path.to_string_lossy().to_string()]);
+    }
+
     /// Write last-good org rules to `path` and record them on the connected team.
     /// Caller holds `data_dir_test_lock` and a `DataDirOverride`.
     fn seed_applied_instructions(team: &str, version: i64, content: &str, path: &std::path::Path) {
@@ -2177,6 +2252,50 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&scratch);
+    }
+
+    #[test]
+    fn unchanged_instructions_remove_a_retained_path_when_its_client_disappears() {
+        use crate::instructions::{Strategy, Target};
+
+        let _env = crate::clients::env_test_lock();
+        let _dirs = crate::registry::data_dir_test_lock();
+        let scratch =
+            std::env::temp_dir().join(format!("toolport-sbs917-uninstalled-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+        let _data = crate::registry::DataDirOverride::set(scratch.join("data"));
+        let path = scratch.join("rules.md");
+        const TEAM: &str = "team_sbs917_uninstalled";
+        const V1: &str = "Keep the approved workflow.";
+        const V2: &str = "A much longer org rule set that a char-cap client will refuse.";
+        seed_applied_instructions(TEAM, 1, V1, &path);
+        let target = Target {
+            path: path.clone(),
+            strategy: Strategy::SentinelBlock,
+            char_cap: Some(20),
+            blocked_if_present: None,
+        };
+        apply_instructions_to(TEAM, 2, Some(V2), std::slice::from_ref(&target));
+        assert!(path.exists(), "fixture: refused rewrite keeps last-good");
+
+        apply_instructions_to(TEAM, 2, Some(V2), &[]);
+
+        let (_, version, recorded) = loaded_instructions();
+        let leftover = std::fs::read_to_string(&path).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&scratch);
+        assert!(
+            !leftover.contains(V1),
+            "the disappeared client's old block must be cleaned"
+        );
+        assert!(
+            recorded.is_empty(),
+            "the obsolete path must be dropped from the record"
+        );
+        assert_eq!(
+            version, 2,
+            "cleanup alone must not change the instruction watermark"
+        );
     }
 
     /// SBS-917: keeping last-good on a refused rewrite must not stop a real removal.
