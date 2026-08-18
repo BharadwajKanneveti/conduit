@@ -329,17 +329,29 @@ fn epoch_millis() -> u64 {
 pub fn read_payload(reader: impl std::io::Read) -> (String, bool) {
     use std::io::Read as _;
 
-    let mut buf = String::new();
+    // BYTES, not a String, and this is load-bearing for the exit-0 guarantee:
+    //
+    //   * `String::truncate` panics when the index is not a char boundary. A capped
+    //     payload whose 1 MiB mark lands inside a multi-byte codepoint - any non-ASCII
+    //     in a `tool_input` or a `Bash` stdout - would panic the hook process, which
+    //     exits non-zero, which is the one thing this path must never do.
+    //   * `read_to_string` fails with `InvalidData` on invalid UTF-8 and leaves the
+    //     buffer as it found it. Cutting a stream at a fixed byte count produces
+    //     exactly that whenever the cut lands mid-codepoint, so the payload, and the
+    //     fact that it was truncated at all, would both be silently lost.
+    //
+    // Truncating bytes and converting lossily cannot do either. A cut codepoint
+    // becomes U+FFFD, the JSON then fails to parse, and the event is recorded as the
+    // flagged `malformed` row, which is the honest outcome.
+    let mut bytes: Vec<u8> = Vec::new();
     // cap + 1 so filling the cap is distinguishable from a payload that ends exactly
     // on it.
-    let _ = reader
-        .take(MAX_HOOK_STDIN_BYTES + 1)
-        .read_to_string(&mut buf);
-    let truncated = buf.len() as u64 > MAX_HOOK_STDIN_BYTES;
+    let _ = reader.take(MAX_HOOK_STDIN_BYTES + 1).read_to_end(&mut bytes);
+    let truncated = bytes.len() as u64 > MAX_HOOK_STDIN_BYTES;
     if truncated {
-        buf.truncate(MAX_HOOK_STDIN_BYTES as usize);
+        bytes.truncate(MAX_HOOK_STDIN_BYTES as usize);
     }
-    (buf, truncated)
+    (String::from_utf8_lossy(&bytes).into_owned(), truncated)
 }
 
 /// Handle one hook invocation, from the gateway binary's `--toolport-hook` path.
@@ -549,6 +561,7 @@ fn apply_to(
             reg.hooks_enabled = enabled;
         }
         let mut statuses: Vec<ProfileStatus> = Vec::new();
+        let previous: Vec<String> = reg.hook_targets.clone();
 
         // Every profile that SHOULD carry the sensor right now. Empty when the user has
         // opted out, which is what turns this pass into a full removal.
@@ -558,6 +571,7 @@ fn apply_to(
             Vec::new()
         };
 
+        let mut written: Vec<String> = Vec::new();
         if reg.hooks_enabled {
             // Resolved before any write. Failing here aborts the whole transaction, so
             // an un-installable build leaves the opt-in exactly as it was.
@@ -566,11 +580,14 @@ fn apply_to(
             })?;
             for path in candidates.iter().map(Path::new) {
                 statuses.push(match install_at(path, binary) {
-                    Ok(()) => ProfileStatus {
-                        path: path.display().to_string(),
-                        installed: true,
-                        error: None,
-                    },
+                    Ok(()) => {
+                        written.push(path.display().to_string());
+                        ProfileStatus {
+                            path: path.display().to_string(),
+                            installed: true,
+                            error: None,
+                        }
+                    }
                     Err(error) => ProfileStatus {
                         path: path.display().to_string(),
                         installed: false,
@@ -601,7 +618,21 @@ fn apply_to(
             }
         }
 
-        let mut targets = candidates;
+        // What we now believe may carry our block on disk. A candidate earns a place by
+        // being written this pass, OR by already being recorded.
+        //
+        // The second half matters and is not the same as "record every candidate". A
+        // profile whose `settings.json` we could not parse may still hold a block from
+        // an earlier successful pass, and we cannot tell, precisely because we could not
+        // read it; forgetting it would strand a sensor that is still firing (SBS-914).
+        // But a profile we have never written and cannot read has no such history, so it
+        // is not recorded, and a broken file the user never enabled does not become a
+        // permanent retry.
+        let mut targets: Vec<String> = candidates
+            .iter()
+            .filter(|p| written.contains(p) || previous.contains(p))
+            .cloned()
+            .collect();
         targets.extend(unremovable);
         reg.hook_targets = targets;
         Ok(statuses)
@@ -1213,6 +1244,100 @@ mod tests {
         let (read, truncated) = read_payload(payload.as_bytes());
         assert!(!truncated);
         assert_eq!(read, payload);
+    }
+
+    #[test]
+    fn a_cap_landing_inside_a_codepoint_does_not_panic() {
+        // The exit-0 guarantee's sharpest edge. `String::truncate` panics off a char
+        // boundary, and a hook process that panics exits non-zero, which on some events
+        // stops the user's work. Three-byte characters mean the 1 MiB mark lands inside
+        // one, not on it.
+        let mut payload = String::from("{\"tool_input\":\"");
+        while payload.len() < (MAX_HOOK_STDIN_BYTES as usize + 64) {
+            payload.push('あ');
+        }
+
+        let (read, truncated) = read_payload(payload.as_bytes());
+        assert!(truncated);
+        // Bounded, but not by the byte cap exactly: a cut codepoint becomes U+FFFD,
+        // which is 3 bytes and can be wider than the 1-2 bytes it replaced. At most one
+        // sits at the end, so the slack is a constant, not a multiplier.
+        assert!(
+            read.len() <= MAX_HOOK_STDIN_BYTES as usize + 3,
+            "payload grew past the cap by more than one replacement char: {}",
+            read.len()
+        );
+        // Lossy conversion, so a cut codepoint is a replacement char, never a panic and
+        // never invalid UTF-8.
+        assert!(std::str::from_utf8(read.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn invalid_utf8_input_still_produces_a_payload() {
+        // `read_to_string` would fail with InvalidData and leave the buffer empty, so
+        // both the payload AND the fact it was oversized would be lost. Reading bytes
+        // cannot do that.
+        let mut raw: Vec<u8> = b"{\"tool_name\":\"Bash\",\"x\":\"".to_vec();
+        raw.push(0xff); // never valid UTF-8
+        raw.extend_from_slice(b"\"}");
+
+        let (read, truncated) = read_payload(raw.as_slice());
+        assert!(!truncated);
+        assert!(read.contains("Bash"), "the readable part must survive: {read}");
+        assert!(read.contains('\u{fffd}'), "the bad byte becomes a replacement char");
+    }
+
+    #[test]
+    fn a_profile_we_never_wrote_and_cannot_read_is_not_recorded_as_a_target() {
+        // Recording a candidate we never wrote makes a file the user broke into a
+        // permanent retry: every later pass tries to remove a block that was never
+        // there and fails on the same parse error.
+        let _guard = crate::registry::data_dir_test_lock();
+        let dir = scratch("never-written");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let profile = dir.join("settings.json");
+        std::fs::write(&profile, "{ not json").unwrap();
+
+        let statuses = apply_to(Some(true), &[profile.clone()], Some(&binary())).unwrap();
+        assert_eq!(statuses.len(), 1);
+        assert!(!statuses[0].installed);
+        assert!(statuses[0].error.is_some(), "the failure must be reported");
+        assert!(
+            crate::registry::load().unwrap().hook_targets.is_empty(),
+            "a profile we never wrote must not be recorded as ours"
+        );
+
+        drop(_override);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_profile_we_did_write_stays_recorded_when_a_later_pass_cannot_read_it() {
+        // The other half, and the one the naive "record only successful writes" rule
+        // gets wrong: a block we really did write must stay tracked through a failure,
+        // or a later disable will not clean it and the sensor keeps firing (SBS-914).
+        let _guard = crate::registry::data_dir_test_lock();
+        let dir = scratch("written-then-broken");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let profile = dir.join("settings.json");
+
+        apply_to(Some(true), &[profile.clone()], Some(&binary())).unwrap();
+        assert_eq!(
+            crate::registry::load().unwrap().hook_targets,
+            vec![profile.display().to_string()]
+        );
+
+        // The user (or another tool) breaks the file after we installed into it.
+        std::fs::write(&profile, "{ broken").unwrap();
+        apply_to(None, &[profile.clone()], Some(&binary())).unwrap();
+        assert_eq!(
+            crate::registry::load().unwrap().hook_targets,
+            vec![profile.display().to_string()],
+            "a profile we wrote must stay recorded through a read failure"
+        );
+
+        drop(_override);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
