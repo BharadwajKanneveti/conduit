@@ -649,29 +649,40 @@ pub(crate) fn write_settings_json(
     if original.is_some() {
         backup_file_named("claude-code", path, &claude_settings_backup_name(path))?;
     }
+    atomic_write(path, &render_settings_json(original, root)?)
+}
+
+/// The exact bytes [`write_settings_json`] would put on disk.
+///
+/// Split out so a dry run can show the real result. Pretty-printing the value instead
+/// would report that every comment in the file is about to vanish, which is the
+/// opposite of what the CST write does (SBS-822 review).
+pub(crate) fn render_settings_json(
+    original: Option<&str>,
+    root: &serde_json::Value,
+) -> Result<String, String> {
     match (original, root.get("hooks")) {
-        // The key is gone, which is what uninstall produces. `atomic_write_json_config`
+        // The key is gone, which is what uninstall produces. `render_json_config`
         // only rewrites a key it can still find, so this case would fall through to a
         // pretty-print of the whole file and strip every comment in it. Delete the key
         // through the CST instead.
-        (Some(src), None) if !src.trim().is_empty() => {
-            let text = remove_json_key_preserving(src, "hooks")?;
-            atomic_write(path, &text)
-        }
-        _ => atomic_write_json_config(path, original, root, "hooks"),
+        (Some(src), None) if !src.trim().is_empty() => remove_json_key_preserving(src, "hooks"),
+        _ => render_json_config(original, root, "hooks"),
     }
 }
 
-/// Give each profile's `settings.json` its own backup identity, so a work profile's
-/// backups can never overwrite or prune a personal profile's. Same rule, and the same
-/// reason, as [`secondary_claude_backup_name`].
+/// Give each profile's `settings.json` its own backup identity, so one profile's
+/// backups can never overwrite or prune another's.
+///
+/// Hashes the FULL path, exactly like [`secondary_claude_backup_name`] and for the same
+/// reason: the parent directory's leaf name is not unique. `~/.claude` and a
+/// `CLAUDE_CONFIG_DIR` of `D:\work\.claude` share the leaf `.claude`, so a leaf-based
+/// identity makes both profiles share one backup series and `prune_backups` then deletes
+/// one profile's only recovery copies to stay inside `CONFIG_BACKUP_GENERATIONS`
+/// (SBS-822 review).
 fn claude_settings_backup_name(path: &Path) -> String {
-    let profile = path
-        .parent()
-        .and_then(|dir| dir.file_name())
-        .map(|name| name.to_string_lossy().replace(['/', '\\'], "-"))
-        .unwrap_or_else(|| "claude".into());
-    format!("{profile}-settings.json")
+    let digest = crate::registry::sha256_hex(&path.to_string_lossy());
+    format!("claude-settings-{}.json", &digest[..16])
 }
 
 fn client_config_path(client_id: &str) -> Option<PathBuf> {
@@ -3553,6 +3564,16 @@ fn atomic_write_json_config(
     root: &serde_json::Value,
     changed_key: &str,
 ) -> Result<(), String> {
+    atomic_write(path, &render_json_config(original, root, changed_key)?)
+}
+
+/// The rendering half of [`atomic_write_json_config`], so a dry run can show the exact
+/// bytes without writing them.
+fn render_json_config(
+    original: Option<&str>,
+    root: &serde_json::Value,
+    changed_key: &str,
+) -> Result<String, String> {
     let pretty = || serde_json::to_string_pretty(root).map_err(|e| e.to_string());
 
     let out = match (original, root.get(changed_key)) {
@@ -3570,7 +3591,7 @@ fn atomic_write_json_config(
         }
         _ => pretty()?,
     };
-    atomic_write(path, &out)
+    Ok(out)
 }
 
 /// Convert a `toml::Value` into a `toml_edit::Item` so we can splice a rewritten
@@ -5070,7 +5091,36 @@ pub(crate) fn resolve_gateway_path() -> Option<PathBuf> {
     if let Some(p) = crate::gateway_publish::client_gateway_path() {
         return Some(p);
     }
+    resolve_gateway_sidecar()
+}
 
+/// [`resolve_gateway_path`] with every side effect removed: no publish of the bundled
+/// gateway, no AppImage stable copy, and no optimistic "here is where it would be"
+/// fallback. Returns a path only when that exact file exists right now.
+///
+/// For callers that must not write, which is narrower than it sounds: publishing copies
+/// a versioned binary into the data dir and writes a manifest, and the AppImage path
+/// copies a binary, so a read-only view or a dry run that used the normal resolver
+/// would create files as a side effect of rendering (SBS-822 review).
+pub(crate) fn resolve_gateway_path_readonly() -> Option<PathBuf> {
+    if let Some(p) = crate::gateway_publish::published_gateway_path() {
+        return Some(p);
+    }
+    // An AppImage's in-mount binary is the wrong answer: it dies with the mount. Only
+    // an existing stable copy counts, and making one is a write.
+    if std::env::var_os("APPIMAGE").is_some() {
+        let dest_dir = crate::registry::conduit_dir()?.join("bin");
+        let ext = std::env::consts::EXE_SUFFIX;
+        return ["toolport-gateway", "conduit-gateway"]
+            .into_iter()
+            .map(|name| dest_dir.join(format!("{name}{ext}")))
+            .find(|p| p.is_file());
+    }
+    resolve_gateway_sidecar().filter(|p| p.is_file())
+}
+
+/// The gateway that ships beside the app binary, for when nothing has been published.
+fn resolve_gateway_sidecar() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     let ext = std::env::consts::EXE_SUFFIX;
@@ -6391,13 +6441,22 @@ mod tests {
     #[test]
     fn each_claude_profile_backs_its_settings_up_under_its_own_name() {
         // A work profile's backups must never overwrite or prune a personal profile's,
-        // which is why the profile directory is part of the backup identity.
+        // which is why the FULL path is the backup identity.
         let home = PathBuf::from("/home/someone");
         let personal = claude_settings_backup_name(&home.join(".claude").join("settings.json"));
         let work = claude_settings_backup_name(&home.join(".claude-work").join("settings.json"));
         assert_ne!(personal, work);
-        assert!(personal.ends_with("settings.json"));
-        assert!(work.starts_with(".claude-work"));
+
+        // The case a leaf-name identity got wrong: two profiles whose directories share
+        // a leaf. `prune_backups` keys on this name, so a collision here deletes one
+        // profile's recovery copies (SBS-822 review).
+        let other_volume =
+            claude_settings_backup_name(Path::new("/mnt/work/.claude/settings.json"));
+        assert_ne!(
+            personal, other_volume,
+            "two profiles both ending in `.claude` must not share a backup series"
+        );
+        assert!(personal.ends_with(".json"));
     }
 
     #[test]

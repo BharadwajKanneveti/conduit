@@ -14945,12 +14945,15 @@ fn main() {
             // no socket, no gateway startup. This path runs once per observed tool
             // call, so it has to stay a parse-and-append.
             //
-            // Exit 0 on EVERY path, including a stdin that never arrives or does not
-            // parse. A hook's exit status is a signal to the harness, and on some
-            // events a non-zero one stops the user's work; a sensor that can do that
-            // is not a sensor. Nothing is written to stdout for the same reason.
-            let mut payload = String::new();
-            let _ = std::io::Read::read_to_string(&mut std::io::stdin(), &mut payload);
+            // Exit 0 on EVERY path, including a payload that does not parse or is too
+            // large to keep. A hook's exit status is a signal to the harness, and on
+            // some events a non-zero one stops the user's work; a sensor that can do
+            // that is not a sensor. Nothing is written to stdout for the same reason.
+            //
+            // The read is capped: a PostToolUse payload embeds the tool's whole
+            // response, which `handle_event` discards but would otherwise have to
+            // allocate and parse first.
+            let (payload, _truncated) = conduit_lib::hooks::read_payload(std::io::stdin());
             conduit_lib::hooks::handle_event(&event, &payload);
             std::process::exit(0);
         }

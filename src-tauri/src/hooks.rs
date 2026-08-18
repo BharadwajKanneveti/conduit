@@ -49,6 +49,16 @@ const SENSOR_EVENTS: [(&str, &str); 3] = [
 /// must cost the user a bounded pause, never a hung agent.
 const HOOK_TIMEOUT_SECS: u64 = 5;
 
+/// Cap on the payload read from stdin.
+///
+/// A `PostToolUse` payload embeds `tool_response`: the body of a `Read`, a `Bash`
+/// process's stdout. [`row`] drops all of it, but an unbounded `read_to_string` would
+/// allocate and parse the whole thing first, so a large native result could stall the
+/// agent until the harness's hook timeout, or OOM this process and lose the row
+/// entirely (SBS-822 review; SBS-930 is the same shape on the gateway's stderr drain).
+/// Generous next to any real payload's identifying fields, which are all this keeps.
+const MAX_HOOK_STDIN_BYTES: u64 = 1024 * 1024;
+
 /// Trim the sensor log once it passes this size.
 const MAX_HOOK_LOG_BYTES: u64 = 4 * 1024 * 1024;
 /// Lines kept when trimming. Rows are small (no content), so this stays well inside
@@ -307,6 +317,31 @@ fn epoch_millis() -> u64 {
         .unwrap_or(0)
 }
 
+/// Read a hook payload from `reader`, bounded by [`MAX_HOOK_STDIN_BYTES`].
+///
+/// Returns the bytes read and whether the cap was reached. A payload at the cap is
+/// truncated, so it will not parse, and [`handle_event`] records the flagged
+/// `malformed` row rather than guessing at half a document.
+///
+/// This bounds SIZE, not TIME: the read still ends at EOF. The harness closes the pipe
+/// after writing and kills a hook that overruns its own timeout, so waiting on EOF is
+/// bounded by the caller rather than by us.
+pub fn read_payload(reader: impl std::io::Read) -> (String, bool) {
+    use std::io::Read as _;
+
+    let mut buf = String::new();
+    // cap + 1 so filling the cap is distinguishable from a payload that ends exactly
+    // on it.
+    let _ = reader
+        .take(MAX_HOOK_STDIN_BYTES + 1)
+        .read_to_string(&mut buf);
+    let truncated = buf.len() as u64 > MAX_HOOK_STDIN_BYTES;
+    if truncated {
+        buf.truncate(MAX_HOOK_STDIN_BYTES as usize);
+    }
+    (buf, truncated)
+}
+
 /// Handle one hook invocation, from the gateway binary's `--toolport-hook` path.
 ///
 /// **Never fails the caller.** The binary exits 0 whatever happens here, because a
@@ -384,21 +419,25 @@ pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
 
 /// The gateway binary the hook command should invoke.
 ///
-/// The same binary clients already spawn, so it inherits the install location,
-/// version pinning, pruning and signing that path already has.
+/// The same resolution client MCP install uses, so the sensor inherits the install
+/// location, version pinning, pruning and signing that path already has.
 ///
-/// Publishes the bundled gateway if it has not been published yet, so this is the
-/// write-capable variant. Read-only callers use [`hook_binary_readonly`].
+/// NOT `gateway_publish::client_gateway_path` on its own: that returns `None` unless
+/// `should_publish_client_gateway()`, which is hard-false on macOS and Linux and on any
+/// Windows `cargo run`. Using it alone made the sensor un-installable everywhere except
+/// a packaged Windows build, while `hook_command` quoted `/Applications/...` paths it
+/// could never actually produce (SBS-822 review).
 fn hook_binary() -> Option<PathBuf> {
-    crate::gateway_publish::client_gateway_path()
+    crate::clients::resolve_gateway_path().filter(|p| p.is_file())
 }
 
-/// The published gateway path, without publishing one as a side effect.
+/// [`hook_binary`] for callers that must not write.
 ///
-/// `view` must not write: a UI that merely renders the hooks panel should not be able
-/// to publish a binary.
+/// `resolve_gateway_path` publishes the bundled gateway, and copies one on AppImage,
+/// when nothing is published yet. Rendering a read-only view or a dry run must not
+/// create files, so this resolves only what already exists.
 fn hook_binary_readonly() -> Option<PathBuf> {
-    crate::gateway_publish::published_gateway_path()
+    crate::clients::resolve_gateway_path_readonly()
 }
 
 /// Re-apply at app start, so the sensor keeps pointing at a gateway that exists.
@@ -453,12 +492,13 @@ pub fn view() -> HooksView {
 }
 
 /// Turn the sensor on or off, then make every profile match.
+///
+/// The opt-in and the install commit together. Persisting `hooks_enabled = true` first
+/// and applying second meant a failed install left the registry saying the user opted
+/// in with nothing installed, `view()` reporting `enabled` with no profile, and every
+/// later startup retrying the same failing apply, with no path back (SBS-822 review).
 pub fn set_enabled(enabled: bool) -> Result<HooksView, String> {
-    crate::registry::update(|reg| {
-        reg.hooks_enabled = enabled;
-        Ok(())
-    })?;
-    apply()?;
+    apply_with(Some(enabled))?;
     Ok(view())
 }
 
@@ -468,66 +508,103 @@ pub fn set_enabled(enabled: bool) -> Result<HooksView, String> {
 /// A profile that fails is reported, not fatal: one unreadable `settings.json` must
 /// not stop the other profiles from being installed or, more importantly, cleaned.
 pub fn apply() -> Result<Vec<ProfileStatus>, String> {
-    let reg = crate::registry::load()?;
-    let mut statuses: Vec<ProfileStatus> = Vec::new();
+    apply_with(None)
+}
 
-    // Every profile that SHOULD carry the sensor right now. Empty when the user has
-    // opted out, which is what turns this pass into a full removal.
-    let candidates: Vec<String> = if reg.hooks_enabled {
-        crate::clients::claude_settings_paths()
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect()
-    } else {
-        Vec::new()
-    };
+/// [`apply`], optionally committing an opt-in change in the same transaction.
+///
+/// Everything runs inside `registry::update_authoritative`, holding the registry's
+/// cross-process lock from the one authoritative load through every settings write and
+/// the `hook_targets` save. Three things that buys, all of which the earlier
+/// load-then-write-then-update shape got wrong (SBS-822 review):
+///
+///   * `registry::load` discards its [`crate::registry::LoadSource`], so a backup
+///     snapshot read because the primary was missing or unreadable looked like live
+///     opt-in state. `update_authoritative` refuses a non-authoritative registry
+///     BEFORE the closure runs, so no settings file is touched on that path. Previously
+///     the refusal came after the writes.
+///   * A concurrent `set_enabled(false)` could commit while a slow apply was mid-flight,
+///     and the apply would then reinstall the sensor the user just turned off.
+///   * An `Err` out of the closure means nothing is saved, so a failed install cannot
+///     leave `hooks_enabled = true` behind.
+///
+/// Matches `rules::apply_to`, which holds the same lock across the same shape of work.
+fn apply_with(set_enabled: Option<bool>) -> Result<Vec<ProfileStatus>, String> {
+    apply_to(
+        set_enabled,
+        &crate::clients::claude_settings_paths(),
+        hook_binary().as_deref(),
+    )
+}
 
-    if reg.hooks_enabled {
-        let binary = hook_binary()
-            .ok_or_else(|| "no gateway binary is available to run as a hook".to_string())?;
-        for path in candidates.iter().map(Path::new) {
-            let status = match install_at(path, &binary) {
-                Ok(()) => ProfileStatus {
-                    path: path.display().to_string(),
-                    installed: true,
-                    error: None,
-                },
-                Err(error) => ProfileStatus {
-                    path: path.display().to_string(),
+/// [`apply_with`] over an explicit profile set and binary, so tests drive known files
+/// instead of the developer's real `~/.claude`. Same rationale as `rules::apply_to`.
+fn apply_to(
+    set_enabled: Option<bool>,
+    profiles: &[PathBuf],
+    binary: Option<&Path>,
+) -> Result<Vec<ProfileStatus>, String> {
+    let (_, statuses) = crate::registry::update_authoritative(|reg| {
+        if let Some(enabled) = set_enabled {
+            reg.hooks_enabled = enabled;
+        }
+        let mut statuses: Vec<ProfileStatus> = Vec::new();
+
+        // Every profile that SHOULD carry the sensor right now. Empty when the user has
+        // opted out, which is what turns this pass into a full removal.
+        let candidates: Vec<String> = if reg.hooks_enabled {
+            profiles.iter().map(|p| p.display().to_string()).collect()
+        } else {
+            Vec::new()
+        };
+
+        if reg.hooks_enabled {
+            // Resolved before any write. Failing here aborts the whole transaction, so
+            // an un-installable build leaves the opt-in exactly as it was.
+            let binary = binary.ok_or_else(|| {
+                "no gateway binary is available to run as a hook".to_string()
+            })?;
+            for path in candidates.iter().map(Path::new) {
+                statuses.push(match install_at(path, binary) {
+                    Ok(()) => ProfileStatus {
+                        path: path.display().to_string(),
+                        installed: true,
+                        error: None,
+                    },
+                    Err(error) => ProfileStatus {
+                        path: path.display().to_string(),
+                        installed: false,
+                        error: Some(error),
+                    },
+                });
+            }
+        }
+
+        // Clean what we recorded and no longer want: a profile that disappeared, or
+        // every profile once the user opts out. Same contract as `rules_targets`.
+        //
+        // Cleanup is keyed on "no longer a candidate", NOT on "failed to write this
+        // pass". A transient read failure must not be read as "this profile is gone"
+        // and trigger an uninstall of a sensor that is working.
+        let mut unremovable: Vec<String> = Vec::new();
+        for stale in reg.hook_targets.iter().filter(|p| !candidates.contains(p)) {
+            if let Err(error) = remove_at(Path::new(stale)) {
+                // Keep it on the list. Dropping a path whose removal failed would
+                // strand the file forever, because nothing would ever try again
+                // (SBS-914 is the same bug on the rules path).
+                unremovable.push(stale.clone());
+                statuses.push(ProfileStatus {
+                    path: stale.clone(),
                     installed: false,
                     error: Some(error),
-                },
-            };
-            statuses.push(status);
+                });
+            }
         }
-    }
 
-    // Clean what we recorded and no longer want: a profile that disappeared, or every
-    // profile once the user opts out. Same contract as `rules_targets`.
-    //
-    // Cleanup is keyed on "no longer a candidate", NOT on "failed to write this pass".
-    // A transient read failure must not be read as "this profile is gone" and trigger
-    // an uninstall of a sensor that is working.
-    let mut unremovable: Vec<String> = Vec::new();
-    for stale in reg.hook_targets.iter().filter(|p| !candidates.contains(p)) {
-        if let Err(error) = remove_at(Path::new(stale)) {
-            // Keep it on the list. Dropping a path whose removal failed would strand
-            // the file forever, because nothing would ever try again (SBS-914 is the
-            // same bug on the rules path).
-            unremovable.push(stale.clone());
-            statuses.push(ProfileStatus {
-                path: stale.clone(),
-                installed: false,
-                error: Some(error),
-            });
-        }
-    }
-
-    let mut targets = candidates;
-    targets.extend(unremovable);
-    crate::registry::update(|reg| {
-        reg.hook_targets = targets.clone();
-        Ok(())
+        let mut targets = candidates;
+        targets.extend(unremovable);
+        reg.hook_targets = targets;
+        Ok(statuses)
     })?;
     Ok(statuses)
 }
@@ -568,18 +645,36 @@ fn remove_at(path: &Path) -> Result<(), String> {
     crate::clients::write_settings_json(path, original.as_deref(), &stripped)
 }
 
-/// The exact bytes the write would produce, for every profile. Touches nothing.
+/// The exact bytes the write would produce, for every profile. Writes nothing, anywhere.
+///
+/// `after` goes through the same renderer as the real write
+/// ([`crate::clients::render_settings_json`]), not `to_string_pretty`. Pretty-printing
+/// the value reformats the document and drops every comment, so the dry run would tell
+/// the user that enabling the sensor is about to destroy their annotations when the
+/// actual write preserves them (SBS-822 review).
+///
+/// The binary is resolved read-only for the same reason the doc says "writes nothing":
+/// the normal resolver publishes a versioned gateway and a manifest into the data dir
+/// when none exists, which a dry run must not do. When nothing is published yet this
+/// reports that instead of publishing one.
 pub fn preview() -> Result<Vec<HooksPreview>, String> {
-    let binary =
-        hook_binary().ok_or_else(|| "no gateway binary is available to run as a hook".to_string())?;
+    let binary = hook_binary_readonly().ok_or_else(|| {
+        "no gateway binary has been published yet, so there is nothing to preview".to_string()
+    })?;
+    preview_to(&crate::clients::claude_settings_paths(), &binary)
+}
+
+/// [`preview`] over an explicit profile set and binary, so tests drive known files
+/// instead of the developer's real `~/.claude`. Same rationale as [`apply_to`].
+fn preview_to(profiles: &[PathBuf], binary: &Path) -> Result<Vec<HooksPreview>, String> {
     let mut out = Vec::new();
-    for path in crate::clients::claude_settings_paths() {
-        let (root, original) = crate::clients::read_settings_json(&path)?;
-        let updated = upsert_hooks(&root, &binary)?;
+    for path in profiles {
+        let (root, original) = crate::clients::read_settings_json(path)?;
+        let updated = upsert_hooks(&root, binary)?;
         out.push(HooksPreview {
             path: path.display().to_string(),
-            before: original.unwrap_or_default(),
-            after: serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?,
+            before: original.clone().unwrap_or_default(),
+            after: crate::clients::render_settings_json(original.as_deref(), &updated)?,
         });
     }
     Ok(out)
@@ -1058,6 +1153,164 @@ mod tests {
         );
         assert!(path.exists(), "and must not be deleted or rewritten");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_hook_binary_resolves_on_every_platform_not_just_packaged_windows() {
+        // `gateway_publish::client_gateway_path` is gated on
+        // `should_publish_client_gateway()`, which is false on macOS, Linux, and any
+        // Windows `cargo run`. Resolving through it alone made the sensor
+        // un-installable everywhere but a packaged Windows build (SBS-822 review).
+        // This test runs on all three CI platforms, and in dev, where that gate is off.
+        assert!(
+            !crate::gateway_publish::should_publish_client_gateway(),
+            "test premise: this build is not publish-capable, so a publish-only \
+             resolver returns None here"
+        );
+        assert!(
+            crate::gateway_publish::client_gateway_path().is_none(),
+            "test premise: the publish-gated resolver is the one that returns None"
+        );
+        // `hook_binary` is this resolver, filtered to a file that exists. It is the
+        // difference between the two that the bug was: one of them can answer on this
+        // platform and the other cannot.
+        assert!(
+            crate::clients::resolve_gateway_path().is_some(),
+            "the resolver the sensor uses must still answer where the publish-gated \
+             one cannot"
+        );
+    }
+
+    #[test]
+    fn a_capped_payload_is_recorded_as_malformed_and_never_carries_its_content() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        // A single tool_response far past the cap, the shape a big Read or Bash
+        // produces.
+        let huge = json!({
+            "session_id": "s1",
+            "tool_name": "Read",
+            "tool_response": { "stdout": format!("{}{secret}", "x".repeat(2 * 1024 * 1024)) },
+        })
+        .to_string();
+
+        let (payload, truncated) = read_payload(huge.as_bytes());
+        assert!(truncated, "a payload past the cap must report as truncated");
+        assert_eq!(payload.len() as u64, MAX_HOOK_STDIN_BYTES);
+        assert!(
+            !payload.contains(secret),
+            "the cap must land before the tail of the response"
+        );
+
+        // Truncated JSON does not parse, so this lands on the flagged row rather than
+        // a guess at half a document.
+        assert!(serde_json::from_str::<Value>(&payload).is_err());
+    }
+
+    #[test]
+    fn a_payload_inside_the_cap_is_read_whole() {
+        let payload = json!({ "session_id": "s1", "tool_name": "Bash" }).to_string();
+        let (read, truncated) = read_payload(payload.as_bytes());
+        assert!(!truncated);
+        assert_eq!(read, payload);
+    }
+
+    #[test]
+    fn preview_text_is_the_bytes_install_actually_writes() {
+        // The dry run must not claim a comment is about to disappear when the real
+        // write keeps it (SBS-822 review).
+        let dir = scratch("preview-bytes");
+        let path = dir.join("settings.json");
+        let original =
+            "{\n  // the model I actually want\n  \"model\": \"opus\"\n}\n";
+        std::fs::write(&path, original).unwrap();
+
+        // Drive preview() itself, not just the renderer underneath it, so swapping the
+        // dry run back to `to_string_pretty` is caught.
+        let previews = preview_to(&[path.clone()], &binary()).unwrap();
+        assert_eq!(previews.len(), 1);
+        assert_eq!(previews[0].before, original);
+
+        install_at(&path, &binary()).unwrap();
+        assert_eq!(
+            previews[0].after,
+            read(&path),
+            "preview text and the written file must be byte-identical"
+        );
+        assert!(previews[0].after.contains("// the model I actually want"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_writes_nothing_at_all() {
+        let dir = scratch("preview-readonly");
+        let path = dir.join("settings.json");
+
+        // A profile with no settings file yet: the dry run must not create one.
+        let previews = preview_to(&[path.clone()], &binary()).unwrap();
+        assert!(previews[0].before.is_empty());
+        assert!(previews[0].after.contains(HOOK_MARKER));
+        assert!(!path.exists(), "a dry run must not create the settings file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enabling_does_not_persist_the_opt_in_when_the_install_cannot_run() {
+        // A failed apply must leave the registry exactly as it was. Otherwise `view()`
+        // reports enabled with nothing installed and every startup retries the same
+        // failing apply forever, with no path back (SBS-822 review).
+        let _guard = crate::registry::data_dir_test_lock();
+        let dir = scratch("enable-fails");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let profile = dir.join(".claude").join("settings.json");
+
+        // No resolvable binary is the real-world case this models: every non-Windows
+        // build before a gateway is published.
+        let err = apply_to(Some(true), &[profile.clone()], None).unwrap_err();
+        assert!(err.contains("gateway binary"), "unexpected error: {err}");
+
+        assert!(
+            !crate::registry::load().unwrap().hooks_enabled,
+            "a failed enable must not leave hooks_enabled = true behind"
+        );
+        assert!(
+            !profile.exists(),
+            "and must not have written a settings file first"
+        );
+
+        drop(_override);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enabling_commits_the_opt_in_and_the_targets_together() {
+        let _guard = crate::registry::data_dir_test_lock();
+        let dir = scratch("enable-commits");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+        let profile = dir.join(".claude").join("settings.json");
+        std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+
+        apply_to(Some(true), &[profile.clone()], Some(&binary())).unwrap();
+
+        let reg = crate::registry::load().unwrap();
+        assert!(reg.hooks_enabled);
+        assert_eq!(reg.hook_targets, vec![profile.display().to_string()]);
+        assert!(is_installed(
+            &crate::clients::read_settings_json(&profile).unwrap().0
+        ));
+
+        // Opting out removes the sensor and forgets the target in one transaction.
+        apply_to(Some(false), &[profile.clone()], Some(&binary())).unwrap();
+        let reg = crate::registry::load().unwrap();
+        assert!(!reg.hooks_enabled);
+        assert!(reg.hook_targets.is_empty());
+        assert!(!is_installed(
+            &crate::clients::read_settings_json(&profile).unwrap().0
+        ));
+
+        drop(_override);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
