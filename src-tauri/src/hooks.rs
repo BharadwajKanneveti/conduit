@@ -1,0 +1,1080 @@
+//! Native-agent hook sensor - record what an agent does outside the gateway.
+//!
+//! The sensor half of SBS-822 (`agent-permissions` spec). Toolport governs calls that
+//! go through the gateway; it is blind to what Claude Code does natively (`Bash`,
+//! `Edit`, `Read`), because none of that is MCP. Agent harnesses expose hooks - a
+//! command the harness runs at a lifecycle point, fed a JSON payload on stdin - so
+//! this module installs three of them and records one line per event.
+//!
+//! Three properties this module exists to hold:
+//!
+//!   * **It cannot block a tool call.** `PreToolUse` is the blocking event and is
+//!     deliberately not registered ([`SENSOR_EVENTS`]). "The sensor cannot stop your
+//!     agent" is therefore structural, not a promise that the code is correct.
+//!   * **It stores no content.** Hook payloads carry `tool_input` and `tool_response`:
+//!     the `Bash` command line, the bytes of an `Edit`, whatever a `Read` returned.
+//!     [`row`] keeps a tool name and an [`crate::audit::args_hash`] and drops the rest,
+//!     the same contract the gateway audit log already holds.
+//!   * **It cleans up exactly what it wrote.** JSON has no comments, so a settings
+//!     block cannot carry a sentinel the way [`crate::instructions`] markers do.
+//!     Instead every entry Toolport installs carries [`HOOK_MARKER`] in its command,
+//!     and removal drops entries by that marker and nothing else - the same
+//!     "identify what we wrote by content" rule as `instructions::remove_recorded`.
+
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Value};
+use std::path::{Path, PathBuf};
+
+/// The literal that marks a hook entry as Toolport's, in the command it runs.
+///
+/// Doubles as the gateway subcommand flag, so one string is both "how the binary
+/// knows it is being invoked as a hook" and "how we recognise our own entry later".
+pub const HOOK_MARKER: &str = "--toolport-hook";
+
+/// The harness lifecycle events the sensor registers, paired with the argument the
+/// hook command passes back to us.
+///
+/// `PreToolUse` is absent on purpose: it is the event whose exit status can refuse a
+/// user's tool call, and this ship has no enforcement story yet (see the spec's
+/// "Why the sensor ships alone"). `UserPromptSubmit` and `Notification` are absent
+/// because their payload is the user's prompt text and there is no redaction path
+/// for it here.
+const SENSOR_EVENTS: [(&str, &str); 3] = [
+    ("SessionStart", "session-start"),
+    ("PostToolUse", "tool"),
+    ("SessionEnd", "session-end"),
+];
+
+/// Seconds the harness should allow a hook before giving up on it. A wedged sensor
+/// must cost the user a bounded pause, never a hung agent.
+const HOOK_TIMEOUT_SECS: u64 = 5;
+
+/// Trim the sensor log once it passes this size.
+const MAX_HOOK_LOG_BYTES: u64 = 4 * 1024 * 1024;
+/// Lines kept when trimming. Rows are small (no content), so this stays well inside
+/// the byte cap; if it did not, every append past the cap would re-trim.
+const KEEP_HOOK_LINES: usize = 10_000;
+
+/// One agent settings file and what the sensor's state in it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProfileStatus {
+    /// Absolute path to the profile's `settings.json`.
+    pub path: String,
+    /// True when this file currently carries Toolport's hook entries.
+    pub installed: bool,
+    /// Why this profile could not be read or written, when that is the case. A
+    /// profile that is merely not installed reports `None` here; an unreadable or
+    /// malformed one reports the reason instead of silently looking "not installed".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Everything the (future) hooks view needs, in one round trip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HooksView {
+    /// The user's opt-in. Off by default.
+    pub enabled: bool,
+    /// The harness events the sensor registers, for the UI to name them honestly.
+    pub events: Vec<String>,
+    /// Every Claude Code profile found, installed or not.
+    pub profiles: Vec<ProfileStatus>,
+    /// Absent when no gateway binary is resolvable, which is the one condition that
+    /// makes installing impossible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+}
+
+/// A dry run: the exact hook block that would be written, and where.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HooksPreview {
+    pub path: String,
+    /// The file as it is now (empty string when it does not exist yet).
+    pub before: String,
+    /// The file as it would be after the write.
+    pub after: String,
+}
+
+// ---------------------------------------------------------------------------
+// The hook block: pure functions over a settings value
+// ---------------------------------------------------------------------------
+
+/// The command the harness runs for one event.
+///
+/// Quoted because the harness hands this to a shell and installed paths contain
+/// spaces on every platform Toolport ships to (`C:\Program Files\...`,
+/// `/Applications/...`).
+fn hook_command(binary: &Path, event_arg: &str) -> String {
+    format!("\"{}\" {HOOK_MARKER} {event_arg}", binary.display())
+}
+
+/// One matcher group holding one Toolport hook.
+///
+/// No `matcher` key: an absent matcher observes every tool, which is what a sensor
+/// wants, and it avoids guessing a matcher dialect that differs between harness
+/// versions.
+fn matcher_group(command: String) -> Value {
+    json!({
+        "hooks": [{
+            "type": "command",
+            "command": command,
+            "timeout": HOOK_TIMEOUT_SECS,
+        }]
+    })
+}
+
+/// True when this hook entry is one Toolport installed.
+fn is_ours(entry: &Value) -> bool {
+    entry
+        .get("command")
+        .and_then(Value::as_str)
+        .map(|command| command.contains(HOOK_MARKER))
+        .unwrap_or(false)
+}
+
+/// True when `root` currently carries any Toolport hook entry.
+pub fn is_installed(root: &Value) -> bool {
+    let Some(hooks) = root.get("hooks").and_then(Value::as_object) else {
+        return false;
+    };
+    hooks.values().any(|groups| {
+        groups
+            .as_array()
+            .map(|groups| {
+                groups.iter().any(|group| {
+                    group
+                        .get("hooks")
+                        .and_then(Value::as_array)
+                        .map(|entries| entries.iter().any(is_ours))
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// Return `root` with every Toolport hook entry removed, pruning each container the
+/// removal empties.
+///
+/// Removal is per ENTRY, not per group: a user who added their own hook to the same
+/// event, in the same group, keeps it. Pruning matters because a leftover
+/// `"hooks": {}` or `"PostToolUse": []` is residue from a feature the user turned
+/// off, and "clean up exactly what we wrote" includes the shape.
+pub fn strip_hooks(root: &Value) -> Value {
+    let mut out = root.clone();
+    let Some(obj) = out.as_object_mut() else {
+        return out;
+    };
+    let Some(hooks) = obj.get_mut("hooks").and_then(Value::as_object_mut) else {
+        return out;
+    };
+
+    let events: Vec<String> = hooks.keys().cloned().collect();
+    for event in events {
+        let Some(groups) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for group in groups.iter_mut() {
+            if let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                entries.retain(|entry| !is_ours(entry));
+            }
+        }
+        // A group whose hook list we emptied was ours alone; drop it. A group that
+        // never had a `hooks` array is left exactly as found.
+        groups.retain(|group| match group.get("hooks").and_then(Value::as_array) {
+            Some(entries) => !entries.is_empty(),
+            None => true,
+        });
+        if groups.is_empty() {
+            hooks.remove(&event);
+        }
+    }
+    if hooks.is_empty() {
+        obj.remove("hooks");
+    }
+    out
+}
+
+/// Return `root` with Toolport's sensor entries present exactly once per event.
+///
+/// Built as strip-then-add so it is idempotent: applying it to a file we already
+/// wrote, or to one carrying an entry from an older build that pointed at a
+/// superseded gateway binary, converges on one current entry per event rather than
+/// accumulating them.
+pub fn upsert_hooks(root: &Value, binary: &Path) -> Result<Value, String> {
+    let mut out = strip_hooks(root);
+    let obj = out
+        .as_object_mut()
+        .ok_or_else(|| "settings root is not a JSON object".to_string())?;
+
+    let hooks = obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    let hooks = hooks
+        .as_object_mut()
+        .ok_or_else(|| "`hooks` is present but is not an object".to_string())?;
+
+    for (event, arg) in SENSOR_EVENTS {
+        let groups = hooks
+            .entry(event.to_string())
+            .or_insert_with(|| Value::Array(Vec::new()));
+        let groups = groups
+            .as_array_mut()
+            .ok_or_else(|| format!("`hooks.{event}` is present but is not an array"))?;
+        groups.push(matcher_group(hook_command(binary, arg)));
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// The sensor log
+// ---------------------------------------------------------------------------
+
+/// Where hook rows are recorded.
+///
+/// Deliberately NOT `audit.jsonl`. One active Claude Code session fires
+/// `PostToolUse` on every `Read`, `Edit` and `Bash`, which is one to two orders of
+/// magnitude more rows than gateway traffic; sharing the file would push the
+/// governance rows out through the audit log's own trim, so the compliance artifact
+/// would be evicted by telemetry. Separate files, separate caps; SBS-823 merges them
+/// at read time.
+pub fn log_path() -> Option<PathBuf> {
+    Some(crate::registry::conduit_dir()?.join("hooks.jsonl"))
+}
+
+/// Outcome of one observed native tool call.
+///
+/// `None` means unknown and must never be counted as success. The harness does not
+/// promise a machine-readable outcome on every tool, so an absent `ok` is the normal
+/// case rather than an error - which is exactly why defaulting it to `true` would
+/// quietly inflate a success rate (the SBS-932 rule, applied before the bug).
+pub fn hook_call_ok(entry: &Value) -> Option<bool> {
+    entry.get("ok").and_then(Value::as_bool)
+}
+
+/// Read a tool call's outcome out of a `PostToolUse` payload, when it says.
+fn tool_outcome(payload: &Value) -> Option<bool> {
+    let response = payload.get("tool_response")?;
+    if let Some(success) = response.get("success").and_then(Value::as_bool) {
+        return Some(success);
+    }
+    // An `error` that is present and not null is a failure. Its VALUE is not read:
+    // an error string can carry the same content the rest of this module drops.
+    match response.get("error") {
+        Some(Value::Null) | None => None,
+        Some(_) => Some(false),
+    }
+}
+
+/// Build the row for one hook event.
+///
+/// Pure, so the "no content is ever stored" contract is unit-testable against a
+/// payload carrying a secret. Everything recorded is either a name, an identifier,
+/// a path, or a hash.
+pub fn row(event_arg: &str, payload: &Value) -> Value {
+    let mut entry = json!({
+        "ts": epoch_millis(),
+        "event": event_arg,
+        "agent": "claude-code",
+    });
+
+    if let Some(session) = payload.get("session_id").and_then(Value::as_str) {
+        entry["sessionId"] = json!(session);
+    }
+    if let Some(cwd) = payload.get("cwd").and_then(Value::as_str) {
+        entry["cwd"] = json!(cwd);
+    }
+    if let Some(tool) = payload.get("tool_name").and_then(Value::as_str) {
+        entry["tool"] = json!(tool);
+    }
+    // Identity without content, from the same canonical hash the gateway audit uses,
+    // so a repeated call is recognisable across both logs.
+    if let Some(input) = payload.get("tool_input") {
+        entry["argsHash"] = json!(crate::audit::args_hash(input));
+    }
+    if let Some(ok) = tool_outcome(payload) {
+        entry["ok"] = json!(ok);
+    }
+    entry
+}
+
+fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Handle one hook invocation, from the gateway binary's `--toolport-hook` path.
+///
+/// **Never fails the caller.** The binary exits 0 whatever happens here, because a
+/// non-zero exit from a hook is a signal to the harness, and on some events that
+/// signal stops the user's work. Nothing is printed to stdout either: the harness
+/// reads hook stdout, so noise there lands in the user's session. Diagnostics go to
+/// the gateway log.
+pub fn handle_event(event_arg: &str, stdin: &str) {
+    if !SENSOR_EVENTS.iter().any(|(_, arg)| *arg == event_arg) {
+        // A settings.json written by another build naming an event this one does not
+        // record. Dropping it is correct; saying so is what makes it debuggable.
+        crate::gatewaylog::append(&format!(
+            "toolport: ignoring unknown hook event '{event_arg}'"
+        ));
+        return;
+    }
+
+    let entry = match serde_json::from_str::<Value>(stdin) {
+        Ok(payload) => row(event_arg, &payload),
+        Err(error) => {
+            crate::gatewaylog::append(&format!(
+                "toolport: hook '{event_arg}' payload did not parse: {error}"
+            ));
+            // Recorded anyway, flagged, and with no `tool` key so no reader can
+            // mistake it for an observed call. Silence here would be indistinguishable
+            // from the agent doing nothing.
+            json!({
+                "ts": epoch_millis(),
+                "event": event_arg,
+                "agent": "claude-code",
+                "malformed": true,
+            })
+        }
+    };
+
+    let Some(path) = log_path() else {
+        crate::gatewaylog::append("toolport: hook row dropped, no data directory");
+        return;
+    };
+    if let Err(error) = crate::registry::append_line_locked(
+        &path,
+        &entry.to_string(),
+        MAX_HOOK_LOG_BYTES,
+        KEEP_HOOK_LINES,
+        None,
+    ) {
+        crate::gatewaylog::append(&format!("toolport: hook row dropped: {error}"));
+    }
+}
+
+/// The most recent `limit` rows, newest first.
+///
+/// A missing file is an empty log. Any other IO error is returned, so a caller cannot
+/// show "no agent activity" for a log it simply failed to read (SBS-873).
+pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
+    let Some(path) = log_path() else {
+        return Ok(Vec::new());
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    Ok(content
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .take(limit)
+        .collect())
+}
+
+// ---------------------------------------------------------------------------
+// Install / remove
+// ---------------------------------------------------------------------------
+
+/// The gateway binary the hook command should invoke.
+///
+/// The same binary clients already spawn, so it inherits the install location,
+/// version pinning, pruning and signing that path already has.
+///
+/// Publishes the bundled gateway if it has not been published yet, so this is the
+/// write-capable variant. Read-only callers use [`hook_binary_readonly`].
+fn hook_binary() -> Option<PathBuf> {
+    crate::gateway_publish::client_gateway_path()
+}
+
+/// The published gateway path, without publishing one as a side effect.
+///
+/// `view` must not write: a UI that merely renders the hooks panel should not be able
+/// to publish a binary.
+fn hook_binary_readonly() -> Option<PathBuf> {
+    crate::gateway_publish::published_gateway_path()
+}
+
+/// Re-apply at app start, so the sensor keeps pointing at a gateway that exists.
+///
+/// The published gateway path is VERSIONED, and the reaper prunes superseded builds.
+/// An update therefore leaves every installed hook naming a binary that is about to
+/// disappear, and the harness would run a missing command once per tool call. Because
+/// [`upsert_hooks`] is idempotent and rewrites a stale binary path, one apply on the
+/// launch after an update repairs every profile; a launch with nothing to change
+/// writes no bytes ([`install_at`] compares first).
+pub fn apply_on_startup() {
+    let enabled = crate::registry::load()
+        .map(|reg| reg.hooks_enabled || !reg.hook_targets.is_empty())
+        .unwrap_or(false);
+    if !enabled {
+        return;
+    }
+    if let Err(error) = apply() {
+        crate::gatewaylog::append(&format!("toolport: hook sensor startup apply failed: {error}"));
+    }
+}
+
+/// Current state, without writing anything.
+pub fn view() -> HooksView {
+    let reg = crate::registry::load().unwrap_or_default();
+    let binary = hook_binary_readonly();
+    let profiles = crate::clients::claude_settings_paths()
+        .into_iter()
+        .map(|path| match crate::clients::read_settings_json(&path) {
+            Ok((root, _)) => ProfileStatus {
+                path: path.display().to_string(),
+                installed: is_installed(&root),
+                error: None,
+            },
+            Err(error) => ProfileStatus {
+                path: path.display().to_string(),
+                installed: false,
+                error: Some(error),
+            },
+        })
+        .collect();
+
+    HooksView {
+        enabled: reg.hooks_enabled,
+        events: SENSOR_EVENTS
+            .iter()
+            .map(|(event, _)| (*event).to_string())
+            .collect(),
+        profiles,
+        binary: binary.map(|p| p.display().to_string()),
+    }
+}
+
+/// Turn the sensor on or off, then make every profile match.
+pub fn set_enabled(enabled: bool) -> Result<HooksView, String> {
+    crate::registry::update(|reg| {
+        reg.hooks_enabled = enabled;
+        Ok(())
+    })?;
+    apply()?;
+    Ok(view())
+}
+
+/// Write the sensor into every profile when enabled, and remove it from every
+/// recorded target when not.
+///
+/// A profile that fails is reported, not fatal: one unreadable `settings.json` must
+/// not stop the other profiles from being installed or, more importantly, cleaned.
+pub fn apply() -> Result<Vec<ProfileStatus>, String> {
+    let reg = crate::registry::load()?;
+    let mut statuses: Vec<ProfileStatus> = Vec::new();
+
+    // Every profile that SHOULD carry the sensor right now. Empty when the user has
+    // opted out, which is what turns this pass into a full removal.
+    let candidates: Vec<String> = if reg.hooks_enabled {
+        crate::clients::claude_settings_paths()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    if reg.hooks_enabled {
+        let binary = hook_binary()
+            .ok_or_else(|| "no gateway binary is available to run as a hook".to_string())?;
+        for path in candidates.iter().map(Path::new) {
+            let status = match install_at(path, &binary) {
+                Ok(()) => ProfileStatus {
+                    path: path.display().to_string(),
+                    installed: true,
+                    error: None,
+                },
+                Err(error) => ProfileStatus {
+                    path: path.display().to_string(),
+                    installed: false,
+                    error: Some(error),
+                },
+            };
+            statuses.push(status);
+        }
+    }
+
+    // Clean what we recorded and no longer want: a profile that disappeared, or every
+    // profile once the user opts out. Same contract as `rules_targets`.
+    //
+    // Cleanup is keyed on "no longer a candidate", NOT on "failed to write this pass".
+    // A transient read failure must not be read as "this profile is gone" and trigger
+    // an uninstall of a sensor that is working.
+    let mut unremovable: Vec<String> = Vec::new();
+    for stale in reg.hook_targets.iter().filter(|p| !candidates.contains(p)) {
+        if let Err(error) = remove_at(Path::new(stale)) {
+            // Keep it on the list. Dropping a path whose removal failed would strand
+            // the file forever, because nothing would ever try again (SBS-914 is the
+            // same bug on the rules path).
+            unremovable.push(stale.clone());
+            statuses.push(ProfileStatus {
+                path: stale.clone(),
+                installed: false,
+                error: Some(error),
+            });
+        }
+    }
+
+    let mut targets = candidates;
+    targets.extend(unremovable);
+    crate::registry::update(|reg| {
+        reg.hook_targets = targets.clone();
+        Ok(())
+    })?;
+    Ok(statuses)
+}
+
+/// Install the sensor into one settings file. No-op (and no backup) when the file
+/// already says exactly what we would write.
+fn install_at(path: &Path, binary: &Path) -> Result<(), String> {
+    let (root, original) = crate::clients::read_settings_json(path)?;
+    let updated = upsert_hooks(&root, binary)?;
+    if updated == root {
+        return Ok(());
+    }
+    crate::clients::write_settings_json(path, original.as_deref(), &updated)
+}
+
+/// Remove the sensor from one settings file.
+///
+/// A file that is gone is success: the profile it belonged to was deleted, which is a
+/// stronger form of removed. A file we cannot parse is NOT success - refusing loudly
+/// beats rewriting a file we do not understand.
+fn remove_at(path: &Path) -> Result<(), String> {
+    let (root, original) = match crate::clients::read_settings_json(path) {
+        Ok(pair) => pair,
+        Err(error) => {
+            if !path.exists() {
+                return Ok(());
+            }
+            return Err(error);
+        }
+    };
+    if original.is_none() {
+        return Ok(());
+    }
+    let stripped = strip_hooks(&root);
+    if stripped == root {
+        return Ok(());
+    }
+    crate::clients::write_settings_json(path, original.as_deref(), &stripped)
+}
+
+/// The exact bytes the write would produce, for every profile. Touches nothing.
+pub fn preview() -> Result<Vec<HooksPreview>, String> {
+    let binary =
+        hook_binary().ok_or_else(|| "no gateway binary is available to run as a hook".to_string())?;
+    let mut out = Vec::new();
+    for path in crate::clients::claude_settings_paths() {
+        let (root, original) = crate::clients::read_settings_json(&path)?;
+        let updated = upsert_hooks(&root, &binary)?;
+        out.push(HooksPreview {
+            path: path.display().to_string(),
+            before: original.unwrap_or_default(),
+            after: serde_json::to_string_pretty(&updated).map_err(|e| e.to_string())?,
+        });
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn binary() -> PathBuf {
+        PathBuf::from("/opt/Toolport/toolport-gateway")
+    }
+
+    fn our_command() -> String {
+        hook_command(&binary(), "tool")
+    }
+
+    fn foreign_group() -> Value {
+        json!({
+            "matcher": "Bash",
+            "hooks": [{ "type": "command", "command": "/usr/local/bin/my-linter" }]
+        })
+    }
+
+    #[test]
+    fn upsert_into_a_fresh_file_registers_every_sensor_event_once() {
+        let out = upsert_hooks(&json!({}), &binary()).unwrap();
+        let hooks = out["hooks"].as_object().unwrap();
+
+        assert_eq!(hooks.len(), SENSOR_EVENTS.len());
+        for (event, arg) in SENSOR_EVENTS {
+            let groups = hooks[event].as_array().unwrap();
+            assert_eq!(groups.len(), 1, "{event} should have exactly one group");
+            let entries = groups[0]["hooks"].as_array().unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0]["command"], json!(hook_command(&binary(), arg)));
+            assert_eq!(entries[0]["type"], json!("command"));
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_is_never_registered() {
+        let out = upsert_hooks(&json!({}), &binary()).unwrap();
+        assert!(
+            out["hooks"].get("PreToolUse").is_none(),
+            "the sensor must not register on the blocking event"
+        );
+        assert!(!SENSOR_EVENTS.iter().any(|(event, _)| *event == "PreToolUse"));
+    }
+
+    #[test]
+    fn upsert_is_idempotent_and_refreshes_a_stale_binary_path() {
+        let once = upsert_hooks(&json!({}), &binary()).unwrap();
+        let twice = upsert_hooks(&once, &binary()).unwrap();
+        assert_eq!(once, twice, "re-applying must not accumulate entries");
+
+        // An entry an older build wrote, pointing at a gateway that has since been
+        // pruned, is replaced rather than joined.
+        let stale = upsert_hooks(&json!({}), Path::new("/old/toolport-gateway")).unwrap();
+        let fresh = upsert_hooks(&stale, &binary()).unwrap();
+        let entries = fresh["hooks"]["PostToolUse"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["hooks"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            entries[0]["hooks"][0]["command"],
+            json!(hook_command(&binary(), "tool"))
+        );
+    }
+
+    #[test]
+    fn foreign_hooks_and_unrelated_settings_survive_a_round_trip() {
+        let before = json!({
+            "model": "opus",
+            "permissions": { "allow": ["Bash(git status)"] },
+            "hooks": {
+                "PostToolUse": [foreign_group()],
+                "PreToolUse": [foreign_group()],
+            }
+        });
+
+        let installed = upsert_hooks(&before, &binary()).unwrap();
+        assert_eq!(installed["model"], json!("opus"));
+        assert_eq!(installed["permissions"]["allow"][0], json!("Bash(git status)"));
+        // Ours is added alongside theirs, and their PreToolUse hook is untouched.
+        assert_eq!(installed["hooks"]["PostToolUse"].as_array().unwrap().len(), 2);
+        assert_eq!(installed["hooks"]["PreToolUse"], json!([foreign_group()]));
+
+        let removed = strip_hooks(&installed);
+        assert_eq!(removed, before, "uninstall must restore the file exactly");
+    }
+
+    #[test]
+    fn strip_removes_only_our_entry_from_a_shared_group() {
+        // A user who hand-edited our group to add their own hook keeps it.
+        let shared = json!({
+            "hooks": {
+                "PostToolUse": [{
+                    "hooks": [
+                        { "type": "command", "command": our_command() },
+                        { "type": "command", "command": "/usr/local/bin/my-linter" },
+                    ]
+                }]
+            }
+        });
+        let out = strip_hooks(&shared);
+        let entries = out["hooks"]["PostToolUse"][0]["hooks"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["command"], json!("/usr/local/bin/my-linter"));
+    }
+
+    #[test]
+    fn strip_prunes_the_containers_it_empties() {
+        let installed = upsert_hooks(&json!({ "model": "opus" }), &binary()).unwrap();
+        let out = strip_hooks(&installed);
+        assert_eq!(
+            out,
+            json!({ "model": "opus" }),
+            "no empty `hooks` object or event array may be left behind"
+        );
+    }
+
+    #[test]
+    fn strip_leaves_a_file_that_was_never_ours_untouched() {
+        let theirs = json!({ "hooks": { "PostToolUse": [foreign_group()] } });
+        assert_eq!(strip_hooks(&theirs), theirs);
+        assert!(!is_installed(&theirs));
+    }
+
+    #[test]
+    fn is_installed_tracks_upsert_and_strip() {
+        let empty = json!({});
+        assert!(!is_installed(&empty));
+        let installed = upsert_hooks(&empty, &binary()).unwrap();
+        assert!(is_installed(&installed));
+        assert!(!is_installed(&strip_hooks(&installed)));
+    }
+
+    #[test]
+    fn a_hooks_key_of_the_wrong_type_is_refused_not_overwritten() {
+        let broken = json!({ "hooks": "off" });
+        assert!(upsert_hooks(&broken, &binary()).is_err());
+
+        let broken_event = json!({ "hooks": { "PostToolUse": {} } });
+        let err = upsert_hooks(&broken_event, &binary()).unwrap_err();
+        assert!(err.contains("PostToolUse"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_non_object_root_is_refused() {
+        assert!(upsert_hooks(&json!([1, 2, 3]), &binary()).is_err());
+    }
+
+    #[test]
+    fn the_command_is_quoted_so_an_installed_path_with_spaces_survives_a_shell() {
+        let command = hook_command(Path::new("/Applications/My Toolport/toolport-gateway"), "tool");
+        assert!(command.starts_with('"'));
+        assert!(command.contains("My Toolport"));
+        assert!(command.ends_with(&format!("{HOOK_MARKER} tool")));
+    }
+
+    #[test]
+    fn a_row_stores_identity_and_never_content() {
+        let secret = "AKIAIOSFODNN7EXAMPLE";
+        let payload = json!({
+            "session_id": "sess-1",
+            "cwd": "/home/dev/app",
+            "tool_name": "Bash",
+            "tool_input": { "command": format!("aws configure set key {secret}") },
+            "tool_response": { "success": true, "stdout": secret },
+        });
+
+        let row = row("tool", &payload);
+        let text = row.to_string();
+
+        assert!(
+            !text.contains(secret),
+            "a hook row must never carry payload content: {text}"
+        );
+        assert!(!text.contains("aws configure"));
+        assert_eq!(row["tool"], json!("Bash"));
+        assert_eq!(row["sessionId"], json!("sess-1"));
+        assert_eq!(row["cwd"], json!("/home/dev/app"));
+        assert_eq!(row["ok"], json!(true));
+        assert_eq!(
+            row["argsHash"],
+            json!(crate::audit::args_hash(&payload["tool_input"]))
+        );
+        assert!(row["ts"].as_u64().is_some());
+    }
+
+    #[test]
+    fn an_undecidable_outcome_is_absent_rather_than_success() {
+        // No tool_response at all.
+        let row = row("tool", &json!({ "tool_name": "Read" }));
+        assert!(row.get("ok").is_none());
+        assert_eq!(hook_call_ok(&row), None);
+
+        // A response that simply does not say.
+        let quiet = row_for(json!({ "tool_response": { "stdout": "hi" } }));
+        assert!(quiet.get("ok").is_none());
+
+        // An explicit null error is not a failure, and not a success either.
+        let null_error = row_for(json!({ "tool_response": { "error": Value::Null } }));
+        assert!(null_error.get("ok").is_none());
+    }
+
+    #[test]
+    fn an_error_in_the_response_is_a_failed_call() {
+        let failed = row_for(json!({ "tool_response": { "error": "no such file" } }));
+        assert_eq!(hook_call_ok(&failed), Some(false));
+        assert!(
+            !failed.to_string().contains("no such file"),
+            "the error VALUE must not be stored, only the outcome"
+        );
+
+        let explicit = row_for(json!({ "tool_response": { "success": false } }));
+        assert_eq!(hook_call_ok(&explicit), Some(false));
+    }
+
+    fn row_for(payload: Value) -> Value {
+        row("tool", &payload)
+    }
+
+    #[test]
+    fn a_session_row_carries_no_tool_and_no_outcome() {
+        let row = row("session-start", &json!({ "session_id": "s", "cwd": "/w" }));
+        assert!(row.get("tool").is_none());
+        assert!(row.get("ok").is_none());
+        assert!(row.get("argsHash").is_none());
+        assert_eq!(row["event"], json!("session-start"));
+    }
+
+    #[test]
+    fn hook_call_ok_never_infers_success_from_a_missing_field() {
+        assert_eq!(hook_call_ok(&json!({ "tool": "Bash" })), None);
+        assert_eq!(hook_call_ok(&json!({ "ok": true })), Some(true));
+        assert_eq!(hook_call_ok(&json!({ "ok": "yes" })), None);
+    }
+
+    // --- on-disk behavior ---------------------------------------------------
+
+    fn scratch(name: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-hooks-{name}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn read(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap()
+    }
+
+    #[test]
+    fn install_creates_a_settings_file_that_did_not_exist() {
+        let dir = scratch("fresh");
+        let path = dir.join("settings.json");
+
+        install_at(&path, &binary()).unwrap();
+
+        let root: Value = serde_json::from_str(&read(&path)).unwrap();
+        assert!(is_installed(&root));
+        // A file we created holds nothing but our block.
+        assert_eq!(root.as_object().unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_preserves_comments_and_every_unrelated_setting() {
+        let dir = scratch("comments");
+        let path = dir.join("settings.json");
+        let original = "{\n  // the model I actually want\n  \"model\": \"opus\",\n  \"permissions\": { \"allow\": [\"Bash(git status)\"] }\n}\n";
+        std::fs::write(&path, original).unwrap();
+
+        install_at(&path, &binary()).unwrap();
+
+        let after = read(&path);
+        assert!(
+            after.contains("// the model I actually want"),
+            "the comment must survive the write: {after}"
+        );
+        assert!(after.contains("\"model\": \"opus\""));
+        assert!(after.contains(HOOK_MARKER));
+
+        // Removing puts every byte outside the `hooks` key back as it was.
+        remove_at(&path).unwrap();
+        let restored = read(&path);
+        assert!(restored.contains("// the model I actually want"));
+        assert!(!restored.contains(HOOK_MARKER));
+        let root: Value = crate::clients::read_settings_json(&path).unwrap().0;
+        assert!(
+            root.get("hooks").is_none(),
+            "uninstall must not leave an empty hooks object: {restored}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn install_is_a_no_op_when_the_file_already_says_what_we_would_write() {
+        let dir = scratch("noop");
+        let path = dir.join("settings.json");
+
+        install_at(&path, &binary()).unwrap();
+        let first = read(&path);
+        install_at(&path, &binary()).unwrap();
+
+        assert_eq!(first, read(&path), "a second apply must not rewrite bytes");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_duplicate_hooks_key_is_refused_and_the_file_is_left_alone() {
+        let dir = scratch("dupe");
+        let path = dir.join("settings.json");
+        // Ambiguous: a rewrite would silently drop one of the two.
+        let original = "{ \"hooks\": {}, \"hooks\": {} }";
+        std::fs::write(&path, original).unwrap();
+
+        assert!(install_at(&path, &binary()).is_err());
+        assert_eq!(read(&path), original, "the file must be untouched");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_malformed_settings_file_is_refused_rather_than_replaced() {
+        let dir = scratch("malformed");
+        let path = dir.join("settings.json");
+        let original = "{ this is not json";
+        std::fs::write(&path, original).unwrap();
+
+        assert!(install_at(&path, &binary()).is_err());
+        assert!(remove_at(&path).is_err(), "removal must not rewrite it either");
+        assert_eq!(read(&path), original);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_from_a_profile_that_no_longer_exists_is_success() {
+        let dir = scratch("gone");
+        let path = dir.join("settings.json");
+        // A profile the user deleted between apply and remove is a stronger form of
+        // "removed", not an error to report.
+        assert!(remove_at(&path).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn removing_leaves_a_foreign_hook_on_the_same_event_intact() {
+        let dir = scratch("foreign");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&json!({
+                "hooks": { "PostToolUse": [foreign_group()] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        install_at(&path, &binary()).unwrap();
+        remove_at(&path).unwrap();
+
+        let root: Value = crate::clients::read_settings_json(&path).unwrap().0;
+        assert_eq!(root["hooks"]["PostToolUse"], json!([foreign_group()]));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_event_records_a_row_without_a_registry() {
+        // The hook path runs before any gateway startup, so it must work against a
+        // data directory that holds nothing at all - no registry.json, no keychain.
+        // This is the "does not touch the registry" property from the spec.
+        let _guard = crate::registry::data_dir_test_lock();
+        let dir = scratch("no-registry");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+
+        handle_event(
+            "tool",
+            &json!({ "session_id": "s1", "tool_name": "Bash", "tool_input": { "command": "ls" } })
+                .to_string(),
+        );
+
+        let rows = read_recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["tool"], json!("Bash"));
+        assert_eq!(rows[0]["sessionId"], json!("s1"));
+        assert!(!dir.join("registry.json").exists(), "no registry was created");
+
+        drop(_override);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn handle_event_survives_junk_stdin_and_an_unknown_event() {
+        let _guard = crate::registry::data_dir_test_lock();
+        let dir = scratch("junk");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+
+        // Unparseable payload: recorded, flagged, and with no `tool` key so no reader
+        // can mistake it for an observed call.
+        handle_event("tool", "not json at all");
+        // An event this build does not record is dropped, not recorded as junk.
+        handle_event("no-such-event", "{}");
+
+        let rows = read_recent(10).unwrap();
+        assert_eq!(rows.len(), 1, "only the malformed-payload row is kept");
+        assert_eq!(rows[0]["malformed"], json!(true));
+        assert!(rows[0].get("tool").is_none());
+        assert!(rows[0].get("ok").is_none());
+
+        drop(_override);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recorded_rows_are_one_json_line_each_and_newest_first() {
+        let _guard = crate::registry::data_dir_test_lock();
+        let dir = scratch("order");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+
+        handle_event("session-start", &json!({ "session_id": "s1" }).to_string());
+        handle_event("tool", &json!({ "session_id": "s1", "tool_name": "Read" }).to_string());
+        handle_event("session-end", &json!({ "session_id": "s1" }).to_string());
+
+        let raw = std::fs::read_to_string(log_path().unwrap()).unwrap();
+        assert_eq!(raw.lines().count(), 3, "one line per event: {raw}");
+
+        let rows = read_recent(10).unwrap();
+        assert_eq!(rows[0]["event"], json!("session-end"));
+        assert_eq!(rows[2]["event"], json!("session-start"));
+
+        drop(_override);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn startup_apply_does_nothing_when_the_sensor_was_never_turned_on() {
+        // The overwhelmingly common launch. It must not scan profiles, resolve a
+        // gateway binary, or write to the registry, because it runs on the same
+        // thread as every other launch task.
+        let _guard = crate::registry::data_dir_test_lock();
+        let dir = scratch("startup-off");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+
+        apply_on_startup();
+
+        assert!(
+            !dir.join("registry.json").exists(),
+            "a launch with the sensor off must not write anything"
+        );
+
+        drop(_override);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_target_whose_removal_failed_stays_recorded_for_the_next_pass() {
+        // The SBS-914 shape: dropping a path we could not clean strands the file,
+        // because nothing would ever try again.
+        let dir = scratch("retry");
+        let path = dir.join("settings.json");
+        std::fs::write(&path, "{ not json }").unwrap();
+
+        assert!(
+            remove_at(&path).is_err(),
+            "an unparseable file must not report a successful removal"
+        );
+        assert!(path.exists(), "and must not be deleted or rewritten");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn read_recent_reports_an_unreadable_log_instead_of_saying_nothing_happened() {
+        let _guard = crate::registry::data_dir_test_lock();
+        let dir = scratch("unreadable");
+        let _override = crate::registry::DataDirOverride::set(&dir);
+
+        // A directory where the log file should be: readable as a path, not as a file.
+        std::fs::create_dir_all(dir.join("hooks.jsonl")).unwrap();
+        assert!(
+            read_recent(10).is_err(),
+            "an unreadable log must not read as an empty one (SBS-873)"
+        );
+
+        drop(_override);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

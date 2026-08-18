@@ -12,6 +12,7 @@ mod desktop;
 pub mod downstream;
 pub mod gateway_publish;
 pub mod gatewaylog;
+pub mod hooks;
 pub mod inspect;
 pub mod instructions;
 pub mod integrity;

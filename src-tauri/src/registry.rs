@@ -77,6 +77,81 @@ pub fn open_append_private(path: &Path) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
+/// Keep the last `keep` non-empty lines of `content`, newline-terminated.
+pub(crate) fn trimmed_tail(content: &str, keep: usize) -> String {
+    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = lines.len().saturating_sub(keep);
+    let mut out = lines[start..].join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out
+}
+
+/// Append one already-serialized JSONL `line` to `path` under the cross-process
+/// lock for that path, then trim to `keep_lines` once the file passes `max_bytes`.
+///
+/// Shared by the tool-call audit log ([`crate::audit`]) and the agent-hook sensor
+/// log ([`crate::hooks`]). Both are appended to by several independent processes at
+/// once - every client's gateway, and one short-lived process per hook event - so an
+/// in-process mutex is not enough. Atomic replacement protects readers from partial
+/// files, but only this shared critical section prevents a stale rotation snapshot
+/// from replacing an append that completed in another process (#708).
+///
+/// `after_snapshot` is a test seam: it runs between reading the file for rotation and
+/// writing the trimmed result, so a test can prove an append landing in that window
+/// is not lost.
+///
+/// Returns `Err` only when the line could not be recorded. Trimming is best-effort:
+/// a failure there never fails the append it follows.
+pub(crate) fn append_line_locked(
+    path: &Path,
+    line: &str,
+    max_bytes: u64,
+    keep_lines: usize,
+    after_snapshot: Option<&mut dyn FnMut()>,
+) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let _lock = lock_at(path)?;
+    // Owner-only from creation, not from the first rotation onward (SBS-868).
+    let open = || open_append_private(path);
+    // The registry normally created this directory before any call. Avoid a
+    // redundant create-directory syscall on every append, but retain the
+    // standalone/first-writer behavior by creating it and retrying on NotFound.
+    let mut file = match open() {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            open().map_err(|e| e.to_string())?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut bytes = line.to_string();
+    if !bytes.ends_with('\n') {
+        bytes.push('\n');
+    }
+    file.write_all(bytes.as_bytes()).map_err(|e| e.to_string())?;
+    // Query size through the handle we already opened instead of reopening the
+    // path for metadata. Drop it before rotation so Windows can atomically replace
+    // the log when the cap is crossed.
+    let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    drop(file);
+    if size > max_bytes {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if let Some(hook) = after_snapshot {
+                hook();
+            }
+            // Atomic + unique temp: several processes share this file, so a bespoke
+            // fixed temp name could let two rotations collide.
+            let _ = atomic_write(path, &trimmed_tail(&content, keep_lines));
+        }
+    }
+    Ok(())
+}
+
 trait AtomicWriteOps {
     fn set_owner_only(&self, file: &std::fs::File) -> std::io::Result<()>;
     fn write_all(&self, file: &mut std::fs::File, contents: &[u8]) -> std::io::Result<()>;
@@ -759,6 +834,16 @@ pub struct Registry {
     /// Same role as `TeamConnection::team_instructions_targets`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules_targets: Vec<String>,
+    /// Whether the native-agent hook sensor is installed. OFF until the user opts in:
+    /// it writes into a settings file they own and it observes every native tool call
+    /// their agent makes. See [`crate::hooks`].
+    #[serde(default)]
+    pub hooks_enabled: bool,
+    /// Absolute paths of the agent settings files we have written hooks into, so
+    /// removal touches exactly what we created. Same role as `rules_targets`, and the
+    /// reason a profile that disappears between apply and remove is not an error.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hook_targets: Vec<String>,
     /// Top-level fields THIS build doesn't know, preserved verbatim across
     /// load -> save. The registry is shared by mixed versions of the app and
     /// long-running gateways (a dev build, the installed release, and gateways
@@ -1017,6 +1102,8 @@ impl Default for Registry {
             active_rule_set_id: None,
             rules_clients: HashMap::new(),
             rules_targets: Vec::new(),
+            hooks_enabled: false,
+            hook_targets: Vec::new(),
             unknown_fields: serde_json::Map::new(),
         }
     }
@@ -5570,5 +5657,56 @@ mod tests {
                 "Toolport"
             }
         );
+    }
+
+    #[test]
+    fn trimmed_tail_keeps_last_n_lines() {
+        assert_eq!(trimmed_tail("a\nb\nc\nd\ne\n", 2), "d\ne\n");
+        // Fewer lines than the cap -> unchanged (re-normalized with trailing \n).
+        assert_eq!(trimmed_tail("x\ny\n", 5), "x\ny\n");
+        // Blank lines are dropped.
+        assert_eq!(trimmed_tail("a\n\n\nb\n", 5), "a\nb\n");
+        assert_eq!(trimmed_tail("", 5), "");
+    }
+
+    #[test]
+    fn append_line_locked_creates_parent_and_terminates_the_line() {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-append-line-{}-{}",
+            std::process::id(),
+            ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = dir.join("nested").join("log.jsonl");
+
+        // No trailing newline from the caller: the appender supplies it, so two
+        // appends cannot end up concatenated on one line.
+        append_line_locked(&path, "{\"a\":1}", 1024 * 1024, 100, None).unwrap();
+        append_line_locked(&path, "{\"a\":2}\n", 1024 * 1024, 100, None).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "{\"a\":1}\n{\"a\":2}\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_line_locked_trims_once_past_the_cap() {
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-append-trim-{}-{}",
+            std::process::id(),
+            ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let path = dir.join("log.jsonl");
+
+        // A 1-byte cap makes every append cross it, so the keep_lines window is
+        // what bounds the file.
+        for i in 0..10 {
+            append_line_locked(&path, &format!("{{\"i\":{i}}}"), 1, 3, None).unwrap();
+        }
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(content, "{\"i\":7}\n{\"i\":8}\n{\"i\":9}\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
