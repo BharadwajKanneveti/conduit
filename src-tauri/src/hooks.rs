@@ -1302,7 +1302,10 @@ mod tests {
         ));
 
         // Opting out removes the sensor and forgets the target in one transaction.
-        apply_to(Some(false), &[profile.clone()], Some(&binary())).unwrap();
+        // Deliberately with NO binary: turning the sensor off must never depend on
+        // resolving one, or a user whose gateway went missing could not uninstall the
+        // hooks it left in their settings.
+        apply_to(Some(false), &[profile.clone()], None).unwrap();
         let reg = crate::registry::load().unwrap();
         assert!(!reg.hooks_enabled);
         assert!(reg.hook_targets.is_empty());
