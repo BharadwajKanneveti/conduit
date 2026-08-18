@@ -2905,6 +2905,24 @@ pub fn update<T>(
     Ok((reg, out))
 }
 
+/// Like [`update`], but refuses to mutate or save when the registry was reconstructed from a
+/// backup or defaulted over unreadable contents. Use this for reconciliations whose filesystem
+/// side effects depend on absence being authoritative: a placeholder registry must never make
+/// rules cleanup look like an intentional clear.
+pub fn update_authoritative<T>(
+    f: impl FnOnce(&mut Registry) -> Result<T, String>,
+) -> Result<(Registry, T), String> {
+    let path = resolved_path().ok_or("Could not resolve registry path")?;
+    let lock = lock_for(&path, registry_lock_timeout())?;
+    let (mut reg, source) = load_from_locked_with_source(&path, &lock)?;
+    if !source.is_authoritative() {
+        return Err("Registry contents are not authoritative; refusing filesystem changes".into());
+    }
+    let out = f(&mut reg)?;
+    save_to(&path, &reg)?;
+    Ok((reg, out))
+}
+
 /// Acquire the cross-process lock guarding an explicit path (its sibling `<path>.lock`), for a
 /// caller that runs its own load-modify-save rather than using [`update_at`]: the gateway's
 /// agent toggle (which interleaves audit + early returns), and the integrity pins/quarantine

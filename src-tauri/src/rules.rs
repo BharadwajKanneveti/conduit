@@ -173,108 +173,64 @@ pub fn apply() -> Result<RulesView, String> {
 /// [`apply`] over an explicit client/target set, so tests drive a known set of files instead of
 /// the developer's real machine.
 fn apply_to(installed: &[ClientTarget]) -> Result<RulesView, String> {
-    let set = crate::registry::load()?.active_rule_set().cloned();
-    apply_to_with_set(installed, set)
-}
+    // Hold the registry's cross-process lock from the ONE authoritative load through every file
+    // write/cleanup and the rules_targets save. Rule mutations also use this lock, so an older
+    // apply cannot write stale bytes after a newer set wins, and a placeholder/default snapshot
+    // can never be mistaken for an intentional clear.
+    let (reg, ()) = crate::registry::update_authoritative(|reg| {
+        let set = reg.active_rule_set().cloned();
+        let prev_targets = reg.rules_targets.clone();
+        let targets = enabled_targets(reg, installed);
 
-/// [`apply_to`] with the set to write given explicitly rather than read from the registry.
-///
-/// The seam exists for one reason: passing a set that is NO LONGER the active one is exactly what
-/// an apply that loses the compare-and-set experiences, and that path is otherwise untestable
-/// without real concurrency.
-fn apply_to_with_set(
-    installed: &[ClientTarget],
-    set: Option<RuleSet>,
-) -> Result<RulesView, String> {
-    let reg = crate::registry::load()?;
-    let prev_targets = reg.rules_targets.clone();
-    let targets = enabled_targets(&reg, installed);
+        // Every path this apply still WANTS to own, whether or not writing it succeeded. Cleanup
+        // is driven by this rather than by successful writes: a transient failure must keep the
+        // previous good block and its cleanup record.
+        let desired: Vec<String> = if set.is_some() {
+            targets
+                .iter()
+                .map(|t| t.path.to_string_lossy().to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-    // Every path this apply still WANTS to own, whether or not writing it succeeded. Cleanup is
-    // driven by this rather than by the successful writes: a client that failed to write (a full
-    // disk, a permission error, Windsurf's cap, a Codex override that appeared) is still opted in,
-    // and deleting its last known-good block because today's write failed would turn a transient
-    // failure into lost rules. Only a path that is no longer desired at all (opted out,
-    // uninstalled, set cleared, path moved) gets removed.
-    let desired: Vec<String> = if set.is_some() {
-        targets
-            .iter()
-            .map(|t| t.path.to_string_lossy().to_string())
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let mut written: Vec<String> = Vec::new();
-    if let Some(s) = set.as_ref() {
-        for target in &targets {
-            if instructions::write_target(target, &s.id, s.revision, &s.content)
-                == ApplyState::Applied
-            {
-                written.push(target.path.to_string_lossy().to_string());
+        let mut written: Vec<String> = Vec::new();
+        if let Some(s) = set.as_ref() {
+            for target in &targets {
+                if instructions::write_target(target, &s.id, s.revision, &s.content)
+                    == ApplyState::Applied
+                {
+                    written.push(target.path.to_string_lossy().to_string());
+                }
             }
         }
-    }
-    // Paths we could not actually clean. They stay on record so the next pass retries: cleanup is
-    // driven by that record, so forgetting one strands its block with nothing left to find it.
-    let mut uncleaned: Vec<String> = Vec::new();
-    for old in &prev_targets {
-        if !desired.iter().any(|d| d == old) {
-            let gone =
-                instructions::remove_recorded(std::path::Path::new(old), Scope::Personal);
-            if !gone {
+
+        // Paths we could not clean stay recorded so the next pass retries.
+        let mut uncleaned: Vec<String> = Vec::new();
+        for old in &prev_targets {
+            if !desired.iter().any(|d| d == old)
+                && !instructions::remove_recorded(
+                    std::path::Path::new(old),
+                    Scope::Personal,
+                )
+            {
                 uncleaned.push(old.clone());
             }
         }
-    }
 
-    // What we now own on disk: everything written this pass, plus any still-desired path we owned
-    // before and could not rewrite (our older block is very likely still in that file), plus
-    // anything we tried and failed to clean. Every one of those needs a record, because the record
-    // is the only thing that will ever bring us back to the file.
-    let mut owned = written.clone();
-    for old in prev_targets.iter().chain(uncleaned.iter()) {
-        let still_wanted = desired.iter().any(|d| d == old) || uncleaned.contains(old);
-        if still_wanted && !owned.contains(old) {
-            owned.push(old.clone());
-        }
-    }
-
-    // Record it. The compare-and-set fails if the active set changed underneath us, which means a
-    // newer apply has taken over.
-    let expected = set.as_ref().map(|s| (s.id.clone(), s.revision));
-    let recorded = crate::registry::update(|reg| {
-        let current = reg.active_rule_set().map(|s| (s.id.clone(), s.revision));
-        if current != expected {
-            return Ok(false);
-        }
-        reg.rules_targets = owned.clone();
-        Ok(true)
-    });
-    if !matches!(recorded, Ok((_, true))) {
-        // A newer apply won the race. DO NOT delete what we wrote.
-        //
-        // Deleting looks tempting (our writes are not in the winner's record) but it is wrong in
-        // the case that matters: if the winner switched sets and its own write FAILED, our block
-        // is the only one on disk, and removing it leaves the user with no rules at all while the
-        // UI reports the new set. "Keep the last thing that worked" is the rule everywhere else
-        // in this function; a lost race is not a reason to break it.
-        //
-        // The real risk of keeping them is an unrecorded file nothing would clean later, so fix
-        // that directly: merge our paths INTO whatever record the winner left. `rules_targets` is
-        // just "paths holding our block", independent of which set put it there, so this is
-        // additive and safe — the next apply reconciles it against `desired` as usual.
-        let _ = crate::registry::update(|reg| {
-            for path in owned.iter() {
-                if !reg.rules_targets.contains(path) {
-                    reg.rules_targets.push(path.clone());
-                }
+        // What we now own on disk: successful writes, still-desired previous good files, and
+        // failed cleanups. Every path remains discoverable for a later reconciliation.
+        let mut owned = written;
+        for old in prev_targets.iter().chain(uncleaned.iter()) {
+            let still_wanted = desired.iter().any(|d| d == old) || uncleaned.contains(old);
+            if still_wanted && !owned.contains(old) {
+                owned.push(old.clone());
             }
-            Ok(())
-        });
-    }
+        }
+        reg.rules_targets = owned;
+        Ok(())
+    })?;
 
-    let reg = crate::registry::load()?;
     let set = reg.active_rule_set().cloned();
     Ok(RulesView {
         clients: status_from(&reg, installed, set.as_ref()),
@@ -301,6 +257,15 @@ pub fn preview(client_id: &str, content: Option<&str>) -> Result<Option<RulesPre
         return Ok(None);
     };
     let content = content.unwrap_or(set.content.as_str());
+    preview_target(client_id, &target, set, content).map(Some)
+}
+
+fn preview_target(
+    client_id: &str,
+    target: &Target,
+    set: &RuleSet,
+    content: &str,
+) -> Result<RulesPreview, String> {
     // An unreadable file must NOT read as empty. Preview is the safeguard the user leans on
     // before letting Toolport touch a file they own, and "" would render the dry-run as a
     // first-time write of a file that actually has content we could not see. Only a genuinely
@@ -310,7 +275,7 @@ pub fn preview(client_id: &str, content: Option<&str>) -> Result<Option<RulesPre
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(e) => return Err(format!("Could not read {}: {e}", target.path.display())),
     };
-    let after = match target.strategy {
+    let candidate = match target.strategy {
         Strategy::OwnedFile => {
             instructions::render_owned_file(Scope::Personal, &set.id, set.revision, content)
         }
@@ -318,7 +283,14 @@ pub fn preview(client_id: &str, content: Option<&str>) -> Result<Option<RulesPre
             instructions::upsert_block(&before, Scope::Personal, &set.id, set.revision, content)
         }
     };
-    Ok(Some(RulesPreview {
+    let state = instructions::current_state(target, &set.id, set.revision, content);
+    // Blocked, over-cap, and invalid writes leave the file untouched. Showing the candidate bytes
+    // in those states would promise a result that write_target deliberately refuses to create.
+    let after = match state {
+        ApplyState::Applied | ApplyState::Stale => candidate,
+        _ => before.clone(),
+    };
+    Ok(RulesPreview {
         client_id: client_id.to_string(),
         path: target.path.to_string_lossy().to_string(),
         strategy: match target.strategy {
@@ -326,10 +298,10 @@ pub fn preview(client_id: &str, content: Option<&str>) -> Result<Option<RulesPre
             Strategy::SentinelBlock => "sentinelBlock",
         }
         .to_string(),
-        state: instructions::current_state(&target, &set.id, set.revision, content),
+        state,
         before,
         after,
-    }))
+    })
 }
 
 /// Create or update a set, then apply. Returns the refreshed view.
@@ -388,12 +360,19 @@ pub fn set_client_enabled(client_id: &str, enabled: bool) -> Result<RulesView, S
 /// a client updated (or reinstalled) since the last apply picks the rules back up without the
 /// user opening the Rules tab.
 pub fn apply_on_startup() {
-    if let Ok(reg) = crate::registry::load() {
-        if reg.active_rule_set().is_none() && reg.rules_targets.is_empty() {
+    match crate::registry::load() {
+        Ok(reg) if reg.active_rule_set().is_none() && reg.rules_targets.is_empty() => {
             return; // nothing configured and nothing written: skip the client scan entirely
         }
+        Ok(_) => {}
+        Err(error) => {
+            eprintln!("toolport: could not inspect personal rules at startup: {error}");
+            return;
+        }
     }
-    let _ = apply();
+    if let Err(error) = apply() {
+        eprintln!("toolport: could not apply personal rules at startup: {error}");
+    }
 }
 
 #[cfg(test)]
@@ -861,16 +840,10 @@ mod tests {
             .cloned()
             .unwrap();
 
-        // Rendering the draft is the same call the command makes, minus the client lookup.
-        let rendered = instructions::upsert_block(
-            &before,
-            Scope::Personal,
-            &set.id,
-            set.revision,
-            "Draft rules.",
-        );
-        assert!(rendered.contains("Draft rules."));
-        assert!(!rendered.contains("Saved rules."));
+        let preview = preview_target("codex", &target, &set, "Draft rules.").unwrap();
+        assert!(preview.after.contains("Draft rules."));
+        assert!(!preview.after.contains("Saved rules."));
+        assert_eq!(preview.state, ApplyState::Stale);
 
         // And nothing was written: the file is byte-identical and the set still holds saved text.
         assert_eq!(std::fs::read_to_string(&target.path).unwrap(), before);
@@ -882,6 +855,49 @@ mod tests {
                 .content,
             "Saved rules."
         );
+    }
+
+    #[test]
+    fn preview_matches_refused_writes_and_rejects_unreadable_files() {
+        let s = Scratch::new();
+        let path = s.path("AGENTS.md");
+        let before = "# Mine\n";
+        std::fs::write(&path, before).unwrap();
+        let rules = set("work", 1, "A rule that does not fit.");
+
+        let capped = Target {
+            char_cap: Some(before.chars().count()),
+            ..sentinel(path.clone())
+        };
+        let capped_preview = preview_target("windsurf", &capped, &rules, &rules.content).unwrap();
+        assert_eq!(capped_preview.state, ApplyState::TooLong);
+        assert_eq!(capped_preview.after, before);
+        assert_eq!(
+            instructions::write_target(&capped, &rules.id, rules.revision, &rules.content),
+            ApplyState::TooLong
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let shadow = s.path("shadow.md");
+        std::fs::write(&shadow, "local override").unwrap();
+        let blocked = Target {
+            blocked_if_present: Some(shadow),
+            ..sentinel(path.clone())
+        };
+        let blocked_preview = preview_target("codex", &blocked, &rules, &rules.content).unwrap();
+        assert_eq!(blocked_preview.state, ApplyState::BlockedOverride);
+        assert_eq!(blocked_preview.after, before);
+        assert_eq!(
+            instructions::write_target(&blocked, &rules.id, rules.revision, &rules.content),
+            ApplyState::BlockedOverride
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+
+        let directory = s.path("unreadable");
+        std::fs::create_dir_all(&directory).unwrap();
+        let err = preview_target("codex", &sentinel(directory), &rules, &rules.content)
+            .expect_err("an unreadable target must not preview as empty");
+        assert!(err.contains("Could not read"), "unexpected error: {err}");
     }
 
     /// Marker text must be refused when the user submits it, not when the write fails. Realistic
@@ -967,12 +983,11 @@ mod tests {
         );
     }
 
-    /// Losing the compare-and-set must never delete what we wrote. If the winner switched sets and
-    /// its own write failed, our block is the only one on disk; removing it would leave the user
-    /// with nothing while the UI reported the new set. Our paths are merged into the record
-    /// instead, so nothing is stranded and nothing good is destroyed.
+    /// A rules mutation and its reconciliation are separate calls, so two UI workers can interleave
+    /// them. Each apply must reconcile the fresh registry state while holding the same cross-process
+    /// lock as mutations; whichever set is active at the end must also be the bytes on disk.
     #[test]
-    fn losing_the_race_keeps_our_files_and_records_them() {
+    fn concurrent_applies_leave_the_active_sets_bytes_on_disk() {
         let _dirs = crate::registry::data_dir_test_lock();
         let s = Scratch::new();
         let _data_dir = crate::registry::DataDirOverride::set(s.path("data"));
@@ -981,44 +996,49 @@ mod tests {
         let installed = vec![codex.clone()];
         let path = codex.target.clone().unwrap().path;
 
-        // Set A is active and opted in, but nothing has been applied yet.
-        crate::registry::update(|reg| {
-            reg.upsert_rule_set(None, "A", "Rules A.")?;
-            reg.set_rules_client_enabled("codex", true);
-            Ok(())
-        })
-        .unwrap();
-
-        // Stand in for "a newer apply won": write set A's block, then switch the active set out
-        // from under it, exactly as the CAS sees it.
-        let set_a = crate::registry::load().unwrap().active_rule_set().cloned().unwrap();
-        let target = codex.target.clone().unwrap();
-        assert_eq!(
-            instructions::write_target(&target, &set_a.id, set_a.revision, &set_a.content),
-            ApplyState::Applied
-        );
-        crate::registry::update(|reg| {
+        let (_, (a, b)) = crate::registry::update(|reg| {
+            let a = reg.upsert_rule_set(None, "A", "Rules A.")?;
             let b = reg.upsert_rule_set(None, "B", "Rules B.")?;
-            reg.set_active_rule_set(Some(&b));
-            Ok(())
+            reg.set_rules_client_enabled("codex", true);
+            Ok((a, b))
         })
         .unwrap();
 
-        // Now run the apply that is about to lose: it loaded set A, wrote it, and will find the
-        // active set changed.
-        apply_to_with_set(&installed, Some(set_a.clone())).unwrap();
+        for _ in 0..20 {
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    crate::registry::update(|reg| {
+                        reg.set_active_rule_set(Some(&a));
+                        Ok(())
+                    })
+                    .unwrap();
+                    apply_to(&installed).unwrap();
+                });
+                scope.spawn(|| {
+                    crate::registry::update(|reg| {
+                        reg.set_active_rule_set(Some(&b));
+                        Ok(())
+                    })
+                    .unwrap();
+                    apply_to(&installed).unwrap();
+                });
+            });
 
-        assert!(
-            std::fs::read_to_string(&path).unwrap().contains("Rules A."),
-            "the loser must not delete the only block on disk"
-        );
-        assert!(
-            crate::registry::load()
-                .unwrap()
-                .rules_targets
-                .contains(&path.to_string_lossy().to_string()),
-            "and the path must be recorded so a later pass can clean it"
-        );
+            let reg = crate::registry::load().unwrap();
+            let active = reg.active_rule_set().unwrap();
+            assert_eq!(
+                instructions::current_state(
+                    codex.target.as_ref().unwrap(),
+                    &active.id,
+                    active.revision,
+                    &active.content,
+                ),
+                ApplyState::Applied,
+                "disk and registry diverged for active set {}",
+                active.id
+            );
+            assert_eq!(reg.rules_targets, vec![path.to_string_lossy().to_string()]);
+        }
     }
 
     #[test]
