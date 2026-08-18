@@ -846,14 +846,19 @@ fn read_capped_line<R: BufRead>(
 ) -> std::io::Result<usize> {
     let mut bytes = Vec::new();
     let n = reader.take(max_bytes).read_until(b'\n', &mut bytes)?;
-    let decoded = String::from_utf8_lossy(&bytes);
-    let mut keep = decoded
-        .len()
-        .min(usize::try_from(max_bytes).unwrap_or(usize::MAX));
-    while !decoded.is_char_boundary(keep) {
-        keep -= 1;
-    }
-    line.push_str(&decoded[..keep]);
+    let decoded = match std::str::from_utf8(&bytes) {
+        Ok(text) => std::borrow::Cow::Borrowed(text),
+        // `take` may split a valid multi-byte character exactly at the raw-byte cap. Drop only
+        // that incomplete suffix; genuinely invalid bytes are retained lossily below.
+        Err(error) if error.error_len().is_none() => std::borrow::Cow::Borrowed(
+            std::str::from_utf8(&bytes[..error.valid_up_to()])
+                .expect("valid_up_to is always valid UTF-8"),
+        ),
+        Err(_) => String::from_utf8_lossy(&bytes),
+    };
+    // The raw read is capped. Lossy decoding may expand invalid bytes to U+FFFD, so capping this
+    // decoded length again would be both unnecessary and capable of dropping a real newline.
+    line.push_str(&decoded);
     Ok(n)
 }
 
@@ -11820,6 +11825,21 @@ mod tests {
         assert!(!kept.is_empty());
         assert!(kept.len() <= 16);
         assert!(kept.chars().all(|c| c == '中'));
+    }
+
+    #[test]
+    fn capped_line_keeps_newline_after_lossy_utf8_expansion() {
+        let mut reader = std::io::Cursor::new([0xff, 0xff, 0xff, 0xff, b'\n']);
+        let mut line = String::new();
+
+        let n = super::read_capped_line(&mut reader, &mut line, 5).unwrap();
+
+        assert_eq!(n, 5);
+        assert!(line.ends_with('\n'), "lossy decoding must preserve the raw terminator");
+        assert!(
+            !super::is_unterminated_capped_line(n, &line, 5),
+            "a newline-terminated raw line must not be rejected as unterminated"
+        );
     }
 
     #[test]
