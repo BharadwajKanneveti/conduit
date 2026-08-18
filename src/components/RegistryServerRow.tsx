@@ -151,7 +151,9 @@ export function RegistryServerRow({
         <span className="ml-auto flex shrink-0 items-center gap-2.5">
           <span
             role="status"
-            aria-label={STATUS_ARIA_LABEL[status]}
+            aria-label={
+              installing ? "Installing the server package" : STATUS_ARIA_LABEL[status]
+            }
             className="sr-only"
           />
           {status === "needs-auth" ? (

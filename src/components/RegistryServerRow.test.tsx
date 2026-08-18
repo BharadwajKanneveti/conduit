@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { ProbeResult, ServerEntry } from "@/lib/types";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -26,11 +26,11 @@ function health(overrides: Partial<ProbeResult>): ProbeResult {
   };
 }
 
-function renderRow(enabled: boolean, result?: ProbeResult) {
+function renderRow(enabled: boolean, result?: ProbeResult, rowServer = server) {
   return render(
     <TooltipProvider>
       <RegistryServerRow
-        server={server}
+        server={rowServer}
         registry={null}
         enabled={enabled}
         health={result}
@@ -54,5 +54,22 @@ describe("RegistryServerRow status accessibility", () => {
 
     expect(screen.getByRole("status", { name: label })).toBeInTheDocument();
     view.unmount();
+  });
+
+  it("announces when a launcher package is being installed", () => {
+    vi.useFakeTimers();
+    const view = renderRow(true, undefined, {
+      ...server,
+      command: "npx",
+      args: ["example-package"],
+    });
+
+    act(() => vi.advanceTimersByTime(4000));
+
+    expect(
+      screen.getByRole("status", { name: "Installing the server package" }),
+    ).toBeInTheDocument();
+    view.unmount();
+    vi.useRealTimers();
   });
 });
