@@ -30,7 +30,12 @@ function assertSafeGatewayCache(job: WorkflowJob): void {
   const steps = job.steps ?? [];
   const rustCache = steps.filter((step) => step.uses?.startsWith("Swatinem/rust-cache@"));
   expect(rustCache).toHaveLength(1);
+  expect(rustCache[0].uses).toBe(
+    "Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32",
+  );
   expect(rustCache[0].with?.workspaces).toBe("src-tauri");
+  expect(rustCache[0].with?.key).toBe("docker-gateway");
+  expect(rustCache[0].with?.["cache-bin"]).toBe("false");
 
   const unsafeTargetCaches = steps.filter(
     (step) =>
