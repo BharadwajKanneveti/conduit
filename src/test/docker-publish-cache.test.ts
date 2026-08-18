@@ -34,7 +34,7 @@ function assertSafeGatewayCache(job: WorkflowJob): void {
 
   const unsafeTargetCaches = steps.filter(
     (step) =>
-      step.uses?.startsWith("actions/cache@") &&
+      step.uses?.startsWith("actions/cache") &&
       String(step.with?.path ?? "").includes("src-tauri/target"),
   );
   expect(unsafeTargetCaches).toEqual([]);
@@ -49,18 +49,21 @@ describe("docker publish Rust cache (SBS-926)", () => {
     assertSafeGatewayCache(workflow.jobs!["build-gateway"]);
   });
 
-  it("rejects the stale workspace-target cache shape", () => {
-    const fixture = parseWorkflow(`
+  it.each(["actions/cache@sha", "actions/cache/restore@sha", "actions/cache/save@sha"])(
+    "rejects the stale workspace-target cache shape from %s",
+    (cacheAction) => {
+      const fixture = parseWorkflow(`
 jobs:
   build-gateway:
     steps:
-      - uses: actions/cache@sha
+      - uses: ${cacheAction}
         with:
           path: src-tauri/target
       - uses: Swatinem/rust-cache@sha
         with:
           workspaces: src-tauri
 `);
-    expect(() => assertSafeGatewayCache(fixture.jobs!["build-gateway"])).toThrow();
-  });
+      expect(() => assertSafeGatewayCache(fixture.jobs!["build-gateway"])).toThrow();
+    },
+  );
 });
