@@ -66,14 +66,27 @@ function jobLevelSignerSecrets(job: WorkflowJob): string[] {
   return AZURE_SIGNER_KEYS.filter((k) => envKeys(job.env).includes(k));
 }
 
+function azureValueIsWindowsGated(value: string | undefined, key: string): boolean {
+  return (
+    value !== undefined &&
+    new RegExp(
+      String.raw`^\s*\$\{\{\s*matrix\.os\s*==\s*'windows-latest'\s*&&\s*secrets\.${key}\s*\|\|\s*''\s*\}\}\s*$`,
+    ).test(value)
+  );
+}
+
 const release = parseWorkflow(
   readFileSync(join(process.cwd(), ".github", "workflows", "release.yml"), "utf8"),
 );
-const build = release.jobs!.build;
+const jobs = release.jobs!;
+const build = jobs.build;
+if (!build) throw new Error("release.yml has no build job");
 
 describe("release Azure signer env scope (SBS-925)", () => {
-  it("does not put Azure signer secrets on the build job env", () => {
-    expect(jobLevelSignerSecrets(build)).toEqual([]);
+  it("does not put Azure signer secrets on any job env", () => {
+    for (const [jobName, job] of Object.entries(jobs)) {
+      expect(jobLevelSignerSecrets(job), jobName).toEqual([]);
+    }
     expect(envHasAny(build.env, TAURI_SIGNER_KEYS)).toBe(false);
     expect(envHasAny(build.env, APPLE_SIGNER_KEYS)).toBe(false);
   });
@@ -81,19 +94,19 @@ describe("release Azure signer env scope (SBS-925)", () => {
   it("injects Azure signer secrets only on the Windows-gated Build installer step", () => {
     const step = stepByName(build, "Build installer");
     expect(step).toBeDefined();
-    for (const other of build.steps ?? []) {
-      if (other !== step) {
-        expect(envHasAny(other.env, AZURE_SIGNER_KEYS), other.name).toBe(false);
+    for (const [jobName, job] of Object.entries(jobs)) {
+      for (const other of job.steps ?? []) {
+        if (other !== step) {
+          expect(
+            envHasAny(other.env, AZURE_SIGNER_KEYS),
+            `${jobName} / ${other.name ?? "unnamed step"}`,
+          ).toBe(false);
+        }
       }
     }
     for (const key of AZURE_SIGNER_KEYS) {
       const value = step!.env?.[key];
-      expect(value, key).toBeDefined();
-      expect(value, key).toMatch(
-        new RegExp(
-          String.raw`^\s*\$\{\{\s*matrix\.os\s*==\s*'windows-latest'\s*&&\s*secrets\.${key}\s*\|\|\s*''\s*\}\}\s*$`,
-        ),
-      );
+      expect(azureValueIsWindowsGated(value, key), key).toBe(true);
     }
     for (const key of TAURI_SIGNER_KEYS) {
       expect(step!.env?.[key]).toContain("secrets." + key);
@@ -103,7 +116,7 @@ describe("release Azure signer env scope (SBS-925)", () => {
   it("keeps APPLE secrets on the macOS signing step only", () => {
     const step = stepByName(build, "Sign + notarize + package (macOS)");
     expect(step).toBeDefined();
-    expect(step!.if).toMatch(/macos/);
+    expect(step!.if).toBe("startsWith(matrix.os, 'macos')");
     for (const key of APPLE_SIGNER_KEYS) {
       expect(step!.env?.[key]).toContain("secrets." + key);
     }
@@ -118,9 +131,13 @@ describe("release Azure signer env scope (SBS-925)", () => {
       "Set up Windows code signing (Azure Trusted Signing)",
     );
     const cache = stepByName(build, "Cache trusted-signing-cli");
-    expect(build.env?.AZURE_SIGNING_CONFIGURED).toContain("secrets.AZURE_CLIENT_ID");
-    expect(setup?.if).toContain("AZURE_SIGNING_CONFIGURED");
-    expect(cache?.if).toContain("AZURE_SIGNING_CONFIGURED");
+    const windowsGate =
+      "matrix.os == 'windows-latest' && env.AZURE_SIGNING_CONFIGURED == 'true'";
+    expect(build.env?.AZURE_SIGNING_CONFIGURED).toBe(
+      "${{ secrets.AZURE_CLIENT_ID != '' }}",
+    );
+    expect(setup?.if).toBe(windowsGate);
+    expect(cache?.if).toBe(windowsGate);
     expect(setup?.env?.AZURE_SIGNING_CONFIGURED).toBeUndefined();
     expect(cache?.env?.AZURE_SIGNING_CONFIGURED).toBeUndefined();
     expect(envHasAny(setup?.env, AZURE_SIGNER_KEYS)).toBe(false);
@@ -149,6 +166,8 @@ describe("the Azure env assertions reject a workflow that reopens the hole", () 
       "jobs:\n  build:\n    steps:\n      - name: Build installer\n        run: echo build\n        env:\n          TAURI_SIGNING_PRIVATE_KEY: x\n",
     );
     const step = stepByName(fixture.jobs!.build, "Build installer");
-    expect(step?.env?.AZURE_CLIENT_SECRET).toBeUndefined();
+    for (const key of AZURE_SIGNER_KEYS) {
+      expect(azureValueIsWindowsGated(step?.env?.[key], key), key).toBe(false);
+    }
   });
 });
