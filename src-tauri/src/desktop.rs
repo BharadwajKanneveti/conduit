@@ -26,6 +26,7 @@ use crate::registry::{
 use crate::remote;
 use crate::router;
 use crate::routines;
+use crate::rules;
 use crate::savings;
 use crate::searchtrace;
 use crate::secrets;
@@ -3100,6 +3101,85 @@ async fn team_instructions_status() -> Option<teams::InstructionsStatusView> {
         .flatten()
 }
 
+// ---- Personal agent rules (SBS-821) ----
+//
+// All async + `spawn_blocking`: every one of these scans each installed client's rules file, and
+// the mutating ones write to disk, neither of which may run on the UI thread. They are
+// independent of the gateway and of any configured MCP server, so the Rules tab works on a fresh
+// install with nothing connected.
+
+/// The Rules view: the user's rule sets, which one is active, and each installed client's on-disk
+/// state. Read-only.
+#[tauri::command]
+async fn rules_view() -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(rules::view)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Create (`id: None`) or update a rule set, then apply it to every opted-in client.
+#[tauri::command]
+async fn rules_save_set(
+    id: Option<String>,
+    name: String,
+    content: String,
+) -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::save_set(id.as_deref(), &name, &content))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Delete a rule set. Deleting the active one clears the selection, so this also removes every
+/// rules file Toolport wrote.
+#[tauri::command]
+async fn rules_delete_set(id: String) -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::delete_set(&id))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Switch the active rule set, or clear it (`id: None`) to remove our files everywhere.
+#[tauri::command]
+async fn rules_set_active(id: Option<String>) -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::set_active(id.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Opt one client in or out. Opting out removes that client's rules file on the same call.
+#[tauri::command]
+async fn rules_set_client_enabled(
+    client_id: String,
+    enabled: bool,
+) -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::set_client_enabled(&client_id, enabled))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Dry-run one client's write so the UI can show the exact before/after before the first apply.
+/// Never writes. `None` when the client has no rules file we manage, or no set is active.
+///
+/// `content` previews unsaved editor text. It exists so the UI never has to save-then-preview: a
+/// save applies to every opted-in client, which would make "dry run" a write.
+#[tauri::command]
+async fn rules_preview(
+    client_id: String,
+    content: Option<String>,
+) -> Result<Option<rules::RulesPreview>, String> {
+    tauri::async_runtime::spawn_blocking(move || rules::preview(&client_id, content.as_deref()))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Re-apply the active set. Used by the "Apply" button and after a client is connected.
+#[tauri::command]
+async fn rules_apply() -> Result<rules::RulesView, String> {
+    tauri::async_runtime::spawn_blocking(rules::apply)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// Leave the team: remove its merged servers, clear the connection and the token.
 #[tauri::command]
 fn team_disconnect(state: State<RegistryState>) -> Result<Registry, String> {
@@ -5078,6 +5158,13 @@ pub fn run() {
             team_sync_wait,
             main_window_visible,
             team_instructions_status,
+            rules_view,
+            rules_save_set,
+            rules_delete_set,
+            rules_set_active,
+            rules_set_client_enabled,
+            rules_preview,
+            rules_apply,
             team_disconnect,
             team_push_preview,
             team_push,
@@ -5253,6 +5340,15 @@ pub fn run() {
                             .join(", ")
                     );
                 }
+                // Re-assert the user's personal agent rules (SBS-821), on this same launch
+                // thread because it is the one already allowed to touch client files on disk.
+                // Picks up a client installed, reinstalled, or updated since the last apply
+                // without the user opening the Rules tab. Cheap and quiet: it returns before
+                // scanning anything when no rule set is configured and nothing was ever
+                // written, and `write_target` no-ops when a client's block already matches, so
+                // a steady-state launch touches no files.
+                rules::apply_on_startup();
+
                 // Stop obsolete gateway processes. Path-based identity on all OS
                 // (SOU-414); not gated on repoint (SOU-306).
                 //

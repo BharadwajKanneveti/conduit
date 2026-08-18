@@ -66,11 +66,13 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// only `team_servers`. Pure so the math is testable without touching disk; the
 /// caller feeds it the on-disk lines (see `teams::report_usage`).
 ///
-/// Calls count every routed attempt, failed ones included: the dashboard figure
-/// is "tool calls routed through the gateway", and a failed downstream call was
-/// still routed. Savings lines carry a `byServer` token map (new format); lines
-/// without one (pre-attribution builds, rotation carry lines) still count in the
-/// in-app total but can't be placed per server, so they are skipped here.
+/// Calls count every routed tool-call attempt, failed ones included: the
+/// dashboard figure is "tool calls routed through the gateway", and a failed
+/// downstream call was still routed. HITL / routine rows and lines that omit
+/// `ok` are not tool calls (SBS-932). Savings lines carry a `byServer` token
+/// map (new format); lines without one (pre-attribution builds, rotation carry
+/// lines) still count in the in-app total but can't be placed per server, so
+/// they are skipped here.
 pub fn rollup(
     day: &str,
     audit_lines: &[Value],
@@ -84,6 +86,9 @@ pub fn rollup(
             .is_some_and(|ts| utc_day(ts) == day)
     };
     for e in audit_lines.iter().filter(|e| ts_day(e)) {
+        if crate::audit::tool_call_ok(e).is_none() {
+            continue;
+        }
         let Some(server) = e.get("server").and_then(Value::as_str) else {
             continue;
         };
@@ -143,6 +148,30 @@ mod tests {
         let rows = rollup("2026-07-08", &audit, &[], &team(&["github", "stripe"]));
         assert_eq!(rows.len(), 1);
         assert_eq!(rows["github"], Row { calls: 2, tokens_saved: 0 });
+    }
+
+    /// Approval rows are `ok:true` by design; an omitted-ok advisor is not
+    /// success. Neither may increment team showback `calls` (SBS-932).
+    #[test]
+    fn rollup_skips_hitl_and_omitted_ok_rows() {
+        let audit = vec![
+            json!({ "ts": TS_A, "server": "github", "tool": "list", "ok": true }),
+            json!({ "ts": TS_A, "server": "github", "tool": "wipe", "ok": true, "kind": "approval", "decision": "denied" }),
+            json!({ "ts": TS_A, "server": "github", "tool": "wipe", "ok": true, "kind": "approval", "decision": "approved" }),
+            json!({ "ts": TS_B, "server": "github", "tool": "wipe", "ok": true }),
+            json!({ "ts": TS_B, "server": "github", "tool": "routine.advisor.hint_shown", "kind": "routine" }),
+            json!({ "ts": TS_B, "server": "github", "tool": "get", "ok": false }),
+        ];
+        let rows = rollup("2026-07-08", &audit, &[], &team(&["github"]));
+        // timed success + approved-pair timed + failed timed. Not the two
+        // approval rows or the omitted-ok hint.
+        assert_eq!(
+            rows["github"],
+            Row {
+                calls: 3,
+                tokens_saved: 0
+            }
+        );
     }
 
     #[test]
