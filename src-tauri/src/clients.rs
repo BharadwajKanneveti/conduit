@@ -9876,8 +9876,8 @@ command = "npx"
     /// strips the hint `entry_to_json` would emit.
     #[test]
     fn kimi_shared_http_connect_writes_url_not_qwen_http_url() {
-        let _data_lock = crate::registry::data_dir_test_lock();
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _data_lock = crate::registry::data_dir_test_lock();
         let root =
             std::env::temp_dir().join(format!("toolport-kimi-sbs921-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
