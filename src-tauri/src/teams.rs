@@ -903,7 +903,9 @@ fn installed_rules_targets() -> Vec<crate::instructions::Target> {
         // into an absent client's home.
         .filter(|client| client.app_present)
         // `None` = unsupported or covered transitively (Antigravity/Copilot).
-        .filter_map(|client| crate::clients::client_rules_target(&client.id))
+        .filter_map(|client| {
+            crate::clients::client_rules_target(&client.id, crate::instructions::Scope::Team)
+        })
         .filter(|target| seen_paths.insert(target.path.clone()))
         .collect()
 }
@@ -1000,7 +1002,10 @@ fn apply_instructions_to(
         // Only the target set changed. Clean up paths for clients that disappeared without
         // rewriting still-current files or advancing their marker to an unrelated config version.
         for old in &obsolete {
-            instructions::remove_recorded(std::path::Path::new(old));
+            let _ = instructions::remove_recorded(
+                std::path::Path::new(old),
+                instructions::Scope::Team,
+            );
         }
         let retained: Vec<String> = prev_targets
             .into_iter()
@@ -1048,7 +1053,10 @@ fn apply_instructions_to(
     // rewrite of a still-current target is not that — last-good stays (SBS-917).
     for old in &prev_targets {
         if !written.iter().any(|w| w == old) && !keep.iter().any(|k| k == old) {
-            instructions::remove_recorded(std::path::Path::new(old));
+            // Result ignored deliberately: this writer replaces `team_instructions_targets`
+            // wholesale below, so it has nowhere to carry "we could not clean that one" forward.
+            let _ =
+                instructions::remove_recorded(std::path::Path::new(old), instructions::Scope::Team);
         }
     }
 
@@ -1075,7 +1083,10 @@ fn apply_instructions_to(
     });
     if !matches!(recorded, Ok((_, true))) {
         for path in &written {
-            instructions::remove_recorded(std::path::Path::new(path));
+            let _ = instructions::remove_recorded(
+                std::path::Path::new(path),
+                instructions::Scope::Team,
+            );
         }
     }
 }
@@ -1094,7 +1105,8 @@ fn build_instructions_receipt(
         .into_iter()
         .filter(|c| c.app_present)
         .map(|c| {
-            let state = match crate::clients::client_rules_target(&c.id) {
+            let state = match crate::clients::client_rules_target(&c.id, instructions::Scope::Team)
+            {
                 Some(target) => instructions::current_state(&target, team_id, version, content),
                 None => ApplyState::Unsupported,
             };
@@ -1141,7 +1153,8 @@ pub fn instructions_status() -> Option<InstructionsStatusView> {
         .into_iter()
         .filter(|c| c.app_present)
         .map(|c| {
-            let state = match crate::clients::client_rules_target(&c.id) {
+            let state = match crate::clients::client_rules_target(&c.id, instructions::Scope::Team)
+            {
                 Some(target) => instructions::current_state(&target, &team_id, version, &content),
                 None => ApplyState::Unsupported,
             };
@@ -1439,7 +1452,12 @@ pub fn disconnect() -> Result<(), String> {
         Ok(())
     })?;
     for path in &instr_targets {
-        crate::instructions::remove_recorded(std::path::Path::new(path));
+        // Leaving the team clears the record either way, so there is nothing to carry a failure
+        // forward into. Same pre-existing behaviour as `apply_instructions_to`.
+        let _ = crate::instructions::remove_recorded(
+            std::path::Path::new(path),
+            crate::instructions::Scope::Team,
+        );
     }
     let _ = clear_token();
     Ok(())
@@ -2011,6 +2029,7 @@ mod tests {
         let old_target = Target {
             path: old_path.clone(),
             strategy: Strategy::SentinelBlock,
+            scope: crate::instructions::Scope::Team,
             char_cap: None,
             blocked_if_present: None,
         };
@@ -2034,7 +2053,8 @@ mod tests {
         })
         .expect("seed the registry");
 
-        let target = crate::clients::client_rules_target("goose").expect("goose rules target");
+        let target = crate::clients::client_rules_target("goose", crate::instructions::Scope::Team)
+            .expect("goose rules target");
         assert_eq!(
             target.path,
             root.join("config").join(".goosehints"),
@@ -2071,7 +2091,7 @@ mod tests {
 
     #[test]
     fn unchanged_instructions_ignore_an_unrelated_config_version_bump() {
-        use crate::instructions::{Strategy, Target};
+        use crate::instructions::{Scope, Strategy, Target};
 
         let _env = crate::clients::env_test_lock();
         let _dirs = crate::registry::data_dir_test_lock();
@@ -2087,6 +2107,7 @@ mod tests {
         let target = Target {
             path: path.clone(),
             strategy: Strategy::SentinelBlock,
+            scope: Scope::Team,
             char_cap: None,
             blocked_if_present: None,
         };
@@ -2111,10 +2132,11 @@ mod tests {
     /// Write last-good org rules to `path` and record them on the connected team.
     /// Caller holds `data_dir_test_lock` and a `DataDirOverride`.
     fn seed_applied_instructions(team: &str, version: i64, content: &str, path: &std::path::Path) {
-        use crate::instructions::{ApplyState, Strategy, Target};
+        use crate::instructions::{ApplyState, Scope, Strategy, Target};
         let target = Target {
             path: path.to_path_buf(),
             strategy: Strategy::SentinelBlock,
+            scope: Scope::Team,
             char_cap: None,
             blocked_if_present: None,
         };
@@ -2157,7 +2179,7 @@ mod tests {
     /// than Applied for leftover v1.
     #[test]
     fn apply_instructions_keeps_last_good_when_rewrite_is_refused() {
-        use crate::instructions::{ApplyState, Strategy, Target};
+        use crate::instructions::{ApplyState, Scope, Strategy, Target};
 
         let _env = crate::clients::env_test_lock();
         let _dirs = crate::registry::data_dir_test_lock();
@@ -2177,6 +2199,7 @@ mod tests {
         let too_long_target = Target {
             path: too_long_path.clone(),
             strategy: Strategy::SentinelBlock,
+            scope: Scope::Team,
             char_cap: Some(20),
             blocked_if_present: None,
         };
@@ -2210,6 +2233,7 @@ mod tests {
         let err_target = Target {
             path: err_path.clone(),
             strategy: Strategy::SentinelBlock,
+            scope: Scope::Team,
             char_cap: None,
             blocked_if_present: None,
         };
@@ -2231,6 +2255,7 @@ mod tests {
         let blocked_target = Target {
             path: blocked_path.clone(),
             strategy: Strategy::SentinelBlock,
+            scope: Scope::Team,
             char_cap: None,
             blocked_if_present: Some(shadow.clone()),
         };
@@ -2256,7 +2281,7 @@ mod tests {
 
     #[test]
     fn unchanged_instructions_remove_a_retained_path_when_its_client_disappears() {
-        use crate::instructions::{Strategy, Target};
+        use crate::instructions::{Scope, Strategy, Target};
 
         let _env = crate::clients::env_test_lock();
         let _dirs = crate::registry::data_dir_test_lock();
@@ -2273,6 +2298,7 @@ mod tests {
         let target = Target {
             path: path.clone(),
             strategy: Strategy::SentinelBlock,
+            scope: Scope::Team,
             char_cap: Some(20),
             blocked_if_present: None,
         };
@@ -2302,7 +2328,7 @@ mod tests {
     /// When the org clears instructions, every recorded path is obsolete and must go.
     #[test]
     fn apply_instructions_still_removes_last_good_when_org_clears_instructions() {
-        use crate::instructions::{Strategy, Target};
+        use crate::instructions::{Scope, Strategy, Target};
 
         let _env = crate::clients::env_test_lock();
         let _dirs = crate::registry::data_dir_test_lock();
@@ -2318,6 +2344,7 @@ mod tests {
         let target = Target {
             path: path.clone(),
             strategy: Strategy::SentinelBlock,
+            scope: Scope::Team,
             char_cap: None,
             blocked_if_present: None,
         };
