@@ -18,6 +18,12 @@ Entries before the rename below shipped under the project's former name, Conduit
   successes while the Activity list painted them as failures. Aggregators now
   require `ok` to be present and skip `kind` in {approval, routine, advisor,
   suggestion, candidate}. (SBS-932)
+- **Homebrew cask snapshot was three releases behind.** `packaging/homebrew/toolport.rb`
+  still said 1.11.0 after 1.14.0 shipped, and `docs/RELEASING.md` had no tap-bump
+  step, so the next release would leave `brew install --cask tsouth89/toolport/toolport`
+  stale again. The snapshot now matches 1.14.0 (sha256s from the published dmgs)
+  and the release doc names `tsouth89/homebrew-toolport`. The live tap is a
+  separate repo; bumping it is that step, not this file. (SBS-936)
 
 ### Removed
 
