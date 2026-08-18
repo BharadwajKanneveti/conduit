@@ -445,10 +445,14 @@ fn goose_hints_under_root(root: &Path) -> PathBuf {
     root.join("config").join(".goosehints")
 }
 
-fn rules_sentinel_block(path: PathBuf) -> crate::instructions::Target {
+fn rules_sentinel_block(
+    path: PathBuf,
+    scope: crate::instructions::Scope,
+) -> crate::instructions::Target {
     crate::instructions::Target {
         path,
         strategy: crate::instructions::Strategy::SentinelBlock,
+        scope,
         char_cap: None,
         blocked_if_present: None,
     }
@@ -634,7 +638,11 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
     Some(path)
 }
 
-/// Resolve where a client reads its GLOBAL agent-rules file (Team Instructions, spec "W2").
+/// Resolve where a client reads its GLOBAL agent-rules file, for one [`crate::instructions::Scope`]
+/// (Team Instructions spec "W2"; personal rules in the `agent-rules` spec). The scope only changes
+/// the file NAME under [`crate::instructions::Strategy::OwnedFile`] — sentinel clients share one
+/// file and are separated by their markers instead, so both scopes resolve to the same path there
+/// by design.
 /// This is DISTINCT from the client's MCP-config path — e.g. Claude Code's config is
 /// `~/.claude.json` but its rules live under `~/.claude/rules/`. `None` means the client has
 /// no global-rules location we write: either its globals are UI/cloud-stored (Cursor, Warp),
@@ -649,18 +657,23 @@ fn resolve_rules_target(
     client_id: &str,
     home: &std::path::Path,
     platform: Platform,
+    scope: crate::instructions::Scope,
 ) -> Option<crate::instructions::Target> {
     use crate::instructions::{Strategy, Target};
     let config = roaming_config_dir(home, platform);
-    let owned = |path: PathBuf| Target {
-        path,
+    // `dir` is the client's rules DIRECTORY; the file name inside it is the scope's, so a team
+    // file and a personal file sit side by side and the client loads both.
+    let owned = |dir: PathBuf| Target {
+        path: dir.join(scope.owned_file_name()),
         strategy: Strategy::OwnedFile,
+        scope,
         char_cap: None,
         blocked_if_present: None,
     };
     let block = |path: PathBuf| Target {
         path,
         strategy: Strategy::SentinelBlock,
+        scope,
         char_cap: None,
         blocked_if_present: None,
     };
@@ -669,31 +682,14 @@ fn resolve_rules_target(
         // Claude Code's `~/.claude/rules/` is also read by VS Code Copilot (Claude-compat
         // paths), so both map here; path-dedup writes it once when both are installed and a
         // standalone VS Code install is still covered.
-        "claude-code" | "vscode" => owned(
-            home.join(".claude")
-                .join("rules")
-                .join("toolport-team-rules.md"),
-        ),
-        "kiro" => owned(
-            home.join(".kiro")
-                .join("steering")
-                .join("toolport-team-rules.md"),
-        ),
-        "roo-code" => owned(
-            home.join(".roo")
-                .join("rules")
-                .join("toolport-team-rules.md"),
-        ),
-        "cline" => owned(
-            home.join("Documents")
-                .join("Cline")
-                .join("Rules")
-                .join("toolport-team-rules.md"),
-        ),
+        "claude-code" | "vscode" => owned(home.join(".claude").join("rules")),
+        "kiro" => owned(home.join(".kiro").join("steering")),
+        "roo-code" => owned(home.join(".roo").join("rules")),
+        "cline" => owned(home.join("Documents").join("Cline").join("Rules")),
         // Strategy B — Toolport owns only the sentinel span in a shared global file.
         // Default home only. `client_rules_target` relocates Codex / Gemini CLI
         // when `CODEX_HOME` / `GEMINI_CLI_HOME` is an absolute path (SBS-885).
-        "codex" => codex_rules_target(&home.join(".codex")),
+        "codex" => codex_rules_target(&home.join(".codex"), scope),
         // Gemini CLI and Antigravity share `~/.gemini/GEMINI.md` at the default
         // home so a standalone install of EITHER is covered, and
         // `apply_instructions`' path-dedup writes it once when both are present.
@@ -707,6 +703,7 @@ fn resolve_rules_target(
                 .join("memories")
                 .join("global_rules.md"),
             strategy: Strategy::SentinelBlock,
+            scope,
             char_cap: Some(6000), // Windsurf hard-caps the global rules file.
             blocked_if_present: None,
         },
@@ -739,48 +736,60 @@ fn resolve_rules_target(
     Some(target)
 }
 
-/// Codex team-instructions live next to `config.toml` under `CODEX_HOME`
-/// (default `~/.codex`). `AGENTS.override.md` in that same directory, if
-/// present, makes Codex ignore `AGENTS.md` entirely.
-fn codex_rules_target(codex_home: &Path) -> crate::instructions::Target {
+/// Codex rules live next to `config.toml` under `CODEX_HOME` (default `~/.codex`).
+/// `AGENTS.override.md` in that same directory, if present, makes Codex ignore
+/// `AGENTS.md` entirely — for either scope, since both share the one file.
+fn codex_rules_target(
+    codex_home: &Path,
+    scope: crate::instructions::Scope,
+) -> crate::instructions::Target {
     crate::instructions::Target {
         path: codex_home.join("AGENTS.md"),
         strategy: crate::instructions::Strategy::SentinelBlock,
+        scope,
         char_cap: None,
         blocked_if_present: Some(codex_home.join("AGENTS.override.md")),
     }
 }
 
-/// Gemini CLI team-instructions follow `GEMINI_CLI_HOME` the same way settings
+/// Gemini CLI rules follow `GEMINI_CLI_HOME` the same way settings
 /// do: the env replaces the process home, then `.gemini/` is still appended.
-fn gemini_cli_rules_target(cli_home: &Path) -> crate::instructions::Target {
+fn gemini_cli_rules_target(
+    cli_home: &Path,
+    scope: crate::instructions::Scope,
+) -> crate::instructions::Target {
     crate::instructions::Target {
         path: cli_home.join(".gemini").join("GEMINI.md"),
         strategy: crate::instructions::Strategy::SentinelBlock,
+        scope,
         char_cap: None,
         blocked_if_present: None,
     }
 }
 
-/// The rules-file target for a client on the current machine, or `None` if unsupported /
-/// transitively covered. Mirrors [`client_config_path`]: Goose/Zed on Linux honor
-/// `XDG_CONFIG_HOME`, and Goose honors absolute `GOOSE_PATH_ROOT` (SBS-899).
-pub fn client_rules_target(client_id: &str) -> Option<crate::instructions::Target> {
+/// The rules-file target for a client on the current machine for one
+/// [`crate::instructions::Scope`], or `None` if unsupported / transitively covered. Mirrors
+/// [`client_config_path`]: Goose/Zed on Linux honor `XDG_CONFIG_HOME`, and Goose honors absolute
+/// `GOOSE_PATH_ROOT` (SBS-899).
+pub fn client_rules_target(
+    client_id: &str,
+    scope: crate::instructions::Scope,
+) -> Option<crate::instructions::Target> {
     // Honor relocate envs even when `$HOME` is unset: the live file is under
     // the override, not the default home table (SBS-885, SBS-899).
     if client_id == "goose" {
         if let Some(root) = goose_path_root_from(std::env::var_os("GOOSE_PATH_ROOT")) {
-            return Some(rules_sentinel_block(goose_hints_under_root(&root)));
+            return Some(rules_sentinel_block(goose_hints_under_root(&root), scope));
         }
     }
     if client_id == "codex" {
         if let Some(dir) = codex_home_from(std::env::var_os("CODEX_HOME")) {
-            return Some(codex_rules_target(&dir));
+            return Some(codex_rules_target(&dir, scope));
         }
     }
     if client_id == "gemini-cli" {
         if let Some(dir) = gemini_cli_home_from(std::env::var_os("GEMINI_CLI_HOME")) {
-            return Some(gemini_cli_rules_target(&dir));
+            return Some(gemini_cli_rules_target(&dir, scope));
         }
     }
     let home = home()?;
@@ -792,9 +801,9 @@ pub fn client_rules_target(client_id: &str) -> Option<crate::instructions::Targe
             "zed" => config.join("zed").join("AGENTS.md"),
             _ => unreachable!("guarded by matches! above"),
         };
-        return Some(rules_sentinel_block(path));
+        return Some(rules_sentinel_block(path, scope));
     }
-    resolve_rules_target(client_id, &home, Platform::current())
+    resolve_rules_target(client_id, &home, Platform::current(), scope)
 }
 
 fn claude_desktop_path() -> Option<PathBuf> {
@@ -5291,6 +5300,33 @@ fn edit_droid_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(
     )
 }
 
+fn edit_qwen_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
+    edit_json_gateway_with(
+        path,
+        "mcpServers",
+        entry,
+        true,
+        Some(entry_to_qwen_json),
+        false,
+        false,
+    )
+}
+
+/// Kimi requires `url` (and `transport: "sse"` on legacy SSE). The generic
+/// editor used to remap remotes through `entry_to_qwen_json` (`url` → `httpUrl`)
+/// whenever the map key was not VS Code `"servers"`, which Kimi rejects (SBS-921).
+fn edit_kimi_json_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<(), String> {
+    edit_json_gateway_with(
+        path,
+        "mcpServers",
+        entry,
+        true,
+        Some(entry_to_kimi_json),
+        false,
+        false,
+    )
+}
+
 fn edit_json_gateway_with(
     path: &Path,
     key: &str,
@@ -5357,18 +5393,12 @@ fn edit_json_gateway_body(
         !gateway_identity_matches(name, name, command)
     });
     if let Some(entry) = entry {
+        // Default is the standard `url`/`command` shape. Qwen's `httpUrl` remap
+        // used to fire for every remote whose map key was not VS Code `"servers"`,
+        // so Kimi Shared HTTP Connect wrote a field Kimi rejects (SBS-921).
+        // Clients with a distinct remote schema pass their own formatter.
         let mut value = if let Some(formatter) = entry_formatter {
             formatter(entry)
-        } else if include_tools {
-            entry_to_json(entry)
-        } else if entry.command.is_none() && entry.url.is_some() {
-            // Remote-only entries: Qwen wants httpUrl+headers; VS Code "servers" keeps url.
-            // entry_to_qwen_json leaves url as-is for SSE and renames for streamable HTTP.
-            if key == "servers" {
-                entry_to_json(entry)
-            } else {
-                entry_to_qwen_json(entry)
-            }
         } else {
             entry_to_json(entry)
         };
@@ -5474,8 +5504,8 @@ fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<Wri
         Format::JsonCopilotMcpServers => edit_copilot_json_gateway(&path, entry)?,
         Format::JsonDroidMcpServers => edit_droid_json_gateway(&path, entry)?,
         Format::JsonAmpMcpServers => edit_json_gateway(&path, "amp.mcpServers", entry, true)?,
-        Format::JsonQwenMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
-        Format::JsonKimiMcpServers => edit_json_gateway(&path, "mcpServers", entry, true)?,
+        Format::JsonQwenMcpServers => edit_qwen_json_gateway(&path, entry)?,
+        Format::JsonKimiMcpServers => edit_kimi_json_gateway(&path, entry)?,
         Format::JsonServers => edit_json_gateway(&path, "servers", entry, lenient)?,
         Format::JsonMcp => edit_crush_gateway(&path, entry)?,
         Format::JsonOpenCodeMcp => edit_opencode_gateway(&path, entry)?,
@@ -6381,7 +6411,7 @@ mod tests {
             Some(relocated.clone())
         );
         assert_eq!(codex_config_path(&relocated), relocated.join("config.toml"));
-        let rules = codex_rules_target(&relocated);
+        let rules = codex_rules_target(&relocated, crate::instructions::Scope::Team);
         assert_eq!(rules.path, relocated.join("AGENTS.md"));
         assert_eq!(
             rules.blocked_if_present,
@@ -6410,7 +6440,7 @@ mod tests {
             relocated.join(".gemini").join("settings.json")
         );
         assert_eq!(
-            gemini_cli_rules_target(&relocated).path,
+            gemini_cli_rules_target(&relocated, crate::instructions::Scope::Team).path,
             relocated.join(".gemini").join("GEMINI.md")
         );
     }
@@ -7789,7 +7819,7 @@ bad = "not-a-table"
             let path = temp_path("ws3-qwen.json");
             std::fs::write(&path, r#"{"mcpServers":{}}"#).unwrap();
             let entry = gateway_entry_shared_http("qwen-code", None, &spec);
-            edit_json_gateway(&path, "mcpServers", Some(&entry), true).unwrap();
+            edit_qwen_json_gateway(&path, Some(&entry)).unwrap();
             let root: serde_json::Value =
                 serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
             let slot = &root["mcpServers"][GATEWAY_ENTRY_NAME];
@@ -9667,7 +9697,8 @@ command = "npx"
         let root = std::env::temp_dir().join(format!("toolport-codex-home-{}", std::process::id()));
         let _restore = EnvRestore::set("CODEX_HOME", &root);
         assert_eq!(codex_path(), Some(root.join("config.toml")));
-        let rules = client_rules_target("codex").expect("codex rules");
+        let rules = client_rules_target("codex", crate::instructions::Scope::Team)
+            .expect("codex rules");
         assert_eq!(rules.path, root.join("AGENTS.md"));
         assert_eq!(
             rules.blocked_if_present,
@@ -9685,12 +9716,18 @@ command = "npx"
             gemini_cli_path(),
             Some(root.join(".gemini").join("settings.json"))
         );
-        let rules = client_rules_target("gemini-cli").expect("gemini rules");
+        let rules = client_rules_target("gemini-cli", crate::instructions::Scope::Team)
+            .expect("gemini rules");
         assert_eq!(rules.path, root.join(".gemini").join("GEMINI.md"));
         // Antigravity is a different product; GEMINI_CLI_HOME must not move it.
         let home = home().expect("home");
-        let antigravity = resolve_rules_target("antigravity", &home, Platform::current())
-            .expect("antigravity rules");
+        let antigravity = resolve_rules_target(
+            "antigravity",
+            &home,
+            Platform::current(),
+            crate::instructions::Scope::Team,
+        )
+        .expect("antigravity rules");
         assert_eq!(antigravity.path, home.join(".gemini").join("GEMINI.md"));
     }
 
@@ -9845,6 +9882,74 @@ command = "npx"
         assert!(installed.iter().any(|s| s.name == GATEWAY_ENTRY_NAME));
 
         std::fs::remove_file(&path).ok();
+    }
+
+    /// SBS-921: Shared HTTP Connect/rescope/reset for Kimi goes through
+    /// `install_gateway_shared_http` → `install_or_remove`. That used to remap
+    /// remotes via `entry_to_qwen_json` (`url` → `httpUrl`) whenever the key was
+    /// not VS Code `"servers"`. Kimi requires `url` and rejects `httpUrl`.
+    /// `type` must also stay off: Kimi ignores it, and `entry_to_kimi_json`
+    /// strips the hint `entry_to_json` would emit.
+    #[test]
+    fn kimi_shared_http_connect_writes_url_not_qwen_http_url() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _data_lock = crate::registry::data_dir_test_lock();
+        let root =
+            std::env::temp_dir().join(format!("toolport-kimi-sbs921-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let data_dir = root.join("toolport-data");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        let _data_dir = crate::registry::DataDirOverride::set(&data_dir);
+        let path = root.join("mcp.json");
+        std::fs::write(
+            &path,
+            r#"{"mcpServers":{"keep":{"command":"node","args":["server.js"]}}}"#,
+        )
+        .unwrap();
+        let _restore = EnvRestore::set("KIMI_CODE_HOME", &root);
+
+        let spec = SharedHttpSpec {
+            url: "http://127.0.0.1:8765/mcp".into(),
+            token: "kimi-tok".into(),
+        };
+        install_gateway_shared_http("kimi-code", Some("Work"), &spec).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let slot = &written["mcpServers"][GATEWAY_ENTRY_NAME];
+        assert_eq!(
+            slot["url"],
+            spec.url,
+            "Kimi Shared HTTP must write url: {slot}"
+        );
+        assert!(
+            slot.get("httpUrl").is_none(),
+            "Kimi rejects Qwen's httpUrl: {slot}"
+        );
+        assert!(
+            slot.get("type").is_none(),
+            "Kimi ignores type; entry_to_kimi_json must strip it: {slot}"
+        );
+        assert!(
+            slot.get("transport").is_none(),
+            "streamable HTTP is Kimi's default; do not emit transport: {slot}"
+        );
+        assert_eq!(slot["headers"]["Authorization"], "Bearer kimi-tok");
+        assert!(
+            written["mcpServers"].get("keep").is_some(),
+            "Connect must preserve existing servers: {written}"
+        );
+        let backups = data_dir.join("backups").join("kimi-code");
+        assert_eq!(
+            std::fs::read_dir(&backups).unwrap().count(),
+            1,
+            "the fixture backup must stay under the overridden test data dir"
+        );
+
+        drop(_data_dir);
+        drop(_restore);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
@@ -10429,11 +10534,22 @@ rules:
         }
     }
 
+    /// Team-scope resolution, the default for these path tests. Scope changes only the owned-file
+    /// NAME; `rules_target_owned_file_name_follows_the_scope` covers the personal variant, and
+    /// sentinel clients share one file across scopes by design.
+    fn team_rules_target(
+        client_id: &str,
+        home: &Path,
+        platform: Platform,
+    ) -> Option<crate::instructions::Target> {
+        resolve_rules_target(client_id, home, platform, crate::instructions::Scope::Team)
+    }
+
     #[test]
     fn rules_target_claude_code_is_owned_file_all_platforms() {
         use crate::instructions::Strategy;
         for p in [Platform::Windows, Platform::MacOs, Platform::Linux] {
-            let t = resolve_rules_target("claude-code", &mock_home(p), p).expect("supported");
+            let t = team_rules_target("claude-code", &mock_home(p), p).expect("supported");
             assert_eq!(t.strategy, Strategy::OwnedFile);
             assert!(
                 t.path
@@ -10445,11 +10561,54 @@ rules:
         }
     }
 
+    /// Team and personal owned files are siblings in the client's rules DIRECTORY, never the same
+    /// file: the client reads the whole directory, so both apply and neither clobbers the other.
+    #[test]
+    fn rules_target_owned_file_name_follows_the_scope() {
+        use crate::instructions::Scope;
+        let home = mock_home(Platform::MacOs);
+        let p = Platform::MacOs;
+        for client in ["claude-code", "vscode", "kiro", "roo-code", "cline"] {
+            let team = resolve_rules_target(client, &home, p, Scope::Team).expect("supported");
+            let personal =
+                resolve_rules_target(client, &home, p, Scope::Personal).expect("supported");
+            assert_eq!(
+                team.path.parent(),
+                personal.path.parent(),
+                "{client}: both scopes live in the same rules directory"
+            );
+            assert_ne!(team.path, personal.path, "{client}: scopes must not share a file");
+            assert!(team.path.ends_with(Scope::Team.owned_file_name()));
+            assert!(personal.path.ends_with(Scope::Personal.owned_file_name()));
+            assert_eq!(personal.scope, Scope::Personal);
+        }
+    }
+
+    /// Sentinel clients deliberately resolve to ONE file for both scopes. The two managed spans
+    /// coexist there, separated by their disjoint markers.
+    #[test]
+    fn rules_target_sentinel_clients_share_one_file_across_scopes() {
+        use crate::instructions::Scope;
+        let home = mock_home(Platform::MacOs);
+        let p = Platform::MacOs;
+        for client in ["codex", "gemini-cli", "windsurf", "goose", "zed", "pi", "omp"] {
+            let team = resolve_rules_target(client, &home, p, Scope::Team).expect("supported");
+            let personal =
+                resolve_rules_target(client, &home, p, Scope::Personal).expect("supported");
+            assert_eq!(team.path, personal.path, "{client}: one shared rules file");
+            assert_eq!(team.char_cap, personal.char_cap, "{client}: same cap");
+            assert_eq!(
+                team.blocked_if_present, personal.blocked_if_present,
+                "{client}: a shadow file blocks both scopes"
+            );
+        }
+    }
+
     #[test]
     fn rules_target_codex_is_sentinel_and_flags_override() {
         use crate::instructions::Strategy;
         let home = mock_home(Platform::MacOs);
-        let t = resolve_rules_target("codex", &home, Platform::MacOs).expect("supported");
+        let t = team_rules_target("codex", &home, Platform::MacOs).expect("supported");
         assert_eq!(t.strategy, Strategy::SentinelBlock);
         assert!(t.path.ends_with(PathBuf::from(".codex").join("AGENTS.md")));
         assert_eq!(
@@ -10461,17 +10620,17 @@ rules:
 
     #[test]
     fn rules_target_windsurf_carries_hard_cap() {
-        let t = resolve_rules_target("windsurf", &mock_home(Platform::Linux), Platform::Linux)
+        let t = team_rules_target("windsurf", &mock_home(Platform::Linux), Platform::Linux)
             .expect("supported");
         assert_eq!(t.char_cap, Some(6000));
     }
 
     #[test]
     fn rules_target_zed_is_platform_specific() {
-        let win = resolve_rules_target("zed", &mock_home(Platform::Windows), Platform::Windows)
+        let win = team_rules_target("zed", &mock_home(Platform::Windows), Platform::Windows)
             .expect("supported");
         assert!(win.path.to_string_lossy().contains("Zed"));
-        let mac = resolve_rules_target("zed", &mock_home(Platform::MacOs), Platform::MacOs)
+        let mac = team_rules_target("zed", &mock_home(Platform::MacOs), Platform::MacOs)
             .expect("supported");
         assert!(mac
             .path
@@ -10486,7 +10645,7 @@ rules:
         // Application Support — a pre-existing split, listed in the PR).
         for platform in Platform::ALL {
             let home = mock_home(platform);
-            let rules = resolve_rules_target("goose", &home, platform).expect("supported");
+            let rules = team_rules_target("goose", &home, platform).expect("supported");
             let config =
                 resolve_client_config_path("goose", &home, platform).expect("goose config");
             match platform {
@@ -10526,7 +10685,7 @@ rules:
             "hermes",
         ] {
             assert!(
-                resolve_rules_target(id, &mock_home(Platform::MacOs), Platform::MacOs).is_none(),
+                team_rules_target(id, &mock_home(Platform::MacOs), Platform::MacOs).is_none(),
                 "{id} should have no managed rules target"
             );
         }
@@ -10540,13 +10699,13 @@ rules:
         let home = mock_home(Platform::MacOs);
         let p = Platform::MacOs;
         assert_eq!(
-            resolve_rules_target("antigravity", &home, p),
-            resolve_rules_target("gemini-cli", &home, p),
+            team_rules_target("antigravity", &home, p),
+            team_rules_target("gemini-cli", &home, p),
             "Antigravity shares Gemini's GEMINI.md"
         );
         assert_eq!(
-            resolve_rules_target("vscode", &home, p),
-            resolve_rules_target("claude-code", &home, p),
+            team_rules_target("vscode", &home, p),
+            team_rules_target("claude-code", &home, p),
             "VS Code Copilot shares Claude Code's rules file"
         );
     }
@@ -10846,8 +11005,10 @@ rules:
         let _xdg = EnvRestore::set("XDG_CONFIG_HOME", &xdg_config);
         let _goose_root = EnvRestore::set("GOOSE_PATH_ROOT", Path::new(""));
 
-        let goose = client_rules_target("goose").expect("goose has a rules target");
-        let zed = client_rules_target("zed").expect("zed has a rules target");
+        let goose = client_rules_target("goose", crate::instructions::Scope::Team)
+            .expect("goose has a rules target");
+        let zed = client_rules_target("zed", crate::instructions::Scope::Team)
+            .expect("zed has a rules target");
         let goose_config = client_config_path("goose").expect("goose config");
         let zed_config = client_config_path("zed").expect("zed config");
 
@@ -10888,7 +11049,7 @@ rules:
             Some(root.join("config").join("config.yaml"))
         );
         assert_eq!(
-            client_rules_target("goose")
+            client_rules_target("goose", crate::instructions::Scope::Team)
                 .expect("goose has a rules target")
                 .path,
             root.join("config").join(".goosehints")

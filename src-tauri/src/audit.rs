@@ -712,6 +712,23 @@ pub fn read_all() -> std::io::Result<Vec<Value>> {
         .collect())
 }
 
+/// Outcome of a routed tool-call audit row.
+///
+/// `None` means this line is not a tool call and must not increment call or
+/// success counters (SBS-932):
+/// - a missing `ok` is unknown, not success (advisor / suggestion / candidate
+///   writers omit the field)
+/// - `kind` in {approval, routine, advisor, suggestion, candidate} is a
+///   governance or routine row, even when `ok` is present (`ok:true` on
+///   approval is intentional so a deny stays out of the error-rate numerator)
+pub fn tool_call_ok(entry: &Value) -> Option<bool> {
+    let ok = entry.get("ok").and_then(Value::as_bool)?;
+    match entry.get("kind").and_then(Value::as_str) {
+        Some("approval" | "routine" | "advisor" | "suggestion" | "candidate") => None,
+        _ => Some(ok),
+    }
+}
+
 /// Aggregate the FULL retained log into per-server stats plus global totals: call volume,
 /// error rate, and latency per server, computed locally. Totals are the real count of what's
 /// retained (the byte cap bounds it), not a fixed window, so the error rate stays consistent
@@ -747,9 +764,11 @@ fn aggregate(entries: &[Value]) -> Value {
     let mut errors = 0u64;
 
     for e in entries {
+        let Some(ok) = tool_call_ok(e) else {
+            continue;
+        };
         let server = e.get("server").and_then(|v| v.as_str()).unwrap_or("?");
         let tool = e.get("tool").and_then(|v| v.as_str()).unwrap_or("?");
-        let ok = e.get("ok").and_then(|v| v.as_bool()).unwrap_or(true);
         let ts = e.get("ts").and_then(|v| v.as_u64()).unwrap_or(0);
         let dur = e.get("durationMs").and_then(|v| v.as_u64());
 
@@ -1135,6 +1154,54 @@ mod tests {
         assert_eq!(s["total"], 0);
         assert_eq!(s["errorRate"], 0.0);
         assert_eq!(s["servers"].as_array().unwrap().len(), 0);
+    }
+
+    /// HITL / routine rows must not inflate Activity "calls logged" or the
+    /// error-rate denominator. Missing `ok` is unknown, not success (SBS-932).
+    #[test]
+    fn aggregate_skips_hitl_and_omitted_ok_rows() {
+        let entries = vec![
+            json!({"server":"github","tool":"list","ok":true,"ts":10,"durationMs":8}),
+            json!({"server":"github","tool":"wipe","ok":true,"kind":"approval","decision":"denied","held":true,"ts":20}),
+            json!({"server":"github","tool":"wipe","ok":true,"kind":"approval","decision":"approved","held":false,"ts":30}),
+            json!({"server":"github","tool":"wipe","ok":true,"ts":31,"durationMs":12}),
+            json!({"server":"toolport","tool":"routine.advisor.hint_shown","kind":"routine","action":"hint_shown","ts":40}),
+            json!({"server":"github","tool":"get","ok":false,"ts":50,"durationMs":4}),
+        ];
+        let s = aggregate(&entries);
+        // Two successful timed calls + one failed timed call. Approval pair and
+        // the omitted-ok hint are not tool calls.
+        assert_eq!(s["total"], 3);
+        assert_eq!(s["errors"], 1);
+        assert_eq!(s["servers"][0]["calls"], 3);
+        assert_eq!(s["servers"][0]["errors"], 1);
+        assert!(s["servers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["server"] != "toolport"));
+    }
+
+    #[test]
+    fn tool_call_ok_treats_missing_ok_and_hitl_kinds_as_not_a_call() {
+        assert_eq!(tool_call_ok(&json!({"ok":true})), Some(true));
+        assert_eq!(tool_call_ok(&json!({"ok":false})), Some(false));
+        assert_eq!(tool_call_ok(&json!({"tool":"hint"})), None);
+        assert_eq!(
+            tool_call_ok(&json!({"ok":true,"kind":"approval","decision":"denied"})),
+            None
+        );
+        assert_eq!(
+            tool_call_ok(&json!({"ok":true,"kind":"routine","action":"save"})),
+            None
+        );
+        for kind in ["advisor", "suggestion", "candidate"] {
+            assert_eq!(
+                tool_call_ok(&json!({"ok":true,"kind":kind})),
+                None,
+                "kind {kind} is not a tool call"
+            );
+        }
     }
 
     #[test]

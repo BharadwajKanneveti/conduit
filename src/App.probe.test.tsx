@@ -8,6 +8,7 @@ const probeServers = vi.fn();
 const getRegistry = vi.fn();
 const detectClients = vi.fn();
 const takeRegistryRecoveryNotice = vi.fn();
+const setServerEnabled = vi.fn();
 
 // Captures the props App hands to the (mocked) Onboarding wizard so the test can
 // invoke onProbe exactly the way the Done step does.
@@ -25,7 +26,7 @@ vi.mock("@/lib/api", () => ({
   removeServer: vi.fn(),
   setAllEnabled: vi.fn(),
   setSecret: vi.fn(),
-  setServerEnabled: vi.fn(),
+  setServerEnabled: (...a: unknown[]) => setServerEnabled(...a),
   takeRegistryRecoveryNotice: (...a: unknown[]) => takeRegistryRecoveryNotice(...a),
   teamSyncWait: vi.fn(),
   testServer: vi.fn(),
@@ -158,5 +159,64 @@ describe("App health visibility", () => {
       await screen.findByRole("button", { name: /checking 1/i }),
     ).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+  });
+
+  it("drops stale health when a server is re-enabled", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    const server = {
+      id: "server-1",
+      name: "Example",
+      transport: "stdio",
+      command: "example",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+    };
+    const enabledRegistry = {
+      version: 1,
+      servers: [server],
+      profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
+      activeProfileId: "default",
+    };
+    const disabledRegistry = {
+      ...enabledRegistry,
+      profiles: [{ id: "default", name: "Default", enabledServerIds: [] }],
+    };
+    const nextProbe = deferred<ProbeResult[]>();
+    probeServers
+      .mockResolvedValueOnce([
+        {
+          serverId: "server-1",
+          ok: true,
+          toolCount: 1,
+          error: null,
+          authRequired: false,
+        },
+      ])
+      .mockReturnValueOnce(nextProbe.promise);
+    getRegistry.mockResolvedValue(enabledRegistry);
+    setServerEnabled
+      .mockResolvedValueOnce(disabledRegistry)
+      .mockResolvedValueOnce(enabledRegistry);
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
+    await userEvent.click(screen.getByLabelText("Toggle Example"));
+    await waitFor(() =>
+      expect(setServerEnabled).toHaveBeenCalledWith("default", "server-1", false, false),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /disabled 1/i }));
+    await userEvent.click(screen.getByLabelText("Toggle Example"));
+
+    expect(
+      await screen.findByRole("button", { name: /checking 1/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/1 of 1 enabled servers reachable/i),
+    ).not.toBeInTheDocument();
   });
 });

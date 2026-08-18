@@ -27,6 +27,7 @@ pub mod routine_advisor;
 pub mod routine_candidates;
 pub mod routine_catalog;
 pub mod routines;
+pub mod rules;
 pub mod savings;
 pub mod searchtrace;
 pub mod secrets;

@@ -4,6 +4,7 @@ import {
   ArrowUpCircle,
   ClipboardList,
   Compass,
+  FileText,
   FlaskConical,
   FolderOpen,
   Layers,
@@ -524,6 +525,9 @@ export function AppSidebar({
           )}
           {navItem(ScrollText, "Activity", view === "activity", () =>
             onSelectView("activity"),
+          )}
+          {navItem(FileText, "Agent rules", view === "rules", () =>
+            onSelectView("rules"),
           )}
           {navItem(Users, "Teams", view === "teams", () => onSelectView("teams"))}
           {navItem(
