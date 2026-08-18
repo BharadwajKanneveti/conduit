@@ -8,6 +8,9 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Security
 
+- **Release job no longer inherits Azure Trusted Signing credentials during
+  frontend install.** They are now step-scoped to the Windows tauri build,
+  matching TAURI and APPLE. (SBS-925)
 - **Downstream stderr drain no longer grows without bound on a newline-less write.**
   Stdout was already capped at 16 MiB per line; stderr still used unbounded
   `read_line` and only trimmed the kept tail afterwards. A hostile or buggy
