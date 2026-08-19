@@ -29,13 +29,23 @@ fi
 attempts=3
 per_attempt_secs=120
 # Downloads are bulkier than an index refresh, so they get their own budget:
-# a healthy WebKitGTK fetch is well under two minutes, and 3 x 300s still caps
-# the whole step at 15 rather than letting it eat the job.
+# a healthy WebKitGTK fetch is well under two minutes. Worst case the two loops
+# together are 3x120s + 3x300s plus the retry sleeps, so roughly 21 minutes -
+# still a backstop well inside the job's 45, which is the point.
 download_attempt_secs=300
+# SIGTERM is the polite ask. An apt wedged on a dead socket can sit through it,
+# which would put the unbounded wait straight back; follow up with SIGKILL.
+kill_after_secs=30
+
+run_apt() {
+  local budget="$1"
+  shift
+  sudo timeout --kill-after="$kill_after_secs" "$budget" apt-get "$@"
+}
 
 updated=
 for attempt in $(seq 1 "$attempts"); do
-  if sudo timeout "$per_attempt_secs" apt-get update; then
+  if run_apt "$per_attempt_secs" update; then
     updated=1
     break
   fi
@@ -44,7 +54,7 @@ for attempt in $(seq 1 "$attempts"); do
 done
 
 if [ -z "$updated" ]; then
-  echo "apt-get update failed ${attempts} times; the mirror is unreachable" >&2
+  echo "apt-get update failed ${attempts} times; see the apt error above" >&2
   exit 1
 fi
 
@@ -54,7 +64,14 @@ fi
 # instead of starting the whole set again.
 downloaded=
 for attempt in $(seq 1 "$attempts"); do
-  if sudo timeout "$download_attempt_secs" apt-get install -y --download-only "$@"; then
+  # Refresh the index before each retry, never on the first pass. A mirror that
+  # publishes a new version between our update and our download 404s every
+  # attempt on the version we were told to ask for, and retrying the same stale
+  # plan just burns the budget three times over.
+  if [ "$attempt" -gt 1 ] && ! run_apt "$per_attempt_secs" update; then
+    echo "index refresh before download attempt ${attempt} failed; trying the download anyway" >&2
+  fi
+  if run_apt "$download_attempt_secs" install -y --download-only "$@"; then
     downloaded=1
     break
   fi
@@ -63,11 +80,18 @@ for attempt in $(seq 1 "$attempts"); do
 done
 
 if [ -z "$downloaded" ]; then
-  echo "apt-get could not download the packages after ${attempts} attempts; the mirror is unreachable" >&2
+  echo "apt-get could not download the packages after ${attempts} attempts; see the apt error above" >&2
   exit 1
 fi
 
-# Unbounded on purpose. Everything is in the local cache by now, so this is
-# fast and offline, and a SIGTERM landing inside dpkg is the one interruption
-# that leaves a half-configured system needing `dpkg --configure -a`.
-sudo apt-get install -y "$@"
+# Install straight from the cache the loop above filled. `--no-download` is what
+# makes "offline" true rather than merely likely: without it this is a fresh
+# acquire session, so one truncated or superseded .deb sends it back to the
+# mirror unbounded, which is the exact hang this script exists to stop. A
+# missing file now fails fast and loudly instead. Deliberately no `-m`: that
+# would drop the missing package and install a quiet subset.
+#
+# No timeout here on purpose. There is no network left to stall on, and a
+# SIGTERM landing inside dpkg is the one interruption that leaves a
+# half-configured system needing `dpkg --configure -a`.
+sudo apt-get install -y --no-download "$@"
