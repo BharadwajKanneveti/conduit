@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
+  Activity,
   ArrowUpCircle,
   ClipboardList,
   Compass,
@@ -528,6 +529,9 @@ export function AppSidebar({
           )}
           {navItem(FileText, "Agent rules", view === "rules", () =>
             onSelectView("rules"),
+          )}
+          {navItem(Activity, "Agent activity", view === "hooks", () =>
+            onSelectView("hooks"),
           )}
           {navItem(Users, "Teams", view === "teams", () => onSelectView("teams"))}
           {navItem(

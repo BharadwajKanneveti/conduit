@@ -624,16 +624,16 @@ fn claude_settings_paths_from(
 pub(crate) fn read_settings_json(
     path: &Path,
 ) -> Result<(serde_json::Value, Option<String>), String> {
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            let value = parse_json_value(&text)?;
-            Ok((value, Some(text)))
-        }
+    match std::fs::symlink_metadata(path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            Ok((serde_json::Value::Object(serde_json::Map::new()), None))
+            return Ok((serde_json::Value::Object(serde_json::Map::new()), None));
         }
-        Err(e) => Err(e.to_string()),
+        Err(e) => return Err(format!("could not stat {}: {e}", path.display())),
+        Ok(_) => {}
     }
+    let text = read_config_file(path)?;
+    let value = parse_json_value(&text)?;
+    Ok((value, Some(text)))
 }
 
 /// Write an agent settings file after backing up whatever was there.
@@ -5106,6 +5106,12 @@ pub(crate) fn resolve_gateway_path_readonly() -> Option<PathBuf> {
     if let Some(p) = crate::gateway_publish::published_gateway_path() {
         return Some(p);
     }
+    // A missing/corrupt manifest does not mean the matching published image is gone.
+    // Select it by the same source digest as publication before falling back to a
+    // sidecar, so preview and apply agree without writing a manifest during preview.
+    if let Some(p) = crate::gateway_publish::existing_publish_destination() {
+        return Some(p);
+    }
     // An AppImage's in-mount binary is the wrong answer: it dies with the mount. Only
     // an existing stable copy counts, and making one is a write.
     if std::env::var_os("APPIMAGE").is_some() {
@@ -7231,6 +7237,25 @@ mod tests {
         // A missing file is an error.
         std::fs::remove_file(&path).ok();
         assert!(read_config_file(&path).is_err());
+    }
+
+    #[test]
+    fn settings_reader_keeps_the_missing_case_but_rejects_non_files() {
+        let path = temp_path("read-settings");
+        std::fs::remove_file(&path).ok();
+        let (missing, original) = read_settings_json(&path).unwrap();
+        assert_eq!(missing, serde_json::json!({}));
+        assert!(original.is_none());
+
+        std::fs::write(&path, "{ \"model\": \"opus\" }").unwrap();
+        let (value, original) = read_settings_json(&path).unwrap();
+        assert_eq!(value["model"], serde_json::json!("opus"));
+        assert!(original.is_some());
+
+        assert!(read_settings_json(&std::env::temp_dir())
+            .unwrap_err()
+            .contains("not a regular file"));
+        std::fs::remove_file(path).ok();
     }
 
     #[test]

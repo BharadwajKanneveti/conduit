@@ -8,6 +8,7 @@ export type View =
   | "catalog"
   | "playground"
   | "rules"
+  | "hooks"
   | "teams"
   | "settings";
 
@@ -659,4 +660,60 @@ export function importableServers(
       !isGatewayIdentity(server.name, server.name, server.command) &&
       !have.has(server.name.toLowerCase()),
   );
+}
+
+/**
+ * One Claude Code profile's `settings.json` and whether the hook sensor is in it (SBS-822).
+ *
+ * A machine routinely has more than one: `CLAUDE_CONFIG_DIR` picks a profile per shell, so
+ * `~/.claude` and `~/.claude-work` are both real and both need the sensor, or the one Toolport
+ * missed reports nothing.
+ */
+export interface HookProfileStatus {
+  path: string;
+  installed: boolean;
+  /** Why this profile could not be read or written. A profile that is simply not installed has
+   *  no error; an unreadable one says so instead of quietly looking "off". */
+  error?: string;
+}
+
+/** Everything the Hooks tab renders, from one `hooks_view` call. */
+export interface HooksView {
+  enabled: boolean;
+  /** The harness lifecycle events the sensor registers, so the UI can name them exactly. */
+  events: string[];
+  profiles: HookProfileStatus[];
+  /** Absent when no gateway binary has been published yet, which is the one thing that stops
+   *  the sensor being installable. */
+  binary?: string;
+}
+
+/** A dry run of one profile's write. Nothing is written to produce it. */
+export interface HooksPreview {
+  path: string;
+  /** The file as it is now; empty when the profile has no settings file yet. */
+  before: string;
+  after: string;
+  /**
+   * Why this profile has no dry run, when that is the case. Absent on a healthy one.
+   * Mirrors `ProfileStatus.error`: one profile the backend cannot parse must not hide
+   * the preview for the profiles it can.
+   */
+  error?: string;
+}
+
+/** One recorded sensor row. Deliberately loose: SBS-823 owns the shape, this tab only counts. */
+export interface HookEvent {
+  ts?: number;
+  event?: string;
+  agent?: string;
+  tool?: string;
+  sessionId?: string;
+  /** The folder the agent was working in. A path, never its contents. */
+  cwd?: string;
+  /** Canonical fingerprint of the tool input. Cannot be turned back into the input. */
+  argsHash?: string;
+  /** Absent means UNKNOWN, never success. */
+  ok?: boolean;
+  malformed?: boolean;
 }

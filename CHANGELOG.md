@@ -53,6 +53,27 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Added
 
+- **Agent activity: see what your agents do outside Toolport.** Toolport routes every
+  MCP call, so it sees those; it has never seen what Claude Code does natively, which
+  is most of what an agent actually does (`Bash`, `Edit`, `Read`, `WebFetch`). A new
+  Agent activity tab installs a small recorder into Claude Code's own lifecycle and
+  keeps one line per event: which tool, in which folder, in which session. Off until
+  you turn it on, and it removes itself from every file it wrote when you turn it off.
+
+  Two limits it is built around rather than promises about it. It **cannot stop your
+  agent**: the recorder is deliberately not attached to the step that can refuse a tool
+  call, so no defect in it can block your work. And it **does not read your work**:
+  commands, file contents and tool output are dropped before anything is written, and a
+  row keeps only names, a folder, a session, and a fingerprint that cannot be turned
+  back into the input.
+
+  Every Claude Code profile on the machine is covered, not just the one Toolport
+  resolved: `CLAUDE_CONFIG_DIR` picks a profile per shell, so `~/.claude` and
+  `~/.claude-work` are both real and a recorder in only one of them would quietly
+  under-report. As with agent rules, your file is never rewritten wholesale: only a
+  marked block is added, comments and formatting elsewhere survive, and a preview shows
+  the exact bytes before the first write. (SBS-822)
+
 - **Agent rules: write your instructions once, apply them everywhere.** A new Agent
   rules tab holds one or more named rule sets and writes the active one into every
   AI client's own global rules location (`AGENTS.md`, `GEMINI.md`, `.goosehints`,

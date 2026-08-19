@@ -137,6 +137,26 @@ fn select_publish_dest(base_dest: &Path, src_digest: &str) -> PathBuf {
     }
 }
 
+fn existing_publish_destination_from(src: &Path, base_dest: &Path) -> Option<PathBuf> {
+    let src_digest = file_sha256(src).ok()?;
+    let dest = select_publish_dest(base_dest, &src_digest);
+    match existing_file_sha256(&dest) {
+        Ok(Some(dest_digest)) if dest_digest == src_digest => Some(dest),
+        _ => None,
+    }
+}
+
+/// The destination publication would select, but only when its matching image
+/// already exists. Performs no copy and writes no manifest.
+pub fn existing_publish_destination() -> Option<PathBuf> {
+    if !should_publish_client_gateway() {
+        return None;
+    }
+    let src = bundled_gateway_source()?;
+    let base_dest = versioned_dest(env!("CARGO_PKG_VERSION"))?;
+    existing_publish_destination_from(&src, &base_dest)
+}
+
 /// Copy the install-dir gateway into `Toolport/bin` when needed and write the manifest.
 pub fn publish_bundled_gateway() -> Option<PathBuf> {
     if !should_publish_client_gateway() {
@@ -2217,6 +2237,28 @@ mod tests {
             PathBuf::from(
                 r"C:\Users\u\AppData\Roaming\Toolport\bin\toolport-gateway-1.12.0-0123456789ab.exe"
             )
+        );
+    }
+
+    #[test]
+    fn readonly_publish_selection_finds_the_image_publication_would_reuse() {
+        let dir = ScratchDir::new("readonly-publish-dest");
+        let src = dir.join("bundled-gateway");
+        let base = dir.join("toolport-gateway-1.12.0");
+        std::fs::write(&src, b"current image").unwrap();
+        std::fs::write(&base, b"current image").unwrap();
+        assert_eq!(
+            existing_publish_destination_from(&src, &base),
+            Some(base.clone())
+        );
+
+        std::fs::write(&base, b"older image").unwrap();
+        let digest = file_sha256(&src).unwrap();
+        let addressed = content_addressed_dest(&base, &digest);
+        std::fs::write(&addressed, b"current image").unwrap();
+        assert_eq!(
+            existing_publish_destination_from(&src, &base),
+            Some(addressed)
         );
     }
 
