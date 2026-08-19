@@ -47,6 +47,34 @@ download_attempt_secs=300
 # which would put the unbounded wait straight back; follow up with SIGKILL.
 kill_after_secs=30
 
+# Let apt do its own failover before we cut it off.
+#
+# The runner image already points apt at a three-mirror list through
+# `mirror+file:/etc/apt/apt-mirrors.txt` - azure.archive.ubuntu.com first, then
+# archive.ubuntu.com, then security.ubuntu.com - so a dead primary is something
+# apt can recover from unaided. It never got the chance: the image sets no
+# acquire timeout, apt's default idle timeout is at least as long as the bound
+# below, and so the SIGTERM always landed first. Three attempts against a silent
+# azure mirror produced no error, no failover, and six minutes gone, on three
+# pull requests in one evening (#813, #815, #816).
+#
+# So give apt a much shorter fuse than our own and the fallback engages inside a
+# single attempt, turning the outage into a few wasted seconds.
+#
+# This is an INACTIVITY timeout, not a transfer budget: it measures the gap
+# between bytes, so it does not punish a slow-but-progressing mirror. The
+# throttled ~12 kB/s mirror that broke PR #817 keeps resetting it and is left to
+# the outer bound, which is the right tool for that failure.
+apt_conf=/etc/apt/apt.conf.d/99toolport-ci-acquire
+if ! printf '%s\n' \
+  'Acquire::http::Timeout "20";' \
+  'Acquire::https::Timeout "20";' \
+  'Acquire::Retries "3";' | sudo tee "$apt_conf" >/dev/null; then
+  # Not fatal: without it apt keeps its own defaults and the loops below still
+  # bound the damage. Say so rather than failing a build over a tuning file.
+  echo "could not write ${apt_conf}; apt keeps its default timeouts" >&2
+fi
+
 run_apt() {
   local budget="$1"
   shift
