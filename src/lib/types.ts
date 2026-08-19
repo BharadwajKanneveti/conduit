@@ -693,6 +693,12 @@ export interface HooksPreview {
   /** The file as it is now; empty when the profile has no settings file yet. */
   before: string;
   after: string;
+  /**
+   * Why this profile has no dry run, when that is the case. Absent on a healthy one.
+   * Mirrors `ProfileStatus.error`: one profile the backend cannot parse must not hide
+   * the preview for the profiles it can.
+   */
+  error?: string;
 }
 
 /** One recorded sensor row. Deliberately loose: SBS-823 owns the shape, this tab only counts. */

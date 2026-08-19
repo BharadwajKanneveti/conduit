@@ -245,6 +245,34 @@ describe("HooksView", () => {
     expect(screen.getByText(/keep me/).className).not.toMatch(/bg-success/);
   });
 
+  it("says why a profile has no preview instead of blanking it", async () => {
+    // The backend degrades per profile, so an unreadable one arrives with an `error` and an
+    // empty `after`. Rendered as a normal row that would be a blank block over the caption
+    // "would be created", which is a lie about a file that plainly exists — and it would
+    // bury the healthy profile underneath it.
+    api.hooksPreview.mockResolvedValue([
+      {
+        path: "/home/a/.claude-backup/settings.json",
+        before: "",
+        after: "",
+        error: "expected `,` or `}` at line 3",
+      },
+      {
+        path: "/home/a/.claude/settings.json",
+        before: "{}\n",
+        after: '{\n  "command": "gw --toolport-hook PostToolUse"\n}\n',
+      },
+    ]);
+    render(<HooksView />);
+
+    await userEvent.click(await screen.findByRole("button", { name: /preview/i }));
+
+    expect(await screen.findByText(/expected `,` or `}` at line 3/)).toBeInTheDocument();
+    expect(screen.queryByText(/does not exist yet and would be created/)).toBeNull();
+    // The healthy profile still previews.
+    expect(screen.getByText(/--toolport-hook/).className).toMatch(/bg-success/);
+  });
+
   it("lists one row per event, with tool, folder and session", async () => {
     // The toggle copy promises "one line per event: which tool, in which folder, in which
     // session". A count alone does not deliver that.

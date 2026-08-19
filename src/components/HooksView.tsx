@@ -574,24 +574,40 @@ function PreviewDialog({
           {previews?.map((p) => (
             <div key={p.path} className="grid gap-1">
               <p className="font-mono text-xs text-muted-foreground">{p.path}</p>
-              <pre className="max-h-64 overflow-auto rounded-md border bg-muted/40 p-3 text-xs">
-                {p.after.split("\n").map((line, i) => (
-                  // The footer claims everything outside the added block survives untouched.
-                  // Marking Toolport's own lines is what lets the user check that claim instead
-                  // of taking it: whatever is not highlighted is their file, unchanged.
-                  <span
-                    key={i}
-                    className={line.includes(HOOK_MARKER) ? "bg-success/15" : undefined}
-                  >
-                    {line}
-                    {"\n"}
-                  </span>
-                ))}
-              </pre>
-              {p.before === "" && (
-                <p className="text-xs text-muted-foreground">
-                  This file does not exist yet and would be created.
+              {p.error ? (
+                // A profile the backend could not parse has no dry run, and its empty
+                // `after` would otherwise render as a blank block over the caption
+                // "would be created" — telling the user a file that plainly exists does
+                // not. Say what actually happened, and leave the healthy profiles above
+                // and below it alone.
+                <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">
+                  No preview for this profile: {p.error}
                 </p>
+              ) : (
+                <>
+                  <pre className="max-h-64 overflow-auto rounded-md border bg-muted/40 p-3 text-xs">
+                    {p.after.split("\n").map((line, i) => (
+                      // The footer claims everything outside the added block survives
+                      // untouched. Marking Toolport's own lines is what lets the user check
+                      // that claim instead of taking it: whatever is not highlighted is
+                      // their file, unchanged.
+                      <span
+                        key={i}
+                        className={
+                          line.includes(HOOK_MARKER) ? "bg-success/15" : undefined
+                        }
+                      >
+                        {line}
+                        {"\n"}
+                      </span>
+                    ))}
+                  </pre>
+                  {p.before === "" && (
+                    <p className="text-xs text-muted-foreground">
+                      This file does not exist yet and would be created.
+                    </p>
+                  )}
+                </>
               )}
             </div>
           ))}
