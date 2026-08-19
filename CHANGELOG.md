@@ -48,7 +48,7 @@ Entries before the rename below shipped under the project's former name, Conduit
 - **Toolport Studio is no longer a supported client.** The project is discontinued, so
   detection, the Connect flow, and its `~/.toolport-studio/mcp.json` target are gone,
   along with the session-scoped restart wording it was the only user of. Toolport now
-  auto-detects 34 clients. If you had connected it, the gateway entry in that file is
+  auto-detects 35 clients. If you had connected it, the gateway entry in that file is
   left where it is and can be deleted by hand; nothing else reads it.
 
 ### Added
@@ -74,10 +74,15 @@ Entries before the rename below shipped under the project's former name, Conduit
   marked block is added, comments and formatting elsewhere survive, and a preview shows
   the exact bytes before the first write. (SBS-822)
 
+- **Devin Desktop, Devin Local, and Devin CLI support.** The legacy `windsurf`
+  integration now uses the current Devin Desktop (Cascade) name and brand while
+  keeping its compatible `~/.codeium/windsurf` paths. A separate Devin Local / CLI
+  client manages the shared user MCP config and global `AGENTS.md` used by the new
+  default local agent and the terminal CLI.
 - **Agent rules: write your instructions once, apply them everywhere.** A new Agent
   rules tab holds one or more named rule sets and writes the active one into every
   AI client's own global rules location (`AGENTS.md`, `GEMINI.md`, `.goosehints`,
-  Windsurf's `global_rules.md`, and a `toolport-rules.md` in the rules directory of
+  Devin Desktop's `global_rules.md`, and a `toolport-rules.md` in the rules directory of
   clients that read one), so keeping every supported client in agreement no longer
   means hand-editing each file. Your own content is never overwritten:
   Toolport either owns its own file in the client's rules directory or owns a
@@ -91,14 +96,14 @@ Entries before the rename below shipped under the project's former name, Conduit
 - **Official brand marks for 14 more clients.** Grok Build, OpenCode, Qwen Code, Kimi
   Code, JetBrains Junie, Kilo Code, GitHub Copilot CLI, Amp, Pi, Oh My Pi, Factory Droid,
   BoltAI, AnythingLLM and Continue now show their own logo in the Clients view instead of
-  a letter badge, so 31 of the 34 supported clients now carry their own mark. Crush, Jan
+  a letter badge, so 32 of the 35 supported clients now carry their own mark. Crush, Jan
   and Witsy keep the badge, since none of them publish a usable vector mark.
 
 ### Fixed
 
 - **A refused Team Instructions rewrite no longer deletes the last-good org rules.**
   `apply_instructions_to` only recorded a target when `write_target` returned
-  `Applied`. Error, TooLong (a Windsurf char-cap miss) and BlockedOverride then
+  `Applied`. Error, TooLong (a Devin Desktop char-cap miss) and BlockedOverride then
   hit `remove_recorded`, which stripped the working v1 block, persisted the new
   content watermark, and left later syncs with nothing to retry — coverage of
   the missing file against too-long v2 is `TooLong`, not `Stale`. Last-good now
