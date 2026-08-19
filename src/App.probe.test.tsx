@@ -1,16 +1,22 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { act, render, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import App from "./App";
-import type { ProbeResult } from "@/lib/types";
+import type { ProbeResult, Registry } from "@/lib/types";
 
 const probeServers = vi.fn();
 const getRegistry = vi.fn();
 const detectClients = vi.fn();
 const takeRegistryRecoveryNotice = vi.fn();
+const setServerEnabled = vi.fn();
+const setAllEnabled = vi.fn();
 
 // Captures the props App hands to the (mocked) Onboarding wizard so the test can
 // invoke onProbe exactly the way the Done step does.
-const captured: { onProbe: (() => Promise<ProbeResult[]>) | null } = { onProbe: null };
+const captured: {
+  onProbe: (() => Promise<ProbeResult[]>) | null;
+  onOpenRules: (() => void) | null;
+} = { onProbe: null, onOpenRules: null };
 
 vi.mock("@/lib/api", () => ({
   addServer: vi.fn(),
@@ -22,9 +28,9 @@ vi.mock("@/lib/api", () => ({
   previewImportServers: vi.fn(),
   probeServers: (...a: unknown[]) => probeServers(...a),
   removeServer: vi.fn(),
-  setAllEnabled: vi.fn(),
+  setAllEnabled: (...a: unknown[]) => setAllEnabled(...a),
   setSecret: vi.fn(),
-  setServerEnabled: vi.fn(),
+  setServerEnabled: (...a: unknown[]) => setServerEnabled(...a),
   takeRegistryRecoveryNotice: (...a: unknown[]) => takeRegistryRecoveryNotice(...a),
   teamSyncWait: vi.fn(),
   testServer: vi.fn(),
@@ -43,13 +49,41 @@ vi.mock("@/lib/theme", () => ({
   useTheme: () => ({ resolved: "light" }),
 }));
 
-vi.mock("@/components/AppSidebar", () => ({ AppSidebar: () => null }));
+vi.mock("@/components/AppSidebar", () => ({
+  AppSidebar: ({
+    registry,
+    onRegistryChange,
+    onSelectView,
+  }: {
+    registry: Registry | null;
+    onRegistryChange: (registry: Registry) => void;
+    onSelectView: (view: "clients") => void;
+  }) => (
+    <>
+      <button type="button" onClick={() => onSelectView("clients")}>
+        Clients
+      </button>
+      {registry?.profiles.some((profile) => profile.id === "work") && (
+        <button
+          type="button"
+          onClick={() => onRegistryChange({ ...registry, activeProfileId: "work" })}
+        >
+          Switch profile
+        </button>
+      )}
+    </>
+  ),
+}));
 vi.mock("@/components/PendingApprovals", () => ({ PendingApprovals: () => null }));
 vi.mock("@/components/QuarantineAlert", () => ({ QuarantineAlert: () => null }));
 
 vi.mock("@/components/Onboarding", () => ({
-  Onboarding: (props: { onProbe: () => Promise<ProbeResult[]> }) => {
+  Onboarding: (props: {
+    onProbe: () => Promise<ProbeResult[]>;
+    onOpenRules: () => void;
+  }) => {
     captured.onProbe = props.onProbe;
+    captured.onOpenRules = props.onOpenRules;
     return null;
   },
 }));
@@ -66,6 +100,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   localStorage.clear();
   captured.onProbe = null;
+  captured.onOpenRules = null;
   getRegistry.mockResolvedValue({
     version: 1,
     servers: [],
@@ -109,5 +144,227 @@ describe("App onboarding probe wiring", () => {
     // ...and no trailing probeServers pass was queued behind it.
     await act(async () => {});
     expect(probeServers).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("App onboarding exit (SBS-826)", () => {
+  // SBS-826 review: `onOpenRules` must FINISH onboarding, not merely hide the wizard.
+  // Onboarding.paths.test.tsx can only assert the callback fired - the persistence lives
+  // here, so a handler that dropped `finishOnboarding()` (the way `onOpenPlayground`
+  // deliberately does) would send a rules user who skipped Connect back through the
+  // whole wizard on the next launch with nothing failing.
+  it("marks onboarding done when a rules user leaves for the Rules tab", async () => {
+    render(<App />);
+
+    await waitFor(() => expect(captured.onOpenRules).not.toBeNull());
+    expect(localStorage.getItem("toolport.onboarded")).toBeNull();
+
+    act(() => {
+      captured.onOpenRules!();
+    });
+
+    expect(localStorage.getItem("toolport.onboarded")).toBe("1");
+  });
+});
+
+describe("App health visibility", () => {
+  it("keeps the backend warning visible after navigating away from Servers", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    probeServers.mockRejectedValue(new Error("backend unavailable"));
+
+    render(<App />);
+
+    expect(await screen.findByText(/backend didn't respond/i)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Clients" }));
+    expect(screen.getByText(/backend didn't respond/i)).toBeInTheDocument();
+  });
+
+  it("keeps an enabled server with no health result out of Ready", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    getRegistry.mockResolvedValue({
+      version: 1,
+      servers: [
+        {
+          id: "server-1",
+          name: "Unchecked server",
+          transport: "stdio",
+          command: "example",
+          args: [],
+          env: [],
+          url: null,
+          source: "manual",
+        },
+      ],
+      profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
+      activeProfileId: "default",
+    });
+    probeServers.mockResolvedValue([]);
+
+    render(<App />);
+
+    expect(
+      await screen.findByRole("button", { name: /checking 1/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+  });
+
+  it("drops stale health when a server is re-enabled", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    const server = {
+      id: "server-1",
+      name: "Example",
+      transport: "stdio",
+      command: "example",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+    };
+    const enabledRegistry = {
+      version: 1,
+      servers: [server],
+      profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
+      activeProfileId: "default",
+    };
+    const disabledRegistry = {
+      ...enabledRegistry,
+      profiles: [{ id: "default", name: "Default", enabledServerIds: [] }],
+    };
+    const nextProbe = deferred<ProbeResult[]>();
+    probeServers
+      .mockResolvedValueOnce([
+        {
+          serverId: "server-1",
+          ok: true,
+          toolCount: 1,
+          error: null,
+          authRequired: false,
+        },
+      ])
+      .mockReturnValueOnce(nextProbe.promise);
+    getRegistry.mockResolvedValue(enabledRegistry);
+    setServerEnabled
+      .mockResolvedValueOnce(disabledRegistry)
+      .mockResolvedValueOnce(enabledRegistry);
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
+    await userEvent.click(screen.getByLabelText("Toggle Example"));
+    await waitFor(() =>
+      expect(setServerEnabled).toHaveBeenCalledWith("default", "server-1", false, false),
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: /disabled 1/i }));
+    await userEvent.click(screen.getByLabelText("Toggle Example"));
+
+    expect(
+      await screen.findByRole("button", { name: /checking 1/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+    expect(
+      screen.queryByText(/1 of 1 enabled servers reachable/i),
+    ).not.toBeInTheDocument();
+  });
+
+  it("drops stale health when all servers are re-enabled", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    const server = {
+      id: "server-1",
+      name: "Example",
+      transport: "stdio",
+      command: "example",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+    };
+    const enabledRegistry = {
+      version: 1,
+      servers: [server],
+      profiles: [{ id: "default", name: "Default", enabledServerIds: ["server-1"] }],
+      activeProfileId: "default",
+    };
+    const disabledRegistry = {
+      ...enabledRegistry,
+      profiles: [{ id: "default", name: "Default", enabledServerIds: [] }],
+    };
+    const nextProbe = deferred<ProbeResult[]>();
+    probeServers
+      .mockResolvedValueOnce([
+        {
+          serverId: "server-1",
+          ok: true,
+          toolCount: 1,
+          error: null,
+          authRequired: false,
+        },
+      ])
+      .mockReturnValueOnce(nextProbe.promise);
+    getRegistry.mockResolvedValue(enabledRegistry);
+    setAllEnabled
+      .mockResolvedValueOnce(disabledRegistry)
+      .mockResolvedValueOnce(enabledRegistry);
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "More actions" }));
+    await userEvent.click(screen.getByText("Disable all"));
+    await waitFor(() => expect(setAllEnabled).toHaveBeenCalledWith("default", false));
+
+    await userEvent.click(screen.getByRole("button", { name: "More actions" }));
+    await userEvent.click(screen.getByText("Enable all"));
+
+    expect(
+      await screen.findByRole("button", { name: /checking 1/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
+  });
+
+  it("invalidates health and probes after switching profiles", async () => {
+    localStorage.setItem("toolport.onboarded", "1");
+    const server = (id: string, name: string) => ({
+      id,
+      name,
+      transport: "stdio",
+      command: "example",
+      args: [],
+      env: [],
+      url: null,
+      source: "manual",
+    });
+    getRegistry.mockResolvedValue({
+      version: 1,
+      servers: [server("server-1", "Default server"), server("server-2", "Work server")],
+      profiles: [
+        { id: "default", name: "Default", enabledServerIds: ["server-1"] },
+        { id: "work", name: "Work", enabledServerIds: ["server-2"] },
+      ],
+      activeProfileId: "default",
+    });
+    const nextProbe = deferred<ProbeResult[]>();
+    probeServers
+      .mockResolvedValueOnce([
+        {
+          serverId: "server-1",
+          ok: true,
+          toolCount: 1,
+          error: null,
+          authRequired: false,
+        },
+      ])
+      .mockReturnValueOnce(nextProbe.promise);
+
+    render(<App />);
+
+    expect(await screen.findByRole("button", { name: /ready 1/i })).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Switch profile" }));
+
+    await waitFor(() => expect(probeServers).toHaveBeenCalledTimes(2));
+    expect(
+      await screen.findByRole("button", { name: /checking 1/i }),
+    ).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /ready/i })).not.toBeInTheDocument();
   });
 });

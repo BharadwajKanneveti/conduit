@@ -928,11 +928,11 @@ export function PlaygroundView({ registry, onRegistryChange }: PlaygroundProps) 
             (looksLikeAuthError(toolsError) ? (
               <Callout variant="warning">
                 <span className="font-medium">
-                  {serverEntry?.name ?? "This server"} needs authentication.
+                  Sign in to {serverEntry?.name ?? "this server"} first.
                 </span>{" "}
-                Listing its tools failed with what looks like an auth error. Open{" "}
-                <span className="font-medium">Servers</span>, pick this server, and add
-                its credentials (the key icon / Secrets) before testing here.
+                Toolport couldn&apos;t list its tools without credentials. Open{" "}
+                <span className="font-medium">Servers</span>, choose this server, and use{" "}
+                <span className="font-medium">Authenticate</span>.
                 <p className="mt-1.5 font-mono text-xs break-words opacity-70">
                   {toolsError}
                 </p>

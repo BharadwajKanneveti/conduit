@@ -11307,10 +11307,6 @@ impl McpSession {
         serde_json::to_string(&tagged).ok()
     }
 
-    fn upstream_call(&self, method: &str, params: Value) -> Result<Value, String> {
-        self.upstream_call_timeout(method, params, upstream_rpc_timeout(method))
-    }
-
     fn upstream_call_timeout(
         &self,
         method: &str,

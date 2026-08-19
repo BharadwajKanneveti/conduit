@@ -3,17 +3,14 @@ import { listen } from "@tauri-apps/api/event";
 import {
   Activity,
   ArrowUpCircle,
-  ChevronRight,
   ClipboardList,
   Compass,
-  Download,
   FileText,
   FlaskConical,
   FolderOpen,
   Layers,
-  Link2,
   Loader2,
-  Puzzle,
+  MonitorCog,
   ScrollText,
   Settings,
   Share2,
@@ -26,13 +23,7 @@ import { openExternal } from "@/lib/openUrl";
 import { toast } from "sonner";
 import { toastError } from "@/lib/toast";
 import type { Update } from "@tauri-apps/plugin-updater";
-import {
-  importableServers,
-  type DetectedClient,
-  type Registry,
-  type SavingsSummary,
-  type View,
-} from "@/lib/types";
+import { type Registry, type SavingsSummary, type View } from "@/lib/types";
 import {
   gatherDiagnostics,
   getSavingsSummary,
@@ -43,7 +34,6 @@ import { fmtTokens } from "@/lib/utils";
 import { checkForUpdate, installUpdate, type UpdateProgress } from "@/lib/updater";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { ProfileBar } from "@/components/ProfileBar";
 import { ShareDialog } from "@/components/ShareDialog";
 
@@ -358,148 +348,21 @@ function UpdateNotes({
   );
 }
 
-/** Present clients (have a config or use connectors) first, then by how many
- * servers they manage, then alphabetical. Keeps not-installed clients at the
- * bottom. */
-function sortClients(clients: DetectedClient[]): DetectedClient[] {
-  const present = (c: DetectedClient) => (c.appPresent ? 1 : 0);
-  const count = (c: DetectedClient) => c.servers.length + c.pluginServers.length;
-  return [...clients].sort((a, b) => {
-    if (present(a) !== present(b)) return present(b) - present(a);
-    if (count(a) !== count(b)) return count(b) - count(a);
-    return a.name.localeCompare(b.name);
-  });
-}
-
-type ClientStatus = "active" | "empty" | "error" | "missing";
-
-function statusOf(client: DetectedClient): ClientStatus {
-  if (client.error) return "error";
-  // "missing" means the app itself isn't here, not merely that MCP is
-  // unconfigured. A present-but-unconfigured client (installed, no servers yet)
-  // is "empty", so it reads as "ready" rather than "not found".
-  if (!client.appPresent) return "missing";
-  return client.servers.length > 0 ? "active" : "empty";
-}
-
-const dotClass: Record<ClientStatus, string> = {
-  // These dots only render for NOT-connected clients (connected ones use the
-  // green chain icon), so none of them should be green - green means connected.
-  active: "bg-muted-foreground/50",
-  empty: "bg-muted-foreground/40",
-  error: "bg-warning",
-  missing: "bg-muted-foreground/20",
-};
-
-interface RowProps {
-  client: DetectedClient;
-  importCount: number;
-  selected: boolean;
-  onSelect: () => void;
-}
-
-/** A client row is about two things only: is Toolport connected here, and is
- * there anything left to import. Raw server counts are deliberately gone -
- * client inventory isn't something you manage from the sidebar. */
-function ClientRow({ client, importCount, selected, onSelect }: RowProps) {
-  const status = statusOf(client);
-  const missing = status === "missing";
-  const connected = client.gatewayInstalled;
-
-  // Label the exception, not the rule. The green chain icon already says
-  // "connected", so we don't repeat the word on every row - that just buries the
-  // one row that isn't connected under a wall of green. Only non-connected /
-  // error / missing states get a status word, so "not connected" actually stands
-  // out. The import backlog is a separate, secondary badge either way.
-  const statusWord =
-    status === "error"
-      ? "error"
-      : status === "missing"
-        ? "not found"
-        : connected
-          ? null
-          : "not connected";
-  const showBadge = importCount > 0 && status !== "error" && status !== "missing";
-
-  return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          onClick={onSelect}
-          aria-current={selected ? "page" : undefined}
-          className={`${NAV_ITEM} ${selected ? "bg-accent" : ""} ${
-            missing ? "opacity-50" : ""
-          }`}
-        >
-          {connected ? (
-            <Link2 className="size-3.5 shrink-0 text-success" />
-          ) : client.usesConnectors ? (
-            <Puzzle className="size-3.5 shrink-0 text-info" />
-          ) : (
-            <span className={`size-2 shrink-0 rounded-full ${dotClass[status]}`} />
-          )}
-          <span className="truncate">{client.name}</span>
-          <span className="ml-auto flex shrink-0 items-center gap-1.5">
-            {showBadge && (
-              <span className="inline-flex items-center gap-0.5 rounded-full bg-owned/15 px-1.5 text-[10px] font-medium text-owned">
-                <Download className="size-2.5" />
-                {importCount}
-              </span>
-            )}
-            {statusWord && (
-              <span
-                className={`text-xs ${
-                  status === "error" ? "text-warning" : "text-muted-foreground"
-                }`}
-              >
-                {statusWord}
-              </span>
-            )}
-          </span>
-        </button>
-      </TooltipTrigger>
-      <TooltipContent side="right" className="max-w-xs">
-        <p className="font-mono text-xs break-all">
-          {client.configPath || "path unavailable on this OS"}
-        </p>
-        <p className="mt-1 text-xs text-muted-foreground">
-          {connected
-            ? "Toolport is the gateway here. Other entries are just import sources."
-            : "Connect Toolport here, and import any servers you want it to manage."}
-        </p>
-        {client.usesConnectors && (
-          <p className="mt-1 text-xs text-info">
-            Manages servers as account connectors, outside the config file.
-          </p>
-        )}
-        {client.error && <p className="mt-1 text-xs text-warning">{client.error}</p>}
-      </TooltipContent>
-    </Tooltip>
-  );
-}
-
 interface Props {
-  clients: DetectedClient[];
   registry: Registry | null;
   onRegistryChange: (registry: Registry) => void;
-  selectedClientId: string | null;
-  onSelectClient: (id: string | null) => void;
   view: View;
   onSelectView: (view: View) => void;
   onReplayOnboarding: () => void;
 }
 
 export function AppSidebar({
-  clients,
   registry,
   onRegistryChange,
-  selectedClientId,
-  onSelectClient,
   view,
   onSelectView,
   onReplayOnboarding,
 }: Props) {
-  const [showMissing, setShowMissing] = useState(false);
   const [savings, setSavings] = useState<SavingsSummary | null>(null);
   // `null` means "no confirmed count": the first poll hasn't answered yet. It
   // must render distinctly from a confirmed zero so a gateway that never
@@ -511,10 +374,6 @@ export function AppSidebar({
   // the "?" glyph and its "Could not reach the gateway" tooltip must only appear
   // once a poll has actually failed, not on every app start (#742).
   const [quarantineStale, setQuarantineStale] = useState(false);
-  const sorted = sortClients(clients);
-  const detectedClients = sorted.filter((c) => statusOf(c) !== "missing");
-  const missingClients = sorted.filter((c) => statusOf(c) === "missing");
-
   // Surface the running token savings in the sidebar so the headline number isn't
   // hidden one click away in Activity. Refresh on a light interval as calls flow.
   useEffect(() => {
@@ -653,11 +512,11 @@ export function AppSidebar({
         )}
 
         <nav aria-label="Views" className="flex flex-col gap-0.5 px-3 pt-2">
-          {navItem(
-            Layers,
-            "All servers",
-            view === "servers" && selectedClientId === null,
-            () => onSelectClient(null),
+          {navItem(Layers, "All servers", view === "servers", () =>
+            onSelectView("servers"),
+          )}
+          {navItem(MonitorCog, "Clients", view === "clients", () =>
+            onSelectView("clients"),
           )}
           {navItem(Store, "Browse catalog", view === "catalog", () =>
             onSelectView("catalog"),
@@ -700,57 +559,6 @@ export function AppSidebar({
             </span>
           </button>
         )}
-
-        <div className="px-3 pt-3">
-          <div className="px-2.5 pb-1.5 text-xs font-medium tracking-wide text-muted-foreground uppercase">
-            Clients
-          </div>
-          <nav aria-label="Clients" className="flex flex-col gap-0.5">
-            {clients.length === 0 ? (
-              <p className="px-2.5 py-1.5 text-xs text-muted-foreground">
-                No MCP clients found. Install Claude Desktop, Cursor, or another supported
-                tool, then refresh.
-              </p>
-            ) : (
-              <>
-                {detectedClients.map((client) => (
-                  <ClientRow
-                    key={client.id}
-                    client={client}
-                    importCount={importableServers(client, registry).length}
-                    selected={view === "servers" && selectedClientId === client.id}
-                    onSelect={() => onSelectClient(client.id)}
-                  />
-                ))}
-                {missingClients.length > 0 && (
-                  <>
-                    <button
-                      onClick={() => setShowMissing((v) => !v)}
-                      aria-expanded={showMissing}
-                      className={`mt-1 flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground ${FOCUS_RING}`}
-                    >
-                      <ChevronRight
-                        className={`size-3.5 shrink-0 transition-transform ${showMissing ? "rotate-90" : ""}`}
-                      />
-                      <span>Not detected</span>
-                      <span className="ml-auto">{missingClients.length}</span>
-                    </button>
-                    {showMissing &&
-                      missingClients.map((client) => (
-                        <ClientRow
-                          key={client.id}
-                          client={client}
-                          importCount={importableServers(client, registry).length}
-                          selected={view === "servers" && selectedClientId === client.id}
-                          onSelect={() => onSelectClient(client.id)}
-                        />
-                      ))}
-                  </>
-                )}
-              </>
-            )}
-          </nav>
-        </div>
       </div>
 
       <VersionFooter onImport={onRegistryChange} onReplay={onReplayOnboarding} />

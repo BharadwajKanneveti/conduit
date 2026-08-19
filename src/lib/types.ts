@@ -3,6 +3,7 @@ export type Transport = "stdio" | "http" | "sse" | "unknown";
 /** The main content views, selected from the sidebar. */
 export type View =
   | "servers"
+  | "clients"
   | "activity"
   | "catalog"
   | "playground"

@@ -9,7 +9,10 @@ import {
 } from "react";
 import { listen } from "@tauri-apps/api/event";
 import {
+  ArrowLeft,
   ChevronDown,
+  CircleCheck,
+  KeyRound,
   MoreHorizontal,
   Download,
   Plus,
@@ -75,6 +78,9 @@ const Onboarding = lazy(() =>
 const ClientDetail = lazy(() =>
   import("@/components/ClientDetail").then((m) => ({ default: m.ClientDetail })),
 );
+const ClientsView = lazy(() =>
+  import("@/components/ClientsView").then((m) => ({ default: m.ClientsView })),
+);
 const ActivityView = lazy(() =>
   import("@/components/ActivityView").then((m) => ({ default: m.ActivityView })),
 );
@@ -99,6 +105,7 @@ const SettingsView = lazy(() =>
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/Callout";
 import { ErrorBoundary } from "@/components/ErrorBoundary";
+import { GitHubStarPrompt, type StarSurface } from "@/components/GitHubStarPrompt";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { Input } from "@/components/ui/input";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -118,6 +125,7 @@ const BULK_DISABLE_CONFIRM_MIN = 3;
 function App() {
   const { resolved: resolvedTheme } = useTheme();
   const [registry, setRegistry] = useState<Registry | null>(null);
+  const registryRef = useRef<Registry | null>(null);
   const [clients, setClients] = useState<DetectedClient[]>([]);
   const [importPreview, setImportPreview] = useState<ImportItem[] | null>(null);
   const [importing, setImporting] = useState(false);
@@ -161,6 +169,12 @@ function App() {
   // Toolport into their tools.
   const [onboardingStep, setOnboardingStep] = useState(0);
   const [resumeAtConnect, setResumeAtConnect] = useState(false);
+  // Set when the wizard is completed in this session, which is the only trigger
+  // for the GitHub star card (see GitHubStarPrompt).
+  const [justOnboarded, setJustOnboarded] = useState(false);
+  // The star prompt shares the bottom-right corner with the toast stack, so
+  // toasts are offset upward while it is on screen instead of covering it.
+  const [starSurface, setStarSurface] = useState<StarSurface>(null);
 
   const lastProbeRef = useRef(0);
   const probeFlightRef = useRef(createSingleFlight<ProbeResult[]>());
@@ -211,6 +225,42 @@ function App() {
     [],
   );
 
+  const applyRegistryChange = useCallback(
+    (next: Registry) => {
+      const activeId = (value: Registry | null) =>
+        value?.activeProfileId ?? value?.profiles[0]?.id;
+      const enabledIds = (value: Registry | null) =>
+        new Set(
+          value?.profiles.find((profile) => profile.id === activeId(value))
+            ?.enabledServerIds ?? [],
+        );
+      const previous = registryRef.current;
+      const previousProfileId = activeId(previous);
+      const nextProfileId = activeId(next);
+      const previousEnabled = enabledIds(previous);
+      const nextEnabled = enabledIds(next);
+      const invalidate =
+        previousProfileId !== nextProfileId
+          ? nextEnabled
+          : new Set([...nextEnabled].filter((id) => !previousEnabled.has(id)));
+
+      if (invalidate.size > 0) {
+        // A profile switch or enablement must not inherit the previous profile/set's
+        // health. Clear those rows before the new registry lands, then probe the
+        // authoritative backend state.
+        setHealth((current) => {
+          const fresh = { ...current };
+          invalidate.forEach((id) => delete fresh[id]);
+          return fresh;
+        });
+      }
+      registryRef.current = next;
+      setRegistry(next);
+      if (invalidate.size > 0) void reprobeAfterMutation().catch(() => {});
+    },
+    [reprobeAfterMutation],
+  );
+
   // Refresh statuses when the user returns to the window, so a server that came
   // up (or went down) while they were away reflects reality without a manual
   // refresh. Guarded so rapid alt-tabbing doesn't re-spawn every server.
@@ -235,6 +285,7 @@ function App() {
           detectClients(),
           takeRegistryRecoveryNotice(),
         ]);
+        registryRef.current = reg;
         setRegistry(reg);
         setClients(dc);
         if (recovery) {
@@ -291,13 +342,13 @@ function App() {
   // without a manual reload.
   useEffect(() => {
     const unlisten = listen<Registry>("registry-changed", (e) => {
-      setRegistry(e.payload);
+      applyRegistryChange(e.payload);
       setActivityKey((k) => k + 1);
     });
     return () => {
       void unlisten.then((f) => f());
     };
-  }, []);
+  }, [applyRegistryChange]);
 
   // The tray remains available while the window is hidden. Its approvals entry
   // should reveal the app at the exact place where the waiting calls can be
@@ -457,7 +508,7 @@ function App() {
         try {
           const fresh = await teamSyncWait(WAIT_SECS);
           if (cancelled) break;
-          setRegistry(fresh);
+          applyRegistryChange(fresh);
         } catch {
           // Network blip or server down: back off before re-parking so we don't spin.
           // Removal is a clean 401/403 the backend turns into a cleared team + the
@@ -483,14 +534,14 @@ function App() {
         wake = null;
       }
     };
-  }, [teamId]);
+  }, [applyRegistryChange, teamId]);
 
-  function selectClient(id: string | null) {
+  function selectClient(id: string) {
     setSelectedClientId(id);
-    setView("servers");
+    setView("clients");
   }
 
-  // Catalog and Activity are top-level destinations, so leave any selected client.
+  // Top-level destinations leave any selected client detail behind.
   function selectView(v: View) {
     setSelectedClientId(null);
     setView(v);
@@ -566,17 +617,27 @@ function App() {
   const enabledCount = registry
     ? servers.filter((s) => isEnabled(registry, s.id)).length
     : 0;
-  const connectedCount = servers.filter((s) => health[s.id]?.ok).length;
+  // Probe results can outlive a profile toggle, so only count servers that are
+  // still enabled. Otherwise a newly disabled server makes the posture claim
+  // more reachable "enabled servers" than the profile actually contains.
+  const connectedCount = registry
+    ? servers.filter((s) => isEnabled(registry, s.id) && health[s.id]?.ok).length
+    : 0;
 
   // Bucket each server so the list can lead with what needs action. A server
   // needs attention when it's enabled but its probe failed (auth or error).
-  type Group = "attention" | "active" | "disabled";
+  type Group = "attention" | "checking" | "active" | "disabled";
   const groupOf = (s: ServerEntry): Group => {
     if (!registry || !isEnabled(registry, s.id)) return "disabled";
     const h = health[s.id];
-    return h && !h.ok ? "attention" : "active";
+    if (!h) return "checking";
+    return h.ok ? "active" : "attention";
   };
-  const attentionCount = servers.filter((s) => groupOf(s) === "attention").length;
+  const attentionServers = servers.filter((s) => groupOf(s) === "attention");
+  const attentionCount = attentionServers.length;
+  const checkedCount = registry
+    ? servers.filter((s) => isEnabled(registry, s.id) && health[s.id]).length
+    : 0;
 
   const q = query.trim().toLowerCase();
   const matches = (s: ServerEntry) =>
@@ -590,9 +651,15 @@ function App() {
   const visible = servers.filter(matches);
   const grouped: Record<Group, ServerEntry[]> = {
     attention: visible.filter((s) => groupOf(s) === "attention").sort(byName),
+    checking: visible.filter((s) => groupOf(s) === "checking").sort(byName),
     active: visible.filter((s) => groupOf(s) === "active").sort(byName),
     disabled: visible.filter((s) => groupOf(s) === "disabled").sort(byName),
   };
+  // The posture and next action summarize the profile, not the current search.
+  // Keep these counts independent of `visible` so a filter cannot produce a
+  // misleading "0 servers" action while hiding an affected row.
+  const authAttention = attentionServers.filter((s) => health[s.id]?.authRequired);
+  const errorAttention = attentionServers.filter((s) => !health[s.id]?.authRequired);
 
   // Count what would actually be imported: drop the gateway entry and anything
   // already in the registry, then dedupe by name across clients (the backend
@@ -641,6 +708,7 @@ function App() {
     // Drop the pre-rename key so brand remnants do not linger in DevTools.
     localStorage.removeItem("conduit.onboarded");
     setOnboarded(true);
+    setJustOnboarded(true);
     setShowOnboarding(false);
     setResumeAtConnect(false);
     setOnboardingStep(0);
@@ -650,11 +718,8 @@ function App() {
     if (!profileId) return;
     setBusyId(serverId);
     try {
-      setRegistry(await setServerEnabled(profileId, serverId, enabled, reviewed));
-      // Enabling adds a server with no health entry yet, so its card would sit on
-      // "Checking…" until a manual refresh. Probe now to resolve it. (Disabling
-      // moves it to the disabled group, no probe needed.)
-      if (enabled) void reprobeAfterMutation().catch(() => {});
+      const next = await setServerEnabled(profileId, serverId, enabled, reviewed);
+      applyRegistryChange(next);
     } catch (e) {
       toastError(`Couldn't toggle: ${e}`);
     } finally {
@@ -676,7 +741,7 @@ function App() {
   async function handleRemove(serverId: string, name: string) {
     setBusyId(serverId);
     try {
-      setRegistry(await removeServer(serverId));
+      applyRegistryChange(await removeServer(serverId));
       toast.success(`Removed "${name}"`);
     } catch (e) {
       toastError(`Couldn't remove: ${e}`);
@@ -703,8 +768,7 @@ function App() {
     }
     setTogglingAll(true);
     try {
-      setRegistry(await setAllEnabled(profileId, enable));
-      if (enable) void reprobeAfterMutation().catch(() => {});
+      applyRegistryChange(await setAllEnabled(profileId, enable));
       let message = enable ? "Enabled all servers" : "Disabled all servers";
       if (enable && pendingReview > 0) {
         message =
@@ -741,7 +805,7 @@ function App() {
     try {
       const before = registry?.servers.length ?? 0;
       const next = await importServers(selected);
-      setRegistry(next);
+      applyRegistryChange(next);
       const added = next.servers.length - before;
       toast.success(
         added > 0
@@ -766,7 +830,7 @@ function App() {
       health={health[server.id]}
       onToggle={(en) => handleToggle(server.id, en)}
       onRemove={() => handleRemove(server.id, server.name)}
-      onRegistryChange={setRegistry}
+      onRegistryChange={applyRegistryChange}
       onReprobe={() => void reprobeAfterMutation().catch(() => {})}
     />
   );
@@ -775,11 +839,8 @@ function App() {
     <TooltipProvider delayDuration={200}>
       <div className="flex h-screen overflow-hidden bg-background text-foreground">
         <AppSidebar
-          clients={clients}
           registry={registry}
-          onRegistryChange={setRegistry}
-          selectedClientId={selectedClientId}
-          onSelectClient={selectClient}
+          onRegistryChange={applyRegistryChange}
           view={view}
           onSelectView={selectView}
           onReplayOnboarding={() => {
@@ -791,18 +852,26 @@ function App() {
         <main className="flex min-w-0 flex-1 flex-col">
           <header className="flex items-center justify-between gap-4 border-b px-6 py-4">
             <div className="flex min-w-0 flex-1 items-center gap-3">
-              {view !== "activity" &&
-                view !== "catalog" &&
-                view !== "playground" &&
-                view !== "teams" &&
-                view !== "settings" &&
-                selectedClient && (
+              {view === "clients" && selectedClient && (
+                <>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="-ml-2 text-muted-foreground"
+                    onClick={() => selectView("clients")}
+                    aria-label="Back to clients"
+                  >
+                    <ArrowLeft className="size-4" />
+                    Clients
+                  </Button>
+                  <div className="h-7 w-px bg-border" aria-hidden="true" />
                   <ClientLogo
                     id={selectedClient.id}
                     name={selectedClient.name}
                     size={32}
                   />
-                )}
+                </>
+              )}
               <div className="min-w-0">
                 <h1 className="truncate text-lg font-semibold tracking-tight">
                   {view === "activity"
@@ -819,8 +888,8 @@ function App() {
                               ? "Teams"
                               : view === "settings"
                                 ? "Settings"
-                                : selectedClient
-                                  ? selectedClient.name
+                                : view === "clients"
+                                  ? (selectedClient?.name ?? "Clients")
                                   : "Servers"}
                 </h1>
                 <p className="truncate text-sm text-muted-foreground">
@@ -838,8 +907,10 @@ function App() {
                               ? "Share one MCP server set across your team"
                               : view === "settings"
                                 ? "Global discovery and security policy"
-                                : selectedClient
-                                  ? "MCP client"
+                                : view === "clients"
+                                  ? selectedClient
+                                    ? "MCP client"
+                                    : "Manage Toolport in your installed AI tools"
                                   : loading || !registry
                                     ? "Loading…"
                                     : "One gateway in front of every MCP server you run"}
@@ -847,7 +918,7 @@ function App() {
               </div>
             </div>
             <div className="flex shrink-0 items-center gap-2">
-              {view === "servers" && !selectedClient && (
+              {view === "servers" && (
                 <>
                   <div className="relative">
                     <Search className="pointer-events-none absolute top-1/2 left-2.5 size-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -946,8 +1017,8 @@ function App() {
             >
               <WifiOff className="size-4 shrink-0" aria-hidden="true" />
               <span className="min-w-0 flex-1">
-                Toolport's backend didn't respond to the last health check, so server
-                status below may be stale.
+                Toolport's backend didn't respond to the last health check. Some features
+                may be unavailable, and server status may be stale.
               </span>
               <Button
                 variant="outline"
@@ -976,26 +1047,44 @@ function App() {
                     </div>
                   }
                 >
-                  {view === "activity" ? (
+                  {view === "clients" ? (
+                    selectedClient ? (
+                      <ClientDetail
+                        client={selectedClient}
+                        registry={registry}
+                        onChanged={load}
+                        onRegistryChange={applyRegistryChange}
+                      />
+                    ) : (
+                      <ClientsView
+                        clients={clients}
+                        registry={registry}
+                        loading={loading}
+                        onSelectClient={selectClient}
+                      />
+                    )
+                  ) : view === "activity" ? (
                     <ActivityView refreshKey={activityKey} registry={registry} />
                   ) : view === "catalog" ? (
-                    <CatalogView registry={registry} onAdded={setRegistry} />
+                    <CatalogView registry={registry} onAdded={applyRegistryChange} />
                   ) : view === "playground" ? (
-                    <PlaygroundView registry={registry} onRegistryChange={setRegistry} />
+                    <PlaygroundView
+                      registry={registry}
+                      onRegistryChange={applyRegistryChange}
+                    />
                   ) : view === "rules" ? (
                     <RulesView />
                   ) : view === "hooks" ? (
                     <HooksView refreshKey={activityKey} />
                   ) : view === "teams" ? (
-                    <TeamsView registry={registry} onRegistryChange={setRegistry} />
-                  ) : view === "settings" ? (
-                    <SettingsView registry={registry} onRegistryChange={setRegistry} />
-                  ) : selectedClient ? (
-                    <ClientDetail
-                      client={selectedClient}
+                    <TeamsView
                       registry={registry}
-                      onChanged={load}
-                      onRegistryChange={setRegistry}
+                      onRegistryChange={applyRegistryChange}
+                    />
+                  ) : view === "settings" ? (
+                    <SettingsView
+                      registry={registry}
+                      onRegistryChange={applyRegistryChange}
                     />
                   ) : loading && registry === null ? (
                     <div className="flex flex-col gap-2">
@@ -1027,29 +1116,32 @@ function App() {
                     </div>
                   ) : (
                     <div className="flex flex-col gap-5">
-                      <StatusBar
-                        total={servers.length}
+                      <ServerPosture
+                        backendReachable={backendReachable}
+                        probing={probing}
+                        enabled={enabledCount}
+                        checked={checkedCount}
                         connected={connectedCount}
                         attention={attentionCount}
                         disabled={servers.length - enabledCount}
                       />
-                      <ServerGroup
-                        title="Needs attention"
-                        dot="bg-warning"
-                        count={grouped.attention.length}
-                      >
+                      {backendReachable && attentionCount > 0 && (
+                        <ServerNextAction
+                          authServers={authAttention}
+                          errorServers={errorAttention}
+                        />
+                      )}
+                      <ServerGroup title="To finish" count={grouped.attention.length}>
                         {grouped.attention.map(serverRow)}
                       </ServerGroup>
-                      <ServerGroup
-                        title="Active"
-                        dot="bg-success"
-                        count={grouped.active.length}
-                      >
+                      <ServerGroup title="Checking" count={grouped.checking.length}>
+                        {grouped.checking.map(serverRow)}
+                      </ServerGroup>
+                      <ServerGroup title="Ready" count={grouped.active.length}>
                         {grouped.active.map(serverRow)}
                       </ServerGroup>
                       <ServerGroup
                         title="Disabled"
-                        dot="bg-muted-foreground/40"
                         count={grouped.disabled.length}
                         defaultCollapsed
                       >
@@ -1079,7 +1171,7 @@ function App() {
             initialStep={onboardingStep}
             clients={clients}
             registry={registry}
-            onRegistryChange={setRegistry}
+            onRegistryChange={applyRegistryChange}
             onClientsRefresh={load}
             onBrowseCatalog={() => {
               setShowOnboarding(false);
@@ -1091,10 +1183,22 @@ function App() {
               setShowOnboarding(false);
               selectView("playground");
             }}
+            onOpenRules={() => {
+              // Mark onboarding done, not merely hidden: someone who finished the rules
+              // path IS set up, and re-showing the wizard on next launch because they
+              // never added a server would be the same MCP assumption again (SBS-826).
+              finishOnboarding();
+              selectView("rules");
+            }}
             onFinish={finishOnboarding}
           />
         </Suspense>
       )}
+      <GitHubStarPrompt
+        justOnboarded={justOnboarded}
+        enabledCount={enabledCount}
+        onVisibleChange={setStarSurface}
+      />
       <PendingApprovals />
       {/* Quarantine has no global signal otherwise: the first sign used to be an agent
           call failing, with the only fix buried in Settings (SOU-293). */}
@@ -1157,7 +1261,7 @@ function App() {
           autoOpen
           onClose={() => setAddServerOpen(false)}
           onSaved={(reg) => {
-            setRegistry(reg);
+            applyRegistryChange(reg);
             // A successful save closes the dialog internally without going through
             // onOpenChange, so `onClose` never fires and this stays mounted-but-open.
             // Without clearing it here the next Ctrl+N is a silent no-op. Same pattern
@@ -1187,53 +1291,171 @@ function App() {
           </dl>
         </DialogContent>
       </Dialog>
-      <Toaster theme={resolvedTheme} position="bottom-right" />
+      <Toaster
+        theme={resolvedTheme}
+        position="bottom-right"
+        offset={
+          starSurface === "chip"
+            ? { bottom: "3.5rem" }
+            : starSurface
+              ? { bottom: "10rem" }
+              : undefined
+        }
+      />
     </TooltipProvider>
   );
 }
 
-/** At-a-glance server health as a row of chips: the primary status summary, promoted out
- * of the grey header caption into a scannable status bar with the same semantic dots the
- * groups use. */
-function StatusBar({
-  total,
+/** A factual reachability baseline. Security posture remains in Settings; this only
+ * summarizes the health probe and never presents a stale or partial check as healthy. */
+export function serverPostureCopy({
+  backendReachable,
+  probing,
+  enabled,
+  checked,
   connected,
   attention,
   disabled,
 }: {
-  total: number;
+  backendReachable: boolean;
+  probing: boolean;
+  enabled: number;
+  checked: number;
   connected: number;
   attention: number;
   disabled: number;
 }) {
-  const chip =
-    "inline-flex items-center gap-2 rounded-full border border-border/60 bg-card/50 px-3 py-1.5 text-xs font-semibold";
-  const dot = "size-1.5 rounded-full";
+  const complete = enabled > 0 && checked === enabled && !probing;
+  const healthy = backendReachable && complete && attention === 0;
+  const title = !backendReachable
+    ? "Reachability status unavailable"
+    : enabled === 0
+      ? "No servers enabled"
+      : probing
+        ? "Checking server reachability"
+        : checked < enabled
+          ? "Reachability check incomplete"
+          : attention === 0
+            ? `${connected} enabled server${connected === 1 ? "" : "s"} reachable`
+            : `${connected} of ${enabled} enabled servers reachable`;
+  const detail = !backendReachable
+    ? checked > 0
+      ? attention > 0
+        ? `Last known: ${connected} reachable; ${attention} need${attention === 1 ? "s" : ""} a quick check. Status may be out of date.`
+        : `Last known: ${connected} reachable. Status may be out of date.`
+      : "The last health check did not complete."
+    : enabled === 0
+      ? `${disabled} server${disabled === 1 ? "" : "s"} disabled in this profile.`
+      : probing
+        ? `${checked} of ${enabled} checked so far.`
+        : checked < enabled
+          ? `${checked} of ${enabled} checked. Refresh to try again.`
+          : attention > 0
+            ? `${attention} need${attention === 1 ? "s" : ""} a quick check.`
+            : disabled > 0
+              ? `${disabled} disabled in this profile.`
+              : "Everything enabled in this profile is ready.";
+  return { healthy, title, detail };
+}
+
+function ServerPosture({
+  backendReachable,
+  probing,
+  enabled,
+  checked,
+  connected,
+  attention,
+  disabled,
+}: {
+  backendReachable: boolean;
+  probing: boolean;
+  enabled: number;
+  checked: number;
+  connected: number;
+  attention: number;
+  disabled: number;
+}) {
+  const { healthy, title, detail } = serverPostureCopy({
+    backendReachable,
+    probing,
+    enabled,
+    checked,
+    connected,
+    attention,
+    disabled,
+  });
+
   return (
-    <div className="flex flex-wrap gap-2">
-      <span className={chip}>
-        <span className="tabular-nums">{total}</span>
-        <span className="font-normal text-muted-foreground">servers</span>
-      </span>
-      <span className={chip}>
-        <span className={`${dot} bg-success`} />
-        <span className="tabular-nums">{connected}</span>
-        <span className="font-normal text-muted-foreground">connected</span>
-      </span>
-      {attention > 0 && (
-        <span className={`${chip} border-warning/40`}>
-          <span className={`${dot} bg-warning`} />
-          <span className="tabular-nums">{attention}</span>
-          <span className="font-normal text-muted-foreground">
-            need{attention === 1 ? "s" : ""} attention
-          </span>
-        </span>
-      )}
-      <span className={chip}>
-        <span className={`${dot} bg-muted-foreground/40`} />
-        <span className="tabular-nums">{disabled}</span>
-        <span className="font-normal text-muted-foreground">disabled</span>
-      </span>
+    <div
+      role="status"
+      className={`flex items-center gap-3 rounded-xl border px-4 py-3 ${
+        healthy ? "border-success/20 bg-success/5" : "border-border/70 bg-card/40"
+      }`}
+    >
+      <div
+        className={`grid size-8 shrink-0 place-items-center rounded-lg ${
+          healthy
+            ? "bg-success/10 text-success"
+            : probing
+              ? "bg-info/10 text-info"
+              : "bg-muted text-muted-foreground"
+        }`}
+      >
+        {healthy ? (
+          <CircleCheck className="size-4" />
+        ) : (
+          <RefreshCw className={`size-4 ${probing ? "animate-spin" : ""}`} />
+        )}
+      </div>
+      <div>
+        <p className="text-sm font-semibold">{title}</p>
+        <p className="text-xs text-muted-foreground">{detail}</p>
+      </div>
+    </div>
+  );
+}
+
+/** One page-level owner for the next useful action. The rows below retain the
+ * controls and evidence, but no longer compete with multiple warning summaries. */
+function ServerNextAction({
+  authServers,
+  errorServers,
+}: {
+  authServers: ServerEntry[];
+  errorServers: ServerEntry[];
+}) {
+  const authCount = authServers.length;
+  const errorCount = errorServers.length;
+  const title =
+    authCount === 1 && errorCount === 0
+      ? `Sign in to ${authServers[0].name}`
+      : authCount > 0 && errorCount === 0
+        ? `Sign in to ${authCount} servers`
+        : errorCount === 1 && authCount === 0
+          ? `${errorServers[0].name} couldn't start`
+          : errorCount > 0 && authCount === 0
+            ? `${errorCount} servers couldn't start`
+            : `${authCount + errorCount} servers need a quick check`;
+  const detail =
+    authCount > 0 && errorCount === 0
+      ? "Use Authenticate below to finish setup. Everything else stays available."
+      : errorCount > 0 && authCount === 0
+        ? "Open the affected rows below for the error and recovery details."
+        : `${authCount} need sign-in; ${errorCount} couldn't start. The other servers stay available.`;
+
+  return (
+    <div className="flex items-start gap-3 rounded-xl border border-warning/25 bg-card/45 px-4 py-3">
+      <div className="grid size-8 shrink-0 place-items-center rounded-lg bg-warning/10 text-warning">
+        {authCount > 0 && errorCount === 0 ? (
+          <KeyRound className="size-4" />
+        ) : (
+          <TriangleAlert className="size-4" />
+        )}
+      </div>
+      <div>
+        <p className="text-sm font-semibold">{title}</p>
+        <p className="text-xs text-muted-foreground">{detail}</p>
+      </div>
     </div>
   );
 }
@@ -1243,13 +1465,11 @@ function StatusBar({
  * group; the Disabled bucket starts collapsed. */
 function ServerGroup({
   title,
-  dot,
   count,
   defaultCollapsed = false,
   children,
 }: {
   title: string;
-  dot: string;
   count: number;
   defaultCollapsed?: boolean;
   children: ReactNode;
@@ -1283,7 +1503,6 @@ function ServerGroup({
           }`}
           aria-hidden="true"
         />
-        <span className={`size-2 rounded-full ${dot}`} aria-hidden="true" />
         <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
           {title}
         </h2>
