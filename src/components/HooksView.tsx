@@ -571,46 +571,46 @@ function PreviewDialog({
               No Claude Code profile was found, so there is nothing to write.
             </p>
           )}
-          {previews?.map((p) => (
-            <div key={p.path} className="grid gap-1">
-              <p className="font-mono text-xs text-muted-foreground">{p.path}</p>
-              {p.error ? (
-                // A profile the backend could not parse has no dry run, and its empty
-                // `after` would otherwise render as a blank block over the caption
-                // "would be created" — telling the user a file that plainly exists does
-                // not. Say what actually happened, and leave the healthy profiles above
-                // and below it alone.
-                <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">
-                  No preview for this profile: {p.error}
-                </p>
-              ) : (
-                <>
-                  <pre className="max-h-64 overflow-auto rounded-md border bg-muted/40 p-3 text-xs">
-                    {p.after.split("\n").map((line, i) => (
-                      // The footer claims everything outside the added block survives
-                      // untouched. Marking Toolport's own lines is what lets the user check
-                      // that claim instead of taking it: whatever is not highlighted is
-                      // their file, unchanged.
-                      <span
-                        key={i}
-                        className={
-                          line.includes(HOOK_MARKER) ? "bg-success/15" : undefined
-                        }
-                      >
-                        {line}
-                        {"\n"}
-                      </span>
-                    ))}
-                  </pre>
-                  {p.before === "" && (
-                    <p className="text-xs text-muted-foreground">
-                      This file does not exist yet and would be created.
-                    </p>
-                  )}
-                </>
-              )}
-            </div>
-          ))}
+          {previews?.map((p) => {
+            const addedHookLines = addedHookLineIndexes(p.before, p.after);
+            return (
+              <div key={p.path} className="grid gap-1">
+                <p className="font-mono text-xs text-muted-foreground">{p.path}</p>
+                {p.error ? (
+                  // A profile the backend could not parse has no dry run, and its empty
+                  // `after` would otherwise render as a blank block over the caption
+                  // "would be created" — telling the user a file that plainly exists does
+                  // not. Say what actually happened, and leave the healthy profiles above
+                  // and below it alone.
+                  <p className="rounded-md bg-warning/10 px-3 py-2 text-xs text-warning">
+                    No preview for this profile: {p.error}
+                  </p>
+                ) : (
+                  <>
+                    <pre className="max-h-64 overflow-auto rounded-md border bg-muted/40 p-3 text-xs">
+                      {p.after.split("\n").map((line, i) => (
+                        // Only mark marker-bearing lines that are new in `after`. A user may
+                        // already have the literal marker in a comment or unrelated string;
+                        // highlighting by substring alone would falsely claim Toolport added it.
+                        <span
+                          key={i}
+                          className={addedHookLines.has(i) ? "bg-success/15" : undefined}
+                        >
+                          {line}
+                          {"\n"}
+                        </span>
+                      ))}
+                    </pre>
+                    {p.before === "" && (
+                      <p className="text-xs text-muted-foreground">
+                        This file does not exist yet and would be created.
+                      </p>
+                    )}
+                  </>
+                )}
+              </div>
+            );
+          })}
         </div>
         <DialogFooter className="text-xs text-muted-foreground sm:justify-start">
           Nothing has been written. Everything outside the highlighted block, including
@@ -619,4 +619,26 @@ function PreviewDialog({
       </DialogContent>
     </Dialog>
   );
+}
+
+/** Marker-bearing lines present before the dry run are user content, not additions. */
+function addedHookLineIndexes(before: string, after: string): Set<number> {
+  const existing = new Map<string, number>();
+  for (const line of before.split("\n")) {
+    if (line.includes(HOOK_MARKER)) {
+      existing.set(line, (existing.get(line) ?? 0) + 1);
+    }
+  }
+
+  const added = new Set<number>();
+  after.split("\n").forEach((line, index) => {
+    if (!line.includes(HOOK_MARKER)) return;
+    const count = existing.get(line) ?? 0;
+    if (count > 0) {
+      existing.set(line, count - 1);
+    } else {
+      added.add(index);
+    }
+  });
+  return added;
 }

@@ -228,21 +228,25 @@ describe("HooksView", () => {
 
   it("marks Toolport's own lines in the preview", async () => {
     // The footer promises everything outside the added block survives. Highlighting the block is
-    // what lets a user check that rather than take it on trust.
+    // what lets a user check that rather than take it on trust. A pre-existing mention of the
+    // marker is user content and must not be presented as part of that block.
     api.hooksPreview.mockResolvedValue([
       {
         path: "/home/a/.claude/settings.json",
-        before: "{\n  // keep me\n}\n",
-        after: '{\n  // keep me\n  "command": "gw --toolport-hook PostToolUse"\n}\n',
+        before: "{\n  // existing --toolport-hook note\n}\n",
+        after:
+          '{\n  // existing --toolport-hook note\n  "command": "gw --toolport-hook PostToolUse"\n}\n',
       },
     ]);
     render(<HooksView />);
 
     await userEvent.click(await screen.findByRole("button", { name: /preview/i }));
 
-    const marked = await screen.findByText(/--toolport-hook/);
+    const marked = await screen.findByText('"command": "gw --toolport-hook PostToolUse"');
     expect(marked.className).toMatch(/bg-success/);
-    expect(screen.getByText(/keep me/).className).not.toMatch(/bg-success/);
+    expect(screen.getByText("// existing --toolport-hook note").className).not.toMatch(
+      /bg-success/,
+    );
   });
 
   it("says why a profile has no preview instead of blanking it", async () => {
