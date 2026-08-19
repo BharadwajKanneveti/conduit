@@ -1071,23 +1071,20 @@ static STDIO_CLIENT_READY: AtomicBool = AtomicBool::new(false);
 /// otherwise never learn to re-fetch.
 static STDIO_DEFERRED_LIST_CHANGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-/// Whether an `initialize` request has been read off stdio.
+/// Whether any reply has actually reached stdout yet.
 ///
-/// Tracked separately from [`STDIO_INITIALIZE_ANSWERED`] so a client that never
-/// sends `initialize` at all is not muted waiting for a reply it will never ask
-/// for: with nothing seen there is nothing to order against.
-static STDIO_INITIALIZE_SEEN: AtomicBool = AtomicBool::new(false);
-
-/// Whether the response to that `initialize` has actually reached stdout.
+/// The gateway's first frame must be an answer to something the client asked,
+/// whatever that something was. `initialize` is the usual case but not the only
+/// one: `server/discover` is a documented probe, and a client that treats the
+/// first frame it reads as that probe's result fails exactly the way SBS-1019
+/// failed `initialize`.
 ///
-/// `initialize` carries an id, so the stdio loop hands it to a worker thread,
-/// while a no-id `notifications/initialized` is processed inline on the reader
-/// thread. A client that pipelines the two without waiting therefore lets the
-/// reader mark the peer ready while the worker still has the `initialize` result
-/// in hand - and a notification released then would overtake the very reply it
-/// was waiting for. Ordering against the write, not against the request, is what
-/// makes "after the handshake" mean what it says.
-static STDIO_INITIALIZE_ANSWERED: AtomicBool = AtomicBool::new(false);
+/// Ordering against the write rather than against the request is what makes
+/// "after the handshake" mean what it says. Requests carry an id, so the stdio
+/// loop hands them to a worker thread, while a no-id notification is processed
+/// inline on the reader thread - so a client that pipelines its opening frames
+/// can mark the peer ready while the worker still holds the reply.
+static STDIO_RESPONDED: AtomicBool = AtomicBool::new(false);
 
 /// Where progress for the request being served should be delivered, or `None`
 /// when there is no channel to deliver it on.
@@ -9148,13 +9145,11 @@ const STDIO_HANDSHAKE_WAIT: Duration = Duration::from_secs(10);
 
 /// Whether the gateway may put its own traffic on stdio right now.
 ///
-/// Two conditions, not one. The peer must have handshaked, and any `initialize`
-/// it sent must already have been answered on the wire - see
-/// [`STDIO_INITIALIZE_ANSWERED`] for why the second is not implied by the first.
+/// Two conditions, not one. The peer must have spoken past `initialize`, and it
+/// must already have been answered at least once - see [`STDIO_RESPONDED`] for
+/// why the second is not implied by the first.
 fn stdio_may_speak() -> bool {
-    STDIO_CLIENT_READY.load(Ordering::SeqCst)
-        && (!STDIO_INITIALIZE_SEEN.load(Ordering::SeqCst)
-            || STDIO_INITIALIZE_ANSWERED.load(Ordering::SeqCst))
+    STDIO_CLIENT_READY.load(Ordering::SeqCst) && STDIO_RESPONDED.load(Ordering::SeqCst)
 }
 
 /// Block until the raw-stdio peer has handshaked, up to `timeout`. Returns
@@ -12501,9 +12496,6 @@ fn process_request(
     // behind us: the required `notifications/initialized`, or a first real request
     // from a client that skipped it. Either way the server may speak now (SBS-1019).
     // An empty method is a client->server response, which carries no such signal.
-    if !state.http && method == "initialize" {
-        STDIO_INITIALIZE_SEEN.store(true, Ordering::SeqCst);
-    }
     if !state.http && !method.is_empty() && method != "initialize" {
         mark_stdio_client_ready(&state.stdout);
     }
@@ -12785,7 +12777,6 @@ fn handle_stdio_request(
     cancel_registry: downstream::CancelRegistry,
     stdout_broken: Arc<AtomicBool>,
 ) {
-    let is_initialize = req.get("method").and_then(Value::as_str) == Some("initialize");
     let cancel_context = cancel_registry.context(request_key.clone());
     // A panic in a handler must not kill the gateway: catch it, log it, and
     // return a JSON-RPC internal error for this request unless the client
@@ -12818,13 +12809,14 @@ fn handle_stdio_request(
     cancel_registry.finish_client_request(&request_key);
 
     if let Some(resp) = response {
-        let wrote = write_stdio_response(&state.stdout, &resp, &stdout_broken);
-        // The handshake reply is on the wire now, so anything the catalog
-        // withheld may follow it. This is the second of the two conditions in
-        // `stdio_may_speak`; the peer's own post-handshake message is the other,
-        // and either one may land last.
-        if wrote && is_initialize {
-            STDIO_INITIALIZE_ANSWERED.store(true, Ordering::SeqCst);
+        // The peer has an answer on the wire now, so anything the catalog
+        // withheld may follow it. Every id-bearing request counts, not just
+        // `initialize`: whatever the client opened with, its own reply has to be
+        // the first thing it reads. This is the second of the two conditions in
+        // `stdio_may_speak`; the peer's post-handshake message is the other, and
+        // either one may land last.
+        if write_stdio_response(&state.stdout, &resp, &stdout_broken) {
+            STDIO_RESPONDED.store(true, Ordering::SeqCst);
             drain_stdio_deferred(&state.stdout);
         }
     }
@@ -26119,23 +26111,36 @@ mod tests {
     /// flipped by a failing test would change what an unrelated one observes.
     struct StdioHandshakeGuard;
 
-    impl Drop for StdioHandshakeGuard {
-        fn drop(&mut self) {
+    /// Every method these tests emit starts with this, so cleanup can find its
+    /// own leftovers without touching anything a concurrent test queued.
+    const TEST_METHOD_PREFIX: &str = "notifications/toolport-test-";
+
+    impl StdioHandshakeGuard {
+        fn clear() {
             STDIO_CLIENT_READY.store(false, Ordering::SeqCst);
             MODERN_STDIO_UPSTREAM.store(false, Ordering::SeqCst);
-            STDIO_INITIALIZE_SEEN.store(false, Ordering::SeqCst);
-            STDIO_INITIALIZE_ANSWERED.store(false, Ordering::SeqCst);
+            STDIO_RESPONDED.store(false, Ordering::SeqCst);
+            // Drop this test's own queued methods. Deliberately not a whole
+            // `mem::take`: the queue is shared with reconcile tests running on
+            // other threads, and taking it would swallow entries they queued.
+            STDIO_DEFERRED_LIST_CHANGED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|method| !method.starts_with(TEST_METHOD_PREFIX));
+        }
+    }
+
+    impl Drop for StdioHandshakeGuard {
+        fn drop(&mut self) {
+            Self::clear();
         }
     }
 
     /// Clear the statics now and hand back the guard that clears them again on
-    /// scope exit.
+    /// scope exit, so a panicking test leaves nothing behind either.
     fn reset_stdio_handshake() -> StdioHandshakeGuard {
         let guard = StdioHandshakeGuard;
-        STDIO_CLIENT_READY.store(false, Ordering::SeqCst);
-        MODERN_STDIO_UPSTREAM.store(false, Ordering::SeqCst);
-        STDIO_INITIALIZE_SEEN.store(false, Ordering::SeqCst);
-        STDIO_INITIALIZE_ANSWERED.store(false, Ordering::SeqCst);
+        StdioHandshakeGuard::clear();
         guard
     }
 
@@ -26190,10 +26195,20 @@ mod tests {
             "held back, and held back once: a second replay tells the client nothing"
         );
 
-        // Handshake completes. The held notification is released, not dropped -
-        // the catalog really did change while the client could not be told.
+        // The peer speaks again, but nothing has been answered yet, so the
+        // gateway still has no business putting a frame on the wire.
         mark_stdio_client_ready(&stdout);
         assert!(STDIO_CLIENT_READY.load(Ordering::SeqCst));
+        assert_eq!(
+            deferred_count(method),
+            1,
+            "still held: the client has not read a reply from us yet"
+        );
+
+        // Its reply lands. The held notification is released, not dropped - the
+        // catalog really did change while the client could not be told.
+        STDIO_RESPONDED.store(true, Ordering::SeqCst);
+        drain_stdio_deferred(&stdout);
         assert_eq!(
             deferred_count(method),
             0,
@@ -26210,15 +26225,17 @@ mod tests {
         assert_eq!(deferred_count(method), 0);
     }
 
-    /// The peer sent `initialize` and, without waiting for the reply, whatever
-    /// comes next. `initialize` carries an id so it runs on a worker thread while
-    /// the no-id follow-up is handled inline on the reader thread, so "the client
-    /// has spoken again" can be true while the handshake reply is still in hand.
+    /// The peer opened with an id-bearing request - `initialize`, or the
+    /// `server/discover` probe, or anything else - and the reply is still with
+    /// the worker thread. Requests carry an id so they run on a worker, while a
+    /// no-id notification is handled inline on the reader thread, so "the client
+    /// has spoken again" can be true while its reply has not been written.
     ///
-    /// Failure mode: the replay overtakes the `initialize` result, which is the
-    /// same out-of-order stdout write this change exists to prevent.
+    /// Failure mode: the replay overtakes the answer, so a client that reads the
+    /// first frame as its own result fails the same way SBS-1019 failed
+    /// `initialize`.
     #[test]
-    fn stdio_replay_waits_for_the_initialize_response() {
+    fn stdio_replay_waits_for_the_first_reply() {
         let _serial = STDIO_HANDSHAKE_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -26226,8 +26243,7 @@ mod tests {
         let stdout = Arc::new(Mutex::new(std::io::stdout()));
         let method = "notifications/toolport-test-initorder/list_changed";
 
-        // `initialize` has been read, but the worker has not written its reply.
-        STDIO_INITIALIZE_SEEN.store(true, Ordering::SeqCst);
+        // The opening request has been read, but no reply has been written.
         notify_list_changed(&stdout, None, method);
         assert_eq!(deferred_count(method), 1);
 
@@ -26237,15 +26253,15 @@ mod tests {
         assert_eq!(
             deferred_count(method),
             1,
-            "still withheld: the handshake reply has not been written yet"
+            "still withheld: the peer has not been answered yet"
         );
         // And a notification arriving in this window must not slip out either.
         let during = "notifications/toolport-test-initorder/during";
         notify_list_changed(&stdout, None, during);
         assert_eq!(deferred_count(during), 1);
 
-        // The worker writes the `initialize` result; now the queue may go.
-        STDIO_INITIALIZE_ANSWERED.store(true, Ordering::SeqCst);
+        // The worker writes the reply; now the queue may go.
+        STDIO_RESPONDED.store(true, Ordering::SeqCst);
         drain_stdio_deferred(&stdout);
         assert_eq!(deferred_count(method), 0);
         assert_eq!(deferred_count(during), 0);
@@ -26274,6 +26290,7 @@ mod tests {
         // Its first post-`initialize` message declares the modern version, which
         // `process_request` records before it marks the peer ready.
         MODERN_STDIO_UPSTREAM.store(true, Ordering::SeqCst);
+        STDIO_RESPONDED.store(true, Ordering::SeqCst);
         mark_stdio_client_ready(&stdout);
         assert_eq!(
             deferred_count(method),
