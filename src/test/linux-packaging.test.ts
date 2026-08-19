@@ -161,6 +161,10 @@ describe("the AUR package ships to Arch", () => {
   const aur = workflow("aur.yml");
   const publish = aur.jobs?.publish;
   const steps = publish?.steps ?? [];
+  // By name, not by matching a URL substring in the script body: a substring
+  // test against a URL is exactly the shape CodeQL flags, and the step name is
+  // the stabler handle anyway.
+  const byName = (name: string) => steps.find((s) => s.name === name);
 
   it("waits for the release to be published, like winget does", () => {
     // Draft assets 404, so checksums computed against them would be wrong.
@@ -175,14 +179,27 @@ describe("the AUR package ships to Arch", () => {
   });
 
   it("build-tests the package before pushing", () => {
-    const build = steps.find((s) => s.run?.includes("archlinux:base-devel"));
+    const build = byName("Build and validate the package in an Arch container");
     expect(build, "no Arch container build step").toBeDefined();
     expect(build!.run).toContain("makepkg");
     expect(build!.run).toContain("usr/bin/toolport");
   });
 
+  it("cannot let the build container alter what gets published", () => {
+    // `archlinux:base-devel` is a moving tag. The control is not pinning it, it
+    // is that the container gets the PKGBUILD read-only and its .SRCINFO lands
+    // in a scratch mount that is only diffed, never published.
+    const build = byName("Build and validate the package in an Arch container");
+    expect(build!.run).toContain('-v "$PWD/aur:/pkg:ro"');
+    expect(build!.run).toContain("--printsrcinfo > /out/.SRCINFO");
+    expect(build!.run).toMatch(/diff -u .*srcinfo-out\/\.SRCINFO/);
+    // A mismatch must fail the release, not be quietly adopted.
+    expect(build!.run).toContain("exit 1");
+    expect(build!.env?.AUR_SSH_PRIVATE_KEY).toBeUndefined();
+  });
+
   it("gates the AUR push on the secret and keeps the key step-scoped", () => {
-    const push = steps.find((s) => s.run?.includes("aur.archlinux.org"));
+    const push = byName("Publish to the AUR");
     expect(push, "no AUR push step").toBeDefined();
     expect(push!.if).toContain("env.AUR_KEY_CONFIGURED == 'true'");
     expect(publish?.env?.AUR_KEY_CONFIGURED).toBe(

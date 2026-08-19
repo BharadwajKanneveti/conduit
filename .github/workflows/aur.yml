@@ -84,16 +84,28 @@ jobs:
       # expects. `--nodeps` skips installing webkit2gtk et al: those are runtime
       # dependencies this container never has to satisfy to prove packaging works.
       #
-      # makepkg's own `--printsrcinfo` is authoritative, so the rendered .SRCINFO
-      # is replaced by it here; the copy the script writes by hand is the local
-      # fallback for machines without makepkg.
+      # The container REPORTS, it does not produce. `aur/` is mounted read-only
+      # and the files pushed to the AUR are the ones scripts/render-aur.sh wrote
+      # on the runner; the container's `makepkg --printsrcinfo` goes to a separate
+      # scratch mount and is only DIFFED against them. So `archlinux:base-devel`
+      # being a moving tag can fail this job but cannot put a byte into what is
+      # published, which is a stronger property than pinning the tag by digest -
+      # a pinned digest still writes to whatever it is given. (Pin one here as
+      # well if you want a frozen toolchain, but verify the digest yourself; do
+      # not paste one you have not checked.) The step holds no secrets: the AUR
+      # push key is scoped to the step below.
       - name: Build and validate the package in an Arch container
         run: |
-          docker run --rm -v "$PWD/aur:/pkg" -w /pkg archlinux:base-devel bash -euc '
+          mkdir -p srcinfo-out
+          docker run --rm \
+            -v "$PWD/aur:/pkg:ro" -v "$PWD/srcinfo-out:/out" \
+            -w /build archlinux:base-devel bash -euc '
             pacman -Sy --noconfirm --needed namcap > /dev/null
-            useradd -m builder && chown -R builder /pkg
+            useradd -m builder
+            cp /pkg/PKGBUILD /build/
+            chown -R builder /build /out
             sudo -u builder makepkg --nodeps --noconfirm --nocheck
-            sudo -u builder makepkg --printsrcinfo > .SRCINFO
+            sudo -u builder makepkg --printsrcinfo > /out/.SRCINFO
             namcap PKGBUILD || true
             pkg=$(ls -1 *.pkg.tar.*)
             echo "built $pkg"
@@ -103,7 +115,15 @@ jobs:
             done
             grep -q "^usr/share/applications/" contents.txt || { echo "::error::no .desktop file in $pkg"; exit 1; }
           '
-          echo "--- .SRCINFO ---"
+          # Line order in .SRCINFO carries no meaning, so compare sorted: this is
+          # asking "does the renderer say the same thing makepkg would", not
+          # "did it emit the bytes in the same sequence".
+          norm() { sed '/^[[:space:]]*$/d' "$1" | sort; }
+          if ! diff -u <(norm aur/.SRCINFO) <(norm srcinfo-out/.SRCINFO); then
+            echo "::error::scripts/render-aur.sh disagrees with makepkg --printsrcinfo (left: rendered, right: makepkg). Fix the renderer."
+            exit 1
+          fi
+          echo "--- .SRCINFO (matches makepkg --printsrcinfo) ---"
           cat aur/.SRCINFO
 
       - name: Publish to the AUR

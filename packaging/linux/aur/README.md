@@ -66,10 +66,16 @@ scripts/render-aur.sh 1.15.0 ./aur
 ```
 
 `.github/workflows/aur.yml` runs exactly that on `release: released`, builds the
-package in an `archlinux:base-devel` container to prove the PKGBUILD works,
-replaces the rendered `.SRCINFO` with `makepkg --printsrcinfo` output, and pushes
-to the AUR. Package metadata (description, `depends`, `optdepends`) lives in
-`scripts/render-aur.sh`; edit it there.
+package in an `archlinux:base-devel` container to prove the PKGBUILD works, and
+pushes to the AUR. Package metadata (description, `depends`, `optdepends`) lives
+in `scripts/render-aur.sh`; edit it there.
+
+The container gets `aur/` **read-only** and writes its `makepkg --printsrcinfo`
+output to a scratch mount, which the runner then diffs against the rendered
+`.SRCINFO`. So the container proves the renderer agrees with makepkg without
+being able to put a byte into what is published, and a moving
+`archlinux:base-devel` tag can only fail the job. If that diff fails, the fix is
+in `scripts/render-aur.sh`, not in the workflow.
 
 ## One-time setup before the first publish
 
