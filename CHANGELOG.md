@@ -79,6 +79,7 @@ Entries before the rename below shipped under the project's former name, Conduit
   keeping its compatible `~/.codeium/windsurf` paths. A separate Devin Local / CLI
   client manages the shared user MCP config and global `AGENTS.md` used by the new
   default local agent and the terminal CLI.
+
 - **Agent rules: write your instructions once, apply them everywhere.** A new Agent
   rules tab holds one or more named rule sets and writes the active one into every
   AI client's own global rules location (`AGENTS.md`, `GEMINI.md`, `.goosehints`,

@@ -1,11 +1,12 @@
 # Toolport roadmap
 
 Toolport is a local MCP gateway for AI coding tools (Claude Desktop, Cursor,
-VS Code, Devin Desktop, Devin CLI, Codex CLI). Every server you connect dumps its whole tool list
-into the agent's context on every request; Toolport routes them through one gateway
-that exposes 4 meta-tools the agent searches on demand, so context stays flat:
-measured ~90% fewer tokens at the same task success. This document is the working
-spec, capturing the architecture decision and the build order.
+VS Code, Devin Desktop, Devin CLI, Codex CLI). Every server you connect dumps
+its whole tool list into the agent's context on every request; Toolport routes
+them through one gateway that exposes 4 meta-tools the agent searches on demand,
+so context stays flat: measured ~90% fewer tokens at the same task success. This
+document is the working spec, capturing the architecture decision and the build
+order.
 
 > **Read this as history, not as current state.** The status notes below are dated
 > snapshots and stop at v1.6.2 (2026-07-09), so their client counts and `CONDUIT_*`
