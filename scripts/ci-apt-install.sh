@@ -29,9 +29,19 @@ fi
 attempts=3
 per_attempt_secs=120
 # Downloads are bulkier than an index refresh, so they get their own budget:
-# a healthy WebKitGTK fetch is well under two minutes. Worst case the two loops
-# together are 3x120s + 3x300s plus the retry sleeps, so roughly 21 minutes -
-# still a backstop well inside the job's 45, which is the point.
+# a healthy WebKitGTK fetch is well under two minutes.
+#
+# Worst case, counted honestly: `timeout --kill-after` can spend budget+30s per
+# call, the download loop refreshes the index before each retry, and only the
+# gaps between attempts sleep. That is 3x150s + 2x5s = 460s of update, then
+# 3x330s + 2x150s + 2x5s = 1300s of download: about 29 minutes.
+#
+# That is a backstop, not a plan - it needs every attempt to burn its full bound
+# and still come good. But it is not comfortably inside every caller either: the
+# WebKitGTK job allows 45 minutes, while the four-package jobs in ci.yml and
+# docker-publish.yml allow 30. Those jobs pull a handful of small debs, so they
+# reach the bounds only if the mirror is dead, in which case they were losing the
+# job anyway. Re-check this arithmetic before raising either budget.
 download_attempt_secs=300
 # SIGTERM is the polite ask. An apt wedged on a dead socket can sit through it,
 # which would put the unbounded wait straight back; follow up with SIGKILL.
@@ -49,8 +59,12 @@ for attempt in $(seq 1 "$attempts"); do
     updated=1
     break
   fi
-  echo "apt-get update attempt ${attempt}/${attempts} failed or hung; retrying" >&2
-  sleep 5
+  # Only sleep between attempts. After the last one the caller is about to see
+  # the failure, and five more seconds of dead air buys nothing.
+  if [ "$attempt" -lt "$attempts" ]; then
+    echo "apt-get update attempt ${attempt}/${attempts} failed or hung; retrying" >&2
+    sleep 5
+  fi
 done
 
 if [ -z "$updated" ]; then
@@ -75,8 +89,10 @@ for attempt in $(seq 1 "$attempts"); do
     downloaded=1
     break
   fi
-  echo "apt-get download attempt ${attempt}/${attempts} failed or hung; retrying" >&2
-  sleep 5
+  if [ "$attempt" -lt "$attempts" ]; then
+    echo "apt-get download attempt ${attempt}/${attempts} failed or hung; retrying" >&2
+    sleep 5
+  fi
 done
 
 if [ -z "$downloaded" ]; then
