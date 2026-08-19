@@ -121,6 +121,15 @@ describe("AppImage GDK_BACKEND is a default, not an override", () => {
     // The original runtime is reused rather than a downloaded appimagetool's.
     expect(patchScript).toContain("--appimage-offset");
   });
+
+  it("refuses to repack an image whose xattrs it cannot carry over", () => {
+    // --appimage-extract does not restore xattrs, and the file-count check
+    // cannot see a dropped capability bit, so the source is checked instead.
+    expect(patchScript).toMatch(/xattrs are \(present\|stored\)/);
+    expect(patchScript).toContain("cannot restore");
+    // And no -no-xattrs, which would throw away anything that did survive.
+    expect(patchScript).not.toContain("-no-xattrs");
+  });
 });
 
 describe("release.yml runs the AppImage patch and re-signs", () => {
@@ -223,9 +232,57 @@ describe("the AUR package ships to Arch", () => {
     expect(ignored).toContain("/packaging/linux/aur/.SRCINFO");
   });
 
-  it("points Arch users at the AUR from the install script", () => {
-    const installer = read("scripts", "install.sh");
+  it("serialises pushes so two releases cannot race a non-fast-forward", () => {
+    const raw = read(".github", "workflows", "aur.yml");
+    expect(raw).toContain("group: aur-publish");
+    expect(raw).toContain("cancel-in-progress: false");
+  });
+
+  it("does a full sync before installing into the rolling Arch image", () => {
+    // `pacman -Sy` is a partial upgrade: it can pull a namcap whose deps are
+    // newer than the image, or leave archlinux-keyring too old to verify.
+    const build = byName("Build and validate the package in an Arch container");
+    expect(build!.run).toContain("pacman -Syu");
+    expect(build!.run).not.toMatch(/pacman -Sy\s/);
+  });
+
+  it("normalises a dispatch tag typed without the leading v", () => {
+    const norm = byName("Normalise the tag");
+    expect(norm, "no tag normalisation step").toBeDefined();
+    expect(norm!.run).toContain("v${TAG#v}");
+  });
+});
+
+describe("install.sh routes Arch users without hanging or eating itself", () => {
+  const installer = read("scripts", "install.sh");
+
+  it("detects pacman and names the AUR package", () => {
     expect(installer).toContain("command -v pacman");
     expect(installer).toContain("toolport-bin");
+  });
+
+  it("gives each helper flags that actually skip its review prompt", () => {
+    // pacman's --noconfirm does NOT cover an AUR helper's own PKGBUILD review.
+    expect(installer).toContain("--skipreview");
+    expect(installer).toContain("--answerdiff None");
+    expect(installer).toContain("--answerclean None");
+  });
+
+  it("never lets a helper read the piped installer from stdin", () => {
+    // Documented entry point is `curl ... | bash`, so stdin IS this script. A
+    // helper that prompts would swallow the rest of it.
+    expect(installer).toMatch(/"\$helper" "\$\{helper_args\[@\]\}" <\/dev\/null/);
+  });
+
+  it("tries every installed helper before giving up on the AUR", () => {
+    // A `break` after the first failure would skip a helper that would work.
+    const arch = installer.slice(installer.indexOf("for helper in"));
+    const loop = arch.slice(0, arch.indexOf("\n    done"));
+    expect(loop).toContain("could not install toolport-bin");
+    expect(loop).not.toMatch(/^\s*break\s*$/m);
+  });
+
+  it("tries Omarchy's wrapper, which the docs tell those users to run", () => {
+    expect(installer).toContain("omarchy) helper_args=(pkg aur add toolport-bin)");
   });
 });

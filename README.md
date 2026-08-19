@@ -470,8 +470,16 @@ The frontend is typechecked with `npx tsc --noEmit`.
   `WebKitGPUProcess` and cannot initialise EGL against a current Mesa, so on a
   rolling release the GTK shell starts while `WebKitWebProcess` aborts every
   launch and you get a grey window. None of `WEBKIT_DISABLE_DMABUF_RENDERER`,
-  `WEBKIT_DISABLE_COMPOSITING_MODE` or `WEBKIT_FORCE_SANDBOX=0` avoids it. (This
-  is a packaging/GPU-stack issue, not a Toolport bug.)
+  `WEBKIT_DISABLE_COMPOSITING_MODE` or `WEBKIT_FORCE_SANDBOX=0` avoids that one.
+  (This is a packaging/GPU-stack issue, not a Toolport bug.)
+
+  **If the AppImage is all you have** (a distro with no `.deb` and no AUR), the
+  older workarounds are still worth a try, because a virtualized GPU can fail EGL
+  for reasons that have nothing to do with the bundled WebKit: run
+  `EGL_PLATFORM=surfaceless ./Toolport_*.AppImage`, and in a VM turn on 3D
+  acceleration. They will not fix the rolling-Mesa case above, so if the window
+  opens grey rather than not at all, they are not your problem.
+
 - **Linux: the first launch killed Xwayland, and now nothing happens at all.**
   Fixed in 1.15.0. Older AppImages forced `GDK_BACKEND=x11` in a way nothing could
   override, so on a Wayland session with a fragile Xwayland (a VMware guest on the

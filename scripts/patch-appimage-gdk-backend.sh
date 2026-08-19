@@ -94,6 +94,25 @@ if [ -z "$comp" ] || [ -z "$block" ]; then
 fi
 echo "runtime=${offset}B compression=${comp} block=${block}"
 
+# `--appimage-extract` does not restore extended attributes, so anything the
+# original image stored (file capabilities, SELinux labels) cannot survive an
+# extract/repack no matter what flags mksquashfs is given, and the checks below
+# (file count, hook contents) would not notice the loss. linuxdeploy AppDirs are
+# plain copied files with no xattrs, so this should never fire - but "should" is
+# not a guarantee, so stop if the superblock says otherwise.
+#
+# Best effort by design: the xattr line is echoed either way, so if squashfs-tools
+# ever renames it the log shows the real string and this match can be tightened.
+# A missed match leaves us exactly where we would be without the check.
+xattr_line=$(printf '%s\n' "$superblock" | grep -i 'xattr' || true)
+[ -n "$xattr_line" ] && echo "superblock xattrs: $xattr_line"
+if printf '%s\n' "$xattr_line" | grep -qiE 'xattrs are (present|stored)'; then
+  echo "error: this AppImage stores xattrs, which --appimage-extract cannot restore." >&2
+  echo "Repacking would silently drop them. Handle that before releasing; do not" >&2
+  echo "just delete this check." >&2
+  exit 1
+fi
+
 head -c "$offset" "$appimage" >"$work/runtime"
 runtime_size=$(stat -c %s "$work/runtime")
 if [ "$runtime_size" != "$offset" ]; then
@@ -136,8 +155,12 @@ if grep -qE '^export GDK_BACKEND=x11([[:space:]]|$)' "$hook"; then
   exit 1
 fi
 
+# The xattr-stripping flag is deliberately absent. The guard above established
+# the source has no xattrs, so there is nothing to strip, and leaving the flag
+# off means any that DID survive extraction get carried into the repack rather
+# than thrown away.
 mksquashfs "$appdir" "$work/image.squashfs" \
-  -root-owned -noappend -no-progress -no-xattrs -mkfs-time 0 \
+  -root-owned -noappend -no-progress -mkfs-time 0 \
   -comp "$comp" -b "$block" >/dev/null
 
 cat "$work/runtime" "$work/image.squashfs" >"$work/patched.AppImage"

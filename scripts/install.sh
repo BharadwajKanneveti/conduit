@@ -219,20 +219,38 @@ install_linux() {
   # rolling release. `toolport-bin` in the AUR repackages the same .deb payload
   # against the host WebKitGTK.
   #
-  # The helper call is allowed to FAIL rather than abort the install: AUR account
-  # registration is paused upstream, so toolport-bin may not be published yet, and
-  # a 404 there must not leave the user with nothing. Same for a helper that
-  # cannot build. Either way we fall through to the AppImage with a warning.
+  # Every helper call is allowed to FAIL rather than abort the install: AUR
+  # account registration is paused upstream, so toolport-bin may not be published
+  # yet, and a 404 there must not leave the user with nothing. Same for a helper
+  # that cannot build. Try each helper that is present, then fall through to the
+  # AppImage with a warning.
+  #
+  # Two things this has to get right, because the documented entry point is
+  # `curl ... | bash`:
+  #
+  #   - pacman's `--noconfirm` does NOT cover an AUR helper's own PKGBUILD review
+  #     prompt. paru needs `--skipreview`; yay needs its answer flags. Without
+  #     them the helper waits on a TTY that does not exist.
+  #   - stdin is the INSTALLER ITSELF when piped. A prompt that reads stdin would
+  #     eat the rest of this script, so every helper runs with </dev/null. That is
+  #     the belt to the flags' braces: a helper we do not know about still cannot
+  #     consume the script, it just fails and we move on.
   if command -v pacman >/dev/null 2>&1; then
-    for helper in paru yay pikaur trizen; do
+    for helper in paru yay pikaur trizen omarchy; do
       command -v "$helper" >/dev/null 2>&1 || continue
+      case "$helper" in
+        paru) helper_args=(-S --needed --noconfirm --skipreview toolport-bin) ;;
+        yay) helper_args=(-S --needed --noconfirm --answerdiff None --answerclean None --answeredit None toolport-bin) ;;
+        # Omarchy's wrapper around the AUR; it drives a helper underneath.
+        omarchy) helper_args=(pkg aur add toolport-bin) ;;
+        *) helper_args=(-S --needed --noconfirm toolport-bin) ;;
+      esac
       say "Arch detected: trying toolport-bin from the AUR with $helper"
-      if "$helper" -S --needed --noconfirm toolport-bin; then
+      if "$helper" "${helper_args[@]}" </dev/null; then
         say "Installed. Launch Toolport from your app menu, or run: toolport"
         return
       fi
       say "$helper could not install toolport-bin (it may not be on the AUR yet)."
-      break
     done
     say "The native Arch package is the reliable one. Once it is on the AUR:"
     say "    paru -S toolport-bin      # or: yay -S toolport-bin"

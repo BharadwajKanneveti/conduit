@@ -63,20 +63,37 @@ optdepends=(
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
+# `curl --retry` does not retry a 404, and a 404 is exactly what the release
+# asset CDN serves for a short window right after a release is published - which
+# is the moment aur.yml runs. Retry it explicitly, then give up with an error
+# that names WHICH download failed: the .deb and the LICENSE fail for completely
+# different reasons, and "the release must be published first" sends the operator
+# to republish a release that is already fine when it was the LICENSE path that
+# moved.
 fetch_sha() {
-  local target=$1 dest=$2
-  if ! curl -fsSL --retry 3 -o "$dest" "$target"; then
-    echo "error: could not download $target" >&2
-    echo "The release must be PUBLISHED first; draft assets 404." >&2
-    exit 1
-  fi
-  sha256sum "$dest" | awk '{ print $1 }'
+  local what=$1 target=$2 dest=$3 hint=$4
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    if curl -fsSL --retry 2 -o "$dest" "$target"; then
+      sha256sum "$dest" | awk '{ print $1 }'
+      return 0
+    fi
+    if [ "$attempt" -lt 5 ]; then
+      echo "  $what not available yet (attempt $attempt); retrying in ${attempt}0s" >&2
+      sleep "${attempt}0"
+    fi
+  done
+  echo "error: could not download the $what after 5 attempts: $target" >&2
+  echo "$hint" >&2
+  exit 1
 }
 
 echo "fetching $deb_url" >&2
-deb_sha=$(fetch_sha "$deb_url" "$tmp/pkg.deb")
+deb_sha=$(fetch_sha ".deb" "$deb_url" "$tmp/pkg.deb" \
+  "The release must be PUBLISHED first; draft assets 404. Check the asset name in release.yml if the release is published and this still fails.")
 echo "fetching $license_url" >&2
-license_sha=$(fetch_sha "$license_url" "$tmp/LICENSE")
+license_sha=$(fetch_sha "LICENSE" "$license_url" "$tmp/LICENSE" \
+  "This is the LICENSE file at the tag, not a release asset: publishing the release again will not help. Check that the tag exists and that LICENSE is still at the repository root.")
 
 mkdir -p "$outdir"
 

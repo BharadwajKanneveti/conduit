@@ -32,6 +32,14 @@ on:
         type: boolean
         default: false
 
+# Two published releases close together (or a release plus a workflow_dispatch
+# catch-up) would otherwise clone, commit and `git push` the same AUR repo at the
+# same time, and the loser gets a non-fast-forward rejection. Queue instead of
+# cancelling: the second push has real work to do.
+concurrency:
+  group: aur-publish
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -53,6 +61,18 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           persist-credentials: false
+
+      # `inputs.tag` is whatever a human typed in the dispatch box. The hint says
+      # `v1.15.0`, but `1.15.0` gets typed, and then `gh release view 1.15.0`
+      # fails on a release that exists. Normalise once, here, so every step below
+      # sees the same tag. (render-aur.sh already strips its own leading v.)
+      - name: Normalise the tag
+        run: |
+          normalised="v${TAG#v}"
+          if [ "$normalised" != "$TAG" ]; then
+            echo "tag '$TAG' normalised to '$normalised'"
+          fi
+          echo "TAG=$normalised" >> "$GITHUB_ENV"
 
       # The release trigger cannot fire for a draft or a prerelease; a manual run
       # can name any tag, so it gets the same check explicitly.
@@ -100,7 +120,10 @@ jobs:
           docker run --rm \
             -v "$PWD/aur:/pkg:ro" -v "$PWD/srcinfo-out:/out" \
             -w /build archlinux:base-devel bash -euc '
-            pacman -Sy --noconfirm --needed namcap > /dev/null
+            # -Syu, not -Sy: a partial sync on a rolling image can pull a namcap whose
+            # deps are newer than the image, or leave archlinux-keyring too old to
+            # verify current signatures. Either way makepkg dies before the push.
+            pacman -Syu --noconfirm --needed archlinux-keyring namcap > /dev/null
             useradd -m builder
             cp /pkg/PKGBUILD /build/
             chown -R builder /build /out
