@@ -540,6 +540,151 @@ fn claude_code_config_paths_from(
     out
 }
 
+/// The `settings.json` a Claude Code process reads, given its config dir. This is the
+/// file that carries `hooks`, which `.claude.json` does not.
+fn claude_settings_path(config_dir: &Path) -> PathBuf {
+    config_dir.join("settings.json")
+}
+
+/// Every Claude Code profile's `settings.json` on this machine.
+///
+/// Same discovery, and the same reason, as [`claude_code_config_paths`]: a machine
+/// routinely has `~/.claude` beside `~/.claude-work`, chosen per shell by
+/// `CLAUDE_CONFIG_DIR`. A hook sensor installed into only the profile Toolport
+/// resolved today is blind to every session run under any other one, and would
+/// under-report silently rather than visibly (SBS-822).
+///
+/// Two deliberate differences from the config list:
+///
+///   * The default lives at `~/.claude/settings.json`, a file inside the profile
+///     directory, not `~/.claude.json` at the home root.
+///   * Paths are kept when the file does not exist yet, because a profile that has
+///     never had settings written still needs the sensor; the caller creates it.
+///     What IS required is that the profile directory exists, so a stale
+///     `CLAUDE_CONFIG_DIR` cannot make Toolport conjure a profile that Claude Code
+///     has never used.
+pub(crate) fn claude_settings_paths() -> Vec<PathBuf> {
+    let Some(home) = home() else {
+        return Vec::new();
+    };
+    let dirs = match claude_profile_dirs(&home) {
+        Ok(dirs) => dirs,
+        Err(error) => {
+            let msg = format!(
+                "toolport: could not scan {} for Claude Code profiles: {error}",
+                home.display()
+            );
+            eprintln!("{msg}");
+            crate::gatewaylog::append(&msg);
+            Vec::new()
+        }
+    };
+    claude_settings_paths_from(&home, claude_config_dir_override().as_deref(), &dirs)
+        .into_iter()
+        .filter(|p| p.parent().map(Path::is_dir).unwrap_or(false))
+        .collect()
+}
+
+/// The env- and filesystem-free half of [`claude_settings_paths`], so ordering and
+/// de-duplication are testable without a home directory full of fixtures.
+fn claude_settings_paths_from(
+    home: &Path,
+    override_dir: Option<&Path>,
+    home_dirs: &[String],
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let push = |path: PathBuf, out: &mut Vec<PathBuf>| {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    };
+    if let Some(dir) = override_dir {
+        push(claude_settings_path(dir), &mut out);
+    }
+    push(claude_settings_path(&home.join(".claude")), &mut out);
+    let mut siblings: Vec<&String> = home_dirs
+        .iter()
+        .filter(|name| *name == ".claude" || name.starts_with(".claude-"))
+        .collect();
+    // read_dir order is unspecified; sort so the log and any diagnostics are stable.
+    siblings.sort();
+    for name in siblings {
+        push(claude_settings_path(&home.join(name)), &mut out);
+    }
+    out
+}
+
+/// Read one agent settings file as a value, plus its original text.
+///
+/// A missing file is an empty object: the caller is about to create it. Any other
+/// read failure, and any syntax error, is an `Err` so a caller cannot silently
+/// replace a file it could not understand (the failure mode behind SBS-873 and
+/// friends). The original text is returned so the write can go back through the
+/// JSONC CST and keep the user's comments.
+pub(crate) fn read_settings_json(
+    path: &Path,
+) -> Result<(serde_json::Value, Option<String>), String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let value = parse_json_value(&text)?;
+            Ok((value, Some(text)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok((serde_json::Value::Object(serde_json::Map::new()), None))
+        }
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Write an agent settings file after backing up whatever was there.
+///
+/// Rewrites only the `hooks` key through the JSONC CST ([`atomic_write_json_config`]),
+/// so comments, trailing commas, and the formatting of every other setting survive.
+/// A duplicate top-level `hooks` key is a hard refusal that leaves the file untouched.
+pub(crate) fn write_settings_json(
+    path: &Path,
+    original: Option<&str>,
+    root: &serde_json::Value,
+) -> Result<(), String> {
+    if original.is_some() {
+        backup_file_named("claude-code", path, &claude_settings_backup_name(path))?;
+    }
+    atomic_write(path, &render_settings_json(original, root)?)
+}
+
+/// The exact bytes [`write_settings_json`] would put on disk.
+///
+/// Split out so a dry run can show the real result. Pretty-printing the value instead
+/// would report that every comment in the file is about to vanish, which is the
+/// opposite of what the CST write does (SBS-822 review).
+pub(crate) fn render_settings_json(
+    original: Option<&str>,
+    root: &serde_json::Value,
+) -> Result<String, String> {
+    match (original, root.get("hooks")) {
+        // The key is gone, which is what uninstall produces. `render_json_config`
+        // only rewrites a key it can still find, so this case would fall through to a
+        // pretty-print of the whole file and strip every comment in it. Delete the key
+        // through the CST instead.
+        (Some(src), None) if !src.trim().is_empty() => remove_json_key_preserving(src, "hooks"),
+        _ => render_json_config(original, root, "hooks"),
+    }
+}
+
+/// Give each profile's `settings.json` its own backup identity, so one profile's
+/// backups can never overwrite or prune another's.
+///
+/// Hashes the FULL path, exactly like [`secondary_claude_backup_name`] and for the same
+/// reason: the parent directory's leaf name is not unique. `~/.claude` and a
+/// `CLAUDE_CONFIG_DIR` of `D:\work\.claude` share the leaf `.claude`, so a leaf-based
+/// identity makes both profiles share one backup series and `prune_backups` then deletes
+/// one profile's only recovery copies to stay inside `CONFIG_BACKUP_GENERATIONS`
+/// (SBS-822 review).
+fn claude_settings_backup_name(path: &Path) -> String {
+    let digest = crate::registry::sha256_hex(&path.to_string_lossy());
+    format!("claude-settings-{}.json", &digest[..16])
+}
+
 fn client_config_path(client_id: &str) -> Option<PathBuf> {
     client_config_path_with_home(client_id, home())
 }
@@ -3376,6 +3521,36 @@ fn rewrite_json_key_preserving(
     Ok(root.to_string())
 }
 
+/// Delete a single top-level property from `original` JSON/JSONC text, preserving
+/// comments, trailing commas, and the formatting of everything else.
+///
+/// The counterpart to [`rewrite_json_key_preserving`], and needed for the same reason:
+/// that function can only set or append, so a caller removing a managed key would
+/// otherwise fall through to a pretty-print that silently strips the user's comments
+/// from the whole file. Uninstalling a feature must not cost someone their annotations.
+///
+/// Removing a key that is not there is success, not an error: the outcome is what the
+/// caller asked for.
+fn remove_json_key_preserving(original: &str, key: &str) -> Result<String, String> {
+    use jsonc_parser::cst::CstRootNode;
+    use jsonc_parser::ParseOptions;
+
+    let root = CstRootNode::parse(original, &ParseOptions::default()).map_err(|e| e.to_string())?;
+    let Some(obj) = root.object_value() else {
+        return Err("JSONC root is not an object".into());
+    };
+    let n = count_top_level_key(&obj, key);
+    if n > 1 {
+        return Err(format!(
+            "malformed config: top-level key '{key}' appears {n} times; refusing to write"
+        ));
+    }
+    if let Some(prop) = obj.get(key) {
+        prop.remove();
+    }
+    Ok(root.to_string())
+}
+
 /// Serialize `root` for disk. When `original` is present, surgically rewrite
 /// only `changed_key` via a JSONC CST so comments outside that key survive.
 /// Falls back to `serde_json::to_string_pretty` for new/empty files or when the
@@ -3389,6 +3564,16 @@ fn atomic_write_json_config(
     root: &serde_json::Value,
     changed_key: &str,
 ) -> Result<(), String> {
+    atomic_write(path, &render_json_config(original, root, changed_key)?)
+}
+
+/// The rendering half of [`atomic_write_json_config`], so a dry run can show the exact
+/// bytes without writing them.
+fn render_json_config(
+    original: Option<&str>,
+    root: &serde_json::Value,
+    changed_key: &str,
+) -> Result<String, String> {
     let pretty = || serde_json::to_string_pretty(root).map_err(|e| e.to_string());
 
     let out = match (original, root.get(changed_key)) {
@@ -3406,7 +3591,7 @@ fn atomic_write_json_config(
         }
         _ => pretty()?,
     };
-    atomic_write(path, &out)
+    Ok(out)
 }
 
 /// Convert a `toml::Value` into a `toml_edit::Item` so we can splice a rewritten
@@ -4906,7 +5091,36 @@ pub(crate) fn resolve_gateway_path() -> Option<PathBuf> {
     if let Some(p) = crate::gateway_publish::client_gateway_path() {
         return Some(p);
     }
+    resolve_gateway_sidecar()
+}
 
+/// [`resolve_gateway_path`] with every side effect removed: no publish of the bundled
+/// gateway, no AppImage stable copy, and no optimistic "here is where it would be"
+/// fallback. Returns a path only when that exact file exists right now.
+///
+/// For callers that must not write, which is narrower than it sounds: publishing copies
+/// a versioned binary into the data dir and writes a manifest, and the AppImage path
+/// copies a binary, so a read-only view or a dry run that used the normal resolver
+/// would create files as a side effect of rendering (SBS-822 review).
+pub(crate) fn resolve_gateway_path_readonly() -> Option<PathBuf> {
+    if let Some(p) = crate::gateway_publish::published_gateway_path() {
+        return Some(p);
+    }
+    // An AppImage's in-mount binary is the wrong answer: it dies with the mount. Only
+    // an existing stable copy counts, and making one is a write.
+    if std::env::var_os("APPIMAGE").is_some() {
+        let dest_dir = crate::registry::conduit_dir()?.join("bin");
+        let ext = std::env::consts::EXE_SUFFIX;
+        return ["toolport-gateway", "conduit-gateway"]
+            .into_iter()
+            .map(|name| dest_dir.join(format!("{name}{ext}")))
+            .find(|p| p.is_file());
+    }
+    resolve_gateway_sidecar().filter(|p| p.is_file())
+}
+
+/// The gateway that ships beside the app binary, for when nothing has been published.
+fn resolve_gateway_sidecar() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?;
     let ext = std::env::consts::EXE_SUFFIX;
@@ -6173,6 +6387,76 @@ mod tests {
                 "{impostor} is not a Claude Code profile and must not be written"
             );
         }
+    }
+
+    #[test]
+    fn every_claude_profile_gets_a_settings_path_for_the_hook_sensor() {
+        // Same discovery as the config list, and the same reason: a sensor installed
+        // into only the resolved profile is blind to every session run under another
+        // one, and under-reports silently (SBS-822).
+        let home = PathBuf::from(if cfg!(windows) {
+            r"C:\Users\someone"
+        } else {
+            "/home/someone"
+        });
+        let dirs = [
+            ".claude-work".to_string(),
+            ".claude".to_string(),
+            ".claude.bak".to_string(),
+            ".claudesync".to_string(),
+        ];
+        let paths = claude_settings_paths_from(&home, Some(&home.join(".claude-work")), &dirs);
+        assert_eq!(
+            paths,
+            vec![
+                home.join(".claude-work").join("settings.json"),
+                // Unlike `.claude.json`, the default settings file lives INSIDE the
+                // profile directory, not at the home root.
+                home.join(".claude").join("settings.json"),
+            ],
+            "expected the override first, then the default, de-duplicated"
+        );
+        for impostor in [".claude.bak", ".claudesync"] {
+            assert!(
+                !paths.iter().any(|p| p.starts_with(home.join(impostor))),
+                "{impostor} is not a Claude Code profile and must not be written"
+            );
+        }
+    }
+
+    #[test]
+    fn a_settings_path_is_never_listed_twice() {
+        let home = PathBuf::from(if cfg!(windows) {
+            r"C:\Users\someone"
+        } else {
+            "/home/someone"
+        });
+        // The override commonly IS the default profile; writing it twice would take
+        // two backups of one file and rewrite it needlessly.
+        let paths =
+            claude_settings_paths_from(&home, Some(&home.join(".claude")), &[".claude".to_string()]);
+        assert_eq!(paths, vec![home.join(".claude").join("settings.json")]);
+    }
+
+    #[test]
+    fn each_claude_profile_backs_its_settings_up_under_its_own_name() {
+        // A work profile's backups must never overwrite or prune a personal profile's,
+        // which is why the FULL path is the backup identity.
+        let home = PathBuf::from("/home/someone");
+        let personal = claude_settings_backup_name(&home.join(".claude").join("settings.json"));
+        let work = claude_settings_backup_name(&home.join(".claude-work").join("settings.json"));
+        assert_ne!(personal, work);
+
+        // The case a leaf-name identity got wrong: two profiles whose directories share
+        // a leaf. `prune_backups` keys on this name, so a collision here deletes one
+        // profile's recovery copies (SBS-822 review).
+        let other_volume =
+            claude_settings_backup_name(Path::new("/mnt/work/.claude/settings.json"));
+        assert_ne!(
+            personal, other_volume,
+            "two profiles both ending in `.claude` must not share a backup series"
+        );
+        assert!(personal.ends_with(".json"));
     }
 
     #[test]

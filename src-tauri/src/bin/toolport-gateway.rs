@@ -14847,6 +14847,11 @@ enum ArgAction {
     /// An argument looked like a flag (`-`-prefixed) but isn't one of the
     /// flags this binary knows. Carries the offending argument for the error.
     Unknown(String),
+    /// Invoked as an agent lifecycle hook (`--toolport-hook <event>`). Record the
+    /// event and exit 0. Carries the event argument, which may be empty when the
+    /// flag was written without one - [`conduit_lib::hooks::handle_event`] treats
+    /// that as an unknown event rather than a reason to fail.
+    Hook(String),
     /// Nothing that changes startup mode; fall through to normal gateway
     /// startup.
     Run,
@@ -14866,6 +14871,14 @@ fn parse_args(args: &[String]) -> ArgAction {
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
         return ArgAction::Version;
+    }
+    // Checked before the unknown-flag scan, and never added to KNOWN_FLAGS: falling
+    // through to `Run` would start a whole gateway for what must be a record-and-exit.
+    if let Some(index) = args
+        .iter()
+        .position(|a| a == conduit_lib::hooks::HOOK_MARKER)
+    {
+        return ArgAction::Hook(args.get(index + 1).cloned().unwrap_or_default());
     }
     for arg in args {
         if arg.starts_with('-') && !KNOWN_FLAGS.contains(&arg.as_str()) {
@@ -14888,6 +14901,8 @@ fn usage() -> String {
          \x20   --http [port]         Serve over HTTP instead of stdio (default port 8765)\n\
          \x20   {insecure}   Allow unauthenticated HTTP access on a loopback bind\n\
          \x20   --selftest-secrets    Diagnostic: read every vaulted secret and report\n\
+         \x20   --toolport-hook EVENT Record one agent lifecycle event and exit (installed\n\
+         \x20                         into an agent's settings by Toolport; always exits 0)\n\
          \x20   -h, --help            Print this message and exit\n\
          \x20   -V, --version         Print the version and exit\n\
          \n\
@@ -14920,6 +14935,23 @@ fn main() {
                 usage()
             );
             std::process::exit(1);
+        }
+        ArgAction::Hook(event) => {
+            // Deliberately the first thing main can do: no registry load, no keychain,
+            // no socket, no gateway startup. This path runs once per observed tool
+            // call, so it has to stay a parse-and-append.
+            //
+            // Exit 0 on EVERY path, including a payload that does not parse or is too
+            // large to keep. A hook's exit status is a signal to the harness, and on
+            // some events a non-zero one stops the user's work; a sensor that can do
+            // that is not a sensor. Nothing is written to stdout for the same reason.
+            //
+            // The read is capped: a PostToolUse payload embeds the tool's whole
+            // response, which `handle_event` discards but would otherwise have to
+            // allocate and parse first.
+            let (payload, _truncated) = conduit_lib::hooks::read_payload(std::io::stdin());
+            conduit_lib::hooks::handle_event(&event, &payload);
+            std::process::exit(0);
         }
         ArgAction::Run => {}
     }
@@ -27738,6 +27770,24 @@ mod tests {
         assert_eq!(
             parse_args(&["--insecure".to_string()]),
             ArgAction::Unknown("--insecure".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_args_routes_the_hook_flag_away_from_gateway_startup() {
+        assert_eq!(
+            parse_args(&[
+                conduit_lib::hooks::HOOK_MARKER.to_string(),
+                "tool".to_string()
+            ]),
+            ArgAction::Hook("tool".to_string())
+        );
+        // A flag written without its event argument must still take the hook path,
+        // which exits 0, rather than being rejected as an unknown flag (exit 1) or
+        // falling through and starting a gateway.
+        assert_eq!(
+            parse_args(&[conduit_lib::hooks::HOOK_MARKER.to_string()]),
+            ArgAction::Hook(String::new())
         );
     }
 

@@ -4,7 +4,6 @@
 //! This is the artifact the governance/MSP story is built on: a record of which
 //! AI tool invoked which server's tool, and when. Local and append-only.
 
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
@@ -572,81 +571,30 @@ fn write_line_at(path: &Path, entry: &Value) {
     write_line_at_with_rotation_hook(path, entry, None);
 }
 
+/// Append one audit line, trimming to [`KEEP_LINES`] once the log passes
+/// [`MAX_AUDIT_BYTES`].
+///
+/// The locked append and the rotation live in [`crate::registry::append_line_locked`],
+/// shared with the agent-hook sensor log so both files keep the same cross-process
+/// guarantees by construction rather than by two copies staying in step (#708,
+/// SBS-868, SBS-869).
 fn write_line_at_with_rotation_hook(
     path: &Path,
     entry: &Value,
     after_snapshot: Option<&mut dyn FnMut()>,
 ) {
-    // Atomic replacement protects readers from partial files, but only this
-    // shared cross-process critical section prevents a stale rotation snapshot
-    // from replacing an append that completed in another gateway.
-    let _lock = match crate::registry::lock_at(path) {
-        Ok(lock) => lock,
-        Err(error) => {
-            eprintln!(
-                "toolport: audit record dropped because the lock for '{}' could not be acquired: {error}",
-                path.display()
-            );
-            return;
-        }
-    };
-    // Owner-only from creation, not from the first rotation onward (SBS-868).
-    let open = || crate::registry::open_append_private(&path);
-    // The registry normally created this directory before any call. Avoid a
-    // redundant create-directory syscall on every append, but retain the
-    // standalone/first-writer behavior by creating it and retrying on NotFound.
-    let mut file = match open() {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            if let Some(parent) = path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            match open() {
-                Ok(file) => file,
-                Err(_) => return,
-            }
-        }
-        Err(_) => return,
-    };
-    let line = format!("{entry}\n");
-    if file.write_all(line.as_bytes()).is_err() {
-        return;
+    if let Err(error) = crate::registry::append_line_locked(
+        path,
+        &entry.to_string(),
+        MAX_AUDIT_BYTES,
+        KEEP_LINES,
+        after_snapshot,
+    ) {
+        eprintln!(
+            "toolport: audit record dropped for '{}': {error}",
+            path.display()
+        );
     }
-    // Query size through the handle we already opened instead of reopening the
-    // path for metadata. Drop it before rotation so Windows can atomically
-    // replace the log when the cap is crossed.
-    let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    drop(file);
-    rotate_if_large(path, size, after_snapshot);
-}
-
-/// Trim the audit log to its most recent `KEEP_LINES` lines once it exceeds the
-/// size cap, so it stays bounded over months of use. Best-effort: a failure here
-/// never affects the call being logged.
-fn rotate_if_large(path: &Path, size: u64, after_snapshot: Option<&mut dyn FnMut()>) {
-    if size <= MAX_AUDIT_BYTES {
-        return;
-    }
-    if let Ok(content) = std::fs::read_to_string(path) {
-        if let Some(hook) = after_snapshot {
-            hook();
-        }
-        let trimmed = trimmed_tail(&content, KEEP_LINES);
-        // Atomic + unique temp: every client's gateway shares this file, so a
-        // bespoke fixed temp name could let two rotations collide.
-        let _ = crate::registry::atomic_write(path, &trimmed);
-    }
-}
-
-/// Keep the last `keep` non-empty lines of `content`, newline-terminated.
-fn trimmed_tail(content: &str, keep: usize) -> String {
-    let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-    let start = lines.len().saturating_sub(keep);
-    let mut out = lines[start..].join("\n");
-    if !out.is_empty() {
-        out.push('\n');
-    }
-    out
 }
 
 /// The most recent `limit` entries, newest first.
@@ -1202,16 +1150,6 @@ mod tests {
                 "kind {kind} is not a tool call"
             );
         }
-    }
-
-    #[test]
-    fn trimmed_tail_keeps_last_n_lines() {
-        assert_eq!(trimmed_tail("a\nb\nc\nd\ne\n", 2), "d\ne\n");
-        // Fewer lines than the cap -> unchanged (re-normalized with trailing \n).
-        assert_eq!(trimmed_tail("x\ny\n", 5), "x\ny\n");
-        // Blank lines are dropped.
-        assert_eq!(trimmed_tail("a\n\n\nb\n", 5), "a\nb\n");
-        assert_eq!(trimmed_tail("", 5), "");
     }
 
     #[test]
