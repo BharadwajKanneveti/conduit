@@ -116,14 +116,26 @@ jobs:
           mkdir -p ~/.ssh
           printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
           chmod 600 ~/.ssh/aur
-          # Pinned host key rather than `ssh-keyscan`, which would trust whatever
-          # answers on the day. This is the ed25519 key AUR publishes under "SSH
-          # Fingerprints" at https://aur.archlinux.org/. If AUR rotates it this
-          # step fails closed with "Host key verification failed"; verify the new
-          # fingerprint from that page before changing the line.
-          cat > ~/.ssh/known_hosts <<'KEYS'
-          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV2r/00LnaLenY5Ppq6RXVv8
-          KEYS
+          # Fetch the host key, then REFUSE it unless its SHA256 matches the
+          # fingerprint AUR publishes under "SSH Fingerprints" at
+          # https://aur.archlinux.org/. That is the same guarantee as pasting the
+          # base64 key in here (the fingerprint IS the hash of the key blob) and
+          # it is checkable against the published page, which a wall of base64 is
+          # not. Bare `ssh-keyscan` would be trust-on-first-use against whatever
+          # answers on the day; this fails closed instead.
+          #
+          # If AUR rotates the key this step stops with the mismatch printed.
+          # Re-read the fingerprint from that page before touching the line below.
+          AUR_ED25519_FINGERPRINT='SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4'
+          ssh-keyscan -t ed25519 aur.archlinux.org > ~/.ssh/known_hosts 2>/dev/null
+          got=$(ssh-keygen -lf ~/.ssh/known_hosts | awk '{ print $2 }')
+          if [ "$got" != "$AUR_ED25519_FINGERPRINT" ]; then
+            echo "::error::aur.archlinux.org host key does not match the published fingerprint."
+            echo "  expected $AUR_ED25519_FINGERPRINT"
+            echo "  got      ${got:-<nothing>}"
+            exit 1
+          fi
+          echo "host key verified: $got"
           export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
 
           # AUR serves an empty repo for a package that does not exist yet, so

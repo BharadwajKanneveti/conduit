@@ -25,8 +25,11 @@ Entries before the rename below shipped under the project's former name, Conduit
 
 ### Added
 
-- **Arch Linux package: `toolport-bin` in the AUR** (`paru -S toolport-bin`,
-  or `omarchy pkg aur add toolport-bin`). The AppImage bundles Ubuntu 22.04's
+- **Arch Linux package: `toolport-bin`** (`paru -S toolport-bin`, or
+  `omarchy pkg aur add toolport-bin`, once AUR account registration reopens
+  upstream; until then `scripts/render-aur.sh <version> ./aur && cd aur &&
+makepkg -si` builds the identical package with no AUR account). The AppImage
+  bundles Ubuntu 22.04's
   `libwebkit2gtk-4.1`, which has no `WebKitGPUProcess` and cannot initialise EGL
   against a current Mesa, so on a rolling release the window opens grey and empty
   while `WebKitWebProcess` aborts every launch. No `WEBKIT_*` variable avoids it.

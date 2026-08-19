@@ -217,20 +217,29 @@ install_linux() {
   # Arch and friends: the AppImage bundles Ubuntu 22.04's WebKitGTK, which cannot
   # initialise EGL against a current Mesa, so it opens a grey empty window on a
   # rolling release. `toolport-bin` in the AUR repackages the same .deb payload
-  # against the host WebKitGTK. Use an AUR helper when there is one; otherwise say
-  # what to do and still install the AppImage rather than leaving nothing.
+  # against the host WebKitGTK.
+  #
+  # The helper call is allowed to FAIL rather than abort the install: AUR account
+  # registration is paused upstream, so toolport-bin may not be published yet, and
+  # a 404 there must not leave the user with nothing. Same for a helper that
+  # cannot build. Either way we fall through to the AppImage with a warning.
   if command -v pacman >/dev/null 2>&1; then
     for helper in paru yay pikaur trizen; do
-      if command -v "$helper" >/dev/null 2>&1; then
-        say "Arch detected: installing toolport-bin from the AUR with $helper"
-        "$helper" -S --needed --noconfirm toolport-bin
+      command -v "$helper" >/dev/null 2>&1 || continue
+      say "Arch detected: trying toolport-bin from the AUR with $helper"
+      if "$helper" -S --needed --noconfirm toolport-bin; then
         say "Installed. Launch Toolport from your app menu, or run: toolport"
         return
       fi
+      say "$helper could not install toolport-bin (it may not be on the AUR yet)."
+      break
     done
-    say "Arch detected but no AUR helper found. The AUR package is the reliable one:"
+    say "The native Arch package is the reliable one. Once it is on the AUR:"
     say "    paru -S toolport-bin      # or: yay -S toolport-bin"
     say "    omarchy pkg aur add toolport-bin"
+    say "Until then you can build the same package from source:"
+    say "    git clone https://github.com/tsouth89/toolport && cd toolport"
+    say "    scripts/render-aur.sh ${tag_name#v} ./aur && cd aur && makepkg -si"
     say "Falling back to the AppImage, which can open a grey empty window here."
   fi
 

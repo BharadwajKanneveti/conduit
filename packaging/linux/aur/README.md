@@ -12,6 +12,24 @@ yay -S toolport-bin
 omarchy pkg aur add toolport-bin
 ```
 
+> **Not on the AUR yet.** New AUR account registration is paused upstream while
+> Arch deals with a wave of automated signups (the page returns HTTP 503). Until
+> it reopens there is no account to push `toolport-bin` from, so the workflow
+> below no-ops with a warning and the commands above will not find the package.
+> Nothing to fix here, and do not script retries against the registration page.
+> Arch announces the reopening on `aur-general` and the Arch news feed.
+>
+> Meanwhile the package builds fine from this repo, no AUR account involved:
+>
+> ```bash
+> git clone https://github.com/tsouth89/toolport && cd toolport
+> scripts/render-aur.sh 1.15.0 ./aur     # use the released version
+> cd aur && makepkg -si
+> ```
+>
+> That produces the exact package the AUR would serve, from the same published
+> `.deb` and the same checksums.
+
 ## Why a native package instead of the AppImage
 
 The AppImage bundles Ubuntu 22.04's `libwebkit2gtk-4.1`, because that is what
@@ -59,11 +77,13 @@ The workflow no-ops with a warning until this is done, so it can never fail a
 release.
 
 1. Create an AUR account at <https://aur.archlinux.org/> and add an SSH public
-   key to it.
+   key to it. **Blocked right now**: registration is paused, see the note above.
 2. Put the matching **private** key in the repo secret `AUR_SSH_PRIVATE_KEY`.
-3. Confirm the pinned `aur.archlinux.org` host key in `aur.yml` still matches the
-   "SSH Fingerprints" published on <https://aur.archlinux.org/>. A mismatch fails
-   the push closed rather than trusting a new key.
+3. Confirm the ed25519 fingerprint pinned in `aur.yml`
+   (`SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4`) still matches the "SSH
+   Fingerprints" published on <https://aur.archlinux.org/>. The workflow fetches
+   the host key and refuses it unless the hash matches, so a rotated key fails
+   the push closed instead of being trusted.
 4. Set the `# Maintainer:` line in `scripts/render-aur.sh` to the AUR account's
    name and email if you want the conventional format.
 5. Run the workflow once manually (`workflow_dispatch`) with the release tag and

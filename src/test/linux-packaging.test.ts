@@ -152,6 +152,11 @@ describe("release.yml runs the AppImage patch and re-signs", () => {
   });
 });
 
+// Published at https://aur.archlinux.org/ under "SSH Fingerprints". Duplicated
+// here on purpose: the workflow's copy is what runs, and this is the second
+// witness that catches an edit to it.
+const AUR_ED25519_FINGERPRINT = "SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4";
+
 describe("the AUR package ships to Arch", () => {
   const aur = workflow("aur.yml");
   const publish = aur.jobs?.publish;
@@ -188,9 +193,11 @@ describe("the AUR package ships to Arch", () => {
     for (const s of steps) {
       if (s !== push) expect(s.env?.AUR_SSH_PRIVATE_KEY, s.name).toBeUndefined();
     }
-    // A pinned host key, not a keyscan, which would trust whatever answers.
-    expect(push!.run).not.toMatch(/^\s*ssh-keyscan/m);
-    expect(push!.run).toContain("known_hosts");
+    // The fetched host key is checked against the fingerprint AUR publishes, so
+    // this is not trust-on-first-use. A keyscan with no comparison would be.
+    expect(push!.run).toContain(AUR_ED25519_FINGERPRINT);
+    expect(push!.run).toMatch(/ssh-keygen -lf/);
+    expect(push!.run).toMatch(/if \[ "\$got" != "\$AUR_ED25519_FINGERPRINT" \]/);
   });
 
   it("does not track a generated PKGBUILD, which pins one release's checksum", () => {

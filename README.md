@@ -362,6 +362,17 @@ paru -S toolport-bin        # or: yay -S toolport-bin
 omarchy pkg aur add toolport-bin
 ```
 
+**Arch, right now:** AUR account registration is paused upstream, so
+`toolport-bin` is not published yet and the commands above will not find it.
+Build the identical package from this repo in the meantime, no AUR account
+needed:
+
+```bash
+git clone https://github.com/tsouth89/toolport && cd toolport
+scripts/render-aur.sh 1.15.0 ./aur     # use the released version
+cd aur && makepkg -si
+```
+
 Both the **Windows** and **macOS** installers are code-signed, and macOS is also
 notarized, so it installs cleanly through Gatekeeper. On Windows the installer
 carries a validated publisher name (no "unknown publisher"), but because it uses
@@ -385,7 +396,8 @@ sudo apt purge toolport
 ```
 
 On Arch, `paru -S toolport-bin` upgrades in place and `paru -R toolport-bin`
-removes it.
+removes it. A package built by hand with `makepkg -si` removes the same way:
+`sudo pacman -R toolport-bin`.
 
 If you used the **AppImage**, there's nothing to uninstall, just delete the
 `.AppImage` file. (On Windows use Add or Remove Programs; on macOS drag
@@ -452,9 +464,9 @@ The frontend is typechecked with `npx tsc --noEmit`.
   Code's own MCP handling, not Toolport. After that it reconnects on its own.
 - **Linux: the AppImage shows no window, or a grey empty one (`EGL_BAD_PARAMETER`).**
   Install the native package instead: the **`.deb`** on Debian/Ubuntu, or
-  **`toolport-bin` from the AUR** on Arch/Manjaro/EndeavourOS/Omarchy
-  (`paru -S toolport-bin`). Both link your system's WebKitGTK, and that is the
-  whole fix. The AppImage bundles Ubuntu 22.04's WebKitGTK, which has no
+  **`toolport-bin`** on Arch/Manjaro/EndeavourOS/Omarchy (`paru -S toolport-bin`
+  once it is on the AUR; until then build it from this repo, see Install above).
+  Both link your system's WebKitGTK, and that is the whole fix. The AppImage bundles Ubuntu 22.04's WebKitGTK, which has no
   `WebKitGPUProcess` and cannot initialise EGL against a current Mesa, so on a
   rolling release the GTK shell starts while `WebKitWebProcess` aborts every
   launch and you get a grey window. None of `WEBKIT_DISABLE_DMABUF_RENDERER`,
