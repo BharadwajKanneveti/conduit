@@ -235,7 +235,7 @@ describe("HooksView", () => {
         path: "/home/a/.claude/settings.json",
         before: "{\n  // existing --toolport-hook note\n}\n",
         after:
-          '{\n  // existing --toolport-hook note\n  "command": "gw --toolport-hook PostToolUse"\n}\n',
+          '{\n  // existing --toolport-hook note\n  "hooks": {\n    "PostToolUse": [{\n      "hooks": [{\n        "command": "gw --toolport-hook PostToolUse"\n      }]\n    }]\n  }\n}\n',
       },
     ]);
     render(<HooksView />);
@@ -244,6 +244,8 @@ describe("HooksView", () => {
 
     const marked = await screen.findByText('"command": "gw --toolport-hook PostToolUse"');
     expect(marked.className).toMatch(/bg-success/);
+    expect(screen.getByText('"hooks": {').className).toMatch(/bg-success/);
+    expect(screen.getByText('"PostToolUse": [{').className).toMatch(/bg-success/);
     expect(screen.getByText("// existing --toolport-hook note").className).not.toMatch(
       /bg-success/,
     );

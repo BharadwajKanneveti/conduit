@@ -125,6 +125,23 @@ fn hook_command(binary: &Path, event_arg: &str) -> String {
     format!("\"{}\" {HOOK_MARKER} {event_arg}", binary.display())
 }
 
+/// Refuse paths that a shell can reinterpret inside the quoted command word.
+fn validate_hook_binary(binary: &Path) -> Result<(), String> {
+    let path = binary.to_string_lossy();
+    let unsafe_char = path.chars().any(|c| {
+        c.is_control()
+            || matches!(c, '"' | '`' | '$')
+            || (cfg!(not(windows)) && c == '\\')
+    });
+    if unsafe_char {
+        return Err(format!(
+            "gateway path cannot be represented safely in a hook command: {}",
+            binary.display()
+        ));
+    }
+    Ok(())
+}
+
 /// One matcher group holding one Toolport hook.
 ///
 /// No `matcher` key: an absent matcher observes every tool, which is what a sensor
@@ -191,16 +208,15 @@ pub fn strip_hooks(root: &Value) -> Value {
         let Some(groups) = hooks.get_mut(&event).and_then(Value::as_array_mut) else {
             continue;
         };
-        for group in groups.iter_mut() {
+        groups.retain_mut(|group| {
             if let Some(entries) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                let before = entries.len();
                 entries.retain(|entry| !is_ours(entry));
+                // Drop only a group this pass emptied. A pre-existing empty group belongs
+                // to the user and must survive untouched.
+                return before == entries.len() || !entries.is_empty();
             }
-        }
-        // A group whose hook list we emptied was ours alone; drop it. A group that
-        // never had a `hooks` array is left exactly as found.
-        groups.retain(|group| match group.get("hooks").and_then(Value::as_array) {
-            Some(entries) => !entries.is_empty(),
-            None => true,
+            true
         });
         if groups.is_empty() {
             hooks.remove(&event);
@@ -219,6 +235,7 @@ pub fn strip_hooks(root: &Value) -> Value {
 /// superseded gateway binary, converges on one current entry per event rather than
 /// accumulating them.
 pub fn upsert_hooks(root: &Value, binary: &Path) -> Result<Value, String> {
+    validate_hook_binary(binary)?;
     let mut out = strip_hooks(root);
     let obj = out
         .as_object_mut()
@@ -371,7 +388,7 @@ pub fn handle_event(event_arg: &str, stdin: &str) {
         // A settings.json written by another build naming an event this one does not
         // record. Dropping it is correct; saying so is what makes it debuggable.
         crate::gatewaylog::append(&format!(
-            "toolport: ignoring unknown hook event '{event_arg}'"
+            "toolport: ignoring unknown hook event {event_arg:?}"
         ));
         return;
     }
@@ -873,6 +890,16 @@ mod tests {
     }
 
     #[test]
+    fn strip_preserves_a_foreign_group_that_was_already_empty() {
+        let theirs = json!({
+            "hooks": {
+                "PostToolUse": [{ "matcher": "Bash", "hooks": [] }]
+            }
+        });
+        assert_eq!(strip_hooks(&theirs), theirs);
+    }
+
+    #[test]
     fn is_installed_tracks_upsert_and_strip() {
         let empty = json!({});
         assert!(!is_installed(&empty));
@@ -902,6 +929,16 @@ mod tests {
         assert!(command.starts_with('"'));
         assert!(command.contains("My Toolport"));
         assert!(command.ends_with(&format!("{HOOK_MARKER} tool")));
+    }
+
+    #[test]
+    fn a_shell_metacharacter_in_the_binary_path_is_refused() {
+        let error = upsert_hooks(
+            &json!({}),
+            Path::new("/home/user/Toolport$(touch injected)/toolport-gateway"),
+        )
+        .unwrap_err();
+        assert!(error.contains("cannot be represented safely"));
     }
 
     #[test]
@@ -1174,13 +1211,22 @@ mod tests {
         // can mistake it for an observed call.
         handle_event("tool", "not json at all");
         // An event this build does not record is dropped, not recorded as junk.
-        handle_event("no-such-event", "{}");
+        handle_event("no-such-event\nforged-record", "{}");
 
         let rows = read_recent(10).unwrap();
         assert_eq!(rows.len(), 1, "only the malformed-payload row is kept");
         assert_eq!(rows[0]["malformed"], json!(true));
         assert!(rows[0].get("tool").is_none());
         assert!(rows[0].get("ok").is_none());
+
+        let gateway_log =
+            std::fs::read_to_string(crate::registry::gateway_log_path().unwrap()).unwrap();
+        assert_eq!(
+            gateway_log.lines().count(),
+            2,
+            "an unknown event must not forge another log record: {gateway_log}"
+        );
+        assert!(gateway_log.contains(r#"no-such-event\nforged-record"#));
     }
 
     #[test]

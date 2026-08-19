@@ -27,13 +27,6 @@ const RECENT_ROWS = 12;
 const LIVE_TICK_MS = 3000;
 
 /**
- * The literal argument that marks a line as Toolport's own. The backend writes it into every
- * hook command it adds (`hooks.rs`'s `HOOK_MARKER`), so it is also what tells the preview which
- * lines are the block being added and which are the user's file.
- */
-const HOOK_MARKER = "--toolport-hook";
-
-/**
  * Agent activity: record what your AI agents do OUTSIDE Toolport.
  *
  * Toolport sees every MCP call because it routes them. It sees none of what Claude Code does
@@ -572,7 +565,7 @@ function PreviewDialog({
             </p>
           )}
           {previews?.map((p) => {
-            const addedHookLines = addedHookLineIndexes(p.before, p.after);
+            const changedLines = changedLineIndexes(p.before, p.after);
             return (
               <div key={p.path} className="grid gap-1">
                 <p className="font-mono text-xs text-muted-foreground">{p.path}</p>
@@ -589,12 +582,12 @@ function PreviewDialog({
                   <>
                     <pre className="max-h-64 overflow-auto rounded-md border bg-muted/40 p-3 text-xs">
                       {p.after.split("\n").map((line, i) => (
-                        // Only mark marker-bearing lines that are new in `after`. A user may
-                        // already have the literal marker in a comment or unrelated string;
-                        // highlighting by substring alone would falsely claim Toolport added it.
+                        // The backend rewrites one top-level key, so the changed region is
+                        // contiguous. Mark the whole region rather than only command lines:
+                        // braces and array entries are part of what Toolport would add too.
                         <span
                           key={i}
-                          className={addedHookLines.has(i) ? "bg-success/15" : undefined}
+                          className={changedLines.has(i) ? "bg-success/15" : undefined}
                         >
                           {line}
                           {"\n"}
@@ -621,24 +614,30 @@ function PreviewDialog({
   );
 }
 
-/** Marker-bearing lines present before the dry run are user content, not additions. */
-function addedHookLineIndexes(before: string, after: string): Set<number> {
-  const existing = new Map<string, number>();
-  for (const line of before.split("\n")) {
-    if (line.includes(HOOK_MARKER)) {
-      existing.set(line, (existing.get(line) ?? 0) + 1);
-    }
+/** Lines in the one contiguous region changed by the backend's top-level-key rewrite. */
+function changedLineIndexes(before: string, after: string): Set<number> {
+  const beforeLines = before.split("\n");
+  const afterLines = after.split("\n");
+  let prefix = 0;
+  while (
+    prefix < beforeLines.length &&
+    prefix < afterLines.length &&
+    beforeLines[prefix] === afterLines[prefix]
+  ) {
+    prefix += 1;
   }
 
-  const added = new Set<number>();
-  after.split("\n").forEach((line, index) => {
-    if (!line.includes(HOOK_MARKER)) return;
-    const count = existing.get(line) ?? 0;
-    if (count > 0) {
-      existing.set(line, count - 1);
-    } else {
-      added.add(index);
-    }
-  });
-  return added;
+  let suffix = 0;
+  while (
+    suffix < beforeLines.length - prefix &&
+    suffix < afterLines.length - prefix &&
+    beforeLines[beforeLines.length - 1 - suffix] ===
+      afterLines[afterLines.length - 1 - suffix]
+  ) {
+    suffix += 1;
+  }
+
+  return new Set(
+    Array.from({ length: afterLines.length - prefix - suffix }, (_, i) => prefix + i),
+  );
 }
