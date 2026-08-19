@@ -702,6 +702,10 @@ export interface HookEvent {
   agent?: string;
   tool?: string;
   sessionId?: string;
+  /** The folder the agent was working in. A path, never its contents. */
+  cwd?: string;
+  /** Canonical fingerprint of the tool input. Cannot be turned back into the input. */
+  argsHash?: string;
   /** Absent means UNKNOWN, never success. */
   ok?: boolean;
   malformed?: boolean;

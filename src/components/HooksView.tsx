@@ -1,7 +1,14 @@
-import { useCallback, useEffect, useState } from "react";
-import { AlertTriangle, Check, Clock, Eye, RefreshCw, X } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { AlertTriangle, Check, Clock, Eye, RefreshCw } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Callout } from "@/components/Callout";
+import {
+  Dialog,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { hooksPreview, hooksRecent, hooksSetEnabled, hooksView } from "@/lib/api";
 import type {
   HookEvent,
@@ -12,6 +19,19 @@ import type {
 
 /** How many recent rows to pull just to show that the sensor is producing any. */
 const RECENT_SAMPLE = 200;
+
+/** How many of those rows to actually list. The card is a signal, not the activity log. */
+const RECENT_ROWS = 12;
+
+/** How often the tab re-reads the log while it is open, in milliseconds. */
+const LIVE_TICK_MS = 3000;
+
+/**
+ * The literal argument that marks a line as Toolport's own. The backend writes it into every
+ * hook command it adds (`hooks.rs`'s `HOOK_MARKER`), so it is also what tells the preview which
+ * lines are the block being added and which are the user's file.
+ */
+const HOOK_MARKER = "--toolport-hook";
 
 /**
  * Agent activity: record what your AI agents do OUTSIDE Toolport.
@@ -30,8 +50,12 @@ const RECENT_SAMPLE = 200;
  *     Never the command, never the file, never the output.
  *
  * Needs no MCP server and no gateway, like the Rules tab.
+ *
+ * `refreshKey` is the same counter the header Refresh bumps for Activity. Without it this tab
+ * would keep rendering whatever it read on mount, so a recorder turned off in another window -
+ * or a profile edited by hand - would still be reported here as "Recording".
  */
-export function HooksView() {
+export function HooksView({ refreshKey = 0 }: { refreshKey?: number }) {
   const [data, setData] = useState<HooksViewData | null>(null);
   const [recent, setRecent] = useState<HookEvent[] | null>(null);
   const [loading, setLoading] = useState(true);
@@ -55,6 +79,10 @@ export function HooksView() {
     }
   }, []);
 
+  /**
+   * The first-load path, and the only one allowed to blank the tab. Used by the retry button on
+   * the failed-load screen, where there is nothing on screen to preserve anyway.
+   */
   const load = useCallback(async () => {
     setLoading(true);
     setError(null);
@@ -67,15 +95,35 @@ export function HooksView() {
     }
   }, [refresh]);
 
-  // Mount load, written as a cancellable promise chain rather than an awaited call, to match
-  // `RulesView` and to avoid setting state synchronously inside the effect body. `cancelled`
-  // stops a slow first read from writing into a tab the user has already left.
+  /**
+   * The re-read path once the tab is up. Uses `busy` rather than `loading` so the Refresh button
+   * spins in place: dropping the whole tab back to "Loading…" for a re-read throws away the
+   * profile list the user is looking at, for no gain.
+   */
+  const reload = useCallback(async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(false);
+    }
+  }, [refresh]);
+
+  // Mount load, plus a re-read whenever the parent's refresh counter changes. Written as a
+  // cancellable promise chain rather than an awaited call, to match `RulesView` and to avoid
+  // setting state synchronously inside the effect body. `cancelled` stops a slow read from
+  // writing into a tab the user has already left. It never raises `loading`, so a refresh does
+  // not blank a tab that already has data.
   useEffect(() => {
     let cancelled = false;
     hooksView()
       .then(async (v) => {
         if (cancelled) return;
         setData(v);
+        setError(null);
         try {
           const rows = await hooksRecent(RECENT_SAMPLE);
           if (!cancelled) setRecent(rows);
@@ -92,7 +140,54 @@ export function HooksView() {
     return () => {
       cancelled = true;
     };
+  }, [refreshKey]);
+
+  // The tab tells the user "start a Claude Code session and events will appear here", which is
+  // only true if it looks again. Nothing in the registry changes when an agent runs a tool, so
+  // the parent's refreshKey never bumps for it. Tick while the tab is open, the same way
+  // Activity does. Read through a ref so an in-flight action does not become an effect
+  // dependency and fire an extra read every time `busy` falls.
+  const busyRef = useRef(busy);
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+
+  const [liveTick, setLiveTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => {
+      // Skip while an action is in flight: `act` reseats both pieces of state itself, and a tick
+      // landing mid-write would show the state the backend is still leaving.
+      if (document.visibilityState === "visible" && !busyRef.current) {
+        setLiveTick((t) => t + 1);
+      }
+    }, LIVE_TICK_MS);
+    return () => clearInterval(id);
   }, []);
+
+  // The tick's read is silent on purpose: it touches neither `loading`, `busy` nor `error`. A
+  // background poll that fails is not something the user did, and surfacing it would make a
+  // danger callout blink on and off every few seconds while they read the page.
+  useEffect(() => {
+    if (liveTick === 0) return;
+    let alive = true;
+    hooksRecent(RECENT_SAMPLE)
+      .then((rows) => {
+        if (alive) setRecent(rows);
+      })
+      .catch(() => {
+        /* keep the last known rows; a failed poll is not an empty log */
+      });
+    hooksView()
+      .then((v) => {
+        if (alive) setData(v);
+      })
+      .catch(() => {
+        /* keep the last known view */
+      });
+    return () => {
+      alive = false;
+    };
+  }, [liveTick]);
 
   /** Run a mutating call, then reseat the view on whatever it returns. */
   async function act(run: () => Promise<HooksViewData>) {
@@ -137,18 +232,38 @@ export function HooksView() {
     return <p className="text-sm text-muted-foreground">Loading…</p>;
   }
   if (!data) {
+    // A dead end is worse than the failure: without a way to look again, the only recovery is
+    // leaving the tab and coming back. The Refresh button below lives inside the profiles card,
+    // which this branch never renders.
     return (
-      <Callout variant="danger" role="alert">
-        <strong className="font-medium">Agent activity could not be read.</strong>{" "}
-        {error ?? "Unknown error."}
-      </Callout>
+      <div className="flex flex-col gap-3">
+        <Callout variant="danger" role="alert">
+          <strong className="font-medium">Agent activity could not be read.</strong>{" "}
+          {error ?? "Unknown error."}
+        </Callout>
+        <Button
+          size="sm"
+          variant="outline"
+          className="self-start"
+          disabled={busy}
+          onClick={() => void load()}
+        >
+          <RefreshCw className="size-3.5" />
+          Try again
+        </Button>
+      </div>
     );
   }
 
   const profiles = data.profiles;
-  const installed = profiles.filter((p) => p.installed).length;
-  const broken = profiles.filter((p) => p.error).length;
+  // A profile the backend could not read arrives as `installed: false`, which is the absence of
+  // knowledge and not the absence of a recorder. Counting it as "off" would contradict the
+  // "Could not read" badge on the very same row, so it leaves the fraction entirely.
+  const readable = profiles.filter((p) => !p.error);
+  const installed = readable.filter((p) => p.installed).length;
+  const broken = profiles.length - readable.length;
   const canInstall = Boolean(data.binary);
+  const rows = recent?.slice(0, RECENT_ROWS) ?? [];
 
   return (
     <div className="grid gap-4">
@@ -164,7 +279,10 @@ export function HooksView() {
             type="checkbox"
             className="mt-1"
             checked={data.enabled}
-            disabled={busy || (!data.enabled && !canInstall)}
+            // Locked while the preview is open: the dialog shows the bytes that would be written
+            // NEXT, and letting the toggle write behind it would leave the user reading a
+            // prediction of something that already happened.
+            disabled={busy || preview !== null || (!data.enabled && !canInstall)}
             aria-label="Record what my agents do"
             onChange={(e) => {
               // Read the new value now, before the await: React re-renders this controlled input
@@ -248,10 +366,10 @@ export function HooksView() {
               type="button"
               disabled={busy}
               title="Re-read the profiles on disk"
-              onClick={() => void load()}
+              onClick={() => void reload()}
               className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-foreground disabled:opacity-50"
             >
-              <RefreshCw className="size-3.5" />
+              <RefreshCw className={`size-3.5 ${busy ? "animate-spin" : ""}`} />
               Refresh
             </button>
           </span>
@@ -259,7 +377,17 @@ export function HooksView() {
         <p className="mb-3 text-xs text-muted-foreground">
           {profiles.length === 0
             ? "No Claude Code profile was found on this machine."
-            : `${installed} of ${profiles.length} carry the recorder. A machine can have more than one profile, and each needs it separately.`}
+            : readable.length === 0
+              ? `No profile could be read, so whether ${
+                  profiles.length === 1 ? "it carries" : "they carry"
+                } the recorder is unknown.`
+              : `${installed} of ${readable.length} carry the recorder. A machine can have more than one profile, and each needs it separately.${
+                  broken > 0
+                    ? ` ${broken} more could not be read and ${
+                        broken === 1 ? "is" : "are"
+                      } not counted.`
+                    : ""
+                }`}
         </p>
 
         {profiles.length > 0 && (
@@ -309,9 +437,39 @@ export function HooksView() {
             }${lastToolLabel(recent)}`
           )}
         </p>
+
+        {rows.length > 0 && (
+          // The toggle promises "one line per event: which tool, in which folder, in which
+          // session". A count alone does not show that, and it is also the only way a user can
+          // check the no-content claim for themselves: what is on screen is all that is stored.
+          <ul className="mt-3 grid gap-1 border-t pt-3">
+            {rows.map((r, i) => (
+              <li
+                key={`${r.ts ?? ""}-${r.sessionId ?? ""}-${r.tool ?? r.event ?? ""}-${i}`}
+                className="flex items-center gap-3 text-xs"
+              >
+                <span className="min-w-0 flex-1 truncate font-mono text-foreground">
+                  {r.tool ?? r.event ?? "unknown"}
+                </span>
+                <span
+                  className="min-w-0 flex-1 truncate text-muted-foreground"
+                  title={r.cwd}
+                >
+                  {folderLabel(r.cwd) ?? "—"}
+                </span>
+                <span
+                  className="shrink-0 font-mono text-muted-foreground/70"
+                  title={r.sessionId ? `Session ${r.sessionId}` : "No session recorded"}
+                >
+                  {sessionLabel(r.sessionId) ?? "—"}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
 
-      {preview && <PreviewDialog previews={preview} onClose={() => setPreview(null)} />}
+      <PreviewDialog previews={preview} onClose={() => setPreview(null)} />
     </div>
   );
 }
@@ -320,6 +478,19 @@ export function HooksView() {
 function lastToolLabel(recent: HookEvent[]): string {
   const tool = recent.find((r) => typeof r.tool === "string" && r.tool.length > 0)?.tool;
   return tool ? `, most recently ${tool}.` : ".";
+}
+
+/** Last path segment, so a row reads "toolport" rather than a full home directory. */
+function folderLabel(cwd?: string): string | null {
+  if (!cwd) return null;
+  const parts = cwd.split(/[/\\]+/).filter(Boolean);
+  return parts.length > 0 ? parts[parts.length - 1] : cwd;
+}
+
+/** Enough of a session id to tell two sessions apart without printing a whole UUID. */
+function sessionLabel(id?: string): string | null {
+  if (!id) return null;
+  return id.length > 8 ? id.slice(0, 8) : id;
 }
 
 /**
@@ -374,39 +545,48 @@ function ProfileBadge({
   );
 }
 
-/** The exact bytes that would be written, per profile, before anything is. */
+/**
+ * The exact bytes that would be written, per profile, before anything is.
+ *
+ * Uses the shared Radix dialog rather than a hand-rolled overlay, so Escape closes it, focus is
+ * trapped inside it, and a click outside dismisses it - none of which a bare positioned div
+ * gives you, and all of which a user reading a "nothing has been written yet" screen will try.
+ */
 function PreviewDialog({
   previews,
   onClose,
 }: {
-  previews: HooksPreview[];
+  previews: HooksPreview[] | null;
   onClose: () => void;
 }) {
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-6"
-      role="dialog"
-      aria-modal="true"
-      aria-label="What would be written"
-    >
-      <div className="flex max-h-full w-full max-w-3xl flex-col rounded-xl border bg-card shadow-lg">
-        <div className="flex items-center justify-between gap-3 border-b p-4">
-          <h2 className="text-sm font-medium">What would be written</h2>
-          <Button variant="ghost" size="sm" onClick={onClose} aria-label="Close">
-            <X className="size-4" />
-          </Button>
-        </div>
-        <div className="grid gap-4 overflow-auto p-4">
-          {previews.length === 0 && (
+    <Dialog open={previews !== null} onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>What would be written</DialogTitle>
+        </DialogHeader>
+        <div className="grid gap-4 overflow-auto">
+          {previews?.length === 0 && (
             <p className="text-sm text-muted-foreground">
               No Claude Code profile was found, so there is nothing to write.
             </p>
           )}
-          {previews.map((p) => (
+          {previews?.map((p) => (
             <div key={p.path} className="grid gap-1">
               <p className="font-mono text-xs text-muted-foreground">{p.path}</p>
               <pre className="max-h-64 overflow-auto rounded-md border bg-muted/40 p-3 text-xs">
-                {p.after}
+                {p.after.split("\n").map((line, i) => (
+                  // The footer claims everything outside the added block survives untouched.
+                  // Marking Toolport's own lines is what lets the user check that claim instead
+                  // of taking it: whatever is not highlighted is their file, unchanged.
+                  <span
+                    key={i}
+                    className={line.includes(HOOK_MARKER) ? "bg-success/15" : undefined}
+                  >
+                    {line}
+                    {"\n"}
+                  </span>
+                ))}
               </pre>
               {p.before === "" && (
                 <p className="text-xs text-muted-foreground">
@@ -416,11 +596,11 @@ function PreviewDialog({
             </div>
           ))}
         </div>
-        <div className="border-t p-4 text-xs text-muted-foreground">
+        <DialogFooter className="text-xs text-muted-foreground sm:justify-start">
           Nothing has been written. Everything outside the highlighted block, including
           your comments, is left exactly as it is.
-        </div>
-      </div>
-    </div>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }

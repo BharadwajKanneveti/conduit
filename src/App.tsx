@@ -985,7 +985,7 @@ function App() {
                   ) : view === "rules" ? (
                     <RulesView />
                   ) : view === "hooks" ? (
-                    <HooksView />
+                    <HooksView refreshKey={activityKey} />
                   ) : view === "teams" ? (
                     <TeamsView registry={registry} onRegistryChange={setRegistry} />
                   ) : view === "settings" ? (
