@@ -140,10 +140,24 @@ pub(crate) fn append_line_locked(
     let size = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
     drop(file);
     if size > max_bytes {
-        if let Ok(content) = std::fs::read_to_string(path) {
+        // Read BYTES, not a String. `read_to_string` fails with `InvalidData` on invalid
+        // UTF-8, and an ignored `Err` there disables rotation PERMANENTLY: the file is
+        // never trimmed, every later append grows it, and the cap that is the whole point
+        // of this branch stops existing. One torn write from a killed process, or a hand
+        // edit, is enough to arm that forever (SBS-822 review).
+        //
+        // A lossy conversion cannot fail, so the trim always runs. A mangled line survives
+        // as replacement characters, which readers already skip (they `filter_map` the
+        // JSON parse), and it ages out of the keep window like any other line.
+        //
+        // The `atomic_write` result stays ignored on purpose, and is a different case: a
+        // failed rotation leaves the file oversized, so the NEXT append past the cap tries
+        // again. That self-heals; an unreadable file never would.
+        if let Ok(bytes) = std::fs::read(path) {
             if let Some(hook) = after_snapshot {
                 hook();
             }
+            let content = String::from_utf8_lossy(&bytes);
             // Atomic + unique temp: several processes share this file, so a bespoke
             // fixed temp name could let two rotations collide.
             let _ = atomic_write(path, &trimmed_tail(&content, keep_lines));
@@ -5685,6 +5699,43 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         assert_eq!(content, "{\"a\":1}\n{\"a\":2}\n");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_line_locked_still_trims_a_log_holding_invalid_utf8() {
+        // The permanent-disable case: `read_to_string` would fail here and the ignored
+        // Err would leave the file growing past its cap forever (SBS-822 review).
+        let dir = std::env::temp_dir().join(format!(
+            "toolport-append-utf8-{}-{}",
+            std::process::id(),
+            ATOMIC_WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("log.jsonl");
+
+        // A torn write: a line ending mid-codepoint, exactly what a killed process leaves.
+        let mut seeded: Vec<u8> = b"{\"i\":0}\n{\"i\":1,\"x\":\"".to_vec();
+        seeded.push(0xff);
+        seeded.extend_from_slice(b"\"}\n");
+        std::fs::write(&path, &seeded).unwrap();
+        assert!(
+            std::fs::read_to_string(&path).is_err(),
+            "test premise: this file is not readable as UTF-8"
+        );
+
+        // A 1-byte cap makes this append cross it, so rotation must run.
+        append_line_locked(&path, "{\"i\":2}", 1, 2, None).unwrap();
+
+        let after = std::fs::read(&path).unwrap();
+        assert!(
+            after.len() < seeded.len() + 16,
+            "the log must have been trimmed, not just appended to"
+        );
+        let text = String::from_utf8_lossy(&after);
+        assert_eq!(text.lines().count(), 2, "keep_lines still bounds it: {text}");
+        assert!(text.ends_with("{\"i\":2}\n"), "the new line survives: {text}");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
