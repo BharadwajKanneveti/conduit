@@ -1047,6 +1047,30 @@ static PROGRESS_ROUTES: std::sync::OnceLock<Arc<Mutex<ProgressRoutes>>> =
 /// explicit `subscriptions/listen` filter.
 static MODERN_STDIO_UPSTREAM: AtomicBool = AtomicBool::new(false);
 
+/// Whether the raw-stdio peer has finished the MCP handshake, so the server may
+/// put its own traffic on stdout.
+///
+/// MCP forbids a server sending any request or notification before the client's
+/// `notifications/initialized`, and a client is entitled to enforce that. The
+/// rule matters here because the gateway's startup work is asynchronous: the
+/// background catalog build finishes on its own thread and calls
+/// [`notify_tools_changed`] whenever it is done. A client that spawns the
+/// gateway process first and only sends `initialize` some seconds later (Grok
+/// Code does exactly this - it spawns at session create and handshakes lazily)
+/// therefore reads `notifications/tools/list_changed` as the FIRST frame of the
+/// stream, before it has sent anything at all. Its transport rejects the frame
+/// and the handshake never completes: the server looks like it simply never
+/// answered `initialize` (SBS-1019).
+static STDIO_CLIENT_READY: AtomicBool = AtomicBool::new(false);
+
+/// `list_changed` methods withheld by [`notify_list_changed`], replayed in order
+/// once the handshake completes.
+///
+/// Withheld rather than dropped: the catalog really did change while the client
+/// was still starting up, and a client that cached an empty `tools/list` would
+/// otherwise never learn to re-fetch.
+static STDIO_DEFERRED_LIST_CHANGED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 /// Where progress for the request being served should be delivered, or `None`
 /// when there is no channel to deliver it on.
 ///
@@ -9098,24 +9122,99 @@ fn notify_tools_changed(
     notify_list_changed(stdout, mcp_sessions, "notifications/tools/list_changed");
 }
 
+/// How long a server->client request waits for the stdio handshake to finish
+/// before giving up on it. Generous: the gap between `initialize` and the first
+/// post-handshake message is normally milliseconds, so this only ever expires for
+/// a client that is not going to finish at all.
+const STDIO_HANDSHAKE_WAIT: Duration = Duration::from_secs(10);
+
+/// Block until the raw-stdio peer has handshaked, up to `timeout`. Returns
+/// whether it did.
+fn await_stdio_client_ready(timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if STDIO_CLIENT_READY.load(Ordering::SeqCst) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Put one bare `list_changed` notification on stdout.
+fn write_stdio_list_changed(stdout: &Arc<Mutex<std::io::Stdout>>, method: &str) {
+    let msg = json!({ "jsonrpc": "2.0", "method": method });
+    let mut out = stdout
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let _ = write_json_line(&mut *out, &msg);
+}
+
+/// Record that the raw-stdio peer finished the handshake, and replay whatever
+/// [`notify_list_changed`] withheld while it had not. See [`STDIO_CLIENT_READY`].
+///
+/// Called for `notifications/initialized` and, deliberately, for any other
+/// post-`initialize` stdio request too: `initialized` is required but not every
+/// client sends it, and a client that skips it must not be muted for the life of
+/// the process.
+///
+/// The flag is read and written under the deferral queue's lock so a
+/// `notify_list_changed` racing this cannot queue a notification onto a list that
+/// was just drained, which would strand it until the next catalog change.
+fn mark_stdio_client_ready(stdout: &Arc<Mutex<std::io::Stdout>>) {
+    let deferred = {
+        let mut queue = STDIO_DEFERRED_LIST_CHANGED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if STDIO_CLIENT_READY.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        std::mem::take(&mut *queue)
+    };
+    // Outside the queue lock: writing takes the stdout mutex, and no other path
+    // holds these two at once.
+    for method in deferred {
+        write_stdio_list_changed(stdout, &method);
+    }
+}
+
 /// Emit a bare JSON-RPC `list_changed` notification to the client so it re-fetches
 /// the named list. Used for resources/prompts (which have no persisted cache) and,
-/// via `notify_tools_changed`, for tools. Always writes stdio; when HTTP MCP
-/// sessions are present, also fans the same notification over every live session's
-/// SSE queue (SOU-328) so streamable-HTTP clients see list changes.
+/// via `notify_tools_changed`, for tools. Writes stdio once the peer has
+/// handshaked; when HTTP MCP sessions are present, also fans the same notification
+/// over every live session's SSE queue (SOU-328) so streamable-HTTP clients see
+/// list changes.
+///
+/// Before the handshake the stdio copy is queued rather than written: see
+/// [`STDIO_CLIENT_READY`] for why putting it on the wire early breaks the client
+/// that is still on its way to sending `initialize`. The HTTP fanout is not gated
+/// - an MCP session only exists after that session initialized.
 fn notify_list_changed(
     stdout: &Arc<Mutex<std::io::Stdout>>,
     mcp_sessions: Option<&Arc<Mutex<HashMap<String, Arc<McpSession>>>>>,
     method: &str,
 ) {
-    let msg = json!({ "jsonrpc": "2.0", "method": method });
     if !MODERN_STDIO_UPSTREAM.load(Ordering::SeqCst) {
-        let mut out = stdout
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = write_json_line(&mut *out, &msg);
+        let ready = {
+            let mut queue = STDIO_DEFERRED_LIST_CHANGED
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let ready = STDIO_CLIENT_READY.load(Ordering::SeqCst);
+            // Deduped: replaying "the tool list changed" twice tells the client
+            // nothing the first replay did not.
+            if !ready && !queue.iter().any(|queued| queued == method) {
+                queue.push(method.to_string());
+            }
+            ready
+        };
+        if ready {
+            write_stdio_list_changed(stdout, method);
+        }
     }
     if let Some(sessions) = mcp_sessions {
+        let msg = json!({ "jsonrpc": "2.0", "method": method });
         fanout_mcp_notification(stdout, sessions, &msg);
     }
 }
@@ -12196,7 +12295,15 @@ fn refresh_client_root(state: &GatewayState) {
         .lock()
         .map(|c| c.roots.supported)
         .unwrap_or(false);
-    let new_root = if supported {
+    // `roots/list` is a server->client REQUEST, and this runs from the `initialize`
+    // handler - so without this wait it goes out before the `initialize` RESPONSE
+    // does. That is the same pre-handshake violation as an early notification
+    // (SBS-1019), and it is worse: a client is answering a question it has not yet
+    // agreed to be asked. Waiting costs nothing in practice, because the handshake
+    // completes a few milliseconds later; a client that never finishes it falls
+    // through to the ProcessCwd root it would have used anyway.
+    let handshaked = !supported || await_stdio_client_ready(STDIO_HANDSHAKE_WAIT);
+    let new_root = if supported && handshaked {
         match state.stdio_upstream.call("roots/list", json!({})) {
             Ok(result) => {
                 let roots: Vec<Value> = result
@@ -12333,6 +12440,13 @@ fn process_request(
     let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
     if !state.http && upstream_declared_version(req) == Some(MODERN_PROTOCOL_VERSION) {
         MODERN_STDIO_UPSTREAM.store(true, Ordering::SeqCst);
+    }
+    // Anything on stdio that is not `initialize` itself means the handshake is
+    // behind us: the required `notifications/initialized`, or a first real request
+    // from a client that skipped it. Either way the server may speak now (SBS-1019).
+    // An empty method is a client->server response, which carries no such signal.
+    if !state.http && !method.is_empty() && method != "initialize" {
+        mark_stdio_client_ready(&state.stdout);
     }
     let is_notification = !req.get("id").is_some_and(|id| !id.is_null());
     if is_notification {
@@ -25922,6 +26036,64 @@ mod tests {
     }
 
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn deferred_list_changed() -> Vec<String> {
+        STDIO_DEFERRED_LIST_CHANGED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// SBS-1019. The gateway builds its catalog on a background thread and
+    /// announces the result whenever that finishes. A client is allowed to spawn
+    /// the server process well before it sends `initialize` (Grok Code does), so
+    /// that announcement could be the FIRST frame on the stream - which MCP
+    /// forbids, and which cost 80 of 128 sessions their handshake for most of a
+    /// day: the client rejected the frame and then looked like it had never been
+    /// answered at all.
+    ///
+    /// Failure mode: an unsolicited notification reaches stdout before the peer
+    /// has handshaked, or the notification is withheld and then never delivered.
+    #[test]
+    fn stdio_list_changed_waits_for_the_client_handshake() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let stdout = Arc::new(Mutex::new(std::io::stdout()));
+        STDIO_CLIENT_READY.store(false, Ordering::SeqCst);
+        MODERN_STDIO_UPSTREAM.store(false, Ordering::SeqCst);
+        STDIO_DEFERRED_LIST_CHANGED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        // The background build lands while the client is still starting up. Twice,
+        // because a ${ROOT} rebuild follows the cold build in a real session.
+        notify_list_changed(&stdout, None, "notifications/tools/list_changed");
+        notify_list_changed(&stdout, None, "notifications/tools/list_changed");
+        assert_eq!(
+            deferred_list_changed(),
+            vec!["notifications/tools/list_changed".to_string()],
+            "held back, and held back once: a second replay tells the client nothing"
+        );
+
+        // Handshake completes. The held notification is released, not dropped -
+        // the catalog really did change while the client could not be told.
+        mark_stdio_client_ready(&stdout);
+        assert!(STDIO_CLIENT_READY.load(Ordering::SeqCst));
+        assert!(
+            deferred_list_changed().is_empty(),
+            "the queue is drained on release, not left to replay forever"
+        );
+
+        // From here it goes straight out with nothing queued.
+        notify_list_changed(&stdout, None, "notifications/prompts/list_changed");
+        assert!(deferred_list_changed().is_empty());
+
+        // A second release must not re-drain or re-announce.
+        mark_stdio_client_ready(&stdout);
+        assert!(deferred_list_changed().is_empty());
+
+        STDIO_CLIENT_READY.store(false, Ordering::SeqCst);
+    }
 
     /// The router wrapped the way the gateway holds it, plus a stdout sink.
     fn reconcile_harness() -> (Arc<Mutex<Arc<Router>>>, Arc<Mutex<std::io::Stdout>>) {

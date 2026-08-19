@@ -29,6 +29,34 @@ pub fn append(msg: &str) {
     append_to(&path, msg);
 }
 
+/// How long an append waits for the shared log lock before writing without it.
+///
+/// Deliberately far shorter than the registry's own deadline. This lock exists
+/// only to serialize the *trim*; the append underneath it is a single `O_APPEND`
+/// write that is already safe unserialized. Waiting the registry's five seconds
+/// therefore buys nothing and costs everything: [`append`] is called four times
+/// on the gateway's startup path BEFORE it reads its first line of stdin, so
+/// under contention a client waited up to twenty seconds for its `initialize`
+/// reply and gave up long before that (SBS-1019). Trimming is best effort by
+/// design - see the `Err` arm below - so conceding the lock quickly is the
+/// cheapest thing this function can do.
+const LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// [`LOCK_WAIT`], but never shorter than an explicitly configured store deadline.
+///
+/// `TOOLPORT_LOCK_TIMEOUT_MS` may only RAISE this, never lower it: the tests that
+/// set it are asserting that a contended append genuinely waits its turn, and
+/// they cannot do that against a deadline shorter than the hold they stage. A
+/// caller that wants less contention tolerance than 250ms is asking for torn
+/// diagnostics, so the floor stands.
+fn lock_wait() -> std::time::Duration {
+    crate::brand::env_var("TOOLPORT_LOCK_TIMEOUT_MS", "CONDUIT_LOCK_TIMEOUT_MS")
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(std::time::Duration::from_millis)
+        .map_or(LOCK_WAIT, |configured| configured.max(LOCK_WAIT))
+}
+
 /// Append `msg` to `path` and trim if needed, holding the sibling lock across
 /// both so a concurrent writer cannot land a line that this process's stale
 /// trim snapshot then overwrites (SBS-869). A lock we cannot take degrades to
@@ -40,7 +68,7 @@ pub(crate) fn append_to(path: &Path, msg: &str) {
     // Atomic replacement protects readers from an empty window, but only this
     // shared cross-process critical section prevents a stale trim snapshot
     // from replacing a line another gateway just appended (SBS-869).
-    match crate::registry::lock_at(path) {
+    match crate::registry::lock_at_for(path, lock_wait()) {
         Ok(_lock) => {
             append_line(path, msg);
             trim_log_if_large(path);
