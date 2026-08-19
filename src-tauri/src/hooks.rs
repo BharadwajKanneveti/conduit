@@ -408,12 +408,20 @@ pub fn handle_event(event_arg: &str, stdin: &str) {
 ///
 /// A missing file is an empty log. Any other IO error is returned, so a caller cannot
 /// show "no agent activity" for a log it simply failed to read (SBS-873).
+///
+/// Read as bytes, not `read_to_string`. This is the same log
+/// [`crate::registry::append_line_locked`] just conceded can hold invalid UTF-8 - one
+/// hook process killed mid-write leaves a half-codepoint line - and `read_to_string`
+/// answers `Err(InvalidData)` for the whole file over that one byte. The activity view
+/// would then report "couldn't read your agent activity" for every row until a rotation
+/// happened to trim the bad line out. Lossy decoding costs the torn line, which
+/// `from_str` was going to reject anyway, and keeps every intact row (SBS-822 review).
 pub fn read_recent(limit: usize) -> std::io::Result<Vec<Value>> {
     let Some(path) = log_path() else {
         return Ok(Vec::new());
     };
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c) => c,
+    let content = match std::fs::read(&path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e),
     };
@@ -545,16 +553,23 @@ fn apply_with(set_enabled: Option<bool>) -> Result<Vec<ProfileStatus>, String> {
     apply_to(
         set_enabled,
         &crate::clients::claude_settings_paths(),
-        hook_binary().as_deref(),
+        &hook_binary,
     )
 }
 
 /// [`apply_with`] over an explicit profile set and binary, so tests drive known files
 /// instead of the developer's real `~/.claude`. Same rationale as `rules::apply_to`.
+///
+/// The binary arrives as a resolver, not a path, because resolving it is not free:
+/// `hook_binary` goes through `clients::resolve_gateway_path`, which publishes the
+/// bundled gateway on packaged Windows and copies one into the data directory on
+/// AppImage. Passing an already-resolved `Option<&Path>` meant turning the sensor OFF -
+/// or a startup pass that only had stale targets to clean up - created files for a
+/// feature nobody was installing. Only the enable branch calls it (SBS-822 review).
 fn apply_to(
     set_enabled: Option<bool>,
     profiles: &[PathBuf],
-    binary: Option<&Path>,
+    resolve_binary: &dyn Fn() -> Option<PathBuf>,
 ) -> Result<Vec<ProfileStatus>, String> {
     let (_, statuses) = crate::registry::update_authoritative(|reg| {
         if let Some(enabled) = set_enabled {
@@ -575,11 +590,11 @@ fn apply_to(
         if reg.hooks_enabled {
             // Resolved before any write. Failing here aborts the whole transaction, so
             // an un-installable build leaves the opt-in exactly as it was.
-            let binary = binary.ok_or_else(|| {
+            let binary = resolve_binary().ok_or_else(|| {
                 "no gateway binary is available to run as a hook".to_string()
             })?;
             for path in candidates.iter().map(Path::new) {
-                statuses.push(match install_at(path, binary) {
+                statuses.push(match install_at(path, &binary) {
                     Ok(()) => {
                         written.push(path.display().to_string());
                         ProfileStatus {
@@ -1306,7 +1321,7 @@ mod tests {
         let profile = dir.join("settings.json");
         std::fs::write(&profile, "{ not json").unwrap();
 
-        let statuses = apply_to(Some(true), &[profile.clone()], Some(&binary())).unwrap();
+        let statuses = apply_to(Some(true), &[profile.clone()], &|| Some(binary())).unwrap();
         assert_eq!(statuses.len(), 1);
         assert!(!statuses[0].installed);
         assert!(statuses[0].error.is_some(), "the failure must be reported");
@@ -1326,7 +1341,7 @@ mod tests {
         let dir = env.dir.clone();
         let profile = dir.join("settings.json");
 
-        apply_to(Some(true), &[profile.clone()], Some(&binary())).unwrap();
+        apply_to(Some(true), &[profile.clone()], &|| Some(binary())).unwrap();
         assert_eq!(
             crate::registry::load().unwrap().hook_targets,
             vec![profile.display().to_string()]
@@ -1334,7 +1349,7 @@ mod tests {
 
         // The user (or another tool) breaks the file after we installed into it.
         std::fs::write(&profile, "{ broken").unwrap();
-        apply_to(None, &[profile.clone()], Some(&binary())).unwrap();
+        apply_to(None, &[profile.clone()], &|| Some(binary())).unwrap();
         assert_eq!(
             crate::registry::load().unwrap().hook_targets,
             vec![profile.display().to_string()],
@@ -1395,7 +1410,7 @@ mod tests {
 
         // No resolvable binary is the real-world case this models: every non-Windows
         // build before a gateway is published.
-        let err = apply_to(Some(true), &[profile.clone()], None).unwrap_err();
+        let err = apply_to(Some(true), &[profile.clone()], &|| None).unwrap_err();
         assert!(err.contains("gateway binary"), "unexpected error: {err}");
 
         assert!(
@@ -1416,7 +1431,7 @@ mod tests {
         let profile = dir.join(".claude").join("settings.json");
         std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
 
-        apply_to(Some(true), &[profile.clone()], Some(&binary())).unwrap();
+        apply_to(Some(true), &[profile.clone()], &|| Some(binary())).unwrap();
 
         let reg = crate::registry::load().unwrap();
         assert!(reg.hooks_enabled);
@@ -1429,13 +1444,61 @@ mod tests {
         // Deliberately with NO binary: turning the sensor off must never depend on
         // resolving one, or a user whose gateway went missing could not uninstall the
         // hooks it left in their settings.
-        apply_to(Some(false), &[profile.clone()], None).unwrap();
+        apply_to(Some(false), &[profile.clone()], &|| None).unwrap();
         let reg = crate::registry::load().unwrap();
         assert!(!reg.hooks_enabled);
         assert!(reg.hook_targets.is_empty());
         assert!(!is_installed(
             &crate::clients::read_settings_json(&profile).unwrap().0
         ));
+
+    }
+
+    #[test]
+    fn read_recent_keeps_every_intact_row_around_a_torn_one() {
+        let env = scratch_env("torn");
+        let dir = env.dir.clone();
+        let path = dir.join("hooks.jsonl");
+
+        // A hook killed mid-write leaves a half-codepoint line. `append_line_locked`
+        // already had to concede this file can hold invalid UTF-8; a reader that answers
+        // `Err` for the whole log over that one byte would blank the activity view until
+        // some later rotation happened to trim it out.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(br#"{"event":"tool","tool":"Read"}"#);
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&[0xE2, 0x82]); // a truncated euro sign
+        bytes.push(b'\n');
+        bytes.extend_from_slice(br#"{"event":"tool","tool":"Bash"}"#);
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+
+        let rows = read_recent(10).expect("one torn line must not fail the whole log");
+        let tools: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| r.get("tool").and_then(Value::as_str))
+            .collect();
+        assert_eq!(tools, vec!["Bash", "Read"], "newest first, torn line dropped");
+
+    }
+
+    #[test]
+    fn disabling_never_resolves_a_gateway_binary() {
+        let env = scratch_env("disable-lazy");
+        let dir = env.dir.clone();
+        let profile = dir.join("settings.json");
+        apply_to(Some(true), &[profile.clone()], &|| Some(binary())).unwrap();
+
+        // Resolving is not free: `hook_binary` publishes the bundled gateway on packaged
+        // Windows and copies one into the data directory on AppImage. Turning the sensor
+        // OFF must not create files for a feature the user is removing.
+        let calls = std::cell::Cell::new(0u32);
+        apply_to(Some(false), &[profile.clone()], &|| {
+            calls.set(calls.get() + 1);
+            Some(binary())
+        })
+        .unwrap();
+        assert_eq!(calls.get(), 0, "the disable path asked for a binary");
 
     }
 
