@@ -4,6 +4,38 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
+## [Unreleased]
+
+### Fixed
+
+- **The Linux AppImage no longer forces X11 in a way nothing can override.**
+  `linuxdeploy-plugin-gtk` writes `export GDK_BACKEND=x11` into an AppRun hook
+  that is sourced AFTER the caller's environment, so `GDK_BACKEND=wayland` was
+  silently ignored ("Trying x11 backend", then a tao panic). On Ubuntu/Debian
+  that is only opinionated; on a Wayland session whose Xwayland cannot survive
+  the app (reproduced on Arch/Hyprland in a VMware guest on `vmwgfx`) it was
+  fatal and nearly undiagnosable: the first launch printed `EGL_BAD_PARAMETER`,
+  showed no window, and killed Xwayland **session-wide**, breaking `xdg-open`
+  for every other app; every launch after that produced no window, no output and
+  no error, because the process connected to the orphaned X socket and blocked
+  forever. Release builds now rewrite that line to
+  `export GDK_BACKEND="${GDK_BACKEND:-x11}"` - the same default, so nothing
+  changes for anyone who sets nothing - and the release fails if the line the
+  patch expects has disappeared.
+
+### Added
+
+- **Arch Linux package: `toolport-bin` in the AUR** (`paru -S toolport-bin`,
+  or `omarchy pkg aur add toolport-bin`). The AppImage bundles Ubuntu 22.04's
+  `libwebkit2gtk-4.1`, which has no `WebKitGPUProcess` and cannot initialise EGL
+  against a current Mesa, so on a rolling release the window opens grey and empty
+  while `WebKitWebProcess` aborts every launch. No `WEBKIT_*` variable avoids it.
+  The AUR package repackages the official `.deb` payload against the host
+  WebKitGTK, the same thing the `.deb` already does on Debian/Ubuntu. Published
+  by a new `aur.yml` workflow that build-tests the PKGBUILD in an Arch container
+  before pushing. `scripts/install.sh` now routes Arch users there. The fat
+  AppImage is unchanged and stays correct on Ubuntu/Debian.
+
 ## [1.15.0-rc.1] - 2026-08-19
 
 ### Security

@@ -11,8 +11,9 @@
 # just made will not reach anyone using the short URL.
 #
 # Installs the latest signed release for your OS/arch:
-#   - Linux (x86_64): the .deb via apt where available, else the portable AppImage
-#     into ~/.local/bin with a desktop entry.
+#   - Linux (x86_64): the .deb via apt where available, `toolport-bin` from the AUR
+#     on Arch (the AppImage's bundled WebKitGTK cannot do EGL against a rolling
+#     Mesa), else the portable AppImage into ~/.local/bin with a desktop entry.
 #   - macOS: copies Toolport.app from the signed .dmg into /Applications (Homebrew is
 #     the cleaner path, and this script points you there).
 # Windows: use scripts/install.ps1 instead.
@@ -211,6 +212,26 @@ install_linux() {
     # installed as `$bindir/toolport` as well.
     say "Installed. Launch Toolport from your app menu, or run: toolport"
     return
+  fi
+
+  # Arch and friends: the AppImage bundles Ubuntu 22.04's WebKitGTK, which cannot
+  # initialise EGL against a current Mesa, so it opens a grey empty window on a
+  # rolling release. `toolport-bin` in the AUR repackages the same .deb payload
+  # against the host WebKitGTK. Use an AUR helper when there is one; otherwise say
+  # what to do and still install the AppImage rather than leaving nothing.
+  if command -v pacman >/dev/null 2>&1; then
+    for helper in paru yay pikaur trizen; do
+      if command -v "$helper" >/dev/null 2>&1; then
+        say "Arch detected: installing toolport-bin from the AUR with $helper"
+        "$helper" -S --needed --noconfirm toolport-bin
+        say "Installed. Launch Toolport from your app menu, or run: toolport"
+        return
+      fi
+    done
+    say "Arch detected but no AUR helper found. The AUR package is the reliable one:"
+    say "    paru -S toolport-bin      # or: yay -S toolport-bin"
+    say "    omarchy pkg aur add toolport-bin"
+    say "Falling back to the AppImage, which can open a grey empty window here."
   fi
 
   url="$(asset_url '_amd64[.]AppImage')"

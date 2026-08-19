@@ -347,10 +347,20 @@ parameters.
 
 Prebuilt installers are published on the
 [Releases](https://github.com/tsouth89/toolport/releases) page. Toolport runs on
-**Windows, macOS, and Linux**. On Linux, prefer the **`.deb`** (it links your
-system's WebKitGTK and is the most reliable package); the **AppImage** is a
-portable, no-root fallback but can clash with very new or virtualized graphics
-stacks (see Troubleshooting). To run from source, see Development below.
+**Windows, macOS, and Linux**. On Linux, install the package that links your
+system's WebKitGTK: the **`.deb`** on Debian/Ubuntu, and **`toolport-bin` from
+the AUR** on Arch and its derivatives (Manjaro, EndeavourOS, Omarchy). The
+**AppImage** is a portable, no-root fallback for other distros; it bundles
+Ubuntu 22.04's WebKitGTK, which a rolling release's Mesa is too new for (see
+Troubleshooting). To run from source, see Development below.
+
+```bash
+# Arch / Manjaro / EndeavourOS
+paru -S toolport-bin        # or: yay -S toolport-bin
+
+# Omarchy
+omarchy pkg aur add toolport-bin
+```
 
 Both the **Windows** and **macOS** installers are code-signed, and macOS is also
 notarized, so it installs cleanly through Gatekeeper. On Windows the installer
@@ -373,6 +383,9 @@ sudo apt remove toolport
 # Uninstall and wipe app config too (secrets in the keyring stay).
 sudo apt purge toolport
 ```
+
+On Arch, `paru -S toolport-bin` upgrades in place and `paru -R toolport-bin`
+removes it.
 
 If you used the **AppImage**, there's nothing to uninstall, just delete the
 `.AppImage` file. (On Windows use Add or Remove Programs; on macOS drag
@@ -437,14 +450,26 @@ The frontend is typechecked with `npx tsc --noEmit`.
 - **VS Code: the `toolport` server doesn't start automatically.** VS Code may require
   you to click **Start Server** on the `toolport` MCP entry the first time, that's VS
   Code's own MCP handling, not Toolport. After that it reconnects on its own.
-- **Linux: the AppImage won't launch / no window (`EGL_BAD_PARAMETER`).** The
-  AppImage bundles its own libraries, which can clash with a very new or
-  virtualized graphics stack (e.g. VMware's `vmwgfx` driver, where the default EGL
-  display fails). **Use the `.deb` instead**, it links your system's WebKitGTK and
-  is the more reliable Linux package. If you must use the AppImage, try
-  `EGL_PLATFORM=surfaceless ./Toolport_*.AppImage`, or in a VM enable 3D
-  acceleration. (This is a packaging/GPU issue, not a Toolport bug; the `.deb` works
-  where the AppImage doesn't.)
+- **Linux: the AppImage shows no window, or a grey empty one (`EGL_BAD_PARAMETER`).**
+  Install the native package instead: the **`.deb`** on Debian/Ubuntu, or
+  **`toolport-bin` from the AUR** on Arch/Manjaro/EndeavourOS/Omarchy
+  (`paru -S toolport-bin`). Both link your system's WebKitGTK, and that is the
+  whole fix. The AppImage bundles Ubuntu 22.04's WebKitGTK, which has no
+  `WebKitGPUProcess` and cannot initialise EGL against a current Mesa, so on a
+  rolling release the GTK shell starts while `WebKitWebProcess` aborts every
+  launch and you get a grey window. None of `WEBKIT_DISABLE_DMABUF_RENDERER`,
+  `WEBKIT_DISABLE_COMPOSITING_MODE` or `WEBKIT_FORCE_SANDBOX=0` avoids it. (This
+  is a packaging/GPU-stack issue, not a Toolport bug.)
+- **Linux: the first launch killed Xwayland, and now nothing happens at all.**
+  Fixed in 1.15.0. Older AppImages forced `GDK_BACKEND=x11` in a way nothing could
+  override, so on a Wayland session with a fragile Xwayland (a VMware guest on the
+  `vmwgfx` driver, for one) the first launch took Xwayland down session-wide, and
+  every launch after that blocked forever on the orphaned X socket with no window
+  and no error. Log out and back in to get Xwayland back, then use 1.15.0 or newer,
+  where `GDK_BACKEND=wayland ./Toolport_*.AppImage` is honoured. Note the AppImage
+  wrapper is not the app: the real process is `conduit`, and killing only the
+  wrapper leaves it holding the single-instance lock so the next launch hangs the
+  same way.
 
 ## Status
 

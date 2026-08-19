@@ -1,0 +1,151 @@
+name: aur
+
+# Publishes the `toolport-bin` AUR package after a release is PUBLISHED.
+#
+# Why this exists: the AppImage bundles Ubuntu 22.04's libwebkit2gtk-4.1, which
+# has no WebKitGPUProcess and cannot initialise EGL against a current Mesa. On
+# Arch that is a window that opens grey and empty while WebKitWebProcess aborts
+# on EGL_BAD_PARAMETER every launch. It is the bundle, not the machine - the same
+# session renders fine through the system WebKitGTK - and no WEBKIT_* variable
+# avoids it. A bundled browser engine and a rolling-release GPU stack cannot be
+# kept in agreement, so Arch gets a package that links the host WebKitGTK, the
+# same thing the .deb already does for Debian/Ubuntu. The fat AppImage is
+# untouched and still correct there.
+#
+# Not on the version tag, deliberately: release.yml builds into a DRAFT release
+# and PKGBUILD's sha256sums must be computed from the assets people will actually
+# download, which 404 until the draft is published. Same reason winget.yml waits.
+on:
+  release:
+    types: [released]
+  # Manual catch-up: `release` fires exactly once, and a push to the AUR can fail
+  # for a reason that resolves later (a maintainer account that is not set up
+  # yet, an AUR outage). This is also how the very first publish is done.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish, e.g. v1.15.0"
+        required: true
+        type: string
+      dry_run:
+        description: "Render and build-test only; do not push to the AUR"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    # A prerelease is not what `pacman -S` should hand people, and an Arch pkgver
+    # cannot carry the `-rc.1` suffix anyway. On a manual run
+    # `github.event.release` is null, so the tag is re-checked below.
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      # Until this secret exists the publish step no-ops with a warning, so
+      # adding this workflow can never fail a release. Same gating style as
+      # WINGET_TOKEN and the Azure signing steps in release.yml.
+      AUR_KEY_CONFIGURED: ${{ secrets.AUR_SSH_PRIVATE_KEY != '' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          persist-credentials: false
+
+      # The release trigger cannot fire for a draft or a prerelease; a manual run
+      # can name any tag, so it gets the same check explicitly.
+      - name: Check the tag is a published, non-prerelease release
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          state=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,isPrerelease)
+          echo "$state"
+          if [ "$(echo "$state" | jq -r .isDraft)" = "true" ]; then
+            echo "::error::$TAG is still a draft; its assets 404, so the checksums would be wrong."
+            exit 1
+          fi
+          if [ "$(echo "$state" | jq -r .isPrerelease)" = "true" ]; then
+            echo "::error::$TAG is a prerelease; the AUR package is stable-only."
+            exit 1
+          fi
+
+      - name: Render PKGBUILD and .SRCINFO from the published assets
+        run: |
+          mkdir -p aur
+          bash scripts/render-aur.sh "${TAG#v}" aur
+          cat aur/PKGBUILD
+
+      # Actually build the package rather than hoping the PKGBUILD is right. This
+      # verifies the checksums against the published .deb, that the ar/tar
+      # unwrapping works, and that the binaries land where the .desktop file
+      # expects. `--nodeps` skips installing webkit2gtk et al: those are runtime
+      # dependencies this container never has to satisfy to prove packaging works.
+      #
+      # makepkg's own `--printsrcinfo` is authoritative, so the rendered .SRCINFO
+      # is replaced by it here; the copy the script writes by hand is the local
+      # fallback for machines without makepkg.
+      - name: Build and validate the package in an Arch container
+        run: |
+          docker run --rm -v "$PWD/aur:/pkg" -w /pkg archlinux:base-devel bash -euc '
+            pacman -Sy --noconfirm --needed namcap > /dev/null
+            useradd -m builder && chown -R builder /pkg
+            sudo -u builder makepkg --nodeps --noconfirm --nocheck
+            sudo -u builder makepkg --printsrcinfo > .SRCINFO
+            namcap PKGBUILD || true
+            pkg=$(ls -1 *.pkg.tar.*)
+            echo "built $pkg"
+            bsdtar -tf "$pkg" > contents.txt
+            for want in usr/bin/toolport usr/bin/conduit usr/share/licenses/toolport-bin/LICENSE; do
+              grep -qx "$want" contents.txt || { echo "::error::$want missing from $pkg"; exit 1; }
+            done
+            grep -q "^usr/share/applications/" contents.txt || { echo "::error::no .desktop file in $pkg"; exit 1; }
+          '
+          echo "--- .SRCINFO ---"
+          cat aur/.SRCINFO
+
+      - name: Publish to the AUR
+        if: ${{ env.AUR_KEY_CONFIGURED == 'true' && inputs.dry_run != true }}
+        env:
+          # Step-scoped: the Arch container above runs code from a mutable image
+          # tag and has no business being able to read the AUR push key.
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          # Pinned host key rather than `ssh-keyscan`, which would trust whatever
+          # answers on the day. This is the ed25519 key AUR publishes under "SSH
+          # Fingerprints" at https://aur.archlinux.org/. If AUR rotates it this
+          # step fails closed with "Host key verification failed"; verify the new
+          # fingerprint from that page before changing the line.
+          cat > ~/.ssh/known_hosts <<'KEYS'
+          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV2r/00LnaLenY5Ppq6RXVv8
+          KEYS
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+
+          # AUR serves an empty repo for a package that does not exist yet, so
+          # the first release creates `toolport-bin` by pushing to it.
+          git clone ssh://aur@aur.archlinux.org/toolport-bin.git aur-repo
+          cp aur/PKGBUILD aur/.SRCINFO aur-repo/
+          cd aur-repo
+          git config user.name "toolport release"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "The AUR already carries ${TAG#v}; nothing to push."
+            exit 0
+          fi
+          git add PKGBUILD .SRCINFO
+          git commit -m "toolport-bin ${TAG#v}"
+          git push origin HEAD:master
+
+      - name: Say why nothing was published
+        if: ${{ env.AUR_KEY_CONFIGURED != 'true' || inputs.dry_run == true }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "::notice::dry_run was set: the package built and validated, but nothing was pushed."
+          else
+            echo "::warning::AUR_SSH_PRIVATE_KEY is not set, so toolport-bin was not published for $TAG. See packaging/linux/aur/README.md for the one-time setup, or push the rendered files by hand."
+          fi

@@ -86,8 +86,9 @@ jobs:
         if: matrix.os == 'ubuntu-22.04'
         # pkg-config + libdbus-1-dev are required to build libdbus-sys, pulled in
         # by the Secret Service keychain backend; without them the Linux build
-        # fails to compile.
-        run: scripts/ci-apt-install.sh libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev
+        # fails to compile. squashfs-tools is for the post-bundle AppImage patch
+        # below (mksquashfs / unsquashfs); nothing in the build itself needs it.
+        run: scripts/ci-apt-install.sh libwebkit2gtk-4.1-dev libsoup-3.0-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev patchelf pkg-config libdbus-1-dev squashfs-tools
 
       - name: Add the macOS Rust target
         if: matrix.target
@@ -194,6 +195,43 @@ jobs:
           # profiles + inside-out signing, none of which Tauri's built-in macOS
           # signing can do. The "Sign + notarize + package (macOS)" step below owns
           # ALL macOS signing, notarization, dmg, and updater-artifact generation.
+
+      # linuxdeploy-plugin-gtk hard-forces `GDK_BACKEND=x11` in an AppRun hook that is
+      # sourced AFTER the caller's environment, so `GDK_BACKEND=wayland` is silently
+      # ignored. Harmless on Ubuntu/Debian; on a Wayland session whose Xwayland cannot
+      # survive the app (reproduced on Arch/Hyprland in a VMware guest, vmwgfx driver)
+      # it kills Xwayland session-wide on first launch and then every later launch
+      # blocks forever on the orphaned X socket with no window and no error at all.
+      # The script rewrites that one line to `${GDK_BACKEND:-x11}` - identical default,
+      # now overridable - and FAILS the release if the line it expects is gone, so a
+      # linuxdeploy change cannot silently drop the patch.
+      #
+      # It rewrites the AppImage in place, which invalidates the updater signature
+      # `tauri build` just produced, so re-sign here. Skipped when no signing key is
+      # configured (forks), exactly like the unsigned artifacts the build already emits.
+      - name: Make the AppImage's X11 backend overridable, then re-sign
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          shopt -s nullglob
+          images=(src-tauri/target/release/bundle/appimage/*.AppImage)
+          if [ ${#images[@]} -ne 1 ]; then
+            echo "::error::expected exactly one AppImage, found ${#images[@]}"
+            exit 1
+          fi
+          image=${images[0]}
+          bash scripts/patch-appimage-gdk-backend.sh "$image"
+          if [ -n "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            rm -f "$image.sig"
+            npx tauri signer sign "$image"
+            test -s "$image.sig"
+            echo "re-signed $image"
+          else
+            echo "::warning::No TAURI_SIGNING_PRIVATE_KEY; the AppImage ships unsigned."
+          fi
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
 
       # macOS signing + packaging. Tauri built the app UNSIGNED above; this step
       # nests the gateway in its own .app, embeds the app + gateway provisioning
