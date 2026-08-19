@@ -5420,12 +5420,23 @@ pub struct SharedHttpSpec {
 /// remote MCP entry. Native: formats with first-class url+headers. Bridge: most
 /// JsonMcpServers clients (Claude Desktop, etc.) that only spawn stdio.
 pub fn client_uses_mcp_remote_bridge(client_id: &str) -> bool {
-    if client_id == "devin-cli" {
-        return false;
-    }
     let Some(def) = find_def(client_id) else {
         return true;
     };
+    // The one client whose format does not decide this. Devin Local / CLI reads
+    // the plain `mcpServers` shape, but unlike the rest of that format it takes a
+    // remote entry directly: its user config documents `url` plus an optional
+    // `headers` object, with `transport` defaulting to http, which is exactly
+    // what entry_to_json already emits for a native remote. Bridging it through
+    // `npx mcp-remote` would work but would make users install a third-party
+    // shim for a transport the client speaks natively.
+    //
+    // Devin Desktop (the `windsurf` id) is deliberately not covered: it is a
+    // separate config that has not been checked for the same support, so it
+    // keeps the format default.
+    if client_id == "devin-cli" {
+        return false;
+    }
     match def.format {
         // Native remote shapes already exist in our writers.
         Format::JsonQwenMcpServers
@@ -7987,6 +7998,32 @@ bad = "not-a-table"
         assert!(!client_uses_mcp_remote_bridge("vscode"));
         assert!(!client_uses_mcp_remote_bridge("github-copilot-cli"));
         assert!(!client_uses_mcp_remote_bridge("devin-cli"));
+    }
+
+    #[test]
+    fn devin_cli_shared_http_entry_uses_native_remote_schema() {
+        let path = temp_path("devin-cli-http.json");
+        let spec = SharedHttpSpec {
+            url: "http://127.0.0.1:8765/mcp".into(),
+            token: "tok".into(),
+        };
+        let entry = gateway_entry_shared_http("devin-cli", None, &spec);
+        // No mcp-remote shim: Devin Local / CLI takes the remote entry directly.
+        assert!(entry.command.is_none());
+        assert_eq!(entry.url.as_deref(), Some("http://127.0.0.1:8765/mcp"));
+
+        edit_json_gateway(&path, "mcpServers", Some(&entry), false).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let gateway = &root["mcpServers"][GATEWAY_ENTRY_NAME];
+        assert_eq!(gateway["url"], "http://127.0.0.1:8765/mcp");
+        // Devin defaults `transport` to http, so the `type` hint is advisory; the
+        // credential must ride in `headers` rather than `env` to reach the wire.
+        assert_eq!(gateway["type"], "http");
+        assert_eq!(gateway["headers"]["Authorization"], "Bearer tok");
+        assert!(gateway.get("command").is_none());
+        assert!(gateway.get("env").is_none());
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
