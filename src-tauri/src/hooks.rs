@@ -105,6 +105,11 @@ pub struct HooksPreview {
     pub before: String,
     /// The file as it would be after the write.
     pub after: String,
+    /// Why this profile has no dry run, when that is the case. Mirrors
+    /// [`ProfileStatus::error`], and for the same reason: one profile we cannot read
+    /// must not answer for the ones we can.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -712,15 +717,33 @@ pub fn preview() -> Result<Vec<HooksPreview>, String> {
 
 /// [`preview`] over an explicit profile set and binary, so tests drive known files
 /// instead of the developer's real `~/.claude`. Same rationale as [`apply_to`].
+///
+/// Per profile, not all-or-nothing. `?`-ing the first bad `settings.json` out meant one
+/// hand-broken file - a stray comma in a `.claude-backup` nobody uses - hid the dry run
+/// for every healthy profile, and the error named none of them. [`apply_to`] already
+/// takes the opposite position, so the preview also disagreed with what the install it
+/// is previewing would actually do (SBS-822 review).
 fn preview_to(profiles: &[PathBuf], binary: &Path) -> Result<Vec<HooksPreview>, String> {
     let mut out = Vec::new();
     for path in profiles {
-        let (root, original) = crate::clients::read_settings_json(path)?;
-        let updated = upsert_hooks(&root, binary)?;
-        out.push(HooksPreview {
-            path: path.display().to_string(),
-            before: original.clone().unwrap_or_default(),
-            after: crate::clients::render_settings_json(original.as_deref(), &updated)?,
+        let rendered = crate::clients::read_settings_json(path).and_then(|(root, original)| {
+            let updated = upsert_hooks(&root, binary)?;
+            let after = crate::clients::render_settings_json(original.as_deref(), &updated)?;
+            Ok((original.unwrap_or_default(), after))
+        });
+        out.push(match rendered {
+            Ok((before, after)) => HooksPreview {
+                path: path.display().to_string(),
+                before,
+                after,
+                error: None,
+            },
+            Err(error) => HooksPreview {
+                path: path.display().to_string(),
+                before: String::new(),
+                after: String::new(),
+                error: Some(error),
+            },
         });
     }
     Ok(out)
@@ -1396,6 +1419,32 @@ mod tests {
         assert!(previews[0].before.is_empty());
         assert!(previews[0].after.contains(HOOK_MARKER));
         assert!(!path.exists(), "a dry run must not create the settings file");
+
+    }
+
+    #[test]
+    fn one_unreadable_profile_does_not_hide_the_preview_for_the_healthy_ones() {
+        let env = scratch_env("preview-degrades");
+        let dir = env.dir.clone();
+        let broken = dir.join("broken.json");
+        let healthy = dir.join("healthy.json");
+        std::fs::write(&broken, "{ this is not json").unwrap();
+        std::fs::write(&healthy, "{ \"model\": \"opus\" }").unwrap();
+
+        // Broken first, so an all-or-nothing `?` would take the healthy one down with it.
+        let previews = preview_to(&[broken.clone(), healthy.clone()], &binary()).unwrap();
+
+        assert_eq!(previews.len(), 2, "every profile gets a row");
+        assert!(
+            previews[0].error.is_some(),
+            "the unreadable profile must say why it has no dry run"
+        );
+        assert!(previews[0].after.is_empty());
+        assert!(
+            previews[1].error.is_none() && previews[1].after.contains(HOOK_MARKER),
+            "the healthy profile still previews: {:?}",
+            previews[1]
+        );
 
     }
 
