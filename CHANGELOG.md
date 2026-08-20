@@ -4,24 +4,21 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
-## [Unreleased]
+## [1.15.0] - 2026-08-20
 
-### Fixed
+### Security
 
-- **The Linux AppImage no longer forces X11 in a way nothing can override.**
-  `linuxdeploy-plugin-gtk` writes `export GDK_BACKEND=x11` into an AppRun hook
-  that is sourced AFTER the caller's environment, so `GDK_BACKEND=wayland` was
-  silently ignored ("Trying x11 backend", then a tao panic). On Ubuntu/Debian
-  that is only opinionated; on a Wayland session whose Xwayland cannot survive
-  the app (reproduced on Arch/Hyprland in a VMware guest on `vmwgfx`) it was
-  fatal and nearly undiagnosable: the first launch printed `EGL_BAD_PARAMETER`,
-  showed no window, and killed Xwayland **session-wide**, breaking `xdg-open`
-  for every other app; every launch after that produced no window, no output and
-  no error, because the process connected to the orphaned X socket and blocked
-  forever. Release builds now rewrite that line to
-  `export GDK_BACKEND="${GDK_BACKEND:-x11}"` - the same default, so nothing
-  changes for anyone who sets nothing - and the release fails if the line the
-  patch expects has disappeared.
+- **Release job no longer inherits Azure Trusted Signing credentials during
+  frontend install.** They are now step-scoped to the Windows tauri build,
+  matching TAURI and APPLE. (SBS-925)
+
+- **Downstream stderr drain no longer grows without bound on a newline-less write.**
+  Stdout was already capped at 16 MiB per line; stderr still used unbounded
+  `read_line` and only trimmed the kept tail afterwards. A hostile or buggy
+  stdio server that wrote a multi-GB chunk with no newline could OOM the
+  gateway and take every HTTP-bridge client with it. The drain now uses the
+  same `take(MAX_RESPONSE_BYTES)` bound as stdout and stops on an unterminated
+  full-cap line. (SBS-930)
 
 ### Added
 
@@ -38,55 +35,6 @@ makepkg -si` builds the identical package with no AUR account). The AppImage
   by a new `aur.yml` workflow that build-tests the PKGBUILD in an Arch container
   before pushing. `scripts/install.sh` now routes Arch users there. The fat
   AppImage is unchanged and stays correct on Ubuntu/Debian.
-
-## [1.15.0-rc.1] - 2026-08-19
-
-### Security
-
-- **Release job no longer inherits Azure Trusted Signing credentials during
-  frontend install.** They are now step-scoped to the Windows tauri build,
-  matching TAURI and APPLE. (SBS-925)
-- **Downstream stderr drain no longer grows without bound on a newline-less write.**
-  Stdout was already capped at 16 MiB per line; stderr still used unbounded
-  `read_line` and only trimmed the kept tail afterwards. A hostile or buggy
-  stdio server that wrote a multi-GB chunk with no newline could OOM the
-  gateway and take every HTTP-bridge client with it. The drain now uses the
-  same `take(MAX_RESPONSE_BYTES)` bound as stdout and stops on an unterminated
-  full-cap line. (SBS-930)
-
-### Fixed
-
-- **The GHCR gateway image rebuilds from the current commit.** `docker-publish` was still
-  caching all of `src-tauri/target` keyed only on Cargo.lock, the same shape that shipped
-  v0.3.12/v0.3.13 with a stale signed binary. It now uses the same Swatinem/rust-cache
-  eviction as `release.yml`, so workspace crates always recompile while third-party deps
-  stay cached. (SBS-926)
-- **HITL and routine audit rows no longer count as successful tool calls.**
-  Prometheus `toolport_tool_calls_total`, Activity "calls logged", and team
-  showback `calls` treated every `audit.jsonl` line as a routed call and a
-  missing `ok` as success. An approved human-approval gate writes a
-  `kind:approval` decision (`ok:true` on purpose, so a deny stays out of the
-  error rate) plus the timed exec, so one approval showed as two successful
-  calls. Advisor / suggestion / candidate lines omit `ok` and were counted as
-  successes while the Activity list painted them as failures. Aggregators now
-  require `ok` to be present and skip `kind` in {approval, routine, advisor,
-  suggestion, candidate}. (SBS-932)
-- **Homebrew cask snapshot was three releases behind.** `packaging/homebrew/toolport.rb`
-  still said 1.11.0 after 1.14.0 shipped, and `docs/RELEASING.md` had no tap-bump
-  step, so the next release would leave `brew install --cask tsouth89/toolport/toolport`
-  stale again. The snapshot now matches 1.14.0 (sha256s from the published dmgs)
-  and the release doc names `tsouth89/homebrew-toolport`. The live tap is a
-  separate repo; bumping it is that step, not this file. (SBS-936)
-
-### Removed
-
-- **Toolport Studio is no longer a supported client.** The project is discontinued, so
-  detection, the Connect flow, and its `~/.toolport-studio/mcp.json` target are gone,
-  along with the session-scoped restart wording it was the only user of. Toolport now
-  auto-detects 35 clients. If you had connected it, the gateway entry in that file is
-  left where it is and can be deleted by hand; nothing else reads it.
-
-### Added
 
 - **Agent activity: see what your agents do outside Toolport.** Toolport routes every
   MCP call, so it sees those; it has never seen what Claude Code does natively, which
@@ -129,13 +77,86 @@ makepkg -si` builds the identical package with no AUR account). The AppImage
   in their own UI, so the tab names them as clients it cannot write rather than
   silently skipping them. Needs no MCP server or gateway. Team instructions are unaffected and
   coexist in the same files. See [docs/agent-rules.md](docs/agent-rules.md).
+
 - **Official brand marks for 14 more clients.** Grok Build, OpenCode, Qwen Code, Kimi
   Code, JetBrains Junie, Kilo Code, GitHub Copilot CLI, Amp, Pi, Oh My Pi, Factory Droid,
   BoltAI, AnythingLLM and Continue now show their own logo in the Clients view instead of
   a letter badge, so 32 of the 35 supported clients now carry their own mark. Crush, Jan
   and Witsy keep the badge, since none of them publish a usable vector mark.
 
+### Removed
+
+- **Toolport Studio is no longer a supported client.** The project is discontinued, so
+  detection, the Connect flow, and its `~/.toolport-studio/mcp.json` target are gone,
+  along with the session-scoped restart wording it was the only user of. Toolport now
+  auto-detects 35 clients. If you had connected it, the gateway entry in that file is
+  left where it is and can be deleted by hand; nothing else reads it.
+
 ### Fixed
+
+- **The gateway no longer speaks on stdout before the client has handshaked.**
+  MCP forbids a server sending anything before the client's
+  `notifications/initialized`, and the gateway builds its catalog on a
+  background thread that announces the result whenever it finishes. A client
+  that spawns the process early and sends `initialize` seconds later (Grok Code
+  does exactly this) read `notifications/tools/list_changed` as the FIRST frame
+  of the stream, rejected it, and then looked like it had simply never been
+  answered. It cost 80 of 128 sessions their handshake for most of a day. The
+  notification is now withheld and replayed once the peer has both spoken past
+  `initialize` and been answered at least once, so the first frame a client
+  reads is always a reply to something it asked. Withheld, not dropped: the
+  catalog really did change while the client was starting up. (SBS-1019)
+- **A connection test whose details changed underneath it no longer reports a
+  verdict for the old details.** Editing a server's command or URL while its
+  test was in flight left the finished result on screen as though it described
+  what is now in the form. The in-flight test stays visibly busy until it
+  settles and its result is then discarded, and a superseded test can no longer
+  overwrite a newer one. (#739, thanks @forever-ivy)
+- **Catalog and Onboarding tell a failed stack fetch apart from an empty one.**
+  A `listStacks()` failure rendered as "no stacks", indistinguishable from
+  having none, with no way to retry. Both surfaces now show a skeleton while
+  loading and an inline "Try again" on failure, and the stack region renders
+  independently of the popular-catalog empty state, so an empty catalog cannot
+  hide working stacks. (#732, thanks @rohankumardubey)
+
+- **The Linux AppImage no longer forces X11 in a way nothing can override.**
+  `linuxdeploy-plugin-gtk` writes `export GDK_BACKEND=x11` into an AppRun hook
+  that is sourced AFTER the caller's environment, so `GDK_BACKEND=wayland` was
+  silently ignored ("Trying x11 backend", then a tao panic). On Ubuntu/Debian
+  that is only opinionated; on a Wayland session whose Xwayland cannot survive
+  the app (reproduced on Arch/Hyprland in a VMware guest on `vmwgfx`) it was
+  fatal and nearly undiagnosable: the first launch printed `EGL_BAD_PARAMETER`,
+  showed no window, and killed Xwayland **session-wide**, breaking `xdg-open`
+  for every other app; every launch after that produced no window, no output and
+  no error, because the process connected to the orphaned X socket and blocked
+  forever. Release builds now rewrite that line to
+  `export GDK_BACKEND="${GDK_BACKEND:-x11}"` - the same default, so nothing
+  changes for anyone who sets nothing - and the release fails if the line the
+  patch expects has disappeared.
+
+- **The GHCR gateway image rebuilds from the current commit.** `docker-publish` was still
+  caching all of `src-tauri/target` keyed only on Cargo.lock, the same shape that shipped
+  v0.3.12/v0.3.13 with a stale signed binary. It now uses the same Swatinem/rust-cache
+  eviction as `release.yml`, so workspace crates always recompile while third-party deps
+  stay cached. (SBS-926)
+
+- **HITL and routine audit rows no longer count as successful tool calls.**
+  Prometheus `toolport_tool_calls_total`, Activity "calls logged", and team
+  showback `calls` treated every `audit.jsonl` line as a routed call and a
+  missing `ok` as success. An approved human-approval gate writes a
+  `kind:approval` decision (`ok:true` on purpose, so a deny stays out of the
+  error rate) plus the timed exec, so one approval showed as two successful
+  calls. Advisor / suggestion / candidate lines omit `ok` and were counted as
+  successes while the Activity list painted them as failures. Aggregators now
+  require `ok` to be present and skip `kind` in {approval, routine, advisor,
+  suggestion, candidate}. (SBS-932)
+
+- **Homebrew cask snapshot was three releases behind.** `packaging/homebrew/toolport.rb`
+  still said 1.11.0 after 1.14.0 shipped, and `docs/RELEASING.md` had no tap-bump
+  step, so the next release would leave `brew install --cask tsouth89/toolport/toolport`
+  stale again. The snapshot now matches 1.14.0 (sha256s from the published dmgs)
+  and the release doc names `tsouth89/homebrew-toolport`. The live tap is a
+  separate repo; bumping it is that step, not this file. (SBS-936)
 
 - **A refused Team Instructions rewrite no longer deletes the last-good org rules.**
   `apply_instructions_to` only recorded a target when `write_target` returned
@@ -145,11 +166,13 @@ makepkg -si` builds the identical package with no AUR account). The AppImage
   the missing file against too-long v2 is `TooLong`, not `Stale`. Last-good now
   stays on disk and in the recorded set when a rewrite is refused; a real
   removal (org cleared, client gone, path moved) still cleans up. (SBS-917)
+
 - **Kimi Shared HTTP Connect writes `url`, not Qwen's `httpUrl`.** Connect, rescope
   and reset for Kimi went through the generic JSON editor, which remapped remotes
   via Qwen's `url` → `httpUrl` whenever the map key was not VS Code `"servers"`.
   Kimi requires `url` and rejects `httpUrl`. The Kimi writer already emitted the
   right shape; Shared HTTP now uses that same formatter. (SBS-921)
+
 - **Agent rules Preview no longer looks like a dead button.** The preview card renders
   after the clients list, so on any window too short to reach it, clicking Preview
   scrolled nothing and showed nothing: the card was open the whole time, below the fold.
@@ -161,6 +184,7 @@ makepkg -si` builds the identical package with no AUR account). The AppImage
   system asks for reduced motion: `index.css` already zeroes `scroll-behavior`, but an
   explicit `behavior` in the options dict beats that CSS property, so the component reads
   the preference itself.
+
 - **`docs/agent-rules.md` now names every client with no rules file, not two of them.**
   The "no rules file Toolport can write" section named only Cursor and Warp, but the
   Clients section builds that list from whatever is detected, so a user with LM Studio,
@@ -176,6 +200,16 @@ makepkg -si` builds the identical package with no AUR account). The AppImage
 
 ### Internal
 
+- **CI apt installs are bounded and retried instead of hanging.** `apt-get
+update` on the hosted runners intermittently stops responding rather than
+  failing, which burned three jobs' entire timeouts on one pull request without
+  ever reaching a compiler, and a run stuck in progress also blocks
+  `gh run rerun --failed`. `scripts/ci-apt-install.sh` now bounds each attempt,
+  retries, gives apt a short enough acquire timeout to fail over to its backup
+  mirrors on its own, downloads before installing so a throttled mirror is
+  interrupted rather than crept through, and installs from cache with
+  `--no-download` so the final step has no network left to stall on.
+
 - **Every CI job now has a timeout, and apt retries instead of hanging.** `Rust Clippy`
   and `Linux build + test` carried no `timeout-minutes`, so they inherited GitHub's
   6-hour default; the jobs in `audit`, `docker-publish`, `release` and `winget` had none
@@ -188,6 +222,7 @@ makepkg -si` builds the identical package with no AUR account). The AppImage
   release. The five `apt-get update` call sites are now one script,
   `scripts/ci-apt-install.sh`, which bounds each attempt and retries, so a bad mirror
   costs seconds rather than a job.
+
 - **The headless security smoke no longer fails on a stderr race.** `expectBindRefusal`
   read the gateway's captured stderr as soon as the process emitted `exit`, but Node fires
   that while piped stdio can still hold undelivered bytes. The Windows runner duly reported
@@ -196,6 +231,7 @@ makepkg -si` builds the identical package with no AUR account). The AppImage
   assertion passed on the next host, which is the signature of a race, not a defect. The
   capture is now read only after stderr closes, bounded so a stream that never closes
   cannot wedge a security check.
+
 - **A Windows write now retries instead of losing the race.** `atomic_write` published its temp
   file with a single `rename`. On Windows that fails outright while any other handle holds the
   destination, and something usually does - Defender, the search indexer, a backup agent - for
@@ -205,6 +241,7 @@ makepkg -si` builds the identical package with no AUR account). The AppImage
   with antivirus hit the same edge. The publish rename now retries with a capped backoff, bounded
   at 8 attempts so a genuinely locked destination still reports its error. Unix is untouched,
   where `rename(2)` is atomic against open handles and a failure is real.
+
 - **Three more sources of intermittent test failure, found by auditing rather than waiting.**
   The Windows Job Object test waited for its pid file to _exist_ and then read it once, but the
   launcher creates the file and fills it in separate operations, so a read in between parses an
