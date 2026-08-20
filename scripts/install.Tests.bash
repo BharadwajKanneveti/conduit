@@ -137,7 +137,11 @@ run_install() {
   make_shim "$shim" "$release_json"
   local output rc
   set +e
-  output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" env "$@" bash "$INSTALL_SH" 2>&1)"
+  # </dev/null, not inherited stdin: the helper shims read stdin to prove
+  # install.sh never lets them, and an inherited terminal would block them
+  # forever. Only the Arch test below pipes anything, which is what makes its
+  # stdin assertion falsifiable while these stay deterministic.
+  output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" env "$@" bash "$INSTALL_SH" </dev/null 2>&1)"
   rc=$?
   set -e
   printf '%s\t%s' "$rc" "$output"
@@ -187,7 +191,7 @@ mkdir -p "$home" "$bindir"
 printf 'existing working install' > "$bindir/toolport"
 make_shim "$shim" "$(fake_release "sha256:$(printf '0%.0s' $(seq 1 64))" 64)"
 set +e
-mismatch_output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" bash "$INSTALL_SH" 2>&1)"
+mismatch_output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" bash "$INSTALL_SH" </dev/null 2>&1)"
 mismatch_rc=$?
 set -e
 if [ "$mismatch_rc" = "1" ] && [ "$(cat "$bindir/toolport")" = "existing working install" ]; then
@@ -218,7 +222,7 @@ shim="$workdir/shim"; home="$workdir/home"; bindir="$workdir/bin"
 mkdir -p "$home" "$bindir"
 make_shim "$shim" "$(fake_release "sha256:$fake_sha256" 64)"
 set +e
-curl_fail_output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" TOOLPORT_TEST_CURL_FAIL=1 bash "$INSTALL_SH" 2>&1)"
+curl_fail_output="$(cd "$workdir" && PATH="$shim:$PATH" HOME="$home" XDG_BIN_HOME="$bindir" TOOLPORT_TEST_CURL_FAIL=1 bash "$INSTALL_SH" </dev/null 2>&1)"
 curl_fail_rc=$?
 set -e
 check "reports the download failure" "Download failed" "$curl_fail_output"
@@ -240,8 +244,14 @@ arch_workdir="$(mktemp -d)"
 arch_shim="$arch_workdir/shim"; arch_home="$arch_workdir/home"; arch_bin="$arch_workdir/bin"
 mkdir -p "$arch_home" "$arch_bin"
 make_shim "$arch_shim" "$(fake_release "sha256:$fake_sha256" 64)"
+# Feed the script on stdin, the way `curl ... | bash` does. Without this the
+# stdin assertion below is unfalsifiable: run with a file argument and no pipe,
+# a helper's `cat` reads 0 bytes whether or not install.sh redirects, so the
+# check passes on a script that forgot to.
+arch_stdin_sentinel="TOOLPORT_TEST_STDIN_MUST_NOT_BE_READ"
 set +e
-arch_output="$(cd "$arch_workdir" && PATH="$arch_shim:$PATH" HOME="$arch_home" XDG_BIN_HOME="$arch_bin"   TOOLPORT_TEST_AUR_HELPER=yay bash "$INSTALL_SH" 2>&1)"
+arch_output="$(cd "$arch_workdir" && printf '%s
+' "$arch_stdin_sentinel"   | PATH="$arch_shim:$PATH" HOME="$arch_home" XDG_BIN_HOME="$arch_bin"     TOOLPORT_TEST_AUR_HELPER=yay bash "$INSTALL_SH" 2>&1)"
 arch_rc=$?
 set -e
 arch_argv="$(cat "$arch_shim/helper-argv.log" 2>/dev/null || true)"
@@ -266,10 +276,11 @@ else
 fi
 # The documented entry point is `curl ... | bash`, so stdin is the script itself.
 # A helper that prompts would eat the rest of it; install.sh hands it /dev/null.
-if [ ! -s "$arch_shim/helper-stdin.log" ]; then
-  echo "  ok: no helper read from the installer's stdin"; pass=$((pass + 1))
+arch_stdin_seen="$(cat "$arch_shim/helper-stdin.log" 2>/dev/null || true)"
+if [ -z "$arch_stdin_seen" ]; then
+  echo "  ok: no helper read from the installer's piped stdin"; pass=$((pass + 1))
 else
-  echo "  FAIL: a helper consumed stdin: $(head -c 80 "$arch_shim/helper-stdin.log")"; fail=$((fail + 1))
+  echo "  FAIL: a helper consumed stdin: $(printf '%s' "$arch_stdin_seen" | head -c 80)"; fail=$((fail + 1))
 fi
 echo "    argv: $(printf '%s' "$arch_argv" | tr '
 ' ' ' | cut -c1-160)"
