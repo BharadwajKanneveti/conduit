@@ -11,7 +11,7 @@
 //    current Mesa.
 import { describe, expect, it } from "vitest";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { parse } from "yaml";
@@ -64,6 +64,20 @@ function hasGnuSed(): boolean {
   }
 }
 const gnuSed = hasGnuSed();
+
+// The workflow assertions below run real shell out of aur.yml. Needs bash and
+// ssh-keygen; CI runs the frontend tests on ubuntu-22.04, which has both.
+function hasBashTools(): boolean {
+  try {
+    execFileSync("bash", ["-c", "command -v ssh-keygen && command -v sort"], {
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+const bashTools = hasBashTools();
 
 function applyScriptSed(input: string): string {
   const dir = mkdtempSync(join(tmpdir(), "toolport-gdk-"));
@@ -207,6 +221,82 @@ describe("the AUR package ships to Arch", () => {
     expect(build!.env?.AUR_SSH_PRIVATE_KEY).toBeUndefined();
   });
 
+  it.skipIf(!bashTools)("reads one key as one key when the host is dual-stack", () => {
+    // ssh-keyscan walks every getaddrinfo result, so an A and an AAAA record for
+    // the same host write the SAME key twice. Without the unique step the
+    // comparison sees two concatenated fingerprints and fails closed forever.
+    const push = byName("Publish to the AUR")!;
+    const got = push.run!.match(/^got=\$\(.*$/m)?.[0];
+    const uniq = push.run!.match(/^unique=.*$/m)?.[0];
+    expect(got, "no host-key fingerprint line").toBeDefined();
+    expect(uniq, "no unique-count line").toBeDefined();
+
+    const dir = mkdtempSync(join(tmpdir(), "toolport-hostkey-"));
+    try {
+      const key = join(dir, "k");
+      execFileSync("ssh-keygen", ["-q", "-t", "ed25519", "-N", "", "-f", key]);
+      // A known_hosts line is "<host> <type> <base64>", i.e. the .pub without
+      // its trailing comment.
+      const pub = readFileSync(`${key}.pub`, "utf8").trim().split(/\s+/);
+      const line = `aur.archlinux.org ${pub[0]} ${pub[1]}\n`;
+      const kh = join(dir, "known_hosts");
+      writeFileSync(kh, line + line); // the dual-stack case: same key, twice
+
+      const script = `${got!.replace("~/.ssh/known_hosts", JSON.stringify(kh))}\n${uniq}\nprintf '%s|%s' "$unique" "$got"`;
+      const out = execFileSync("bash", ["-c", script], { encoding: "utf8" });
+      const [unique, fingerprint] = out.split("|");
+      expect(unique, `two copies of one key read as ${unique} keys`).toBe("1");
+      expect(fingerprint).toMatch(/^SHA256:/);
+      expect(fingerprint).not.toContain("\n");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(!bashTools)("refuses to publish an older version over a newer one", () => {
+    // The concurrency group serialises pushes but does not order them by
+    // version, so a workflow_dispatch catch-up for an old tag could overwrite a
+    // newer AUR package and start handing out the older release.
+    const push = byName("Publish to the AUR")!;
+    const start = push.run!.indexOf('new_version="${TAG#v}"');
+    const end = push.run!.indexOf("cp aur/PKGBUILD");
+    expect(start, "no downgrade guard").toBeGreaterThan(-1);
+    const guard = push.run!.slice(start, end);
+
+    const run = (onAur: string, tag: string) => {
+      const dir = mkdtempSync(join(tmpdir(), "toolport-aurver-"));
+      try {
+        mkdirSync(join(dir, "aur-repo"));
+        writeFileSync(join(dir, "aur-repo", "PKGBUILD"), `pkgver=${onAur}\n`);
+        return execFileSync(
+          "bash",
+          ["-c", `cd ${JSON.stringify(dir)}\nTAG=v${tag}\n${guard}\necho PROCEEDED`],
+          { encoding: "utf8" },
+        );
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    };
+
+    expect(run("1.16.0", "1.15.0")).toContain("Not downgrading");
+    expect(run("1.16.0", "1.15.0")).not.toContain("PROCEEDED");
+    expect(run("1.14.0", "1.15.0")).toContain("PROCEEDED");
+    expect(run("1.15.0", "1.15.0")).toContain("PROCEEDED"); // same version, new pkgrel
+    // Not lexical: 1.9.0 must not read as newer than 1.10.0.
+    expect(run("1.9.0", "1.10.0")).toContain("PROCEEDED");
+  });
+
+  it("can bump pkgrel so a same-version PKGBUILD fix actually upgrades", () => {
+    // pacman compares pkgver-pkgrel; re-publishing a fixed PKGBUILD at the same
+    // pkgrel reads as "already installed" everywhere it matters.
+    const raw = read(".github", "workflows", "aur.yml");
+    expect(raw).toContain("pkgrel:");
+    expect(publish?.env?.AUR_PKGREL).toBe("${{ inputs.pkgrel || '1' }}");
+    const renderer = read("scripts", "render-aur.sh");
+    expect(renderer).toContain("pkgrel=${AUR_PKGREL:-1}");
+    expect(renderer).toContain("AUR_PKGREL must be a positive integer");
+  });
+
   it("gates the AUR push on the secret and keeps the key step-scoped", () => {
     const push = byName("Publish to the AUR");
     expect(push, "no AUR push step").toBeDefined();
@@ -223,7 +313,7 @@ describe("the AUR package ships to Arch", () => {
     // this is not trust-on-first-use. A keyscan with no comparison would be.
     expect(push!.run).toContain(AUR_ED25519_FINGERPRINT);
     expect(push!.run).toMatch(/ssh-keygen -lf/);
-    expect(push!.run).toMatch(/if \[ "\$got" != "\$AUR_ED25519_FINGERPRINT" \]/);
+    expect(push!.run).toMatch(/\[ "\$got" != "\$AUR_ED25519_FINGERPRINT" \]/);
   });
 
   it("does not track a generated PKGBUILD, which pins one release's checksum", () => {

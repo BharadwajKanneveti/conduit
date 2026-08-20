@@ -96,6 +96,22 @@ release.
    `dry_run` **checked**, to build and validate without pushing. Then re-run with
    `dry_run` unchecked; the first push creates the `toolport-bin` package.
 
+## Re-publishing the same version with a fixed PKGBUILD
+
+`pacman` compares `pkgver-pkgrel`. Pushing a corrected PKGBUILD at the same
+`pkgrel` reads as "already installed" on every machine that took the broken one,
+so only fresh installs get the fix. Bump the revision:
+
+- workflow: run `aur.yml` with the same tag and `pkgrel` set to `2`, `3`, ...
+- by hand: `AUR_PKGREL=2 scripts/render-aur.sh 1.15.0 ./aur`
+
+The bump is deliberate, never automatic: silently re-rolling an already-published
+AUR revision is worse than leaving it alone.
+
+The publish step also refuses to move the AUR _backwards_. A catch-up dispatch
+for an old tag after a newer release has shipped exits without pushing, since the
+concurrency group serialises pushes but does not order them by version.
+
 ## Verifying a release by hand
 
 ```bash

@@ -31,6 +31,16 @@ on:
         description: "Render and build-test only; do not push to the AUR"
         type: boolean
         default: false
+      pkgrel:
+        # pacman compares pkgver-pkgrel. Re-publishing the same tag after fixing
+        # render-aur.sh (wrong depends, moved source URL) with pkgrel still 1
+        # looks "already installed" to every machine that took the broken
+        # package; only fresh installs get the fix. Bumping this is deliberate,
+        # an operator choice, which is why it is an input and not automatic.
+        description: "Arch package revision; bump when re-publishing the SAME version with a fixed PKGBUILD"
+        required: false
+        type: string
+        default: "1"
 
 # Two published releases close together (or a release plus a workflow_dispatch
 # catch-up) would otherwise clone, commit and `git push` the same AUR repo at the
@@ -57,6 +67,8 @@ jobs:
       # adding this workflow can never fail a release. Same gating style as
       # WINGET_TOKEN and the Azure signing steps in release.yml.
       AUR_KEY_CONFIGURED: ${{ secrets.AUR_SSH_PRIVATE_KEY != '' }}
+      # Empty on the `release` trigger, where `inputs` does not exist.
+      AUR_PKGREL: ${{ inputs.pkgrel || '1' }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
@@ -170,12 +182,18 @@ jobs:
           # If AUR rotates the key this step stops with the mismatch printed.
           # Re-read the fingerprint from that page before touching the line below.
           AUR_ED25519_FINGERPRINT='SHA256:RFzBCUItH9LZS0cKB5UE6ceAYhBD5C8GeOBip8Z11+4'
-          ssh-keyscan -t ed25519 aur.archlinux.org > ~/.ssh/known_hosts 2>/dev/null
-          got=$(ssh-keygen -lf ~/.ssh/known_hosts | awk '{ print $2 }')
-          if [ "$got" != "$AUR_ED25519_FINGERPRINT" ]; then
+          ssh-keyscan -t ed25519 aur.archlinux.org > ~/.ssh/known_hosts 2>/dev/null || true
+          # `sort -u`, because ssh-keyscan walks every getaddrinfo result: on a
+          # dual-stack runner it writes the SAME key once for A and once for AAAA,
+          # and two identical fingerprints must not read as a mismatch. Requiring
+          # exactly one unique value keeps the check strict - two DIFFERENT keys
+          # still fail, which is the case that matters.
+          got=$(ssh-keygen -lf ~/.ssh/known_hosts 2>/dev/null | awk '{ print $2 }' | sort -u)
+          unique=$(printf '%s' "$got" | grep -c . || true)
+          if [ "$unique" != "1" ] || [ "$got" != "$AUR_ED25519_FINGERPRINT" ]; then
             echo "::error::aur.archlinux.org host key does not match the published fingerprint."
-            echo "  expected $AUR_ED25519_FINGERPRINT"
-            echo "  got      ${got:-<nothing>}"
+            echo "  expected exactly one key with $AUR_ED25519_FINGERPRINT"
+            echo "  got ($unique unique) ${got:-<nothing>}"
             exit 1
           fi
           echo "host key verified: $got"
@@ -184,16 +202,33 @@ jobs:
           # AUR serves an empty repo for a package that does not exist yet, so
           # the first release creates `toolport-bin` by pushing to it.
           git clone ssh://aur@aur.archlinux.org/toolport-bin.git aur-repo
+
+          # The concurrency group serialises pushes; it does not order them by
+          # version. A workflow_dispatch catch-up for an OLD tag - the documented
+          # retry path - would otherwise happily overwrite a newer pkgver, and
+          # `paru -S toolport-bin` would start handing out the older release while
+          # already-upgraded machines stay put. Read what is there and refuse to
+          # go backwards.
+          new_version="${TAG#v}"
+          existing=$(sed -n 's/^pkgver=//p' aur-repo/PKGBUILD 2>/dev/null | head -1)
+          if [ -n "$existing" ] && [ "$existing" != "$new_version" ]; then
+            newest=$(printf '%s\n%s\n' "$existing" "$new_version" | sort -V | tail -1)
+            if [ "$newest" != "$new_version" ]; then
+              echo "::notice::The AUR carries $existing, which is newer than $new_version. Not downgrading."
+              exit 0
+            fi
+          fi
+
           cp aur/PKGBUILD aur/.SRCINFO aur-repo/
           cd aur-repo
           git config user.name "toolport release"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if [ -z "$(git status --porcelain)" ]; then
-            echo "The AUR already carries ${TAG#v}; nothing to push."
+            echo "The AUR already carries $new_version at this pkgrel; nothing to push."
             exit 0
           fi
           git add PKGBUILD .SRCINFO
-          git commit -m "toolport-bin ${TAG#v}"
+          git commit -m "toolport-bin $new_version-$AUR_PKGREL"
           git push origin HEAD:master
 
       - name: Say why nothing was published

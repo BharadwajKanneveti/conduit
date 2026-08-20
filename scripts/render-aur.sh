@@ -19,9 +19,12 @@
 # each other; .SRCINFO is emitted directly rather than via `makepkg
 # --printsrcinfo` so this runs on any Linux, not just Arch.
 #
-# Usage: scripts/render-aur.sh <version> [outdir]
-#   version  release version WITHOUT the leading v, e.g. 1.15.0
-#   outdir   defaults to packaging/linux/aur
+# Usage: [AUR_PKGREL=n] scripts/render-aur.sh <version> [outdir]
+#   version     release version WITHOUT the leading v, e.g. 1.15.0
+#   outdir      defaults to packaging/linux/aur
+#   AUR_PKGREL  Arch package revision, default 1. Bump it when re-publishing the
+#               SAME version with a corrected PKGBUILD, or pacman will treat the
+#               fix as already installed.
 #
 # Needs curl + sha256sum and network access: the checksums must come from the
 # assets that were actually published, never from a previous release.
@@ -43,7 +46,16 @@ if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
 fi
 
 pkgname=toolport-bin
-pkgrel=1
+# pacman compares pkgver-pkgrel. Re-rendering the SAME version with a fixed
+# PKGBUILD (wrong depends, moved source URL) and pkgrel still 1 reads as "already
+# installed" on every machine that took the broken package, so only fresh
+# installs get the fix. Bumping it is an operator decision, never automatic:
+# AUR_PKGREL=2 scripts/render-aur.sh 1.15.0 ./aur
+pkgrel=${AUR_PKGREL:-1}
+if ! printf '%s' "$pkgrel" | grep -qE '^[1-9][0-9]*$'; then
+  echo "error: AUR_PKGREL must be a positive integer, got '$pkgrel'." >&2
+  exit 1
+fi
 repo=tsouth89/toolport
 url="https://github.com/$repo"
 pkgdesc='One MCP endpoint for every AI client: governance, approvals, and audit for your MCP servers'
