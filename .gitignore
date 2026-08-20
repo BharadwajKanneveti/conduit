@@ -113,3 +113,11 @@ src-tauri/rate_limit_counters.test.json
 *.tsbuildinfo
 /vite.config.js
 /vite.config.d.ts
+
+# Rendered per-release AUR package (scripts/render-aur.sh). PKGBUILD/.SRCINFO
+# carry the sha256 of ONE release's .deb, so a checked-in copy would either be
+# stale or be a checksum nobody verified. CI renders them on release; only
+# packaging/linux/aur/README.md is tracked.
+/packaging/linux/aur/PKGBUILD
+/packaging/linux/aur/.SRCINFO
+/aur/

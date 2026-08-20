@@ -58,6 +58,18 @@ shipped, so submitting it unchanged re-submits that version's metadata and the n
 release never reaches winget. Check it with `winget validate --manifest <dir>`
 before opening the PR.
 
+Publishing also triggers the **AUR** (`aur.yml`): it renders
+`PKGBUILD`/`.SRCINFO` from the published `.deb` with `scripts/render-aur.sh`,
+builds the package in an `archlinux:base-devel` container to prove the PKGBUILD
+works, and pushes `toolport-bin`. Same reason as winget for waiting on publish:
+the sha256sums must come from assets that are actually downloadable. It skips
+prereleases (an Arch `pkgver` cannot carry `-rc.1`), and no-ops with a warning
+unless the `AUR_SSH_PRIVATE_KEY` secret is set, so it can never fail a release.
+One-time setup and how to publish by hand are in
+[`packaging/linux/aur/README.md`](../packaging/linux/aur/README.md). `PKGBUILD`
+is deliberately NOT checked in: it pins one release's checksum, so a tracked copy
+would only ever be stale.
+
 Publishing is also when the **Homebrew tap** must be bumped. There is no
 workflow for this next to `winget.yml` (SBS-260 is the backlog for automating
 it). `brew install --cask tsouth89/toolport/toolport` and

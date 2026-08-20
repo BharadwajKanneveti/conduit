@@ -11,8 +11,9 @@
 # just made will not reach anyone using the short URL.
 #
 # Installs the latest signed release for your OS/arch:
-#   - Linux (x86_64): the .deb via apt where available, else the portable AppImage
-#     into ~/.local/bin with a desktop entry.
+#   - Linux (x86_64): the .deb via apt where available, `toolport-bin` from the AUR
+#     on Arch (the AppImage's bundled WebKitGTK cannot do EGL against a rolling
+#     Mesa), else the portable AppImage into ~/.local/bin with a desktop entry.
 #   - macOS: copies Toolport.app from the signed .dmg into /Applications (Homebrew is
 #     the cleaner path, and this script points you there).
 # Windows: use scripts/install.ps1 instead.
@@ -211,6 +212,59 @@ install_linux() {
     # installed as `$bindir/toolport` as well.
     say "Installed. Launch Toolport from your app menu, or run: toolport"
     return
+  fi
+
+  # Arch and friends: the AppImage bundles Ubuntu 22.04's WebKitGTK, which cannot
+  # initialise EGL against a current Mesa, so it opens a grey empty window on a
+  # rolling release. `toolport-bin` in the AUR repackages the same .deb payload
+  # against the host WebKitGTK.
+  #
+  # Every helper call is allowed to FAIL rather than abort the install: AUR
+  # account registration is paused upstream, so toolport-bin may not be published
+  # yet, and a 404 there must not leave the user with nothing. Same for a helper
+  # that cannot build. Try each helper that is present, then fall through to the
+  # AppImage with a warning.
+  #
+  # Two things this has to get right, because the documented entry point is
+  # `curl ... | bash`:
+  #
+  #   - pacman's `--noconfirm` does NOT cover an AUR helper's own PKGBUILD review
+  #     prompt. paru needs `--skipreview`; yay needs its answer flags. Without
+  #     them the helper waits on a TTY that does not exist.
+  #   - stdin is the INSTALLER ITSELF when piped. A prompt that reads stdin would
+  #     eat the rest of this script, so every helper runs with </dev/null. That is
+  #     the belt to the flags' braces: a helper we do not know about still cannot
+  #     consume the script, it just fails and we move on.
+  if command -v pacman >/dev/null 2>&1; then
+    for helper in paru yay pamac pikaur trizen omarchy; do
+      command -v "$helper" >/dev/null 2>&1 || continue
+      case "$helper" in
+        paru) helper_args=(-S --needed --noconfirm --skipreview toolport-bin) ;;
+        yay) helper_args=(-S --needed --noconfirm --answerdiff None --answerclean None --answeredit None toolport-bin) ;;
+        # Manjaro's default, and usually the ONLY helper a stock Manjaro has:
+        # without this the distro the README names would skip every branch here
+        # and land on the AppImage. `build` is the AUR verb; `install` is repos
+        # only.
+        pamac) helper_args=(build --no-confirm toolport-bin) ;;
+        # Omarchy's wrapper around the AUR; it drives a helper underneath.
+        omarchy) helper_args=(pkg aur add toolport-bin) ;;
+        *) helper_args=(-S --needed --noconfirm toolport-bin) ;;
+      esac
+      say "Arch detected: trying toolport-bin from the AUR with $helper"
+      if "$helper" "${helper_args[@]}" </dev/null; then
+        say "Installed. Launch Toolport from your app menu, or run: toolport"
+        return
+      fi
+      say "$helper could not install toolport-bin (it may not be on the AUR yet)."
+    done
+    say "The native Arch package is the reliable one. Once it is on the AUR:"
+    say "    paru -S toolport-bin      # or: yay -S toolport-bin"
+    say "    pamac build toolport-bin  # Manjaro"
+    say "    omarchy pkg aur add toolport-bin"
+    say "Until then you can build the same package from source:"
+    say "    git clone https://github.com/tsouth89/toolport && cd toolport"
+    say "    scripts/render-aur.sh ${tag_name#v} ./aur && cd aur && makepkg -si"
+    say "Falling back to the AppImage, which can open a grey empty window here."
   fi
 
   url="$(asset_url '_amd64[.]AppImage')"
