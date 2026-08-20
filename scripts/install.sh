@@ -236,11 +236,16 @@ install_linux() {
   #     the belt to the flags' braces: a helper we do not know about still cannot
   #     consume the script, it just fails and we move on.
   if command -v pacman >/dev/null 2>&1; then
-    for helper in paru yay pikaur trizen omarchy; do
+    for helper in paru yay pamac pikaur trizen omarchy; do
       command -v "$helper" >/dev/null 2>&1 || continue
       case "$helper" in
         paru) helper_args=(-S --needed --noconfirm --skipreview toolport-bin) ;;
         yay) helper_args=(-S --needed --noconfirm --answerdiff None --answerclean None --answeredit None toolport-bin) ;;
+        # Manjaro's default, and usually the ONLY helper a stock Manjaro has:
+        # without this the distro the README names would skip every branch here
+        # and land on the AppImage. `build` is the AUR verb; `install` is repos
+        # only.
+        pamac) helper_args=(build --no-confirm toolport-bin) ;;
         # Omarchy's wrapper around the AUR; it drives a helper underneath.
         omarchy) helper_args=(pkg aur add toolport-bin) ;;
         *) helper_args=(-S --needed --noconfirm toolport-bin) ;;
@@ -254,6 +259,7 @@ install_linux() {
     done
     say "The native Arch package is the reliable one. Once it is on the AUR:"
     say "    paru -S toolport-bin      # or: yay -S toolport-bin"
+    say "    pamac build toolport-bin  # Manjaro"
     say "    omarchy pkg aur add toolport-bin"
     say "Until then you can build the same package from source:"
     say "    git clone https://github.com/tsouth89/toolport && cd toolport"

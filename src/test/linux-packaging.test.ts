@@ -258,19 +258,28 @@ describe("the AUR package ships to Arch", () => {
     // version, so a workflow_dispatch catch-up for an old tag could overwrite a
     // newer AUR package and start handing out the older release.
     const push = byName("Publish to the AUR")!;
-    const start = push.run!.indexOf('new_version="${TAG#v}"');
+    const start = push.run!.indexOf('new_full="${TAG#v}-${AUR_PKGREL}"');
     const end = push.run!.indexOf("cp aur/PKGBUILD");
     expect(start, "no downgrade guard").toBeGreaterThan(-1);
     const guard = push.run!.slice(start, end);
 
-    const run = (onAur: string, tag: string) => {
+    // onAur / pushing are "<pkgver>-<pkgrel>", the pair pacman actually orders by.
+    const run = (onAur: string, pushing: string) => {
       const dir = mkdtempSync(join(tmpdir(), "toolport-aurver-"));
+      const [haveVer, haveRel] = onAur.split("-");
+      const [wantVer, wantRel] = pushing.split("-");
       try {
         mkdirSync(join(dir, "aur-repo"));
-        writeFileSync(join(dir, "aur-repo", "PKGBUILD"), `pkgver=${onAur}\n`);
+        writeFileSync(
+          join(dir, "aur-repo", "PKGBUILD"),
+          `pkgver=${haveVer}\npkgrel=${haveRel}\n`,
+        );
         return execFileSync(
           "bash",
-          ["-c", `cd ${JSON.stringify(dir)}\nTAG=v${tag}\n${guard}\necho PROCEEDED`],
+          [
+            "-c",
+            `cd ${JSON.stringify(dir)}\nTAG=v${wantVer}\nAUR_PKGREL=${wantRel}\n${guard}\necho PROCEEDED`,
+          ],
           { encoding: "utf8" },
         );
       } finally {
@@ -278,12 +287,18 @@ describe("the AUR package ships to Arch", () => {
       }
     };
 
-    expect(run("1.16.0", "1.15.0")).toContain("Not downgrading");
-    expect(run("1.16.0", "1.15.0")).not.toContain("PROCEEDED");
-    expect(run("1.14.0", "1.15.0")).toContain("PROCEEDED");
-    expect(run("1.15.0", "1.15.0")).toContain("PROCEEDED"); // same version, new pkgrel
+    expect(run("1.16.0-1", "1.15.0-1")).toContain("Not downgrading");
+    expect(run("1.16.0-1", "1.15.0-1")).not.toContain("PROCEEDED");
+    // pkgrel is the other half of the ordering. Re-dispatching the same tag
+    // defaults pkgrel back to 1, so a pkgver-only guard would push 1.15.0-1
+    // over a 1.15.0-2 that fixed the PKGBUILD, and nobody on -2 would upgrade.
+    expect(run("1.15.0-2", "1.15.0-1")).toContain("Not downgrading");
+    expect(run("1.15.0-2", "1.15.0-1")).not.toContain("PROCEEDED");
+    expect(run("1.15.0-1", "1.15.0-2")).toContain("PROCEEDED");
+    expect(run("1.14.0-1", "1.15.0-1")).toContain("PROCEEDED");
+    expect(run("1.15.0-1", "1.15.0-1")).toContain("PROCEEDED"); // identical, porcelain skips
     // Not lexical: 1.9.0 must not read as newer than 1.10.0.
-    expect(run("1.9.0", "1.10.0")).toContain("PROCEEDED");
+    expect(run("1.9.0-1", "1.10.0-1")).toContain("PROCEEDED");
   });
 
   it("can bump pkgrel so a same-version PKGBUILD fix actually upgrades", () => {
@@ -374,5 +389,24 @@ describe("install.sh routes Arch users without hanging or eating itself", () => 
 
   it("tries Omarchy's wrapper, which the docs tell those users to run", () => {
     expect(installer).toContain("omarchy) helper_args=(pkg aur add toolport-bin)");
+  });
+
+  it("tries pamac, which is all a stock Manjaro has", () => {
+    // The README names Manjaro. A default Manjaro ships pamac and usually none
+    // of paru/yay, so without this the named distro skips every branch and
+    // lands on the AppImage this whole change exists to avoid there.
+    expect(installer).toContain("pamac) helper_args=(build --no-confirm toolport-bin)");
+    expect(installer).toMatch(/^ *for helper in [a-z ]*\bpamac\b/m);
+  });
+
+  it("cannot reach a real AUR helper from the bash installer tests", () => {
+    // These tests only shimmed curl and uname, so on an Arch or Manjaro box the
+    // Arch branch found the REAL pacman and paru and sudo-installed from the
+    // actual AUR mid-test. Ubuntu CI never runs this file, so that only ever
+    // fired on a maintainer's own machine.
+    const harness = read("scripts", "install.Tests.bash");
+    expect(harness).toContain('cat > "$shim_dir/pacman"');
+    expect(harness).toMatch(/for helper in paru yay pamac pikaur trizen omarchy/);
+    expect(harness).toContain("helper-stdin.log");
   });
 });

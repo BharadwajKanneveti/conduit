@@ -92,6 +92,38 @@ case "$1" in
 esac
 EOF
   chmod +x "$shim_dir/uname"
+
+  # Shadow pacman and every AUR helper install.sh knows about.
+  #
+  # Without this, running these tests on an Arch or Manjaro box finds the REAL
+  # pacman and the REAL paru/yay/pamac on PATH, and the Arch branch then builds
+  # and sudo-installs toolport-bin from the actual AUR in the middle of a unit
+  # test. Ubuntu CI never runs this file, so that hole only ever opens on the
+  # maintainer's own machine, which is the worst place for it.
+  #
+  # `pacman` exists so the Arch branch is entered on every platform, making the
+  # coverage below deterministic instead of dependent on the host distro. Each
+  # helper records its argv and its stdin, then fails - unless it is named in
+  # TOOLPORT_TEST_AUR_HELPER, which is how the success path is exercised.
+  cat > "$shim_dir/pacman" <<'EOF'
+#!/usr/bin/env bash
+exit 0
+EOF
+  chmod +x "$shim_dir/pacman"
+  local helper
+  for helper in paru yay pamac pikaur trizen omarchy; do
+    cat > "$shim_dir/$helper" <<EOF
+#!/usr/bin/env bash
+me=\$(basename "\$0")
+printf '%s %s\n' "\$me" "\$*" >> "$shim_dir/helper-argv.log"
+# Whatever this reads from stdin is what a real helper's prompt would have
+# swallowed. install.sh must hand it /dev/null, so this must stay empty.
+cat >> "$shim_dir/helper-stdin.log"
+[ "\${TOOLPORT_TEST_AUR_HELPER:-}" = "\$me" ] && exit 0
+exit 1
+EOF
+    chmod +x "$shim_dir/$helper"
+  done
 }
 
 # run_install <release-json> [ENV=value ...] -> prints "<rc>\t<output>"
@@ -202,6 +234,49 @@ else
 fi
 echo "    output: $(printf '%s' "$curl_fail_output" | tr '\n' ' ' | cut -c1-150)"
 rm -rf "$workdir"
+
+echo "Arch: the AUR helper loop"
+arch_workdir="$(mktemp -d)"
+arch_shim="$arch_workdir/shim"; arch_home="$arch_workdir/home"; arch_bin="$arch_workdir/bin"
+mkdir -p "$arch_home" "$arch_bin"
+make_shim "$arch_shim" "$(fake_release "sha256:$fake_sha256" 64)"
+set +e
+arch_output="$(cd "$arch_workdir" && PATH="$arch_shim:$PATH" HOME="$arch_home" XDG_BIN_HOME="$arch_bin"   TOOLPORT_TEST_AUR_HELPER=yay bash "$INSTALL_SH" 2>&1)"
+arch_rc=$?
+set -e
+arch_argv="$(cat "$arch_shim/helper-argv.log" 2>/dev/null || true)"
+
+check "installs through the AUR helper" "Launch Toolport from your app menu" "$arch_output"
+if [ "$arch_rc" = "0" ]; then
+  echo "  ok: exit code 0"; pass=$((pass + 1))
+else
+  echo "  FAIL: exit code $arch_rc (wanted 0)"; fail=$((fail + 1))
+fi
+# A failing first helper must not end the loop, or a working second one never runs.
+check "tries paru before yay" "paru -S" "$arch_argv"
+check "falls through to yay after paru fails" "yay -S" "$arch_argv"
+# pacman's --noconfirm does not cover a helper's own PKGBUILD review prompt.
+check "passes paru --skipreview" "--skipreview" "$arch_argv"
+check "passes yay's answer flags" "--answerdiff None" "$arch_argv"
+# The AUR path succeeded, so the AppImage must not also have been installed.
+if [ ! -e "$arch_bin/toolport" ]; then
+  echo "  ok: no AppImage installed once the helper succeeded"; pass=$((pass + 1))
+else
+  echo "  FAIL: AppImage installed even though the AUR helper succeeded"; fail=$((fail + 1))
+fi
+# The documented entry point is `curl ... | bash`, so stdin is the script itself.
+# A helper that prompts would eat the rest of it; install.sh hands it /dev/null.
+if [ ! -s "$arch_shim/helper-stdin.log" ]; then
+  echo "  ok: no helper read from the installer's stdin"; pass=$((pass + 1))
+else
+  echo "  FAIL: a helper consumed stdin: $(head -c 80 "$arch_shim/helper-stdin.log")"; fail=$((fail + 1))
+fi
+echo "    argv: $(printf '%s' "$arch_argv" | tr '
+' ' ' | cut -c1-160)"
+rm -rf "$arch_workdir"
+
+echo "Arch: every helper failing still installs something"
+run_check "falls back to the AppImage" "Installed the AppImage" 0 "$(fake_release "sha256:$fake_sha256" 64)"
 
 echo
 echo "$pass passed, $fail failed"

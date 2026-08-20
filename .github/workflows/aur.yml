@@ -209,12 +209,21 @@ jobs:
           # `paru -S toolport-bin` would start handing out the older release while
           # already-upgraded machines stay put. Read what is there and refuse to
           # go backwards.
-          new_version="${TAG#v}"
-          existing=$(sed -n 's/^pkgver=//p' aur-repo/PKGBUILD 2>/dev/null | head -1)
-          if [ -n "$existing" ] && [ "$existing" != "$new_version" ]; then
-            newest=$(printf '%s\n%s\n' "$existing" "$new_version" | sort -V | tail -1)
-            if [ "$newest" != "$new_version" ]; then
-              echo "::notice::The AUR carries $existing, which is newer than $new_version. Not downgrading."
+          #
+          # Compare pkgver-pkgrel, not pkgver. pkgrel is the other half of what
+          # pacman orders by, and the documented retry - dispatch the same tag
+          # again - defaults pkgrel back to 1. Against an AUR already carrying
+          # 1.15.0-2 from a PKGBUILD fix, a pkgver-only comparison finds them
+          # equal, skips the guard, and pushes 1.15.0-1 over it: machines on -2
+          # never upgrade and new installs get the older revision.
+          new_full="${TAG#v}-${AUR_PKGREL}"
+          existing_ver=$(sed -n 's/^pkgver=//p' aur-repo/PKGBUILD 2>/dev/null | head -1)
+          existing_rel=$(sed -n 's/^pkgrel=//p' aur-repo/PKGBUILD 2>/dev/null | head -1)
+          if [ -n "$existing_ver" ]; then
+            existing_full="$existing_ver-${existing_rel:-1}"
+            newest=$(printf '%s\n%s\n' "$existing_full" "$new_full" | sort -V | tail -1)
+            if [ "$existing_full" != "$new_full" ] && [ "$newest" != "$new_full" ]; then
+              echo "::notice::The AUR carries $existing_full, which is newer than $new_full. Not downgrading."
               exit 0
             fi
           fi
@@ -224,11 +233,11 @@ jobs:
           git config user.name "toolport release"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           if [ -z "$(git status --porcelain)" ]; then
-            echo "The AUR already carries $new_version at this pkgrel; nothing to push."
+            echo "The AUR already carries $new_full; nothing to push."
             exit 0
           fi
           git add PKGBUILD .SRCINFO
-          git commit -m "toolport-bin $new_version-$AUR_PKGREL"
+          git commit -m "toolport-bin $new_full"
           git push origin HEAD:master
 
       - name: Say why nothing was published
