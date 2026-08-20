@@ -94,6 +94,13 @@ makepkg -si` builds the identical package with no AUR account). The AppImage
 
 ### Fixed
 
+- **Stopping the HTTP bridge no longer reports a false success.** When the child
+  process survived the stop, the app cleared the handle, port and bearer token
+  anyway, so the bridge read as stopped while it was still listening and nothing
+  was left to retry with. The stop failure is reported, and the state is kept
+  when the child is still running so a later stop can finish the job.
+  (#736, thanks @YuukiRitoTeng)
+
 - **The gateway no longer speaks on stdout before the client has handshaked.**
   MCP forbids a server sending anything before the client's
   `notifications/initialized`, and the gateway builds its catalog on a
@@ -200,6 +207,9 @@ makepkg -si` builds the identical package with no AUR account). The AppImage
 
 ### Internal
 
+- **Dead `McpSession::upstream_call` shim removed.** Nothing called it.
+  (#805, thanks @forever-ivy)
+
 - **CI apt installs are bounded and retried instead of hanging.** `apt-get
 update` on the hosted runners intermittently stops responding rather than
   failing, which burned three jobs' entire timeouts on one pull request without
@@ -253,6 +263,21 @@ update` on the hosted runners intermittently stops responding rather than
   guess-sleeps, which a loaded runner can miss while behaving correctly; it now waits for a real
   signal that the slow call has parked and asserts the property it means - that the fast response
   came back while the slow one was still in flight.
+
+### Thanks
+
+Four of the patches in this release came from outside.
+
+- **[forever-ivy](https://github.com/forever-ivy)** - the stale connection-test
+  verdict, so a test whose connection details changed underneath it stops
+  reporting on the old ones (#814), and the removal of a dead
+  `McpSession::upstream_call` shim (#805).
+- **[YuukiRitoTeng](https://github.com/YuukiRitoTeng)** - stopping the HTTP bridge
+  now reports a failure instead of a false success, and keeps the child handle so
+  a later stop can retry (#788).
+- **[rohankumardubey](https://github.com/rohankumardubey)** - stack loading
+  failures surfaced in the catalog and in onboarding, instead of a failed fetch
+  rendering as "no stacks" with no way to retry (#817).
 
 ## [1.14.0] - 2026-08-16
 
