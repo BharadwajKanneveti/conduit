@@ -270,6 +270,12 @@ fn resolve_client_config_path(
             .join(".codeium")
             .join("windsurf")
             .join("mcp_config.json"),
+        "devin-cli" => match platform {
+            Platform::Windows => config.join("devin").join("mcp_config.json"),
+            Platform::MacOs | Platform::Linux => {
+                home.join(".config").join("devin").join("mcp_config.json")
+            }
+        },
         "opencode" => home.join(".config").join("opencode").join("opencode.json"),
         "kilo-code" => home.join(".config").join("kilo").join("kilo.jsonc"),
         "grok" => home.join(".grok").join("config.toml"),
@@ -736,6 +742,7 @@ fn resolve_client_config_path_linux(client_id: &str, home: &std::path::Path) -> 
             .join(".codeium")
             .join("windsurf")
             .join("mcp_config.json"),
+        "devin-cli" => config.join("devin").join("mcp_config.json"),
         // OpenCode and Kilo Code document literal home-relative paths on every
         // platform; unlike most Linux clients they do not follow XDG_CONFIG_HOME.
         "opencode" => home.join(".config").join("opencode").join("opencode.json"),
@@ -849,8 +856,14 @@ fn resolve_rules_target(
                 .join("global_rules.md"),
             strategy: Strategy::SentinelBlock,
             scope,
-            char_cap: Some(6000), // Windsurf hard-caps the global rules file.
+            char_cap: Some(6000), // Devin Desktop's Cascade agent hard-caps the global rules file.
             blocked_if_present: None,
+        },
+        "devin-cli" => match platform {
+            Platform::Windows => block(config.join("devin").join("AGENTS.md")),
+            Platform::MacOs | Platform::Linux => {
+                block(home.join(".config").join("devin").join("AGENTS.md"))
+            }
         },
         // Sibling of config.yaml. Windows uses the etcetera config dir
         // (%APPDATA%\\Block\\goose\\config); macOS/Linux default to ~/.config/goose
@@ -939,11 +952,12 @@ pub fn client_rules_target(
     }
     let home = home()?;
     #[cfg(all(unix, not(target_os = "macos")))]
-    if matches!(client_id, "goose" | "zed") {
+    if matches!(client_id, "goose" | "zed" | "devin-cli") {
         let config = dirs::config_dir().unwrap_or_else(|| home.join(".config"));
         let path = match client_id {
             "goose" => config.join("goose").join(".goosehints"),
             "zed" => config.join("zed").join("AGENTS.md"),
+            "devin-cli" => config.join("devin").join("AGENTS.md"),
             _ => unreachable!("guarded by matches! above"),
         };
         return Some(rules_sentinel_block(path, scope));
@@ -1071,6 +1085,10 @@ fn amp_path() -> Option<PathBuf> {
 
 fn windsurf_path() -> Option<PathBuf> {
     client_config_path("windsurf")
+}
+
+fn devin_cli_path() -> Option<PathBuf> {
+    client_config_path("devin-cli")
 }
 
 /// Codex reads `$CODEX_HOME/config.toml` when `CODEX_HOME` is set, otherwise
@@ -1490,10 +1508,18 @@ fn defs() -> Vec<ClientDef> {
         },
         ClientDef {
             id: "windsurf",
-            name: "Windsurf",
+            name: "Devin Desktop (Cascade)",
             format: Format::JsonMcpServers,
             uses_connectors: false,
             path: windsurf_path,
+            plugin_scan: None,
+        },
+        ClientDef {
+            id: "devin-cli",
+            name: "Devin Local / CLI",
+            format: Format::JsonMcpServers,
+            uses_connectors: false,
+            path: devin_cli_path,
             plugin_scan: None,
         },
         ClientDef {
@@ -5397,6 +5423,20 @@ pub fn client_uses_mcp_remote_bridge(client_id: &str) -> bool {
     let Some(def) = find_def(client_id) else {
         return true;
     };
+    // The one client whose format does not decide this. Devin Local / CLI reads
+    // the plain `mcpServers` shape, but unlike the rest of that format it takes a
+    // remote entry directly: its user config documents `url` plus an optional
+    // `headers` object, with `transport` defaulting to http, which is exactly
+    // what entry_to_json already emits for a native remote. Bridging it through
+    // `npx mcp-remote` would work but would make users install a third-party
+    // shim for a transport the client speaks natively.
+    //
+    // Devin Desktop (the `windsurf` id) is deliberately not covered: it is a
+    // separate config that has not been checked for the same support, so it
+    // keeps the format default.
+    if client_id == "devin-cli" {
+        return false;
+    }
     match def.format {
         // Native remote shapes already exist in our writers.
         Format::JsonQwenMcpServers
@@ -7957,6 +7997,33 @@ bad = "not-a-table"
         assert!(!client_uses_mcp_remote_bridge("opencode"));
         assert!(!client_uses_mcp_remote_bridge("vscode"));
         assert!(!client_uses_mcp_remote_bridge("github-copilot-cli"));
+        assert!(!client_uses_mcp_remote_bridge("devin-cli"));
+    }
+
+    #[test]
+    fn devin_cli_shared_http_entry_uses_native_remote_schema() {
+        let path = temp_path("devin-cli-http.json");
+        let spec = SharedHttpSpec {
+            url: "http://127.0.0.1:8765/mcp".into(),
+            token: "tok".into(),
+        };
+        let entry = gateway_entry_shared_http("devin-cli", None, &spec);
+        // No mcp-remote shim: Devin Local / CLI takes the remote entry directly.
+        assert!(entry.command.is_none());
+        assert_eq!(entry.url.as_deref(), Some("http://127.0.0.1:8765/mcp"));
+
+        edit_json_gateway(&path, "mcpServers", Some(&entry), false).unwrap();
+        let root: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let gateway = &root["mcpServers"][GATEWAY_ENTRY_NAME];
+        assert_eq!(gateway["url"], "http://127.0.0.1:8765/mcp");
+        // Devin defaults `transport` to http, so the `type` hint is advisory; the
+        // credential must ride in `headers` rather than `env` to reach the wire.
+        assert_eq!(gateway["type"], "http");
+        assert_eq!(gateway["headers"]["Authorization"], "Bearer tok");
+        assert!(gateway.get("command").is_none());
+        assert!(gateway.get("env").is_none());
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -9841,6 +9908,7 @@ command = "npx"
             "anythingllm",
             "witsy",
             "junie",
+            "devin-cli",
         ] {
             let d = defs()
                 .into_iter()
@@ -9852,6 +9920,18 @@ command = "npx"
             );
             assert!((d.path)().is_some(), "{id} path should resolve");
         }
+    }
+
+    #[test]
+    fn devin_clients_keep_legacy_and_current_configs_distinct() {
+        let legacy = defs().into_iter().find(|d| d.id == "windsurf").unwrap();
+        let current = defs().into_iter().find(|d| d.id == "devin-cli").unwrap();
+        assert_eq!(legacy.name, "Devin Desktop (Cascade)");
+        assert_eq!(current.name, "Devin Local / CLI");
+        assert!(matches!(legacy.format, Format::JsonMcpServers));
+        assert!(matches!(current.format, Format::JsonMcpServers));
+        assert_ne!((legacy.path)(), (current.path)());
+        assert!(!client_uses_mcp_remote_bridge("devin-cli"));
     }
 
     #[test]
@@ -10900,7 +10980,7 @@ rules:
         use crate::instructions::Scope;
         let home = mock_home(Platform::MacOs);
         let p = Platform::MacOs;
-        for client in ["codex", "gemini-cli", "windsurf", "goose", "zed", "pi", "omp"] {
+        for client in ["codex", "gemini-cli", "windsurf", "devin-cli", "goose", "zed", "pi", "omp"] {
             let team = resolve_rules_target(client, &home, p, Scope::Team).expect("supported");
             let personal =
                 resolve_rules_target(client, &home, p, Scope::Personal).expect("supported");
@@ -10932,6 +11012,17 @@ rules:
         let t = team_rules_target("windsurf", &mock_home(Platform::Linux), Platform::Linux)
             .expect("supported");
         assert_eq!(t.char_cap, Some(6000));
+    }
+
+    #[test]
+    fn rules_target_devin_cli_matches_user_config_directory() {
+        for platform in Platform::ALL {
+            let home = mock_home(platform);
+            let rules = team_rules_target("devin-cli", &home, platform).expect("supported");
+            let config = resolve_client_config_path("devin-cli", &home, platform).unwrap();
+            assert_eq!(rules.path.parent(), config.parent(), "{platform:?}");
+            assert!(rules.path.ends_with("AGENTS.md"));
+        }
     }
 
     #[test]
@@ -11143,6 +11234,14 @@ rules:
             ("github-copilot-cli", |home, _| {
                 home.join(".copilot").join("mcp-config.json")
             }),
+            ("devin-cli", |home, platform| match platform {
+                Platform::Windows => roaming_config_dir(home, platform)
+                    .join("devin")
+                    .join("mcp_config.json"),
+                Platform::MacOs | Platform::Linux => {
+                    home.join(".config").join("devin").join("mcp_config.json")
+                }
+            }),
             ("opencode", |home, _| {
                 home.join(".config").join("opencode").join("opencode.json")
             }),
@@ -11268,6 +11367,7 @@ rules:
         let zed = client_config_path("zed").unwrap();
         let goose = client_config_path("goose").unwrap();
         let anythingllm = client_config_path("anythingllm").unwrap();
+        let devin_cli = client_config_path("devin-cli").unwrap();
         let opencode = client_config_path("opencode").unwrap();
         let kilo_code = client_config_path("kilo-code").unwrap();
 
@@ -11286,6 +11386,7 @@ rules:
         assert_eq!(crush, xdg_config.join("crush").join("crush.json"));
         assert_eq!(zed, xdg_config.join("zed").join("settings.json"));
         assert_eq!(goose, xdg_config.join("goose").join("config.yaml"));
+        assert_eq!(devin_cli, xdg_config.join("devin").join("mcp_config.json"));
         assert_eq!(
             anythingllm,
             xdg_config
@@ -11324,8 +11425,11 @@ rules:
             .expect("goose has a rules target");
         let zed = client_rules_target("zed", crate::instructions::Scope::Team)
             .expect("zed has a rules target");
+        let devin_cli = client_rules_target("devin-cli", crate::instructions::Scope::Team)
+            .expect("Devin CLI has a rules target");
         let goose_config = client_config_path("goose").expect("goose config");
         let zed_config = client_config_path("zed").expect("zed config");
+        let devin_cli_config = client_config_path("devin-cli").expect("Devin CLI config");
 
         let _ = std::fs::remove_dir_all(&base);
 
@@ -11349,6 +11453,12 @@ rules:
             zed_config.parent(),
             "Zed rules and config must share a directory so the two families cannot drift"
         );
+        assert_eq!(
+            devin_cli.path,
+            xdg_config.join("devin").join("AGENTS.md"),
+            "Devin CLI rules must follow XDG_CONFIG_HOME"
+        );
+        assert_eq!(devin_cli.path.parent(), devin_cli_config.parent());
     }
 
     /// SBS-899: absolute GOOSE_PATH_ROOT relocates both config.yaml and

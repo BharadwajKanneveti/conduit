@@ -330,7 +330,7 @@ export function ServerDialog({
                 <textarea
                   className="min-h-[100px] w-full resize-y rounded-md bg-muted/50 p-2 font-mono text-xs"
                   placeholder={
-                    'Paste a config snippet from any client:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Windsurf/Antigravity: {"mcpServers": ...}\n• VS Code: {"servers": ...}\n• Codex: [mcp_servers.name]\n• Zed: {"context_servers": ...}'
+                    'Paste a config snippet from any client:\n\n• Claude Code: claude mcp add-json ...\n• Cursor/Devin/Antigravity: {"mcpServers": ...}\n• VS Code: {"servers": ...}\n• Codex: [mcp_servers.name]\n• Zed: {"context_servers": ...}'
                   }
                   value={pasteText}
                   onChange={(e) => setPasteText(e.target.value)}

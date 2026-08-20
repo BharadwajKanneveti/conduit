@@ -32,7 +32,7 @@
     <g><rect x="80" y="208" width="210" height="44" rx="10" fill="#16294A" stroke="rgba(255,255,255,0.12)"/><text x="100" y="236">Cursor</text></g>
     <g><rect x="80" y="266" width="210" height="44" rx="10" fill="#16294A" stroke="rgba(255,255,255,0.12)"/><text x="100" y="294">VS Code</text></g>
     <g><rect x="80" y="324" width="210" height="44" rx="10" fill="#16294A" stroke="rgba(255,255,255,0.12)"/><text x="100" y="352">Codex</text></g>
-    <g><rect x="80" y="382" width="210" height="44" rx="10" fill="#16294A" stroke="rgba(255,255,255,0.12)"/><text x="100" y="410">Windsurf</text></g>
+    <g><rect x="80" y="382" width="210" height="44" rx="10" fill="#16294A" stroke="rgba(255,255,255,0.12)"/><text x="100" y="410">Devin</text></g>
   </g>
 
   <!-- gateway: porthole mark -->
