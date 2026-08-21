@@ -96,8 +96,12 @@ export function ServerDialog({
   const [busy, setBusy] = useState(false);
   const [test, setTest] = useState<TestState>(IDLE_TEST);
   const testRequestId = useRef(0);
+  const [partialEdit, setPartialEdit] = useState<{ id: string; name: string } | null>(
+    null,
+  );
+  const currentEditId = editId ?? partialEdit?.id;
   const isStdio = form.transport === "stdio";
-  const editing = editId !== undefined;
+  const editing = currentEditId !== undefined;
 
   // Paste-from-config state.
   const [showPaste, setShowPaste] = useState(false);
@@ -126,6 +130,7 @@ export function ServerDialog({
       return;
     }
     if (next) {
+      setPartialEdit(null);
       setForm({
         name: initial?.name ?? "",
         transport: (initial?.transport ?? "stdio") as Transport,
@@ -207,7 +212,7 @@ export function ServerDialog({
   function buildEntry(withSecretValues: boolean): ServerEntry {
     const declared = envRows.filter((r) => r.key.trim());
     return {
-      id: editId ?? "",
+      id: currentEditId ?? "",
       name: form.name.trim(),
       transport: form.transport,
       command: isStdio ? form.command.trim() || null : null,
@@ -237,7 +242,9 @@ export function ServerDialog({
   } else if (!/^https?:\/\//i.test(urlTrim)) {
     errors.push("The URL must start with http:// or https://.");
   }
-  const ownName = editing ? initial?.name?.trim().toLowerCase() : undefined;
+  const ownName = editing
+    ? (initial?.name ?? partialEdit?.name)?.trim().toLowerCase()
+    : undefined;
   const duplicateName =
     !!nameTrim &&
     nameTrim.toLowerCase() !== ownName &&
@@ -278,21 +285,38 @@ export function ServerDialog({
     if (errors.length > 0) return;
     const entry = buildEntry(false);
     const declared = envRows.filter((r) => r.key.trim());
+    const wasEditing = editing;
     setBusy(true);
     try {
-      let result = editing ? await updateServer(entry) : await addServer(entry);
+      let result = wasEditing ? await updateServer(entry) : await addServer(entry);
       // Vault any values the user entered now. setSecret keys by server id. For a
       // new server, add_server appends it, so it's the last entry - resolving by
       // name would pick the wrong one if two servers share a name.
-      const id = editing ? editId : result.servers[result.servers.length - 1]?.id;
+      const id = wasEditing
+        ? currentEditId
+        : result.servers[result.servers.length - 1]?.id;
+      const failedKeys: string[] = [];
       if (id) {
         for (const r of declared) {
-          if (r.value) result = await setSecret(id, r.key.trim(), r.value);
+          if (!r.value) continue;
+          const key = r.key.trim();
+          try {
+            result = await setSecret(id, key, r.value);
+          } catch {
+            failedKeys.push(key);
+          }
         }
       }
       onSaved(result);
-      toast.success(editing ? `Saved ${entry.name}` : `Added ${entry.name}`);
-      setOpen(false);
+      if (failedKeys.length > 0) {
+        if (!wasEditing && id) setPartialEdit({ id, name: entry.name });
+        toast.warning(
+          `${wasEditing ? "Saved" : "Added"} ${entry.name}, but couldn't save: ${failedKeys.join(", ")}`,
+        );
+        return;
+      }
+      toast.success(wasEditing ? `Saved ${entry.name}` : `Added ${entry.name}`);
+      onOpenChange(false);
     } catch (e) {
       toastError(`Couldn't save ${entry.name}: ${e}`);
     } finally {
