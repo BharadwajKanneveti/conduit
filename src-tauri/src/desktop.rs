@@ -3528,8 +3528,11 @@ fn open_data_dir() -> Result<(), String> {
     let program = "open";
     #[cfg(target_os = "linux")]
     let program = "xdg-open";
-    std::process::Command::new(program)
-        .arg(&dir)
+    let mut cmd = std::process::Command::new(program);
+    // The file manager this launches is a host binary, so it must not inherit an
+    // AppImage's bundled library paths (see hostenv).
+    crate::hostenv::strip_bundled_env(&mut cmd);
+    cmd.arg(&dir)
         .spawn()
         .map_err(|e| format!("could not open the data directory: {e}"))?;
     Ok(())
@@ -5157,6 +5160,85 @@ fn is_launch_at_login_enabled(app: AppHandle) -> Result<bool, String> {
     }
 }
 
+/// Open a web link in the user's browser.
+///
+/// This replaces `tauri-plugin-opener` for the frontend. The plugin spawns with
+/// our inherited environment and offers no hook to change it, so under an
+/// AppImage the browser it launches inherits the bundle's library paths and dies
+/// on `undefined symbol` before drawing anything (see `hostenv`). Going through
+/// `oauth::open_browser` gives every link the same sanitised spawn the OAuth
+/// sign-in already uses, on all three platforms.
+///
+/// SECURITY: some of these URLs come from registry/vendor data, which is not
+/// fully trusted. `openUrl.ts` refuses anything that is not an `http`/`https`
+/// URL with a non-link-local host; this is the matching guard on the IPC
+/// boundary, which the renderer cannot talk its way around.
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    let parsed = url::Url::parse(&url).map_err(|_| "not a URL".to_string())?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("only http and https URLs can be opened".into());
+    }
+    let host = parsed.host_str().ok_or("URL has no host")?;
+    if host_reaches_metadata(host) {
+        return Err("refusing to open a link-local/metadata address".into());
+    }
+    crate::oauth::open_browser(parsed.as_str());
+    Ok(())
+}
+
+/// Hosts that must never reach the OS browser.
+///
+/// This mirrors `isLinkLocalHost` in `src/lib/openUrl.ts` case for case, and the
+/// tests below use that file's vectors. It has to: the point of checking here is
+/// that a compromised renderer cannot `invoke` its way past the frontend guard,
+/// and a backend check that is a strict subset of the frontend one does not do
+/// that. `oauth::ip_is_link_local` alone is such a subset - it has no opinion on
+/// CGNAT, unspecified or broadcast addresses - so it is one input here, not the
+/// whole answer.
+///
+/// Deliberately narrower than `oauth::ip_is_private`: loopback and RFC1918 LAN
+/// hosts are legitimate browser targets (locally served docs, an intranet page).
+/// Only the ranges that reach a metadata service are refused.
+fn host_reaches_metadata(host: &str) -> bool {
+    // WHATWG keeps a trailing dot on named hosts and brackets on IPv6 literals.
+    let host = host.trim_matches(['[', ']']);
+    let host = host.strip_suffix('.').unwrap_or(host);
+    // Well-known metadata names resolve to the service without a link-local
+    // literal ever appearing in the URL, so match them directly.
+    if host.eq_ignore_ascii_case("metadata.google.internal") || host.eq_ignore_ascii_case("metadata")
+    {
+        return true;
+    }
+    let Ok(ip) = host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    ip_reaches_metadata(&ip)
+}
+
+fn ip_reaches_metadata(ip: &std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+    // Covers 169.254/16 (incl. 169.254.169.254), fe80::/10, fd00:ec2::254, and
+    // the IPv4-mapped forms of the first.
+    if crate::oauth::ip_is_link_local(ip) {
+        return true;
+    }
+    let v4 = match ip {
+        IpAddr::V4(v4) => Some(*v4),
+        IpAddr::V6(v6) => {
+            if v6.is_unspecified() {
+                return true; // `::`
+            }
+            v6.to_ipv4_mapped()
+        }
+    };
+    let Some(v4) = v4 else { return false };
+    let [a, b, ..] = v4.octets();
+    // CGNAT 100.64/10 (Alibaba/OCI metadata), "this network" 0/8 (0.0.0.0
+    // reaches loopback/IMDS on some stacks), and the broadcast address.
+    (a == 100 && b & 0xc0 == 64) || a == 0 || v4.is_broadcast()
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // `generate_context!()` must expand exactly once in this crate: on macOS dev
@@ -5229,7 +5311,6 @@ pub fn run() {
             show_main_window(app);
         }))
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_dialog::init())
@@ -5386,6 +5467,7 @@ pub fn run() {
             enable_launch_at_login,
             disable_launch_at_login,
             is_launch_at_login_enabled,
+            open_external,
         ])
         // Close-to-tray: the window's X hides it instead of quitting, so the gateway and
         // approval broker keep running (HITL only works while the app is alive). Quit is
@@ -8058,5 +8140,52 @@ mod tests {
             !fixture.http_row_present(),
             "success means the bearer is gone from the registry"
         );
+    }
+}
+
+#[cfg(test)]
+mod opener_host_tests {
+    use super::host_reaches_metadata;
+
+    /// The vectors are lifted from `src/lib/openUrl.test.ts`. Keeping them
+    /// identical is the point: this guard exists so a compromised renderer
+    /// cannot `invoke` past the frontend one, which it could if the backend
+    /// refused a smaller set.
+    #[test]
+    fn refuses_every_host_the_renderer_refuses() {
+        for host in [
+            "169.254.169.254",
+            "169.254.169.254.", // WHATWG keeps the trailing dot
+            "100.100.100.200",  // CGNAT 100.64/10
+            "0.0.0.0",
+            "255.255.255.255",
+            "[fe80::1]",
+            "[::ffff:169.254.169.254]",
+            "[::]",
+            "[fd00:ec2::254]",
+            "metadata.google.internal",
+            "metadata",
+            "METADATA.GOOGLE.INTERNAL",
+        ] {
+            assert!(host_reaches_metadata(host), "{host} should be refused");
+        }
+    }
+
+    /// Narrower than `ip_is_private` on purpose: locally served docs and an
+    /// intranet page are ordinary browsing.
+    #[test]
+    fn keeps_loopback_lan_and_the_public_internet_reachable() {
+        for host in [
+            "example.com",
+            "localhost",
+            "127.0.0.1",
+            "192.168.1.10",
+            "10.0.0.5",
+            "[::1]",
+            "100.32.0.1", // 100.32/11, outside CGNAT
+            "1.1.1.1",
+        ] {
+            assert!(!host_reaches_metadata(host), "{host} should be allowed");
+        }
     }
 }
