@@ -68,6 +68,26 @@ export default tseslint.config(
     },
   },
 
+  // Node tooling: release/build scripts and the benchmark harness. Without a
+  // block here these files inherit no globals at all, so `process`, `console`
+  // and `Buffer` read as undefined and `eslint .` reports hundreds of bogus
+  // no-undef errors — which in turn meant nobody ran it and these files went
+  // unlinted entirely.
+  {
+    files: ["scripts/**/*.{mjs,js}", "benchmark/**/*.{mjs,js}", "*.mjs"],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: "module",
+      globals: globals.node,
+    },
+    rules: {
+      // These scripts swallow best-effort failures (a probe that may not be
+      // running, a cleanup that may already have happened). An empty catch is
+      // the intent there, not an oversight.
+      "no-empty": ["error", { allowEmptyCatch: true }],
+    },
+  },
+
   // Turn off all rules that conflict with Prettier (formatting concerns).
   prettierConfig,
 );

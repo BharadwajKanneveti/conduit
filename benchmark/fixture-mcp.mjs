@@ -123,7 +123,7 @@ function completeValues(ref, argument, context) {
   const argName = argument?.name ?? "";
   const prefix = String(argument?.value ?? "");
   const ctx = context?.arguments ?? {};
-  let pool = [];
+  let pool;
   if (ref?.type === "ref/prompt") {
     const prompt = promptsByName.get(ref.name);
     if (!prompt) return null;
