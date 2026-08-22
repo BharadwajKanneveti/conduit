@@ -4,7 +4,7 @@ All notable changes to Toolport are documented here. Format loosely follows
 [Keep a Changelog](https://keepachangelog.com/); versions match the GitHub releases.
 Entries before the rename below shipped under the project's former name, Conduit.
 
-## [1.16.0] - Unreleased
+## [1.16.0] - 2026-08-22
 
 ### Fixed
 
