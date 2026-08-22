@@ -421,6 +421,10 @@ struct HttpBridge {
     token: Option<String>,
 }
 type HttpBridgeState = Mutex<HttpBridge>;
+static HTTP_BRIDGE_LIFECYCLE: Mutex<()> = Mutex::new(());
+
+const HTTP_BRIDGE_VAULT_SERVER: &str = "__toolport_http_bridge__";
+const HTTP_BRIDGE_VAULT_KEY: &str = "bearer";
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1012,7 +1016,7 @@ async fn install_gateway(
         {
             // Ensure the supervised bridge is up, mint/reuse a per-client bearer, write
             // native remote or mcp-remote into the client config (SOU-407).
-            let status = start_http_bridge_at(bridge.inner(), None)?;
+            let status = start_persisted_http_bridge(bridge.inner(), state.inner(), None)?;
             let port = status.port.unwrap_or(8765);
             let url = format!("http://127.0.0.1:{port}/mcp");
             let token = ensure_client_http_token(state.inner(), &client_id, profile.as_deref())?;
@@ -1346,7 +1350,7 @@ async fn migrate_client(
     let migrate_write = if transport.eq_ignore_ascii_case("sharedHttp")
         || transport.eq_ignore_ascii_case("shared_http")
     {
-        let status = start_http_bridge_at(bridge.inner(), None)?;
+        let status = start_persisted_http_bridge(bridge.inner(), state.inner(), None)?;
         let port = status.port.unwrap_or(8765);
         let url = format!("http://127.0.0.1:{port}/mcp");
         let token = ensure_client_http_token(state.inner(), &client_id, profile.as_deref())?;
@@ -1754,6 +1758,14 @@ fn registry_summary(reg: &Registry) -> String {
         let _ = writeln!(out, "  per-client discovery: {}", overrides.join(", "));
     }
     let _ = writeln!(out, "  deny destructive: {}", reg.deny_destructive);
+    let _ = writeln!(
+        out,
+        "  HTTP endpoint: {}{}",
+        if reg.http_bridge_enabled { "on" } else { "off" },
+        reg.http_bridge_port
+            .map(|port| format!(" (port {port})"))
+            .unwrap_or_default()
+    );
     let _ = writeln!(out, "  active profile: {active}");
 
     let _ = writeln!(out, "\nservers ({}):", reg.servers.len());
@@ -4100,6 +4112,9 @@ fn stop_spawned_gateways(bridge: State<HttpBridgeState>) -> UpdateShutdownReport
         FailedBeforeIntent(String),
     }
 
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let owned_bridge = {
         let mut bridge = bridge
             .lock()
@@ -4191,6 +4206,9 @@ struct UpdateRecoveryReport {
     /// True only when an HTTP endpoint existed before shutdown and is available
     /// again. External stdio clients are deliberately not represented as restored.
     http_bridge_recovered: bool,
+    /// The endpoint is live, but its durable token or registry state could not
+    /// be saved. The recovery marker is retained so a later launch can retry.
+    persistence_warning: Option<String>,
     /// Endpoint availability and marker cleanup are separate facts. A failed
     /// delete must not turn a verified live endpoint into a false "not restored"
     /// message, but the retained marker still needs to be surfaced.
@@ -4202,9 +4220,12 @@ struct UpdateRecoveryReport {
 /// would create disconnected processes and a false recovery claim.
 #[tauri::command]
 fn recover_update_gateways(
-    bridge: State<HttpBridgeState>,
+    app: AppHandle,
     http_bridge_port: Option<u16>,
 ) -> Result<UpdateRecoveryReport, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(port) = http_bridge_port else {
         return Ok(UpdateRecoveryReport::default());
     };
@@ -4216,10 +4237,21 @@ fn recover_update_gateways(
             intent.port
         ));
     }
-    ensure_http_bridge_at(bridge.inner(), port, Some(intent.token))?;
-    let cleanup_warning = clear_update_http_bridge_intent().err();
+    ensure_http_bridge_at(
+        app.state::<HttpBridgeState>().inner(),
+        port,
+        Some(intent.token.clone()),
+    )?;
+    let persistence_warning =
+        persist_restored_http_bridge(app.state::<RegistryState>().inner(), port, &intent.token)
+            .err();
+    let cleanup_warning = persistence_warning
+        .is_none()
+        .then(clear_update_http_bridge_intent)
+        .and_then(Result::err);
     Ok(UpdateRecoveryReport {
         http_bridge_recovered: true,
+        persistence_warning,
         cleanup_warning,
     })
 }
@@ -4377,6 +4409,9 @@ fn announce_restart_needed(
 /// Connected clients are unaffected by the new process: they authenticate with the
 /// per-client bearers in `http_clients`, not the bridge's own env token.
 fn reap_stale_and_restore_bridge(bridge: &HttpBridgeState, advice: &RestartAdvice) -> ReapOutcome {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut extra_keep = Vec::new();
     if let Some(p) = clients::resolve_gateway_path() {
         extra_keep.push(p);
@@ -4496,24 +4531,69 @@ fn ensure_http_bridge_at(
 /// clients can connect. Idempotent: if it's already running, returns the current
 /// status; otherwise spawns the bundled gateway binary and tracks it.
 #[tauri::command]
-fn start_http_bridge(
-    state: State<HttpBridgeState>,
-    port: Option<u16>,
-) -> Result<HttpBridgeStatus, String> {
-    start_http_bridge_at(state.inner(), port)
+async fn start_http_bridge(app: AppHandle, port: Option<u16>) -> Result<HttpBridgeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<HttpBridgeState>();
+        let registry = app.state::<RegistryState>();
+        start_persisted_http_bridge(state.inner(), registry.inner(), port)
+    })
+    .await
+    .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
 }
 
-/// Body of [`start_http_bridge`], taking the state directly so non-command callers
-/// (the reaper's bridge restore) can reach it without a `State` wrapper.
-fn start_http_bridge_at(
+/// Start the endpoint and durably remember the user's intent. Shared HTTP client
+/// setup also uses this path, since those clients need the endpoint after restart.
+fn start_persisted_http_bridge(
     state: &HttpBridgeState,
+    registry: &RegistryState,
     port: Option<u16>,
 ) -> Result<HttpBridgeStatus, String> {
-    // Every ordinary/user-initiated start supersedes an interrupted-update
-    // marker, including install/migration paths that call this helper directly.
-    // Recovery paths use the token-preserving lower-level function instead.
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let was_alive = {
+        let mut bridge = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        http_bridge_alive(&mut bridge)
+    };
+    let saved_token = secrets::get_secret_result(
+        HTTP_BRIDGE_VAULT_SERVER,
+        HTTP_BRIDGE_VAULT_KEY,
+    )?;
     clear_update_http_bridge_intent()?;
-    start_http_bridge_with_token_at(state, port, None)
+    let status = start_http_bridge_with_token_at(state, port, saved_token)?;
+    let token = status
+        .token
+        .as_deref()
+        .ok_or("The HTTP endpoint started without a bearer token")?;
+    if let Err(error) = secrets::set_secret(
+        HTTP_BRIDGE_VAULT_SERVER,
+        HTTP_BRIDGE_VAULT_KEY,
+        token,
+    ) {
+        if !was_alive {
+            let mut bridge = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = stop_http_bridge_with(&mut bridge, std::process::Child::kill);
+        }
+        return Err(format!("Could not save the HTTP endpoint token: {error}"));
+    }
+    if let Err(error) = write_registry(registry, |reg| {
+        reg.http_bridge_enabled = true;
+        reg.http_bridge_port = status.port;
+        Ok(())
+    }) {
+        if !was_alive {
+            let mut bridge = state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = stop_http_bridge_with(&mut bridge, std::process::Child::kill);
+        }
+        return Err(format!("Could not save the HTTP endpoint setting: {error}"));
+    }
+    Ok(status)
 }
 
 fn http_bridge_identity_ready(port: u16, token: &str) -> bool {
@@ -4647,20 +4727,78 @@ fn stop_http_bridge_with(
 
 /// Stop the supervised HTTP bridge child, if any.
 #[tauri::command]
-fn stop_http_bridge(state: State<HttpBridgeState>) -> Result<HttpBridgeStatus, String> {
-    let mut bridge = state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    // Clear the resume marker before stopping the live endpoint. If cleanup is
-    // denied, leave the endpoint running and report the error; otherwise a later
-    // launch could silently resurrect something the user explicitly disabled.
-    clear_update_http_bridge_intent()?;
-    stop_http_bridge_with(&mut bridge, std::process::Child::kill)
+async fn stop_http_bridge(app: AppHandle) -> Result<HttpBridgeStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let registry = app.state::<RegistryState>();
+        clear_update_http_bridge_intent()?;
+        write_registry(registry.inner(), |reg| {
+            reg.http_bridge_enabled = false;
+            Ok(())
+        })?;
+        let state = app.state::<HttpBridgeState>();
+        let mut bridge = state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        stop_http_bridge_with(&mut bridge, std::process::Child::kill)
+    })
+    .await
+    .map_err(|error| format!("HTTP endpoint task failed: {error}"))?
 }
 
-fn resume_http_bridge_after_update(state: &HttpBridgeState) -> Result<bool, String> {
+fn restore_persisted_http_bridge(state: &HttpBridgeState) -> Result<bool, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let registry = registry::load()?;
+    if !registry.http_bridge_enabled {
+        return Ok(false);
+    }
+    let token = secrets::get_secret_result(
+        HTTP_BRIDGE_VAULT_SERVER,
+        HTTP_BRIDGE_VAULT_KEY,
+    )?
+    .ok_or("The HTTP endpoint is enabled, but its saved bearer token is missing")?;
+    start_http_bridge_with_token_at(state, registry.http_bridge_port, Some(token))?;
+    Ok(true)
+}
+
+/// Make an update-restored endpoint durable before its one-shot recovery marker
+/// is removed, including when upgrading from a version without registry state.
+fn persist_restored_http_bridge(
+    registry: &RegistryState,
+    port: u16,
+    token: &str,
+) -> Result<(), String> {
+    secrets::set_secret(HTTP_BRIDGE_VAULT_SERVER, HTTP_BRIDGE_VAULT_KEY, token)
+        .map_err(|error| format!("Could not save the HTTP endpoint token: {error}"))?;
+    write_registry(registry, |reg| {
+        reg.http_bridge_enabled = true;
+        reg.http_bridge_port = Some(port);
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn resume_http_bridge_after_update(
+    state: &HttpBridgeState,
+    registry: &RegistryState,
+) -> Result<bool, String> {
+    let _lifecycle = HTTP_BRIDGE_LIFECYCLE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(intent) = load_update_http_bridge_intent()? else {
         return Ok(false);
     };
-    ensure_http_bridge_at(state, intent.port, Some(intent.token))?;
+    ensure_http_bridge_at(state, intent.port, Some(intent.token.clone()))?;
+    if let Err(error) = persist_restored_http_bridge(registry, intent.port, &intent.token) {
+        eprintln!(
+            "toolport: restored the HTTP endpoint, but could not save its persistent state: {error}"
+        );
+        return Ok(true);
+    }
     if let Err(error) = clear_update_http_bridge_intent() {
         eprintln!(
             "toolport: restored the HTTP endpoint, but could not clear its update resume state: {error}"
@@ -5329,6 +5467,7 @@ pub fn run() {
                 // restores connectivity without rotating credentials.
                 match resume_http_bridge_after_update(
                     migrate_handle.state::<HttpBridgeState>().inner(),
+                    migrate_handle.state::<RegistryState>().inner(),
                 ) {
                     Ok(true) => eprintln!(
                         "toolport: restored the HTTP endpoint after the in-app update"
@@ -5336,6 +5475,15 @@ pub fn run() {
                     Ok(false) => {}
                     Err(error) => eprintln!(
                         "toolport: could not restore the HTTP endpoint after the in-app update: {error}"
+                    ),
+                }
+                match restore_persisted_http_bridge(
+                    migrate_handle.state::<HttpBridgeState>().inner(),
+                ) {
+                    Ok(true) => eprintln!("toolport: restored the saved HTTP endpoint"),
+                    Ok(false) => {}
+                    Err(error) => eprintln!(
+                        "toolport: could not restore the saved HTTP endpoint: {error}"
                     ),
                 }
                 // Ownership map from disk (this launch thread has no RegistryState handle).
