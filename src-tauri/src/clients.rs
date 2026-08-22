@@ -1225,9 +1225,31 @@ fn roo_code_path() -> Option<PathBuf> {
 }
 
 /// OpenCode stores its global config at the literal
-/// `~/.config/opencode/opencode.json` on every supported OS.
+/// `~/.config/opencode/opencode.json` or `opencode.jsonc` on every supported OS.
 fn opencode_path() -> Option<PathBuf> {
     client_config_path("opencode")
+}
+
+fn resolve_opencode_config_path(json_path: PathBuf) -> Result<PathBuf, String> {
+    let jsonc_path = json_path.with_extension("jsonc");
+    match (json_path.exists(), jsonc_path.exists()) {
+        (true, true) => Err(format!(
+            "Both {} and {} exist. OpenCode config is ambiguous; remove or rename one before Toolport changes it.",
+            json_path.display(),
+            jsonc_path.display()
+        )),
+        (false, true) => Ok(jsonc_path),
+        _ => Ok(json_path),
+    }
+}
+
+fn resolved_definition_path(def: &ClientDef) -> Result<PathBuf, String> {
+    let path = (def.path)().ok_or("Could not resolve a config path on this OS")?;
+    if def.id == "opencode" {
+        resolve_opencode_config_path(path)
+    } else {
+        Ok(path)
+    }
 }
 
 /// Kilo Code stores its global JSONC config at the literal
@@ -2892,15 +2914,16 @@ fn read_client(def: &ClientDef) -> DetectedClient {
         }
     };
 
-    let path = match (def.path)() {
-        Some(p) => p,
-        None => {
-            return build(
-                String::new(),
-                false,
-                Vec::new(),
-                Some("Could not resolve a config path on this OS".to_string()),
-            )
+    let path = match resolved_definition_path(def) {
+        Ok(path) => path,
+        Err(error) => {
+            let fallback = (def.path)();
+            let config_path = fallback
+                .as_ref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_default();
+            let config_exists = fallback.as_ref().is_some_and(|path| path.exists());
+            return build(config_path, config_exists, Vec::new(), Some(error));
         }
     };
     let config_path = path.display().to_string();
@@ -5071,7 +5094,7 @@ fn edit_hermes_yaml_gateway(path: &Path, entry: Option<&ServerEntry>) -> Result<
 /// and preserving any unrelated top-level keys.
 pub fn write_servers(client_id: &str, servers: &[ServerEntry]) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
-    let path = (def.path)().ok_or("Could not resolve a config path on this OS")?;
+    let path = resolved_definition_path(&def)?;
     let backup = backup_file(client_id, &path)?;
     let lenient = config_is_whole_app_state(client_id);
     match def.format {
@@ -5753,7 +5776,7 @@ fn config_is_whole_app_state(client_id: &str) -> bool {
 
 fn install_or_remove(client_id: &str, entry: Option<&ServerEntry>) -> Result<WriteOutcome, String> {
     let def = find_def(client_id).ok_or_else(|| format!("Unknown client '{client_id}'"))?;
-    let path = (def.path)().ok_or("Could not resolve a config path on this OS")?;
+    let path = resolved_definition_path(&def)?;
     let backup = backup_file(client_id, &path)?;
     let lenient = config_is_whole_app_state(client_id);
     // Build the snapshot before writing so the ownership record matches the bytes
@@ -5968,7 +5991,7 @@ fn profile_key_from_config_text(content: &str, key: &str) -> Option<String> {
 
 fn read_gateway_profile(client_id: &str) -> Option<String> {
     let def = find_def(client_id)?;
-    let path = (def.path)()?;
+    let path = resolved_definition_path(&def).ok()?;
     let content = read_config_file(&path).ok()?;
     profile_from_config_text(&content)
 }
@@ -6126,7 +6149,7 @@ pub fn repoint_stale_gateways(managed: &HashMap<String, ManagedEntry>) -> Repoin
         }
         // Raw config text for profile preservation + legacy CONDUIT_* env detection.
         let config_text = find_def(&client.id)
-            .and_then(|def| (def.path)())
+            .and_then(|def| resolved_definition_path(&def).ok())
             .and_then(|path| read_config_file(&path).ok());
         if !gateway_entry_needs_rewrite(entry_name, stored, &current, config_text.as_deref()) {
             continue;
@@ -9213,6 +9236,73 @@ command = "npx"
         assert!(after["mcp"].get(GATEWAY_ENTRY_NAME).is_none());
         assert!(after["mcp"].get("existing").is_some());
         assert_eq!(after["model"], "anthropic/claude-sonnet-4-5");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn opencode_prefers_the_existing_jsonc_config() {
+        let mut json_path = temp_path("opencode-path");
+        json_path.set_extension("json");
+        let jsonc_path = json_path.with_extension("jsonc");
+        std::fs::write(&jsonc_path, "{}\n").unwrap();
+
+        assert_eq!(
+            resolve_opencode_config_path(json_path.clone()).unwrap(),
+            jsonc_path
+        );
+
+        std::fs::remove_file(json_path.with_extension("jsonc")).ok();
+    }
+
+    #[test]
+    fn opencode_refuses_to_choose_when_json_and_jsonc_both_exist() {
+        let mut json_path = temp_path("opencode-conflict");
+        json_path.set_extension("json");
+        let jsonc_path = json_path.with_extension("jsonc");
+        std::fs::write(&json_path, "{}\n").unwrap();
+        std::fs::write(&jsonc_path, "{}\n").unwrap();
+
+        let error = resolve_opencode_config_path(json_path.clone()).unwrap_err();
+        assert!(error.contains("Both"));
+        assert!(error.contains("opencode-conflict.json"));
+        assert!(error.contains("opencode-conflict.jsonc"));
+
+        std::fs::remove_file(&json_path).ok();
+        std::fs::remove_file(&jsonc_path).ok();
+    }
+
+    #[test]
+    fn opencode_jsonc_round_trip_preserves_comments_and_trailing_commas() {
+        let path = temp_path("opencode-round-trip.jsonc");
+        std::fs::write(
+            &path,
+            r#"{
+                // Keep the user's model choice.
+                "model": "anthropic/claude-sonnet-4-5",
+                "mcp": {
+                    "existing": {
+                        "type": "local",
+                        "command": ["node", "server.mjs"],
+                        "enabled": true,
+                    },
+                },
+            }"#,
+        )
+        .unwrap();
+
+        let entry = sample_gateway(None, "opencode");
+        edit_opencode_gateway(&path, Some(&entry)).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(content.contains("// Keep the user's model choice."));
+        assert!(content.contains("anthropic/claude-sonnet-4-5"));
+        let parsed = parse_opencode_json(&content).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed.iter().any(|server| server.name == "existing"));
+        assert!(parsed
+            .iter()
+            .any(|server| server.name == GATEWAY_ENTRY_NAME));
+
         std::fs::remove_file(&path).ok();
     }
 
