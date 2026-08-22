@@ -7442,8 +7442,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn process_group_isolation_puts_child_in_separate_group() {
-        use std::os::unix::process::CommandExt as _;
-
         // Our own process group id.
         let our_pgid = unsafe { libc_getpgrp() };
 

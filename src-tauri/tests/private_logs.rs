@@ -98,7 +98,6 @@ fn the_append_scan_survives_reformatting() {
 #[test]
 fn open_append_private_creates_an_owner_only_file() {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
 
     let dir = temp_dir("create");
     let path = dir.join("gateway.log");

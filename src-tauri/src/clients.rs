@@ -11283,6 +11283,10 @@ rules:
         // table assertion stays on the documented default (SBS-899).
         let _goose_root = EnvRestore::set("GOOSE_PATH_ROOT", Path::new(""));
         let home = home().expect("home dir should be available in tests");
+        // Only the non-Linux expectation takes a Platform; the Linux branch below
+        // resolves without one, so gate the binding the same way to keep the
+        // Linux build warning-free.
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
         let platform = Platform::current();
         for client in defs() {
             // These probe alternate on-disk locations (Antigravity subdirs, Claude

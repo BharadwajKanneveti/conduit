@@ -3035,7 +3035,6 @@ mod tests {
         assert_eq!(push_status_message(500), None);
     }
 
-    #[test]
     /// SBS-524: a shared headless server must stay headless.
     ///
     /// Dropping the block on either leg silently downgrades the member to the

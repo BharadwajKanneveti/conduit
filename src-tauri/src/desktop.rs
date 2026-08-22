@@ -33,7 +33,6 @@ use crate::searchtrace;
 use crate::secrets;
 use crate::stacks;
 use crate::teams;
-use crate::usage_report;
 use crate::vendors;
 
 type RegistryState = Mutex<Registry>;

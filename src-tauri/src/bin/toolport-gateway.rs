@@ -25639,7 +25639,7 @@ mod tests {
         // The common case: clients that never ask for progress cost nothing and
         // leave no state behind.
         let routes = Arc::new(Mutex::new(ProgressRoutes::default()));
-        let (stdio_tx, _stdio_rx) = stdio_progress_channel();
+        let (_stdio_tx, _stdio_rx) = stdio_progress_channel();
         assert!(register_progress(&routes, None, "alpha", "stdio").is_none());
         assert!(register_progress(
             &routes,
