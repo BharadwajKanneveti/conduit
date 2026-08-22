@@ -50,8 +50,8 @@ GTK shell ran while `WebKitWebProcess` aborted on `EGL_BAD_PARAMETER` every
 launch. The bundled Ubuntu 22.04 `libwebkit2gtk-4.1` got the blame, on the theory
 that it was too old to initialise EGL against a current Mesa.
 
-That was wrong, and it is worth writing down because the wrong diagnosis held for
-several releases. The bundled WebKitGTK is 2.50.4, which is current. The AppImage
+That was wrong, and it is worth writing down because the wrong diagnosis was
+convincing enough to ship a whole package around. The bundled WebKitGTK is 2.50.4, which is current. The AppImage
 was bundling **wayland 1.20**, and `AppRun` puts the bundle on
 `LD_LIBRARY_PATH` - which the loader then also applies to the host's GPU drivers,
 since those are deliberately not bundled. So the host's Mesa resolved against it:
