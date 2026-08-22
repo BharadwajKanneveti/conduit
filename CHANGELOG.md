@@ -42,6 +42,31 @@ Entries before the rename below shipped under the project's former name, Conduit
   outside an AppImage, so the `.deb`, the AUR package and dev builds are
   unaffected.
 
+- **Windows: launch at login showed "Off" when it was on.** The status came from
+  the autostart plugin's timestamp heuristic; it now reads the `HKCU` `Run` entry
+  plus the state byte in `Explorer\StartupApproved\Run`, so an enabled entry stops
+  reporting as disabled after a restart. A registry value it cannot make sense of
+  now reports as unreadable rather than quietly as off. (#830)
+
+- **The HTTP/OpenAPI endpoint turned itself off on every restart.** Enablement and
+  port now persist in the registry, and the bearer token is reused from the OS
+  keychain instead of being rotated on each launch, so a client configured against
+  the endpoint keeps working across restarts. Start, stop and restore are
+  serialized behind a lifecycle mutex, and a persistence failure now stops a
+  newly started endpoint rather than leaving it running unrecorded. (#829)
+
+- **OpenCode: an `opencode.jsonc` config was ignored.** Toolport always targeted
+  `opencode.json`, so a JSONC config was neither read nor written. Reads, writes,
+  gateway install and launch migration now share one path picker that prefers an
+  existing `.jsonc` and preserves its comments and trailing commas. If both files
+  exist, Toolport refuses to guess and says so instead of silently picking one. (#827)
+
+- **Adding a server whose secret failed to save could create a duplicate.** A
+  secret-write failure after a successful add is now treated as a partial success:
+  every write is attempted, the failed keys are named, and the dialog stays open in
+  edit mode, so retrying updates the server you just added instead of creating a
+  second one. (#826, thanks @rohankumardubey)
+
 ### Changed
 
 - **External links no longer go through `tauri-plugin-opener`.** The plugin
@@ -50,6 +75,15 @@ Entries before the rename below shipped under the project's former name, Conduit
   `open_external` command that reuses the same sanitised spawn as the OAuth
   flow. The `http`/`https`-only and link-local/metadata guards are unchanged and
   are now enforced on the IPC boundary as well as in the renderer.
+
+### Thanks
+
+One of the patches in this release came from outside.
+
+- **[rohankumardubey](https://github.com/rohankumardubey)** - partial server adds
+  no longer strand you with a duplicate on retry: failed secret writes are
+  reported and the dialog stays in edit mode so the retry updates the existing
+  server (#826).
 
 ## [1.15.0] - 2026-08-20
 
