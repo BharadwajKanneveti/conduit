@@ -1260,14 +1260,7 @@ function App() {
         <ServerDialog
           autoOpen
           onClose={() => setAddServerOpen(false)}
-          onSaved={(reg) => {
-            applyRegistryChange(reg);
-            // A successful save closes the dialog internally without going through
-            // onOpenChange, so `onClose` never fires and this stays mounted-but-open.
-            // Without clearing it here the next Ctrl+N is a silent no-op. Same pattern
-            // CatalogView already uses for its autoOpen dialog.
-            setAddServerOpen(false);
-          }}
+          onSaved={applyRegistryChange}
           existingNames={servers.map((s) => s.name)}
         />
       )}

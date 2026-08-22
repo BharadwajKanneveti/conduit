@@ -378,10 +378,7 @@ export function CatalogView({ registry, onAdded }: Props) {
       )}
       {configEntry && (
         <ServerDialog
-          onSaved={(reg) => {
-            onAdded(reg);
-            setConfigEntry(null);
-          }}
+          onSaved={onAdded}
           onClose={() => setConfigEntry(null)}
           initial={{
             id: "",
